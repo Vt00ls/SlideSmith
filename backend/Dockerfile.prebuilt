@@ -1,0 +1,21 @@
+ARG RUNTIME_BASE=ghcr.io/chaitin/agent-compose:latest
+ARG TARGET=server
+
+FROM ${RUNTIME_BASE}
+
+ARG TARGET=server
+
+WORKDIR /app
+
+COPY backend/bin/slidesmith-${TARGET} /app/slidesmith
+COPY runtime/ppt-master-agent/scripts /app/runtime/ppt-master-agent/scripts
+COPY runtime/ppt-master-agent/workflows /app/runtime/ppt-master-agent/workflows
+
+ENV SLIDESMITH_HTTP_ADDR=0.0.0.0:18080
+ENV SLIDESMITH_GIN_MODE=release
+ENV SLIDESMITH_AGENT_COMPOSE_CLI=agent-compose
+ENV SLIDESMITH_AGENT_COMPOSE_WORKDIR=/app/runtime/ppt-master-agent
+
+EXPOSE 18080
+
+ENTRYPOINT ["/app/slidesmith"]

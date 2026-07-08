@@ -1,0 +1,111 @@
+name: slidesmith-prebuilt
+
+x-prebuilt-env: &prebuilt-env
+  SLIDESMITH_GIN_MODE: release
+  SLIDESMITH_DB_DRIVER: sqlite
+  SLIDESMITH_DB_DSN: /app-data/data/slidesmith.db
+  SLIDESMITH_STORAGE_ROOT: /app-data/storage
+  SLIDESMITH_AGENT_COMPOSE_ENABLED: "true"
+  SLIDESMITH_AGENT_COMPOSE_CLI: agent-compose
+  SLIDESMITH_AGENT_COMPOSE_HOST: http://agent-compose:7410
+  SLIDESMITH_AGENT_COMPOSE_FILE: /data/work/agent-compose.yml
+  SLIDESMITH_AGENT_COMPOSE_WORKDIR: /app/runtime/ppt-master-agent
+  SLIDESMITH_AGENT_COMPOSE_WORKSPACE_ROOT: /data/work/task-workspaces
+  SLIDESMITH_AGENT_COMPOSE_AGENT: ppt_master
+  SLIDESMITH_AGENT_COMPOSE_RUNTIME_IMAGE: ${SLIDESMITH_AGENT_COMPOSE_RUNTIME_IMAGE:-slidesmith/ppt-master-runtime:dev}
+  SLIDESMITH_AGENT_COMPOSE_SESSION_ROOT: /data
+  SLIDESMITH_AGENT_COMPOSE_TIMEOUT: ${SLIDESMITH_AGENT_COMPOSE_TIMEOUT:-30m}
+  SLIDESMITH_PPT_MASTER_SKILL_DIR: /data/skills/ppt-master
+  SLIDESMITH_PPT_RUNNER_PROFILE: ${SLIDESMITH_PPT_RUNNER_PROFILE:-real-lite}
+  SLIDESMITH_WORKER_POLL_INTERVAL: ${SLIDESMITH_WORKER_POLL_INTERVAL:-2s}
+  SLIDESMITH_WORKER_BATCH_SIZE: ${SLIDESMITH_WORKER_BATCH_SIZE:-1}
+
+x-prebuilt-volumes: &prebuilt-volumes
+  - ${SLIDESMITH_PREBUILT_APP_DATA_ROOT:-/root/slidesmith-compose-prebuilt/data/app}:/app-data
+  - ${SLIDESMITH_PREBUILT_AGENT_COMPOSE_DATA_ROOT:-/root/slidesmith-compose-prebuilt/data/agent-compose}:/data
+  - ${SLIDESMITH_PPT_MASTER_SKILL_DIR_HOST:-/root/slidesmith-deps/ppt-master/skills/ppt-master}:/data/skills/ppt-master:ro
+
+services:
+  frontend:
+    image: ${SLIDESMITH_PREBUILT_FRONTEND_IMAGE:-slidesmith/frontend:prebuilt}
+    build:
+      context: ..
+      dockerfile: frontend/Dockerfile.prebuilt
+      args:
+        RUNTIME_BASE: ${SLIDESMITH_PREBUILT_RUNTIME_BASE:-ghcr.io/chaitin/agent-compose:latest}
+    restart: unless-stopped
+    environment:
+      SLIDESMITH_FRONTEND_ADDR: 0.0.0.0:8080
+      SLIDESMITH_API_UPSTREAM: http://api:18080
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "${SLIDESMITH_PREBUILT_FRONTEND_PORT:-18081}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8080/\").read()'"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  api:
+    image: ${SLIDESMITH_PREBUILT_API_IMAGE:-slidesmith/api:prebuilt}
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile.prebuilt
+      args:
+        RUNTIME_BASE: ${SLIDESMITH_PREBUILT_RUNTIME_BASE:-ghcr.io/chaitin/agent-compose:latest}
+        TARGET: server
+    restart: unless-stopped
+    env_file:
+      - ${SLIDESMITH_AGENT_COMPOSE_ENV_FILE:-./agent-compose.env.example}
+    environment:
+      <<: *prebuilt-env
+      SLIDESMITH_HTTP_ADDR: 0.0.0.0:18080
+    volumes: *prebuilt-volumes
+    depends_on:
+      agent-compose:
+        condition: service_started
+    ports:
+      - "${SLIDESMITH_PREBUILT_API_PORT:-18082}:18080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:18080/healthz\").read()'"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  worker:
+    image: ${SLIDESMITH_PREBUILT_WORKER_IMAGE:-slidesmith/worker:prebuilt}
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile.prebuilt
+      args:
+        RUNTIME_BASE: ${SLIDESMITH_PREBUILT_RUNTIME_BASE:-ghcr.io/chaitin/agent-compose:latest}
+        TARGET: worker
+    restart: unless-stopped
+    env_file:
+      - ${SLIDESMITH_AGENT_COMPOSE_ENV_FILE:-./agent-compose.env.example}
+    environment: *prebuilt-env
+    volumes: *prebuilt-volumes
+    depends_on:
+      agent-compose:
+        condition: service_started
+
+  agent-compose:
+    image: ${AGENT_COMPOSE_IMAGE:-ghcr.io/chaitin/agent-compose:latest}
+    container_name: ${SLIDESMITH_PREBUILT_AGENT_COMPOSE_CONTAINER:-slidesmith-compose-agent-compose}
+    restart: unless-stopped
+    privileged: true
+    env_file:
+      - ${SLIDESMITH_AGENT_COMPOSE_ENV_FILE:-./agent-compose.env.example}
+    environment:
+      HTTP_LISTEN: 0.0.0.0:7410
+      DATA_ROOT: /data
+      DOCKER_HOST_SESSION_ROOT: ${SLIDESMITH_PREBUILT_AGENT_COMPOSE_HOST_SESSION_ROOT:-/root/slidesmith-compose-prebuilt/data/agent-compose/sessions}
+      AGENT_COMPOSE_RUNTIME_BASE_URL: ${AGENT_COMPOSE_RUNTIME_BASE_URL:-http://agent-compose:7410}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SLIDESMITH_PREBUILT_AGENT_COMPOSE_DATA_ROOT:-/root/slidesmith-compose-prebuilt/data/agent-compose}:/data
+    working_dir: /data/work
+    ports:
+      - "${SLIDESMITH_PREBUILT_AGENT_COMPOSE_PORT:-127.0.0.1:17410}:7410"

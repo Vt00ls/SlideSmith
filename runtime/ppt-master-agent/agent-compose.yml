@@ -1,0 +1,15 @@
+name: slidesmith-ppt-master-runtime-smoke
+
+workspace:
+  provider: local
+  path: .
+
+agents:
+  ppt_master:
+    provider: codex
+    image: slidesmith/ppt-master-runtime:dev
+    driver:
+      docker: {}
+    scheduler:
+      enabled: false
+

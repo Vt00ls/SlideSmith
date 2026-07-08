@@ -1,0 +1,57 @@
+ARG BASE_IMAGE=agent-compose-guest:latest
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG INSTALL_OFFICE_DEPS=true
+ARG PY_DEPS_PROFILE=full
+ARG PYPI_INDEX_URL=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+ARG PYPI_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn
+
+ENV PIP_INDEX_URL=${PYPI_INDEX_URL}
+ENV PIP_TRUSTED_HOST=${PYPI_TRUSTED_HOST}
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PPT_MASTER_ROOT=/opt/ppt-master
+ENV NODE_PATH=/opt/slidesmith-node/node_modules
+
+RUN if [ "${INSTALL_OFFICE_DEPS}" = "true" ]; then \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        libreoffice \
+        pandoc \
+        poppler-utils \
+        fontconfig \
+        fonts-dejavu-core \
+        fonts-liberation \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji \
+        libcairo2 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        shared-mime-info \
+        && apt-get clean && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+COPY runtime/ppt-master-runtime/ppt-master /opt/ppt-master
+
+RUN if [ "${PY_DEPS_PROFILE}" = "mock" ]; then \
+      python3 -m pip install --break-system-packages --no-cache-dir --no-input \
+        --index-url ${PYPI_INDEX_URL} \
+        --trusted-host ${PYPI_TRUSTED_HOST} \
+        python-pptx svglib reportlab Pillow numpy; \
+    else \
+      python3 -m pip install --break-system-packages --no-cache-dir --no-input \
+        --index-url ${PYPI_INDEX_URL} \
+        --trusted-host ${PYPI_TRUSTED_HOST} \
+        -r /opt/ppt-master/requirements.txt; \
+    fi && \
+    mkdir -p /opt/slidesmith-node && \
+    if [ -f /opt/agent-compose/npm/agent-compose-runtime-sdk.tgz ]; then \
+      npm install --offline --cache /tmp/slidesmith-npm-cache \
+        /opt/agent-compose/npm/agent-compose-runtime-sdk.tgz \
+        --prefix /opt/slidesmith-node; \
+      rm -rf /tmp/slidesmith-npm-cache; \
+    fi && \
+    fc-cache -f
+
+WORKDIR /workspace

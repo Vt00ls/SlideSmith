@@ -1,0 +1,15 @@
+ARG RUNTIME_BASE=ghcr.io/chaitin/agent-compose:latest
+
+FROM ${RUNTIME_BASE}
+
+WORKDIR /app
+
+COPY frontend/dist /app/frontend/dist
+COPY frontend/server.py /app/frontend/server.py
+
+ENV SLIDESMITH_FRONTEND_ADDR=0.0.0.0:8080
+ENV SLIDESMITH_API_UPSTREAM=http://api:18080
+
+EXPOSE 8080
+
+ENTRYPOINT ["python3", "/app/frontend/server.py"]

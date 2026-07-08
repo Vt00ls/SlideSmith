@@ -1,0 +1,273 @@
+package handler
+
+import (
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/slidesmith/slidesmith/backend/internal/repository"
+	"github.com/slidesmith/slidesmith/backend/internal/service"
+)
+
+type TaskHandler struct {
+	tasks *service.TaskService
+}
+
+func NewTaskHandler(tasks *service.TaskService) *TaskHandler {
+	return &TaskHandler{tasks: tasks}
+}
+
+func Health(ctx *gin.Context) {
+	ctx.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *TaskHandler) CreateTask(ctx *gin.Context) {
+	var req struct {
+		Title              string `json:"title"`
+		TemplateID         string `json:"template_id"`
+		SelectedTemplateID string `json:"selected_template_id"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	templateID := req.TemplateID
+	if templateID == "" {
+		templateID = req.SelectedTemplateID
+	}
+	task, err := h.tasks.CreateTask(ctx.Request.Context(), req.Title, templateID)
+	if err != nil {
+		errorJSON(ctx, http.StatusInternalServerError, err)
+		return
+	}
+	ctx.JSON(http.StatusCreated, gin.H{"data": task})
+}
+
+func (h *TaskHandler) ListTasks(ctx *gin.Context) {
+	tasks, err := h.tasks.ListTasks(ctx.Request.Context())
+	if err != nil {
+		errorJSON(ctx, http.StatusInternalServerError, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": tasks})
+}
+
+func (h *TaskHandler) GetTask(ctx *gin.Context) {
+	task, err := h.tasks.GetTask(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) UploadFile(ctx *gin.Context) {
+	file, err := ctx.FormFile("file")
+	if err != nil {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	handle, err := file.Open()
+	if err != nil {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	defer handle.Close()
+	artifact, err := h.tasks.UploadFile(ctx.Request.Context(), ctx.Param("id"), file.Filename, handle)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusCreated, gin.H{"data": artifact})
+}
+
+func (h *TaskHandler) StartTask(ctx *gin.Context) {
+	task, err := h.tasks.StartTask(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) CancelTask(ctx *gin.Context) {
+	task, err := h.tasks.CancelTask(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) RetryTask(ctx *gin.Context) {
+	var req struct {
+		Phase string `json:"phase"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	task, err := h.tasks.RetryTask(ctx.Request.Context(), ctx.Param("id"), req.Phase)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) ContinueTask(ctx *gin.Context) {
+	var req struct {
+		Phase string `json:"phase"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	task, err := h.tasks.ContinueTask(ctx.Request.Context(), ctx.Param("id"), req.Phase)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) ListRuntimeRuns(ctx *gin.Context) {
+	runs, err := h.tasks.ListRuntimeRuns(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": runs})
+}
+
+func (h *TaskHandler) ListPhaseRuns(ctx *gin.Context) {
+	runs, err := h.tasks.ListPhaseRuns(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": runs})
+}
+
+func (h *TaskHandler) GetSpecPreview(ctx *gin.Context) {
+	spec, err := h.tasks.GetSpecPreview(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": spec})
+}
+
+func (h *TaskHandler) ListEvents(ctx *gin.Context) {
+	afterSeq, _ := strconv.ParseInt(ctx.DefaultQuery("after_seq", "0"), 10, 64)
+	limit, _ := strconv.Atoi(ctx.DefaultQuery("limit", "200"))
+	events, err := h.tasks.ListEvents(ctx.Request.Context(), ctx.Param("id"), afterSeq, limit)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": events})
+}
+
+func (h *TaskHandler) StreamEvents(ctx *gin.Context) {
+	ctx.Header("Content-Type", "text/event-stream")
+	ctx.Header("Cache-Control", "no-cache")
+	ctx.Header("Connection", "keep-alive")
+	afterSeq, _ := strconv.ParseInt(ctx.DefaultQuery("after_seq", "0"), 10, 64)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		events, err := h.tasks.ListEvents(ctx.Request.Context(), ctx.Param("id"), afterSeq, 200)
+		if err != nil {
+			ctx.SSEvent("error", gin.H{"error": err.Error()})
+			ctx.Writer.Flush()
+			return
+		}
+		for _, event := range events {
+			afterSeq = event.Seq
+			ctx.SSEvent("event", event)
+		}
+		ctx.Writer.Flush()
+
+		select {
+		case <-ctx.Request.Context().Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *TaskHandler) ListConfirmations(ctx *gin.Context) {
+	confirmations, err := h.tasks.ListConfirmations(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": confirmations})
+}
+
+func (h *TaskHandler) SubmitConfirmations(ctx *gin.Context) {
+	var req struct {
+		Values map[string]any `json:"values"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	if req.Values == nil {
+		req.Values = map[string]any{}
+	}
+	task, err := h.tasks.SubmitConfirmations(ctx.Request.Context(), ctx.Param("id"), req.Values)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) ListArtifacts(ctx *gin.Context) {
+	artifacts, err := h.tasks.ListArtifacts(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": artifacts})
+}
+
+func (h *TaskHandler) GetArtifactContent(ctx *gin.Context) {
+	artifact, path, err := h.tasks.ArtifactFile(ctx.Request.Context(), ctx.Param("id"), ctx.Param("artifactId"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	if artifact.MimeType != "" {
+		ctx.Header("Content-Type", artifact.MimeType)
+	}
+	ctx.Header("Content-Disposition", "inline; filename="+strconv.Quote(artifact.Name))
+	ctx.File(path)
+}
+
+func (h *TaskHandler) DownloadPPTX(ctx *gin.Context) {
+	artifact, path, err := h.tasks.LatestPPTX(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.FileAttachment(path, artifact.Name)
+}
+
+func handleServiceError(ctx *gin.Context, err error) {
+	if errors.Is(err, repository.ErrNotFound) {
+		errorJSON(ctx, http.StatusNotFound, err)
+		return
+	}
+	errorJSON(ctx, http.StatusBadRequest, err)
+}
+
+func errorJSON(ctx *gin.Context, status int, err error) {
+	ctx.JSON(status, gin.H{"error": err.Error()})
+}

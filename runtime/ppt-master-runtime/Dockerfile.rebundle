@@ -1,0 +1,31 @@
+ARG BASE_IMAGE=slidesmith/ppt-master-runtime:base
+FROM ${BASE_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG INSTALL_OFFICE_DEPS=true
+
+ENV PPT_MASTER_ROOT=/opt/ppt-master
+ENV NODE_PATH=/opt/slidesmith-node/node_modules
+
+RUN if [ "${INSTALL_OFFICE_DEPS}" = "true" ]; then \
+      apt-get update && \
+      apt-get install -y --no-install-recommends \
+        libreoffice \
+        pandoc \
+        poppler-utils \
+        fontconfig \
+        fonts-dejavu-core \
+        fonts-liberation \
+        fonts-noto-cjk \
+        fonts-noto-color-emoji \
+        libcairo2 \
+        libpango-1.0-0 \
+        libpangocairo-1.0-0 \
+        shared-mime-info \
+        && apt-get clean && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
+
+COPY runtime/ppt-master-runtime/ppt-master /opt/ppt-master
+
+WORKDIR /workspace

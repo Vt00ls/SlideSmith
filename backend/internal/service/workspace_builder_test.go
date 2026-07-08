@@ -1,0 +1,203 @@
+package service
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/slidesmith/slidesmith/backend/internal/config"
+	"github.com/slidesmith/slidesmith/backend/internal/model"
+)
+
+func TestRuntimeWorkspaceBuilderBuildsTaskWorkspace(t *testing.T) {
+	tmp := t.TempDir()
+	seed := filepath.Join(tmp, "seed")
+	mustWriteFile(t, filepath.Join(seed, "scripts", "ppt_runner.py"), "print('runner')\n")
+	mustWriteFile(t, filepath.Join(seed, "workflows", "ppt_workflow.js"), "console.log('workflow')\n")
+
+	skillSource := filepath.Join(tmp, "ppt-master", "skills", "ppt-master")
+	mustWriteFile(t, filepath.Join(skillSource, "SKILL.md"), "# PPT Master\n")
+	mustWriteFile(t, filepath.Join(skillSource, "scripts", "svg_to_pptx.py"), "print('export')\n")
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "README.md"), "templates\n")
+
+	storage := NewLocalStorage(filepath.Join(tmp, "storage"))
+	sourceKey := filepath.ToSlash(filepath.Join("tasks", "task-1", "source", "input.md"))
+	mustWriteFile(t, storage.Path(sourceKey), "# Source\n")
+
+	cfg := config.AgentComposeConfig{
+		WorkDir:           seed,
+		ComposeFile:       "/data/work/agent-compose.yml",
+		WorkspaceRoot:     filepath.Join(seed, "task-workspaces"),
+		PPTMasterSkillDir: skillSource,
+		Agent:             "ppt_master",
+		RuntimeImage:      "slidesmith/ppt-master-runtime:dev",
+	}
+	builder := NewRuntimeWorkspaceBuilder(cfg, storage)
+	task := &model.Task{
+		ID:             "task-1",
+		RuntimeProject: "task_1",
+	}
+	workspace, err := builder.Build(context.Background(), task, []model.Artifact{{
+		TaskID:    task.ID,
+		Kind:      model.ArtifactKindSource,
+		Name:      "input.md",
+		ObjectKey: sourceKey,
+	}})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	requiredPaths := []string{
+		filepath.Join(workspace.HostDir, "skills", "ppt-master", "SKILL.md"),
+		filepath.Join(workspace.HostDir, "skills", "ppt-master", "scripts", "svg_to_pptx.py"),
+		filepath.Join(workspace.HostDir, "scripts", "ppt_runner.py"),
+		filepath.Join(workspace.HostDir, "workflows", "ppt_workflow.js"),
+		filepath.Join(workspace.HostDir, "uploads", task.ID, "input.md"),
+		filepath.Join(workspace.HostDir, ".slidesmith", "runtime_manifest.json"),
+		filepath.Join(workspace.HostDir, ".slidesmith", "skill_lock.json"),
+		workspace.ComposeFile,
+	}
+	for _, path := range requiredPaths {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("expected %s to exist: %v", path, err)
+		}
+	}
+	if workspace.InputPath != filepath.ToSlash(filepath.Join("uploads", task.ID, "input.md")) {
+		t.Fatalf("unexpected input path %q", workspace.InputPath)
+	}
+	if !strings.HasPrefix(workspace.CLIComposeFile, "/data/work/task-workspaces/task_1/") {
+		t.Fatalf("unexpected cli compose path %q", workspace.CLIComposeFile)
+	}
+	rawCompose, err := os.ReadFile(workspace.ComposeFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawCompose), "workspace:\n  provider: local\n  path: .") {
+		t.Fatalf("compose file does not point to local workspace:\n%s", rawCompose)
+	}
+	actualProjectPath := filepath.Join(workspace.HostDir, "projects", "task_1_ppt169_20260707")
+	if err := builder.WriteRuntimeManifest(workspace, task, actualProjectPath); err != nil {
+		t.Fatalf("WriteRuntimeManifest() error = %v", err)
+	}
+	rawManifest, err := os.ReadFile(filepath.Join(workspace.HostDir, ".slidesmith", "runtime_manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawManifest), `"project_path": "projects/task_1_ppt169_20260707"`) {
+		t.Fatalf("manifest did not record actual project path:\n%s", rawManifest)
+	}
+}
+
+func TestRuntimeWorkspaceBuilderAppliesTemplateLock(t *testing.T) {
+	tmp := t.TempDir()
+	seed := filepath.Join(tmp, "seed")
+	mustWriteFile(t, filepath.Join(seed, "scripts", "ppt_runner.py"), "print('runner')\n")
+	mustWriteFile(t, filepath.Join(seed, "workflows", "ppt_workflow.js"), "console.log('workflow')\n")
+
+	skillSource := filepath.Join(tmp, "ppt-master", "skills", "ppt-master")
+	mustWriteFile(t, filepath.Join(skillSource, "SKILL.md"), "# PPT Master\n")
+	mustWriteFile(t, filepath.Join(skillSource, "scripts", "svg_to_pptx.py"), "print('export')\n")
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "README.md"), "templates\n")
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "design_spec_reference.md"), "reference\n")
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "layouts", "layouts_index.json"), `{
+  "government_blue": {"summary": "blue", "canvas_format": "ppt169", "page_count": 5},
+  "pixel_retro": {"summary": "retro", "canvas_format": "ppt169", "page_count": 5}
+}`)
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "layouts", "government_blue", "01_cover.svg"), "<svg></svg>\n")
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "layouts", "pixel_retro", "01_cover.svg"), "<svg></svg>\n")
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "decks", "decks_index.json"), `{"中国电信": {"summary": "telecom"}}`)
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "decks", "中国电信", "01_cover.svg"), "<svg></svg>\n")
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "brands", "brands_index.json"), `{"google": {"summary": "google"}}`)
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "brands", "google", "google_wordmark.svg"), "<svg></svg>\n")
+	mustWriteFile(t, filepath.Join(skillSource, "templates", "charts", "bar_chart.svg"), "<svg></svg>\n")
+
+	catalog := NewTemplateCatalogService(skillSource)
+	lock, err := catalog.BuildTemplateLock(context.Background(), "layout:government_blue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawLock, err := json.Marshal(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	storage := NewLocalStorage(filepath.Join(tmp, "storage"))
+	sourceKey := filepath.ToSlash(filepath.Join("tasks", "task-1", "source", "input.md"))
+	mustWriteFile(t, storage.Path(sourceKey), "# Source\n")
+	cfg := config.AgentComposeConfig{
+		WorkDir:           seed,
+		ComposeFile:       "/data/work/agent-compose.yml",
+		WorkspaceRoot:     filepath.Join(seed, "task-workspaces"),
+		PPTMasterSkillDir: skillSource,
+		Agent:             "ppt_master",
+		RuntimeImage:      "slidesmith/ppt-master-runtime:dev",
+	}
+	builder := NewRuntimeWorkspaceBuilder(cfg, storage)
+	task := &model.Task{
+		ID:                 "task-1",
+		RuntimeProject:     "task_1",
+		SelectedTemplateID: lock.TemplateID,
+		TemplateLockJSON:   string(rawLock),
+	}
+	workspace, err := builder.Build(context.Background(), task, []model.Artifact{{
+		TaskID:    task.ID,
+		Kind:      model.ArtifactKindSource,
+		Name:      "input.md",
+		ObjectKey: sourceKey,
+	}})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+
+	assertExists(t, filepath.Join(workspace.SkillDir, "templates", "layouts", "government_blue", "01_cover.svg"))
+	assertMissing(t, filepath.Join(workspace.SkillDir, "templates", "layouts", "pixel_retro"))
+	assertMissing(t, filepath.Join(workspace.SkillDir, "templates", "decks", "中国电信"))
+	assertMissing(t, filepath.Join(workspace.SkillDir, "templates", "brands", "google"))
+	assertExists(t, filepath.Join(workspace.SkillDir, "templates", "charts", "bar_chart.svg"))
+	assertExists(t, filepath.Join(workspace.HostDir, ".slidesmith", "template_lock.json"))
+
+	rawIndex, err := os.ReadFile(filepath.Join(workspace.SkillDir, "templates", "layouts", "layouts_index.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawIndex), "government_blue") || strings.Contains(string(rawIndex), "pixel_retro") {
+		t.Fatalf("layout index was not filtered:\n%s", rawIndex)
+	}
+	rawManifest, err := os.ReadFile(filepath.Join(workspace.HostDir, ".slidesmith", "runtime_manifest.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rawManifest), `"selected_template_id": "layout:government_blue"`) {
+		t.Fatalf("manifest missing selected template:\n%s", rawManifest)
+	}
+	if !strings.Contains(string(rawManifest), `"skills/ppt-master/templates/layouts/government_blue"`) {
+		t.Fatalf("manifest missing selected template root:\n%s", rawManifest)
+	}
+}
+
+func mustWriteFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected %s to exist: %v", path, err)
+	}
+}
+
+func assertMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected %s to be missing, err=%v", path, err)
+	}
+}

@@ -1,0 +1,146 @@
+name: slidesmith
+
+x-backend-env: &backend-env
+  SLIDESMITH_GIN_MODE: release
+  SLIDESMITH_DB_DRIVER: postgres
+  SLIDESMITH_DB_DSN: "host=postgres user=${POSTGRES_USER:-slidesmith} password=${POSTGRES_PASSWORD:-slidesmith_dev_password} dbname=${POSTGRES_DB:-slidesmith} port=5432 sslmode=disable TimeZone=Asia/Shanghai"
+  SLIDESMITH_STORAGE_ROOT: /app-data/storage
+  SLIDESMITH_AGENT_COMPOSE_ENABLED: "true"
+  SLIDESMITH_AGENT_COMPOSE_CLI: /app/deploy/server/agent-compose-docker-cli.sh
+  SLIDESMITH_AGENT_COMPOSE_CONTAINER: ${SLIDESMITH_AGENT_COMPOSE_CONTAINER:-slidesmith-agent-compose}
+  SLIDESMITH_AGENT_COMPOSE_CONTAINER_WORKDIR: /data/work
+  SLIDESMITH_AGENT_COMPOSE_HOST: http://127.0.0.1:7410
+  SLIDESMITH_AGENT_COMPOSE_FILE: /data/work/agent-compose.yml
+  SLIDESMITH_AGENT_COMPOSE_WORKDIR: /app/runtime/ppt-master-agent
+  SLIDESMITH_AGENT_COMPOSE_WORKSPACE_ROOT: /data/work/task-workspaces
+  SLIDESMITH_AGENT_COMPOSE_AGENT: ppt_master
+  SLIDESMITH_AGENT_COMPOSE_RUNTIME_IMAGE: ${SLIDESMITH_AGENT_COMPOSE_RUNTIME_IMAGE:-slidesmith/ppt-master-runtime:dev}
+  SLIDESMITH_AGENT_COMPOSE_SESSION_ROOT: /data
+  SLIDESMITH_AGENT_COMPOSE_TIMEOUT: ${SLIDESMITH_AGENT_COMPOSE_TIMEOUT:-30m}
+  SLIDESMITH_PPT_MASTER_SKILL_DIR: /data/skills/ppt-master
+  SLIDESMITH_PPT_RUNNER_PROFILE: ${SLIDESMITH_PPT_RUNNER_PROFILE:-real-lite}
+  SLIDESMITH_WORKER_POLL_INTERVAL: ${SLIDESMITH_WORKER_POLL_INTERVAL:-2s}
+  SLIDESMITH_WORKER_BATCH_SIZE: ${SLIDESMITH_WORKER_BATCH_SIZE:-1}
+
+x-backend-volumes: &backend-volumes
+  - /var/run/docker.sock:/var/run/docker.sock
+  - ${SLIDESMITH_APP_DATA_ROOT:-./data/app}:/app-data
+  - ${SLIDESMITH_AGENT_COMPOSE_DATA_ROOT:-./data/agent-compose}:/data
+  - ${SLIDESMITH_RUNTIME_SEED_HOST:-../runtime/ppt-master-agent}:/app/runtime/ppt-master-agent:ro
+  - ${SLIDESMITH_PPT_MASTER_SKILL_DIR_HOST:-/Users/vt/Dev_space/ppt-master/skills/ppt-master}:/data/skills/ppt-master:ro
+
+services:
+  frontend:
+    image: ${SLIDESMITH_FRONTEND_IMAGE:-slidesmith/frontend:dev}
+    build:
+      context: ..
+      dockerfile: frontend/Dockerfile
+      args:
+        NODE_IMAGE: ${SLIDESMITH_NODE_IMAGE:-node:22-alpine}
+        NGINX_IMAGE: ${SLIDESMITH_NGINX_IMAGE:-nginx:1.27-alpine}
+        VITE_API_BASE: /api
+        NPM_CONFIG_REGISTRY: ${SLIDESMITH_NPM_CONFIG_REGISTRY:-https://registry.npmjs.org/}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_started
+    ports:
+      - "${SLIDESMITH_FRONTEND_PORT:-80}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/ >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
+  api:
+    image: ${SLIDESMITH_API_IMAGE:-slidesmith/api:dev}
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+      args:
+        GO_IMAGE: ${SLIDESMITH_GO_IMAGE:-golang:1.25-alpine}
+        RUNTIME_IMAGE: ${SLIDESMITH_DOCKER_CLI_IMAGE:-docker:27-cli}
+        TARGET: server
+        GOPROXY: ${SLIDESMITH_GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${SLIDESMITH_GOSUMDB:-sum.golang.org}
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      SLIDESMITH_HTTP_ADDR: 0.0.0.0:18080
+    volumes: *backend-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      agent-compose:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:18080/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  worker:
+    image: ${SLIDESMITH_WORKER_IMAGE:-slidesmith/worker:dev}
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+      args:
+        GO_IMAGE: ${SLIDESMITH_GO_IMAGE:-golang:1.25-alpine}
+        RUNTIME_IMAGE: ${SLIDESMITH_DOCKER_CLI_IMAGE:-docker:27-cli}
+        TARGET: worker
+        GOPROXY: ${SLIDESMITH_GOPROXY:-https://proxy.golang.org,direct}
+        GOSUMDB: ${SLIDESMITH_GOSUMDB:-sum.golang.org}
+    restart: unless-stopped
+    environment: *backend-env
+    volumes: *backend-volumes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      agent-compose:
+        condition: service_started
+
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:16-alpine}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-slidesmith}
+      POSTGRES_USER: ${POSTGRES_USER:-slidesmith}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-slidesmith_dev_password}
+    volumes:
+      - ${SLIDESMITH_POSTGRES_DATA_ROOT:-./data/postgres}:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-slidesmith} -d ${POSTGRES_DB:-slidesmith}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: ${REDIS_IMAGE:-redis:7-alpine}
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ${SLIDESMITH_REDIS_DATA_ROOT:-./data/redis}:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  agent-compose:
+    image: ${AGENT_COMPOSE_IMAGE:-ghcr.io/chaitin/agent-compose:latest}
+    container_name: ${SLIDESMITH_AGENT_COMPOSE_CONTAINER:-slidesmith-agent-compose}
+    restart: unless-stopped
+    privileged: true
+    env_file:
+      - ${SLIDESMITH_AGENT_COMPOSE_ENV_FILE:-./agent-compose.env.example}
+    environment:
+      HTTP_LISTEN: 0.0.0.0:7410
+      DATA_ROOT: /data
+      DOCKER_HOST_SESSION_ROOT: ${SLIDESMITH_AGENT_COMPOSE_HOST_SESSION_ROOT:-./data/agent-compose/sessions}
+      AGENT_COMPOSE_RUNTIME_BASE_URL: ${AGENT_COMPOSE_RUNTIME_BASE_URL:-http://agent-compose:7410}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${SLIDESMITH_AGENT_COMPOSE_DATA_ROOT:-./data/agent-compose}:/data
+    working_dir: /data/work
+    ports:
+      - "${SLIDESMITH_AGENT_COMPOSE_PORT:-127.0.0.1:7410}:7410"
