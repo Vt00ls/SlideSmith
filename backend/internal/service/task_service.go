@@ -351,6 +351,18 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 			return err
 		}
 	}
+	sourceContract, err := validateSourcePrepareContract(preparedProjectPath, selection.Route)
+	if err != nil {
+		output := runtimeRunPhaseOutput(run)
+		output["project_path"] = preparedProjectPath
+		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, output, err)
+		_ = s.failWithMetadata(ctx, task, string(PhaseSourcePrepare)+".contract", err, run, map[string]any{
+			"workspace_path": workspace.HostDir,
+			"project_path":   preparedProjectPath,
+			"route":          selection.Route,
+		})
+		return err
+	}
 	task.LastRuntimeRunID = run.ExternalRunID
 	task.LastRuntimeSessionID = run.ExternalSessionID
 	task.RuntimeWorkspacePath = run.WorkspacePath
@@ -359,6 +371,7 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 	}
 	output := runtimeRunPhaseOutput(run)
 	output["project_path"] = preparedProjectPath
+	output["source_contract"] = sourceContract
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
 		return err
 	}
