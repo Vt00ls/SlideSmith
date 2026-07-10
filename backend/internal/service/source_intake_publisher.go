@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -19,6 +20,21 @@ type sourceIntakeArtifactFile struct {
 	Kind       string
 }
 
+type sourceIntakeArtifactPlan struct {
+	File         sourceIntakeArtifactFile
+	ObjectKey    string
+	MetadataJSON string
+	Snapshot     sourceIntakeObjectSnapshot
+}
+
+type sourceIntakeObjectSnapshot struct {
+	ObjectKey string
+	Path      string
+	Bytes     []byte
+	Mode      os.FileMode
+	Existed   bool
+}
+
 func (s *TaskService) publishSourceIntakeArtifacts(ctx context.Context, task *model.Task, projectPath string) ([]model.Artifact, error) {
 	if task == nil {
 		return nil, fmt.Errorf("source intake task is nil")
@@ -32,7 +48,7 @@ func (s *TaskService) publishSourceIntakeArtifacts(ctx context.Context, task *mo
 		return nil, err
 	}
 	prefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "source-intake")) + "/"
-	artifacts := make([]model.Artifact, 0, len(files))
+	plans := make([]sourceIntakeArtifactPlan, 0, len(files))
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -47,13 +63,35 @@ func (s *TaskService) publishSourceIntakeArtifacts(ctx context.Context, task *mo
 			return nil, fmt.Errorf("encode source intake metadata for %s: %w", file.ProjectRel, err)
 		}
 		objectKey := prefix + file.ObjectRel
-		stored, err := s.storage.CopyFileToObject(ctx, objectKey, file.SourcePath)
+		snapshot, err := snapshotSourceIntakeObject(objectKey, s.storage.Path(objectKey))
 		if err != nil {
-			return nil, fmt.Errorf("copy source intake artifact %s: %w", file.ProjectRel, err)
+			return nil, fmt.Errorf("snapshot source intake artifact %s: %w", file.ProjectRel, err)
+		}
+		plans = append(plans, sourceIntakeArtifactPlan{
+			File:         file,
+			ObjectKey:    objectKey,
+			MetadataJSON: string(metadataJSON),
+			Snapshot:     snapshot,
+		})
+	}
+
+	artifacts := make([]model.Artifact, 0, len(plans))
+	touched := 0
+	for _, plan := range plans {
+		if err := ctx.Err(); err != nil {
+			return nil, rollbackSourceIntakeObjects(err, plans[:touched])
+		}
+		touched++
+		stored, err := s.storage.CopyFileToObject(ctx, plan.ObjectKey, plan.File.SourcePath)
+		if err != nil {
+			return nil, rollbackSourceIntakeObjects(
+				fmt.Errorf("copy source intake artifact %s: %w", plan.File.ProjectRel, err),
+				plans[:touched],
+			)
 		}
 		artifacts = append(artifacts, model.Artifact{
 			TaskID:         task.ID,
-			Kind:           file.Kind,
+			Kind:           plan.File.Kind,
 			Name:           stored.Name,
 			Storage:        "local",
 			ObjectKey:      stored.ObjectKey,
@@ -61,13 +99,109 @@ func (s *TaskService) publishSourceIntakeArtifacts(ctx context.Context, task *mo
 			Size:           stored.Size,
 			SHA256:         stored.SHA256,
 			PublishVersion: "",
-			MetadataJSON:   string(metadataJSON),
+			MetadataJSON:   plan.MetadataJSON,
 		})
 	}
 	if err := s.repo.ReplaceArtifactsByObjectKeyPrefix(ctx, task.ID, prefix, artifacts); err != nil {
-		return nil, fmt.Errorf("persist source intake artifacts: %w", err)
+		return nil, rollbackSourceIntakeObjects(
+			fmt.Errorf("persist source intake artifacts: %w", err),
+			plans[:touched],
+		)
 	}
-	return artifacts, nil
+
+	persisted, err := s.repo.ListArtifacts(ctx, task.ID)
+	if err != nil {
+		return nil, fmt.Errorf("load persisted source intake artifacts: %w", err)
+	}
+	persistedByObjectKey := make(map[string]model.Artifact, len(artifacts))
+	for _, artifact := range persisted {
+		if strings.HasPrefix(artifact.ObjectKey, prefix) {
+			persistedByObjectKey[artifact.ObjectKey] = artifact
+		}
+	}
+	if len(persistedByObjectKey) != len(artifacts) {
+		return nil, fmt.Errorf("persisted source intake artifact count is %d, want %d", len(persistedByObjectKey), len(artifacts))
+	}
+	result := make([]model.Artifact, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		persistedArtifact, ok := persistedByObjectKey[artifact.ObjectKey]
+		if !ok {
+			return nil, fmt.Errorf("persisted source intake artifact %s is missing", artifact.ObjectKey)
+		}
+		result = append(result, persistedArtifact)
+	}
+	return result, nil
+}
+
+func snapshotSourceIntakeObject(objectKey, path string) (sourceIntakeObjectSnapshot, error) {
+	snapshot := sourceIntakeObjectSnapshot{ObjectKey: objectKey, Path: path}
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return snapshot, nil
+	}
+	if err != nil {
+		return sourceIntakeObjectSnapshot{}, err
+	}
+	if !info.Mode().IsRegular() {
+		return sourceIntakeObjectSnapshot{}, fmt.Errorf("existing object is not a regular file")
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return sourceIntakeObjectSnapshot{}, err
+	}
+	snapshot.Bytes = contents
+	snapshot.Mode = info.Mode()
+	snapshot.Existed = true
+	return snapshot, nil
+}
+
+func rollbackSourceIntakeObjects(cause error, plans []sourceIntakeArtifactPlan) error {
+	errs := []error{cause}
+	for i := len(plans) - 1; i >= 0; i-- {
+		if err := restoreSourceIntakeObject(plans[i].Snapshot); err != nil {
+			errs = append(errs, fmt.Errorf("rollback source intake object %s: %w", plans[i].ObjectKey, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func restoreSourceIntakeObject(snapshot sourceIntakeObjectSnapshot) error {
+	if !snapshot.Existed {
+		if err := os.Remove(snapshot.Path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(snapshot.Path), 0o755); err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(snapshot.Path), ".source-intake-rollback-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			_ = temp.Close()
+		}
+		_ = os.Remove(tempPath)
+	}()
+	if _, err := temp.Write(snapshot.Bytes); err != nil {
+		return err
+	}
+	if err := temp.Chmod(snapshot.Mode.Perm()); err != nil {
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		closed = true
+		return err
+	}
+	closed = true
+	return os.Rename(tempPath, snapshot.Path)
 }
 
 func collectSourceIntakeArtifactFiles(projectPath string) ([]sourceIntakeArtifactFile, error) {

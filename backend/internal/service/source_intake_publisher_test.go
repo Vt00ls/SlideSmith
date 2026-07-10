@@ -133,6 +133,7 @@ func TestPublishSourceIntakeArtifactsPublishesAndReplacesPersistedIntake(t *test
 	}
 	assertSourceIntakeArtifacts(t, artifacts, want, task, projectPath, storage)
 	assertPersistedSourceIntakeArtifacts(t, repo, task, want, uploaded.ObjectKey)
+	assertReturnedSourceIntakeArtifactsMatchPersistence(t, repo, task.ID, artifacts)
 
 	if err := os.Remove(filepath.Join(projectPath, "sources", "bravo.MARKDOWN")); err != nil {
 		t.Fatal(err)
@@ -150,6 +151,7 @@ func TestPublishSourceIntakeArtifactsPublishesAndReplacesPersistedIntake(t *test
 	}
 	assertSourceIntakeArtifacts(t, retried, want, task, projectPath, storage)
 	assertPersistedSourceIntakeArtifacts(t, repo, task, want, uploaded.ObjectKey)
+	assertReturnedSourceIntakeArtifactsMatchPersistence(t, repo, task.ID, retried)
 	var removedCount int64
 	if err := repo.DB().Model(&model.Artifact{}).
 		Where("task_id = ? AND object_key = ?", task.ID, "tasks/task-intake/source-intake/sources/bravo.MARKDOWN").
@@ -170,6 +172,115 @@ func TestPublishSourceIntakeArtifactsValidatesInputs(t *testing.T) {
 	if _, err := service.publishSourceIntakeArtifacts(ctx, &model.Task{ID: "task-1"}, ""); err == nil {
 		t.Fatal("publishSourceIntakeArtifacts() empty project path error = nil")
 	}
+}
+
+func TestPublishSourceIntakeArtifactsRollsBackObjectsWhenRepositoryReplaceFails(t *testing.T) {
+	ctx := context.Background()
+	service, repo, storage := newSourceIntakePublisherTestService(t)
+	task := &model.Task{ID: "task-intake-db-rollback", Route: model.TaskRouteMain}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	projectPath := filepath.Join(t.TempDir(), "project")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "alpha.md"), "old alpha\n")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "bravo.md"), "old bravo\n")
+	initial, err := service.publishSourceIntakeArtifacts(ctx, task, projectPath)
+	if err != nil {
+		t.Fatalf("initial publishSourceIntakeArtifacts() error = %v", err)
+	}
+	prefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "source-intake")) + "/"
+	if err := os.Chmod(storage.Path(prefix+"sources/alpha.md"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	objectKeys := make([]string, 0, len(initial)+1)
+	for _, artifact := range initial {
+		objectKeys = append(objectKeys, artifact.ObjectKey)
+	}
+	objectKeys = append(objectKeys, prefix+"sources/charlie.md")
+	wantObjects := captureSourceIntakeObjectStates(t, storage, objectKeys)
+	wantRows := loadPersistedSourceIntakeRows(t, repo, task.ID, prefix)
+
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "alpha.md"), "new alpha\n")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "bravo.md"), "new bravo\n")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "charlie.md"), "new charlie\n")
+	if err := repo.DB().Exec(`
+		CREATE TRIGGER fail_source_intake_retry_insert
+		BEFORE INSERT ON artifacts
+		WHEN NEW.object_key LIKE '%/source-intake/%'
+		BEGIN
+			SELECT RAISE(ABORT, 'forced source intake retry failure');
+		END;
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.publishSourceIntakeArtifacts(ctx, task, projectPath); err == nil {
+		t.Fatal("publishSourceIntakeArtifacts() retry error = nil, want repository failure")
+	}
+	assertPersistedSourceIntakeRowsEqual(t, repo, task.ID, prefix, wantRows)
+	assertSourceIntakeObjectStates(t, storage, wantObjects)
+}
+
+type sourceIntakePartialCopyFailStorage struct {
+	*LocalStorage
+	callCount int
+	failAt    int
+}
+
+func (s *sourceIntakePartialCopyFailStorage) CopyFileToObject(ctx context.Context, objectKey, sourcePath string) (*StoredObject, error) {
+	s.callCount++
+	if s.callCount != s.failAt {
+		return s.LocalStorage.CopyFileToObject(ctx, objectKey, sourcePath)
+	}
+	targetPath := s.Path(objectKey)
+	if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(targetPath, []byte("partial replacement"), 0o600); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(targetPath, 0o600); err != nil {
+		return nil, err
+	}
+	return nil, errors.New("forced partial source intake copy failure")
+}
+
+func TestPublishSourceIntakeArtifactsRollsBackObjectsWhenCopyFailsMidPublish(t *testing.T) {
+	ctx := context.Background()
+	service, repo, storage := newSourceIntakePublisherTestService(t)
+	task := &model.Task{ID: "task-intake-copy-rollback", Route: model.TaskRouteMain}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	projectPath := filepath.Join(t.TempDir(), "project")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "alpha.md"), "old alpha\n")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "bravo.md"), "old bravo\n")
+	initial, err := service.publishSourceIntakeArtifacts(ctx, task, projectPath)
+	if err != nil {
+		t.Fatalf("initial publishSourceIntakeArtifacts() error = %v", err)
+	}
+	prefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "source-intake")) + "/"
+	if err := os.Chmod(storage.Path(prefix+"sources/bravo.md"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	objectKeys := make([]string, 0, len(initial))
+	for _, artifact := range initial {
+		objectKeys = append(objectKeys, artifact.ObjectKey)
+	}
+	wantObjects := captureSourceIntakeObjectStates(t, storage, objectKeys)
+	wantRows := loadPersistedSourceIntakeRows(t, repo, task.ID, prefix)
+
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "alpha.md"), "new alpha\n")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "bravo.md"), "new bravo\n")
+	service.storage = &sourceIntakePartialCopyFailStorage{LocalStorage: storage, failAt: 2}
+
+	if _, err := service.publishSourceIntakeArtifacts(ctx, task, projectPath); err == nil {
+		t.Fatal("publishSourceIntakeArtifacts() retry error = nil, want copy failure")
+	}
+	assertPersistedSourceIntakeRowsEqual(t, repo, task.ID, prefix, wantRows)
+	assertSourceIntakeObjectStates(t, storage, wantObjects)
 }
 
 func TestPublishSourceIntakeArtifactsCompletesPrepareWithCount(t *testing.T) {
@@ -427,6 +538,109 @@ func assertPersistedSourceIntakeArtifacts(
 		objectKey := prefix + expected.ObjectRel
 		if countByObject[objectKey] != 1 {
 			t.Fatalf("persisted object %q count = %d, want 1; persisted=%#v", objectKey, countByObject[objectKey], persisted)
+		}
+	}
+}
+
+type sourceIntakeObjectState struct {
+	Bytes  []byte
+	Mode   os.FileMode
+	Exists bool
+}
+
+func captureSourceIntakeObjectStates(t *testing.T, storage *LocalStorage, objectKeys []string) map[string]sourceIntakeObjectState {
+	t.Helper()
+	states := make(map[string]sourceIntakeObjectState, len(objectKeys))
+	for _, objectKey := range objectKeys {
+		path := storage.Path(objectKey)
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			states[objectKey] = sourceIntakeObjectState{}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("inspect object %q: %v", objectKey, err)
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read object %q: %v", objectKey, err)
+		}
+		states[objectKey] = sourceIntakeObjectState{
+			Bytes:  contents,
+			Mode:   info.Mode(),
+			Exists: true,
+		}
+	}
+	return states
+}
+
+func assertSourceIntakeObjectStates(t *testing.T, storage *LocalStorage, want map[string]sourceIntakeObjectState) {
+	t.Helper()
+	objectKeys := make([]string, 0, len(want))
+	for objectKey := range want {
+		objectKeys = append(objectKeys, objectKey)
+	}
+	sort.Strings(objectKeys)
+	for _, objectKey := range objectKeys {
+		got := captureSourceIntakeObjectStates(t, storage, []string{objectKey})[objectKey]
+		if !reflect.DeepEqual(got, want[objectKey]) {
+			t.Fatalf("object %q state = %#v, want %#v", objectKey, got, want[objectKey])
+		}
+	}
+}
+
+func loadPersistedSourceIntakeRows(t *testing.T, repo *repository.Repository, taskID, prefix string) []model.Artifact {
+	t.Helper()
+	var artifacts []model.Artifact
+	if err := repo.DB().
+		Where("task_id = ? AND object_key LIKE ?", taskID, prefix+"%").
+		Order("object_key ASC").
+		Find(&artifacts).Error; err != nil {
+		t.Fatal(err)
+	}
+	return artifacts
+}
+
+func assertPersistedSourceIntakeRowsEqual(
+	t *testing.T,
+	repo *repository.Repository,
+	taskID string,
+	prefix string,
+	want []model.Artifact,
+) {
+	t.Helper()
+	got := loadPersistedSourceIntakeRows(t, repo, taskID, prefix)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("persisted source intake rows changed after failed publish:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func assertReturnedSourceIntakeArtifactsMatchPersistence(
+	t *testing.T,
+	repo *repository.Repository,
+	taskID string,
+	returned []model.Artifact,
+) {
+	t.Helper()
+	prefix := filepath.ToSlash(filepath.Join("tasks", taskID, "source-intake")) + "/"
+	persisted := loadPersistedSourceIntakeRows(t, repo, taskID, prefix)
+	if len(returned) != len(persisted) {
+		t.Fatalf("returned artifact count = %d, persisted count = %d", len(returned), len(persisted))
+	}
+	returnedByObjectKey := make(map[string]model.Artifact, len(returned))
+	for _, artifact := range returned {
+		if artifact.ID == "" || artifact.CreatedAt.IsZero() || artifact.UpdatedAt.IsZero() {
+			t.Fatalf("returned artifact lacks persisted identity: %#v", artifact)
+		}
+		returnedByObjectKey[artifact.ObjectKey] = artifact
+	}
+	for _, artifact := range persisted {
+		returnedArtifact, ok := returnedByObjectKey[artifact.ObjectKey]
+		if !ok {
+			t.Fatalf("persisted artifact %q missing from return value", artifact.ObjectKey)
+		}
+		if !reflect.DeepEqual(returnedArtifact, artifact) {
+			t.Fatalf("returned artifact %q = %#v, persisted = %#v", artifact.ObjectKey, returnedArtifact, artifact)
 		}
 	}
 }
