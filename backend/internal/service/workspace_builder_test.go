@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/slidesmith/slidesmith/backend/internal/config"
 	"github.com/slidesmith/slidesmith/backend/internal/model"
@@ -88,6 +89,118 @@ func TestRuntimeWorkspaceBuilderBuildsTaskWorkspace(t *testing.T) {
 	}
 	if !strings.Contains(string(rawManifest), `"project_path": "projects/task_1_ppt169_20260707"`) {
 		t.Fatalf("manifest did not record actual project path:\n%s", rawManifest)
+	}
+}
+
+func TestRuntimeWorkspaceBuilderWritesSourceInputsManifest(t *testing.T) {
+	tmp := t.TempDir()
+	seed := filepath.Join(tmp, "seed")
+	mustWriteFile(t, filepath.Join(seed, "scripts", "ppt_runner.py"), "print('runner')\n")
+	mustWriteFile(t, filepath.Join(seed, "workflows", "ppt_workflow.js"), "console.log('workflow')\n")
+
+	skillSource := filepath.Join(tmp, "ppt-master", "skills", "ppt-master")
+	mustWriteFile(t, filepath.Join(skillSource, "SKILL.md"), "# PPT Master\n")
+
+	storage := NewLocalStorage(filepath.Join(tmp, "storage"))
+	inputKey := filepath.ToSlash(filepath.Join("tasks", "task-1", "source", "input.md"))
+	deckKey := filepath.ToSlash(filepath.Join("tasks", "task-1", "source", "deck.pptx"))
+	mustWriteFile(t, storage.Path(inputKey), "# Source\n")
+	mustWriteFile(t, storage.Path(deckKey), "presentation bytes\n")
+
+	cfg := config.AgentComposeConfig{
+		WorkDir:           seed,
+		ComposeFile:       "/data/work/agent-compose.yml",
+		WorkspaceRoot:     filepath.Join(seed, "task-workspaces"),
+		PPTMasterSkillDir: skillSource,
+		Agent:             "ppt_master",
+		RuntimeImage:      "slidesmith/ppt-master-runtime:dev",
+	}
+	builder := NewRuntimeWorkspaceBuilder(cfg, storage)
+	task := &model.Task{ID: "task-1", RuntimeProject: "task_1"}
+	inputSHA := strings.Repeat("a", 64)
+	deckSHA := strings.Repeat("b", 64)
+	workspace, err := builder.Build(context.Background(), task, []model.Artifact{
+		{
+			TaskID:    task.ID,
+			Kind:      model.ArtifactKindSource,
+			Name:      "input.md",
+			ObjectKey: inputKey,
+			MimeType:  "text/markdown",
+			Size:      9,
+			SHA256:    inputSHA,
+		},
+		{
+			TaskID:    task.ID,
+			Kind:      model.ArtifactKindSource,
+			Name:      "deck.pptx",
+			ObjectKey: deckKey,
+			MimeType:  "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+			Size:      19,
+			SHA256:    deckSHA,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	if workspace.InputPath != "uploads/task-1/input.md" {
+		t.Fatalf("InputPath = %q, want first source path", workspace.InputPath)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(workspace.HostDir, ".slidesmith", "source_inputs.json"))
+	if err != nil {
+		t.Fatalf("read source inputs manifest: %v", err)
+	}
+	var manifest struct {
+		Schema    string `json:"schema"`
+		TaskID    string `json:"task_id"`
+		CreatedAt string `json:"created_at"`
+		Files     []struct {
+			Name       string `json:"name"`
+			UploadPath string `json:"upload_path"`
+			ObjectKey  string `json:"object_key"`
+			MimeType   string `json:"mime_type"`
+			Size       int64  `json:"size"`
+			SHA256     string `json:"sha256"`
+			SourceKind string `json:"source_kind"`
+			Extension  string `json:"extension"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("parse source inputs manifest: %v", err)
+	}
+	if manifest.Schema != "slidesmith.source_inputs.v1" {
+		t.Fatalf("schema = %q", manifest.Schema)
+	}
+	if manifest.TaskID != task.ID {
+		t.Fatalf("task_id = %q, want %q", manifest.TaskID, task.ID)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, manifest.CreatedAt); err != nil {
+		t.Fatalf("created_at = %q, want RFC3339 timestamp: %v", manifest.CreatedAt, err)
+	}
+	if len(manifest.Files) != 2 {
+		t.Fatalf("files length = %d, want 2", len(manifest.Files))
+	}
+
+	input := manifest.Files[0]
+	if input.Name != "input.md" || input.UploadPath != "uploads/task-1/input.md" || input.ObjectKey != inputKey {
+		t.Fatalf("first file identity = %#v", input)
+	}
+	if input.MimeType != "text/markdown" || input.Size != 9 || input.SHA256 != inputSHA {
+		t.Fatalf("first file metadata = %#v", input)
+	}
+	if input.SourceKind != "markdown" || input.Extension != "md" {
+		t.Fatalf("first file detection = %#v", input)
+	}
+
+	deck := manifest.Files[1]
+	if deck.Name != "deck.pptx" || deck.UploadPath != "uploads/task-1/deck.pptx" || deck.ObjectKey != deckKey {
+		t.Fatalf("second file identity = %#v", deck)
+	}
+	if deck.MimeType != "application/vnd.openxmlformats-officedocument.presentationml.presentation" || deck.Size != 19 || deck.SHA256 != deckSHA {
+		t.Fatalf("second file metadata = %#v", deck)
+	}
+	if deck.SourceKind != "presentation" || deck.Extension != "pptx" {
+		t.Fatalf("second file detection = %#v", deck)
 	}
 }
 
