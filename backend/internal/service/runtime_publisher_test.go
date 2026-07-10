@@ -15,6 +15,9 @@ func TestRuntimeWorkspacePublisherPublishesStage5Contract(t *testing.T) {
 	project := filepath.Join(workspace, "projects", "task_1_ppt169_20260707")
 
 	mustWriteFile(t, filepath.Join(project, "sources", "input.md"), "# Input\n")
+	mustWriteFile(t, filepath.Join(project, "analysis", "source_profile.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "analysis", "deck.identity.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "analysis", "deck.slide_library.json"), "{}\n")
 	mustWriteFile(t, filepath.Join(project, "design_spec.md"), "# Design\n")
 	mustWriteFile(t, filepath.Join(project, "spec_lock.md"), "# Lock\n")
 	mustWriteFile(t, filepath.Join(project, "svg_output", "01.svg"), "<svg></svg>\n")
@@ -34,6 +37,9 @@ func TestRuntimeWorkspacePublisherPublishesStage5Contract(t *testing.T) {
 
 	wantObjects := []string{
 		"tasks/task-1/artifacts/v20260708T120000Z/source/input.md",
+		"tasks/task-1/artifacts/v20260708T120000Z/analysis/source_profile.json",
+		"tasks/task-1/artifacts/v20260708T120000Z/analysis/deck.identity.json",
+		"tasks/task-1/artifacts/v20260708T120000Z/analysis/deck.slide_library.json",
 		"tasks/task-1/artifacts/v20260708T120000Z/design_spec.md",
 		"tasks/task-1/artifacts/v20260708T120000Z/spec_lock.md",
 		"tasks/task-1/artifacts/v20260708T120000Z/svg_output/01.svg",
@@ -64,6 +70,15 @@ func TestRuntimeWorkspacePublisherPublishesStage5Contract(t *testing.T) {
 	}
 	if byObject["tasks/task-1/artifacts/v20260708T120000Z/source/input.md"].Kind != model.ArtifactKindSource {
 		t.Fatalf("source kind = %q", byObject["tasks/task-1/artifacts/v20260708T120000Z/source/input.md"].Kind)
+	}
+	if byObject["tasks/task-1/artifacts/v20260708T120000Z/analysis/source_profile.json"].Kind != model.ArtifactKindSourceProfile {
+		t.Fatalf("source profile kind = %q", byObject["tasks/task-1/artifacts/v20260708T120000Z/analysis/source_profile.json"].Kind)
+	}
+	if byObject["tasks/task-1/artifacts/v20260708T120000Z/analysis/deck.identity.json"].Kind != model.ArtifactKindPPTXIdentity {
+		t.Fatalf("pptx identity kind = %q", byObject["tasks/task-1/artifacts/v20260708T120000Z/analysis/deck.identity.json"].Kind)
+	}
+	if byObject["tasks/task-1/artifacts/v20260708T120000Z/analysis/deck.slide_library.json"].Kind != model.ArtifactKindPPTXSlideLibrary {
+		t.Fatalf("pptx slide library kind = %q", byObject["tasks/task-1/artifacts/v20260708T120000Z/analysis/deck.slide_library.json"].Kind)
 	}
 	for _, artifact := range artifacts {
 		if artifact.PublishVersion != "v20260708T120000Z" {

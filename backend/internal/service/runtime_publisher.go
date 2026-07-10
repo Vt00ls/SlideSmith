@@ -244,6 +244,7 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 		ObjectRel  string
 	}{
 		{"sources", "source"},
+		{"analysis", "analysis"},
 		{"design_spec.md", "design_spec.md"},
 		{"spec_lock.md", "spec_lock.md"},
 		{"svg_output", "svg_output"},
@@ -325,9 +326,16 @@ func addArtifactRoot(ctx context.Context, projectPath, projectRel, objectRel str
 }
 
 func artifactKindFromRuntimePath(path string) string {
+	lowerPath := strings.ToLower(filepath.ToSlash(path))
 	switch {
 	case strings.HasPrefix(path, "source/"):
 		return model.ArtifactKindSource
+	case lowerPath == "analysis/source_profile.json":
+		return model.ArtifactKindSourceProfile
+	case strings.HasPrefix(lowerPath, "analysis/") && strings.HasSuffix(lowerPath, ".identity.json"):
+		return model.ArtifactKindPPTXIdentity
+	case strings.HasPrefix(lowerPath, "analysis/") && strings.HasSuffix(lowerPath, ".slide_library.json"):
+		return model.ArtifactKindPPTXSlideLibrary
 	case path == "design_spec.md":
 		return model.ArtifactKindDesignSpec
 	case path == "spec_lock.md":

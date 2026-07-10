@@ -363,6 +363,16 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 		})
 		return err
 	}
+	sourceArtifacts, err := s.publishSourceIntakeArtifacts(ctx, task, preparedProjectPath)
+	if err != nil {
+		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
+		_ = s.failWithMetadata(ctx, task, string(PhaseSourcePrepare)+".publish_intake", err, run, map[string]any{
+			"workspace_path": workspace.HostDir,
+			"project_path":   preparedProjectPath,
+			"route":          selection.Route,
+		})
+		return err
+	}
 	task.LastRuntimeRunID = run.ExternalRunID
 	task.LastRuntimeSessionID = run.ExternalSessionID
 	task.RuntimeWorkspacePath = run.WorkspacePath
@@ -372,6 +382,7 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 	output := runtimeRunPhaseOutput(run)
 	output["project_path"] = preparedProjectPath
 	output["source_contract"] = sourceContract
+	output["source_intake_artifact_count"] = len(sourceArtifacts)
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
 		return err
 	}
