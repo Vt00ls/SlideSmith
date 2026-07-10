@@ -39,15 +39,20 @@ const (
 )
 
 const (
-	ArtifactKindSource     = "source"
-	ArtifactKindDesignSpec = "design_spec"
-	ArtifactKindSpecLock   = "spec_lock"
-	ArtifactKindSVGOutput  = "svg_output"
-	ArtifactKindSVGFinal   = "svg_final"
-	ArtifactKindPPTX       = "pptx"
-	ArtifactKindLog        = "log"
-	ArtifactKindManifest   = "manifest"
-	ArtifactKindOther      = "other"
+	ArtifactKindSource                  = "source"
+	ArtifactKindSourceMarkdown          = "source_markdown"
+	ArtifactKindSourceConversionProfile = "source_conversion_profile"
+	ArtifactKindSourceProfile           = "source_profile"
+	ArtifactKindDesignSpec              = "design_spec"
+	ArtifactKindSpecLock                = "spec_lock"
+	ArtifactKindSVGOutput               = "svg_output"
+	ArtifactKindSVGFinal                = "svg_final"
+	ArtifactKindPPTX                    = "pptx"
+	ArtifactKindPPTXIdentity            = "pptx_identity"
+	ArtifactKindPPTXSlideLibrary        = "pptx_slide_library"
+	ArtifactKindLog                     = "log"
+	ArtifactKindManifest                = "manifest"
+	ArtifactKindOther                   = "other"
 )
 
 type Task struct {
@@ -106,6 +111,7 @@ type Artifact struct {
 	Size           int64     `json:"size" gorm:"not null;default:0"`
 	SHA256         string    `json:"sha256" gorm:"not null;size:64;default:''"`
 	PublishVersion string    `json:"publish_version" gorm:"not null;size:64;default:'';index"`
+	MetadataJSON   string    `json:"metadata_json" gorm:"not null;type:text;default:'{}'"`
 	CreatedAt      time.Time `json:"created_at" gorm:"not null"`
 	UpdatedAt      time.Time `json:"updated_at" gorm:"not null"`
 }

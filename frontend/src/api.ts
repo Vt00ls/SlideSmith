@@ -66,6 +66,7 @@ export type Artifact = {
   size: number;
   sha256: string;
   publish_version: string;
+  metadata_json: string;
   created_at: string;
   updated_at: string;
 };
