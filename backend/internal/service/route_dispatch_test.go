@@ -11,6 +11,7 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 	"github.com/slidesmith/slidesmith/backend/internal/repository"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 type successfulRoutePrepareAgent struct{}
@@ -172,7 +173,10 @@ func TestProcessPrepareRunsSourcePrepareBeforeBlockingUnsupportedWorkflow(t *tes
 
 func routeDispatchPrepareService(t *testing.T, title string, artifacts []model.Artifact) (*TaskService, *repository.Repository, *model.Task, string) {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	tmp := t.TempDir()
+	db, err := gorm.Open(sqlite.Open(filepath.Join(tmp, "route-dispatch.sqlite")), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +191,6 @@ func routeDispatchPrepareService(t *testing.T, title string, artifacts []model.A
 		t.Fatal(err)
 	}
 	repo := repository.New(db)
-	tmp := t.TempDir()
 	seed := filepath.Join(tmp, "seed")
 	mustWriteFile(t, filepath.Join(seed, "scripts", "ppt_runner.py"), "print('runner')\n")
 	mustWriteFile(t, filepath.Join(seed, "workflows", "ppt_workflow.js"), "console.log('workflow')\n")

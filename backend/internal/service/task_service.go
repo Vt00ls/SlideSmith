@@ -35,6 +35,8 @@ const (
 	retryPhaseQualityCheck   = "quality_check"
 	retryPhaseFinalizeExport = "finalize_export"
 	retryPhasePublish        = "publish"
+
+	sourcePrepareAwaitingAnchorFailure = "source_prepare.awaiting_anchor_confirm"
 )
 
 type TaskSpecFile struct {
@@ -431,7 +433,7 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 	policy = routeExecutionPolicyFor(selection)
 	if !policy.WorkflowExecutable {
 		err := fmt.Errorf("%s", policy.FailureMessage)
-		_ = s.failWithMetadata(ctx, task, policy.FailurePhase, err, run, map[string]any{
+		return s.failTaskAfterSourcePrepare(ctx, task, policy.FailurePhase, err, run, map[string]any{
 			"workspace_path":         workspace.HostDir,
 			"project_path":           preparedProjectPath,
 			"route":                  selection.Route,
@@ -440,22 +442,52 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 			"route_execution_policy": policy,
 			"next_spec":              policy.NextSpec,
 		})
-		return err
 	}
 	templateResolution, err := s.runTemplateResolve(ctx, task, workspace, preparedProjectPath)
 	if err != nil {
-		_ = s.failWithMetadata(ctx, task, string(PhaseTemplateResolve), err, nil, map[string]any{
+		return s.failTaskAfterSourcePrepare(ctx, task, string(PhaseTemplateResolve), err, nil, map[string]any{
 			"workspace_path": workspace.HostDir,
 			"project_path":   preparedProjectPath,
 		})
-		return err
 	}
 	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "template_resolved", "Template resolved for task workspace", map[string]any{
 		"selected_template_id": templateResolution.SelectedTemplateID,
 		"template_root":        templateResolution.TemplateRoot,
 		"template_lock":        templateResolution.TemplateLockPath,
 	})
-	return s.transition(ctx, task, model.TaskStatusAwaitingAnchorConfirm, "Awaiting anchor confirmation", map[string]any{"runtime_run_id": run.ID})
+	if err := s.transition(ctx, task, model.TaskStatusAwaitingAnchorConfirm, "Awaiting anchor confirmation", map[string]any{"runtime_run_id": run.ID}); err != nil {
+		cause := fmt.Errorf("%s: %w", sourcePrepareAwaitingAnchorFailure, err)
+		return s.failTaskAfterSourcePrepare(ctx, task, sourcePrepareAwaitingAnchorFailure, cause, run, map[string]any{
+			"workspace_path": workspace.HostDir,
+			"project_path":   preparedProjectPath,
+			"target_status":  model.TaskStatusAwaitingAnchorConfirm,
+		})
+	}
+	return nil
+}
+
+func (s *TaskService) failTaskAfterSourcePrepare(
+	ctx context.Context,
+	task *model.Task,
+	failurePhase string,
+	cause error,
+	run *model.TaskRuntimeRun,
+	extra map[string]any,
+) error {
+	recoveryCtx := context.WithoutCancel(ctx)
+	if err := s.failWithMetadata(recoveryCtx, task, failurePhase, cause, run, extra); err != nil {
+		errs := []error{cause, fmt.Errorf("persist post-source-prepare task failure: %w", err)}
+		persistedTask, reloadErr := s.repo.GetTask(recoveryCtx, task.ID)
+		if reloadErr != nil {
+			errs = append(errs, fmt.Errorf("reload post-source-prepare task: %w", reloadErr))
+			return errors.Join(errs...)
+		}
+		if retryErr := s.failWithMetadata(recoveryCtx, persistedTask, failurePhase, cause, run, extra); retryErr != nil {
+			errs = append(errs, fmt.Errorf("retry post-source-prepare task failure: %w", retryErr))
+		}
+		return errors.Join(errs...)
+	}
+	return cause
 }
 
 func (s *TaskService) recoverSourcePrepareFailure(
