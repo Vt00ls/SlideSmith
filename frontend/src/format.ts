@@ -58,6 +58,23 @@ export const phaseLabel: Record<string, string> = {
   publish: "发布产物",
 };
 
+export const artifactKindLabel: Record<string, string> = {
+  source: "原始资料",
+  source_markdown: "转换文本",
+  source_conversion_profile: "转换记录",
+  source_profile: "PPTX 资料画像",
+  pptx_identity: "PPTX 视觉识别",
+  pptx_slide_library: "PPTX 页面库",
+  design_spec: "设计规格",
+  spec_lock: "规格锁",
+  svg_output: "SVG 草稿",
+  svg_final: "SVG 最终",
+  pptx: "PPTX",
+  log: "日志",
+  manifest: "清单",
+  other: "其他",
+};
+
 export const routeLabel: Record<string, string> = {
   main: "主生成",
   "template-fill": "模板填充",

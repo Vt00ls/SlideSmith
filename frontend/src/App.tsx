@@ -24,7 +24,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, Artifact, Confirmation, parseJSON, RetryPhase, RuntimeRun, SpecPreview, Task, TaskEvent, TaskPhaseRun, TaskStatus, TemplateCatalogItem } from "./api";
-import { formatBytes, formatTime, phaseLabel, routeLabel, statusLabel, statusTone } from "./format";
+import { artifactKindLabel, formatBytes, formatTime, phaseLabel, routeLabel, statusLabel, statusTone } from "./format";
 import { go, parseRoute, Route } from "./router";
 
 const activeStatuses: TaskStatus[] = [
@@ -631,6 +631,11 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const latestRun = runtimeRuns[0];
   const failureMetadata = task ? parseJSON<Record<string, unknown>>(task.failure_metadata || "{}", {}) : {};
   const routeSelection = task ? parseJSON<Record<string, unknown>>(task.route_selection_json || "{}", {}) : {};
+  const sourcePrepareRun = [...phaseRuns].reverse().find((run) => run.phase === "source_prepare");
+  const sourcePrepareOutput = sourcePrepareRun
+    ? parseJSON<Record<string, unknown>>(sourcePrepareRun.output_json || "{}", {})
+    : {};
+  const sourceContract = sourcePrepareOutput.source_contract as Record<string, unknown> | undefined;
   const taskRoute = task?.route || "main";
   const routeConfidence = typeof routeSelection.confidence === "number" ? Math.round(routeSelection.confidence * 100) : null;
   const retryOptions = task?.status === "failed" ? retryOptionsForFailure(task.failure_phase || "") : [];
@@ -731,13 +736,40 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
 
             <div className="status-panel">
               <div className="section-title">
+                <FileText size={17} />
+                <span>资料解析</span>
+              </div>
+              <div className="kv-grid">
+                <span>源文件</span>
+                <strong>
+                  {typeof sourceContract?.source_count === "number" && sourceContract.source_count !== 0
+                    ? sourceContract.source_count
+                    : "-"}
+                </strong>
+                <span>转换文本</span>
+                <strong>
+                  {typeof sourceContract?.normalized_markdown_count === "number" && sourceContract.normalized_markdown_count !== 0
+                    ? sourceContract.normalized_markdown_count
+                    : "-"}
+                </strong>
+                <span>PPTX 分析</span>
+                <strong>{sourceContract?.has_source_profile ? "已生成" : "-"}</strong>
+                <span>分析目录</span>
+                <strong className="mono">
+                  {typeof sourceContract?.source_profile === "string" ? sourceContract.source_profile : "-"}
+                </strong>
+              </div>
+            </div>
+
+            <div className="status-panel">
+              <div className="section-title">
                 <Presentation size={17} />
                 <span>产物</span>
               </div>
               <div className="artifact-list">
                 {artifacts.slice(0, 8).map((artifact) => (
                   <span className="artifact-chip" key={artifact.id}>
-                    {artifact.kind}
+                    {artifactKindLabel[artifact.kind] || artifact.kind}
                     <small>{artifact.name}</small>
                   </span>
                 ))}
