@@ -58,6 +58,13 @@ const splitRetryOptions: Array<{ phase: RetryPhase; label: string }> = [
 ];
 
 const templateSelectionKey = "slidesmith.newTask.templateId";
+const supportedSourceAccept = [
+  ".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".pdf",
+  ".docx", ".doc", ".odt", ".rtf", ".epub", ".html", ".htm",
+  ".tex", ".latex", ".rst", ".org", ".ipynb", ".typ",
+  ".xlsx", ".xlsm", ".xls",
+  ".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm",
+].join(",");
 const templateKindFilters = [
   { value: "all", label: "全部" },
   { value: "layout", label: "版式" },
@@ -241,7 +248,7 @@ function TaskListPage() {
 
 function NewTaskPage() {
   const [title, setTitle] = useState("");
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [templates, setTemplates] = useState<TemplateCatalogItem[]>([]);
   const [templateLoading, setTemplateLoading] = useState(true);
   const [templateError, setTemplateError] = useState("");
@@ -324,7 +331,7 @@ function NewTaskPage() {
   }
 
   async function submit() {
-    if (!file || busy || !selectedTemplate) {
+    if (files.length === 0 || busy || !selectedTemplate) {
       return;
     }
     setBusy(true);
@@ -332,8 +339,10 @@ function NewTaskPage() {
     try {
       setStage("创建任务");
       const task = await api.createTask(title, selectedTemplate.id);
-      setStage("上传资料");
-      await api.uploadFile(task.id, file);
+      for (const sourceFile of files) {
+        setStage(`上传资料：${sourceFile.name}`);
+        await api.uploadFile(task.id, sourceFile);
+      }
       setStage("启动运行层");
       const started = await api.startTask(task.id);
       writeStoredTemplateID(selectedTemplate.id);
@@ -370,15 +379,16 @@ function NewTaskPage() {
             <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="例如：MVP 运行层验证汇报" />
           </label>
 
-          <label className={file ? "upload-zone has-file" : "upload-zone"}>
+          <label className={files.length > 0 ? "upload-zone has-file" : "upload-zone"}>
             <FileUp size={28} />
             <input
               type="file"
-              accept=".md,.markdown,.pdf,.txt"
-              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
+              multiple
+              accept={supportedSourceAccept}
+              onChange={(event) => setFiles(Array.from(event.target.files ?? []))}
             />
-            <span>{file ? file.name : "选择 Markdown / PDF / TXT 文件"}</span>
-            {file && <small>{formatBytes(file.size)}</small>}
+            <span>{files.length > 0 ? `${files.length} 个文件已选择` : "选择 Markdown / PDF / Office / PPTX 文件"}</span>
+            {files.length > 0 && <small>{files.map((sourceFile) => sourceFile.name).join(" · ")}</small>}
           </label>
 
           <div className="selected-template-strip">
@@ -390,7 +400,7 @@ function NewTaskPage() {
           </div>
 
           {error && <InlineState icon={<XCircle size={18} />} text={error} bad />}
-          <button className="primary-button wide" disabled={!file || !selectedTemplate || busy} onClick={() => void submit()}>
+          <button className="primary-button wide" disabled={files.length === 0 || !selectedTemplate || busy} onClick={() => void submit()}>
             {busy ? <Loader2 className="spin" size={17} /> : <Upload size={17} />}
             <span>{busy ? stage : "创建并启动"}</span>
           </button>
