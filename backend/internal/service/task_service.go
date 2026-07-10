@@ -296,28 +296,30 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 	if !policy.Executable {
 		err := fmt.Errorf("%s", policy.FailureMessage)
 		_ = s.failWithMetadata(ctx, task, policy.FailurePhase, err, nil, map[string]any{
-			"workspace_path":          workspace.HostDir,
-			"route":                   selection.Route,
-			"route_reason":            selection.Reason,
-			"standalone_workflow":     selection.StandaloneWorkflow,
-			"route_selection":         selection,
-			"route_execution_policy":  policy,
-			"next_spec":               policy.NextSpec,
-			"supported_routes":        policy.SupportedRoutes,
-			"known_routes":            policy.KnownRoutes,
+			"workspace_path":         workspace.HostDir,
+			"route":                  selection.Route,
+			"route_reason":           selection.Reason,
+			"standalone_workflow":    selection.StandaloneWorkflow,
+			"route_selection":        selection,
+			"route_execution_policy": policy,
+			"next_spec":              policy.NextSpec,
+			"supported_routes":       policy.SupportedRoutes,
+			"known_routes":           policy.KnownRoutes,
 		})
 		return err
 	}
 	command := fmt.Sprintf(
-		"node workflows/ppt_workflow.js prepare --profile %s --input %s --project %s",
+		"node workflows/ppt_workflow.js prepare --profile %s --sources-manifest %s --input %s --project %s",
 		shellArg(s.commandRunnerProfile()),
+		shellArg(".slidesmith/source_inputs.json"),
 		shellArg(workspace.InputPath),
 		shellArg(task.RuntimeProject),
 	)
 	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSourcePrepare, PhaseRunnerAgent, map[string]any{
-		"command":        command,
-		"workspace_path": workspace.HostDir,
-		"input_path":     workspace.InputPath,
+		"command":          command,
+		"workspace_path":   workspace.HostDir,
+		"sources_manifest": ".slidesmith/source_inputs.json",
+		"input_path":       workspace.InputPath,
 	})
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(PhaseSourcePrepare), err, nil, map[string]any{"workspace_path": workspace.HostDir})

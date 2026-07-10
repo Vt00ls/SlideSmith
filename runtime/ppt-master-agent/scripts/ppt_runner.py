@@ -174,12 +174,68 @@ def project_path_from_args(args: argparse.Namespace) -> Path:
     return direct.resolve()
 
 
+def load_source_manifest(path: Path) -> list[Path]:
+    manifest_path = path if path.is_absolute() else WORKSPACE / path
+    manifest_path = manifest_path.resolve()
+    if not manifest_path.exists():
+        return []
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("source manifest must be a JSON object")
+    if payload.get("schema") != "slidesmith.source_inputs.v1":
+        raise ValueError(f"unsupported source manifest schema: {payload.get('schema')!r}")
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise ValueError("source manifest files must be a list")
+
+    sources: list[Path] = []
+    for index, entry in enumerate(files):
+        if not isinstance(entry, dict):
+            raise ValueError(f"source manifest files[{index}] must be an object")
+        upload_path = entry.get("upload_path", "")
+        if not isinstance(upload_path, str):
+            raise ValueError(f"source manifest files[{index}].upload_path must be a string")
+        upload_path = upload_path.strip()
+        if not upload_path:
+            continue
+
+        source_path = (WORKSPACE / upload_path).resolve()
+        try:
+            source_path.relative_to(WORKSPACE)
+        except ValueError as exc:
+            raise ValueError(f"source path escapes workspace: {upload_path}") from exc
+        if source_path.is_file():
+            sources.append(source_path)
+    return sources
+
+
+def stage_prepare_inputs(args: argparse.Namespace, scratch_input_dir: Path) -> list[Path]:
+    manifest_arg = getattr(args, "sources_manifest", "")
+    selected = load_source_manifest(Path(manifest_arg)) if manifest_arg else []
+    if not selected:
+        input_arg = getattr(args, "input", "")
+        if input_arg:
+            input_path = Path(input_arg)
+            if not input_path.is_absolute():
+                input_path = WORKSPACE / input_path
+            input_path = input_path.resolve()
+            if not input_path.exists():
+                raise FileNotFoundError(f"input not found: {input_path}")
+            selected = [input_path]
+    if not selected:
+        raise FileNotFoundError("no source inputs found")
+
+    staged: list[Path] = []
+    for source_path in selected:
+        staged_path = scratch_input_dir / source_path.name
+        shutil.copy2(source_path, staged_path)
+        staged.append(staged_path)
+    return staged
+
+
 def prepare(args: argparse.Namespace) -> None:
     set_status("source_converting", project=args.project)
-    input_path = Path(args.input).resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(f"input not found: {input_path}")
-
     projects_dir = WORKSPACE / "projects"
     projects_dir.mkdir(parents=True, exist_ok=True)
     project_path = project_path_from_args(args)
@@ -193,13 +249,14 @@ def prepare(args: argparse.Namespace) -> None:
     if scratch_input_dir.exists():
         shutil.rmtree(scratch_input_dir)
     scratch_input_dir.mkdir(parents=True, exist_ok=True)
-    staged_input = scratch_input_dir / input_path.name
-    shutil.copy2(input_path, staged_input)
+    staged_inputs = stage_prepare_inputs(args, scratch_input_dir)
+    if not staged_inputs:
+        raise FileNotFoundError("no staged source inputs")
 
-    if staged_input.suffix.lower() not in TEXT_SOURCE_SUFFIXES:
-        run_command(["python3", str(script_path("source_to_md.py")), str(staged_input)])
-
-    run_command(["python3", str(script_path("project_manager.py")), "import-sources", str(project_path), str(scratch_input_dir), "--move"])
+    run_command([
+        "python3", str(script_path("project_manager.py")), "import-sources",
+        str(project_path), str(scratch_input_dir), "--move",
+    ])
 
     confirmation_dir = project_path / "confirm_ui"
     confirmation_dir.mkdir(parents=True, exist_ok=True)
@@ -1146,7 +1203,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--profile", choices=["mock", "full"], default="full")
 
     prepare_parser = sub.add_parser("prepare")
-    prepare_parser.add_argument("--input", required=True)
+    prepare_parser.add_argument("--input", default="")
+    prepare_parser.add_argument("--sources-manifest", default=".slidesmith/source_inputs.json")
     prepare_parser.add_argument("--project", required=True)
     prepare_parser.add_argument("--format", default="ppt169")
     prepare_parser.add_argument("--profile", choices=["smoke", "real-lite"], default="smoke")
