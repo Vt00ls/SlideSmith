@@ -49,6 +49,10 @@ type sourcePrepareFile struct {
 }
 
 func validateSourcePrepareContract(projectPath, route string) (map[string]any, error) {
+	return validateSourcePrepareContractWithSourceCount(projectPath, route, 0)
+}
+
+func validateSourcePrepareContractWithSourceCount(projectPath, route string, manifestSourceCount int) (map[string]any, error) {
 	absoluteProjectPath, err := filepath.Abs(projectPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve source prepare project path: %w", err)
@@ -66,6 +70,7 @@ func validateSourcePrepareContract(projectPath, route string) (map[string]any, e
 	normalizedMarkdownCount := 0
 	conversionProfileCount := 0
 	pptxDeckStems := make([]string, 0)
+	pptxDeckFilesByFoldedStem := make(map[string]string)
 	for _, sourceFile := range sourceFiles {
 		if sourceFile.isReadable {
 			normalizedMarkdownCount++
@@ -74,6 +79,16 @@ func validateSourcePrepareContract(projectPath, route string) (map[string]any, e
 			conversionProfileCount++
 		}
 		if _, ok := pptxDeckExtensions[sourceFile.extension]; ok {
+			foldedStem := strings.ToLower(sourceFile.stem)
+			if previousFile, exists := pptxDeckFilesByFoldedStem[foldedStem]; exists {
+				return nil, fmt.Errorf(
+					"source prepare contract deck stem collision: %s and %s share case-folded stem %q",
+					previousFile,
+					sourceFile.name,
+					foldedStem,
+				)
+			}
+			pptxDeckFilesByFoldedStem[foldedStem] = sourceFile.name
 			pptxDeckStems = append(pptxDeckStems, sourceFile.stem)
 		}
 	}
@@ -106,12 +121,16 @@ func validateSourcePrepareContract(projectPath, route string) (map[string]any, e
 	if hasSourceProfile {
 		sourceProfile = "analysis/source_profile.json"
 	}
+	sourceCount := inferSourcePrepareCount(sourceFiles)
+	if manifestSourceCount > 0 {
+		sourceCount = manifestSourceCount
+	}
 	contract := map[string]any{
 		"schema":                    sourcePrepareContractSchema,
 		"phase":                     string(PhaseSourcePrepare),
 		"route":                     route,
 		"project_path":              absoluteProjectPath,
-		"source_count":              inferSourcePrepareCount(sourceFiles),
+		"source_count":              sourceCount,
 		"normalized_markdown_count": normalizedMarkdownCount,
 		"conversion_profile_count":  conversionProfileCount,
 		"pptx_deck_count":           len(pptxDeckStems),

@@ -119,7 +119,8 @@ func (r *Repository) CreateArtifact(ctx context.Context, artifact *model.Artifac
 
 func (r *Repository) ReplaceArtifactsByObjectKeyPrefix(ctx context.Context, taskID, objectKeyPrefix string, artifacts []model.Artifact) error {
 	now := time.Now().UTC()
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	persisted := append([]model.Artifact(nil), artifacts...)
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if objectKeyPrefix != "" {
 			if err := tx.
 				Where("task_id = ? AND object_key LIKE ?", taskID, objectKeyPrefix+"%").
@@ -127,8 +128,8 @@ func (r *Repository) ReplaceArtifactsByObjectKeyPrefix(ctx context.Context, task
 				return err
 			}
 		}
-		for i := range artifacts {
-			artifact := artifacts[i]
+		for i := range persisted {
+			artifact := &persisted[i]
 			if artifact.ID == "" {
 				artifact.ID = uuid.NewString()
 			}
@@ -138,12 +139,26 @@ func (r *Repository) ReplaceArtifactsByObjectKeyPrefix(ctx context.Context, task
 			if artifact.Storage == "" {
 				artifact.Storage = "local"
 			}
-			if err := tx.Create(&artifact).Error; err != nil {
+			if err := tx.Create(artifact).Error; err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	copy(artifacts, persisted)
+	return nil
+}
+
+func (r *Repository) ListArtifactsByObjectKeyPrefix(ctx context.Context, taskID, objectKeyPrefix string) ([]model.Artifact, error) {
+	var artifacts []model.Artifact
+	err := r.db.WithContext(ctx).
+		Where("task_id = ? AND object_key LIKE ?", taskID, objectKeyPrefix+"%").
+		Order("object_key ASC").
+		Find(&artifacts).Error
+	return artifacts, err
 }
 
 func (r *Repository) ListArtifacts(ctx context.Context, taskID string) ([]model.Artifact, error) {

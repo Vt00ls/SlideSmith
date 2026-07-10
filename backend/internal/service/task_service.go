@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -351,7 +352,7 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 			return err
 		}
 	}
-	sourceContract, err := validateSourcePrepareContract(preparedProjectPath, selection.Route)
+	sourceContract, err := validateSourcePrepareContractWithSourceCount(preparedProjectPath, selection.Route, workspace.SourceCount)
 	if err != nil {
 		output := runtimeRunPhaseOutput(run)
 		output["project_path"] = preparedProjectPath
@@ -363,28 +364,69 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 		})
 		return err
 	}
-	sourceArtifacts, err := s.publishSourceIntakeArtifacts(ctx, task, preparedProjectPath)
-	if err != nil {
-		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
-		_ = s.failWithMetadata(ctx, task, string(PhaseSourcePrepare)+".publish_intake", err, run, map[string]any{
-			"workspace_path": workspace.HostDir,
-			"project_path":   preparedProjectPath,
-			"route":          selection.Route,
-		})
-		return err
-	}
 	task.LastRuntimeRunID = run.ExternalRunID
 	task.LastRuntimeSessionID = run.ExternalSessionID
 	task.RuntimeWorkspacePath = run.WorkspacePath
 	if err := s.repo.SaveTask(ctx, task); err != nil {
-		return err
+		cause := fmt.Errorf("source_prepare.persist_runtime: %w", err)
+		output := runtimeRunPhaseOutput(run)
+		output["project_path"] = preparedProjectPath
+		return s.recoverSourcePrepareFailure(
+			ctx,
+			task,
+			phaseRun,
+			"source_prepare.persist_runtime",
+			cause,
+			run,
+			output,
+			map[string]any{
+				"workspace_path": workspace.HostDir,
+				"project_path":   preparedProjectPath,
+				"route":          selection.Route,
+			},
+		)
+	}
+	sourceArtifacts, err := s.publishSourceIntakeArtifacts(ctx, task, preparedProjectPath)
+	if err != nil {
+		cause := fmt.Errorf("source_prepare.publish_intake: %w", err)
+		output := runtimeRunPhaseOutput(run)
+		output["project_path"] = preparedProjectPath
+		return s.recoverSourcePrepareFailure(
+			ctx,
+			task,
+			phaseRun,
+			"source_prepare.publish_intake",
+			cause,
+			run,
+			output,
+			map[string]any{
+				"workspace_path": workspace.HostDir,
+				"project_path":   preparedProjectPath,
+				"route":          selection.Route,
+			},
+		)
 	}
 	output := runtimeRunPhaseOutput(run)
 	output["project_path"] = preparedProjectPath
 	output["source_contract"] = sourceContract
 	output["source_intake_artifact_count"] = len(sourceArtifacts)
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
-		return err
+		cause := fmt.Errorf("source_prepare.finalize: %w", err)
+		return s.recoverSourcePrepareFailure(
+			ctx,
+			task,
+			phaseRun,
+			"source_prepare.finalize",
+			cause,
+			run,
+			output,
+			map[string]any{
+				"workspace_path":  workspace.HostDir,
+				"project_path":    preparedProjectPath,
+				"route":           selection.Route,
+				"source_contract": sourceContract,
+			},
+		)
 	}
 	policy = routeExecutionPolicyFor(selection)
 	if !policy.WorkflowExecutable {
@@ -414,6 +456,27 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 		"template_lock":        templateResolution.TemplateLockPath,
 	})
 	return s.transition(ctx, task, model.TaskStatusAwaitingAnchorConfirm, "Awaiting anchor confirmation", map[string]any{"runtime_run_id": run.ID})
+}
+
+func (s *TaskService) recoverSourcePrepareFailure(
+	ctx context.Context,
+	task *model.Task,
+	phaseRun *model.TaskPhaseRun,
+	failurePhase string,
+	cause error,
+	run *model.TaskRuntimeRun,
+	phaseOutput map[string]any,
+	extra map[string]any,
+) error {
+	recoveryCtx := context.WithoutCancel(ctx)
+	errs := []error{cause}
+	if err := s.finishPhaseRun(recoveryCtx, phaseRun, PhaseRunStatusFailed, phaseOutput, cause); err != nil {
+		errs = append(errs, fmt.Errorf("recover source_prepare phase: %w", err))
+	}
+	if err := s.failWithMetadata(recoveryCtx, task, failurePhase, cause, run, extra); err != nil {
+		errs = append(errs, fmt.Errorf("recover source_prepare task: %w", err))
+	}
+	return errors.Join(errs...)
 }
 
 func (s *TaskService) processGenerate(ctx context.Context, task *model.Task) error {

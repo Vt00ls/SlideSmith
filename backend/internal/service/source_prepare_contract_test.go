@@ -272,6 +272,40 @@ func TestValidateSourcePrepareContractRejectsMissingPerStemPPTXAnalysis(t *testi
 	}
 }
 
+func TestValidateSourcePrepareContractRejectsCaseFoldedDuplicateDeckStems(t *testing.T) {
+	tests := []struct {
+		name       string
+		secondDeck string
+		secondStem string
+	}{
+		{name: "same spelling different extensions", secondDeck: "deck.pptm", secondStem: "deck"},
+		{name: "case folded collision", secondDeck: "DECK.pptm", secondStem: "DECK"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projectPath := t.TempDir()
+			mustWriteFileNoTest(projectPath, filepath.Join("sources", "deck.pptx"), "pptx")
+			mustWriteFileNoTest(projectPath, filepath.Join("sources", test.secondDeck), "pptm")
+			mustWriteFileNoTest(projectPath, filepath.Join("sources", "deck.md"), "# Deck\n")
+			mustWriteFileNoTest(projectPath, filepath.Join("analysis", "source_profile.json"), `{}`)
+			mustWriteFileNoTest(projectPath, filepath.Join("analysis", "deck.identity.json"), `{}`)
+			mustWriteFileNoTest(projectPath, filepath.Join("analysis", "deck.slide_library.json"), `{}`)
+			if test.secondStem != "deck" {
+				mustWriteFileNoTest(projectPath, filepath.Join("analysis", test.secondStem+".identity.json"), `{}`)
+				mustWriteFileNoTest(projectPath, filepath.Join("analysis", test.secondStem+".slide_library.json"), `{}`)
+			}
+
+			_, err := validateSourcePrepareContract(projectPath, model.TaskRouteMain)
+			if err == nil {
+				t.Fatal("validateSourcePrepareContract() error = nil, want deck stem collision")
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), "deck stem collision") {
+				t.Fatalf("error = %q, want clear deck stem collision", err)
+			}
+		})
+	}
+}
+
 func TestValidateSourcePrepareContractAcceptsReadableMainSources(t *testing.T) {
 	tests := []struct {
 		name string
@@ -393,6 +427,81 @@ func TestProcessPrepareAddsSourceContractToPhaseOutput(t *testing.T) {
 		doc := decodeSourcePrepareContract(t, output.SourceContract)
 		if doc.SourceCount != 1 || doc.NormalizedMarkdownCount != 1 {
 			t.Fatalf("unexpected phase contract counts: source=%d normalized=%d", doc.SourceCount, doc.NormalizedMarkdownCount)
+		}
+		return
+	}
+	t.Fatal("source_prepare phase run not found")
+}
+
+type sameStemMixedSourcePrepareAgent struct{}
+
+func (sameStemMixedSourcePrepareAgent) Up(context.Context, AgentRunRequest) error {
+	return nil
+}
+
+func (sameStemMixedSourcePrepareAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+	project := filepath.Join(req.WorkDir, "projects", "task_template_ppt169_20260708")
+	mustWriteFileNoTest(project, filepath.Join("sources", "foo.pdf"), "pdf")
+	mustWriteFileNoTest(project, filepath.Join("sources", "foo.txt"), "text")
+	mustWriteFileNoTest(project, filepath.Join("sources", "foo.md"), "# PDF conversion\n")
+	mustWriteFileNoTest(project, filepath.Join("sources", "foo_2.md"), "# Text conversion\n")
+	exitCode := 0
+	return &AgentRunResult{
+		RunID:         "run-same-stem-mixed",
+		SessionID:     "session-same-stem-mixed",
+		Status:        "succeeded",
+		ExitCode:      &exitCode,
+		WorkspacePath: req.WorkDir,
+	}, nil
+}
+
+func TestProcessPrepareUsesExactManifestSourceCountForSameStemMixedSources(t *testing.T) {
+	service, repo, task, _ := templateResolvePrepareService(t)
+	ctx := context.Background()
+	if err := repo.DB().Where("task_id = ?", task.ID).Delete(&model.Artifact{}).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range []struct {
+		name    string
+		content string
+	}{
+		{name: "foo.pdf", content: "pdf upload"},
+		{name: "foo.txt", content: "text upload"},
+	} {
+		objectKey := filepath.ToSlash(filepath.Join("tasks", task.ID, "source", source.name))
+		mustWriteFile(t, service.storage.Path(objectKey), source.content)
+		if err := repo.CreateArtifact(ctx, &model.Artifact{
+			TaskID:    task.ID,
+			Kind:      model.ArtifactKindSource,
+			Name:      source.name,
+			ObjectKey: objectKey,
+			Storage:   "local",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service.agent = sameStemMixedSourcePrepareAgent{}
+
+	if err := service.processPrepare(ctx, task); err != nil {
+		t.Fatalf("processPrepare() error = %v", err)
+	}
+	phaseRuns, err := repo.ListPhaseRuns(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phaseRun := range phaseRuns {
+		if phaseRun.Phase != string(PhaseSourcePrepare) {
+			continue
+		}
+		var output struct {
+			SourceContract map[string]any `json:"source_contract"`
+		}
+		if err := json.Unmarshal([]byte(phaseRun.OutputJSON), &output); err != nil {
+			t.Fatal(err)
+		}
+		doc := decodeSourcePrepareContract(t, output.SourceContract)
+		if doc.SourceCount != 2 {
+			t.Fatalf("source_count = %d, want exact manifest input count 2", doc.SourceCount)
 		}
 		return
 	}

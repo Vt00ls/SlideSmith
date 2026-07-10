@@ -10,6 +10,9 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -46,7 +49,38 @@ STATE_DIR = WORKSPACE / ".slidesmith"
 EVENTS_PATH = STATE_DIR / "events.ndjson"
 STATUS_PATH = STATE_DIR / "status.json"
 ARTIFACTS_PATH = STATE_DIR / "artifacts.json"
-TEXT_SOURCE_SUFFIXES = {".md", ".markdown", ".txt", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml"}
+TEXT_SOURCE_SUFFIXES = {".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml"}
+
+PRESENTATION_MAIN_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+MACRO_PRESENTATION_MAIN_CONTENT_TYPE = "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml"
+OOXML_CONTENT_TYPES_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/content-types"
+PRESENTATIONML_NAMESPACE = "http://schemas.openxmlformats.org/presentationml/2006/main"
+PRESERVED_PRESENTATION_CONTENT_TYPES = {
+    ".pptx": (PRESENTATION_MAIN_CONTENT_TYPE, "presentation"),
+    ".pptm": (MACRO_PRESENTATION_MAIN_CONTENT_TYPE, "macro presentation"),
+}
+STAGED_PRESENTATION_CONTENT_TYPES = {
+    ".ppsx": (
+        "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",
+        PRESENTATION_MAIN_CONTENT_TYPE,
+        "slideshow",
+    ),
+    ".ppsm": (
+        "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",
+        MACRO_PRESENTATION_MAIN_CONTENT_TYPE,
+        "macro slideshow",
+    ),
+    ".potx": (
+        "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+        PRESENTATION_MAIN_CONTENT_TYPE,
+        "template",
+    ),
+    ".potm": (
+        "application/vnd.ms-powerpoint.template.macroEnabled.main+xml",
+        MACRO_PRESENTATION_MAIN_CONTENT_TYPE,
+        "macro template",
+    ),
+}
 
 
 def utc_now() -> str:
@@ -230,8 +264,117 @@ def stage_prepare_inputs(args: argparse.Namespace, scratch_input_dir: Path) -> l
     for source_path in selected:
         staged_path = scratch_input_dir / source_path.name
         shutil.copy2(source_path, staged_path)
+        normalize_staged_presentation_package(staged_path)
         staged.append(staged_path)
     return staged
+
+
+def normalize_staged_presentation_package(staged_path: Path) -> None:
+    normalization = STAGED_PRESENTATION_CONTENT_TYPES.get(staged_path.suffix.lower())
+    preserved = PRESERVED_PRESENTATION_CONTENT_TYPES.get(staged_path.suffix.lower())
+    if normalization is None and preserved is None:
+        return
+    should_normalize = normalization is not None
+    if normalization is not None:
+        expected_content_type, target_content_type, content_type_label = normalization
+    else:
+        expected_content_type, content_type_label = preserved
+        target_content_type = expected_content_type
+    temp_path: Path | None = None
+    try:
+        with zipfile.ZipFile(staged_path, "r") as source:
+            try:
+                content_types_raw = source.read("[Content_Types].xml")
+            except KeyError as exc:
+                raise ValueError(
+                    f"non-OOXML presentation package {staged_path.name}: missing [Content_Types].xml"
+                ) from exc
+            try:
+                content_types = ET.fromstring(content_types_raw)
+            except ET.ParseError as exc:
+                raise ValueError(
+                    f"malformed OOXML presentation package {staged_path.name}: invalid [Content_Types].xml"
+                ) from exc
+            expected_types_tag = f"{{{OOXML_CONTENT_TYPES_NAMESPACE}}}Types"
+            if content_types.tag != expected_types_tag:
+                raise ValueError(
+                    f"non-OOXML presentation package {staged_path.name}: invalid content-types namespace"
+                )
+            override_tag = f"{{{OOXML_CONTENT_TYPES_NAMESPACE}}}Override"
+            presentation_overrides = [
+                element
+                for element in content_types
+                if element.tag == override_tag
+                and element.attrib.get("PartName") == "/ppt/presentation.xml"
+            ]
+            if len(presentation_overrides) != 1:
+                raise ValueError(
+                    f"{staged_path.name}: expected exactly one {content_type_label} main content type; "
+                    f"found {len(presentation_overrides)} overrides"
+                )
+            presentation_override = presentation_overrides[0]
+            actual_content_type = presentation_override.attrib.get("ContentType")
+            if actual_content_type != expected_content_type:
+                raise ValueError(
+                    f"{staged_path.name}: expected {content_type_label} main content type "
+                    f"{expected_content_type!r}; found {actual_content_type!r}"
+                )
+
+            try:
+                presentation_raw = source.read("ppt/presentation.xml")
+            except KeyError as exc:
+                raise ValueError(
+                    f"non-OOXML presentation package {staged_path.name}: missing ppt/presentation.xml"
+                ) from exc
+            try:
+                presentation = ET.fromstring(presentation_raw)
+            except ET.ParseError as exc:
+                raise ValueError(
+                    f"malformed OOXML presentation package {staged_path.name}: invalid ppt/presentation.xml"
+                ) from exc
+            expected_presentation_tag = f"{{{PRESENTATIONML_NAMESPACE}}}presentation"
+            if presentation.tag != expected_presentation_tag:
+                raise ValueError(
+                    f"non-OOXML presentation package {staged_path.name}: "
+                    "missing PresentationML presentation root"
+                )
+            if not should_normalize:
+                return
+
+            presentation_override.set("ContentType", target_content_type)
+            ET.register_namespace("", OOXML_CONTENT_TYPES_NAMESPACE)
+            normalized_content_types = ET.tostring(
+                content_types,
+                encoding="utf-8",
+                xml_declaration=True,
+            )
+
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{staged_path.name}.",
+                suffix=".tmp",
+                dir=staged_path.parent,
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+            with zipfile.ZipFile(temp_path, "w") as destination:
+                destination.comment = source.comment
+                for entry in source.infolist():
+                    data = (
+                        normalized_content_types
+                        if entry.filename == "[Content_Types].xml"
+                        else source.read(entry)
+                    )
+                    destination.writestr(entry, data)
+        shutil.copystat(staged_path, temp_path)
+        temp_path.replace(staged_path)
+        temp_path = None
+    except zipfile.BadZipFile as exc:
+        raise ValueError(
+            f"malformed OOXML presentation package {staged_path.name}: invalid ZIP package"
+        ) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def prepare(args: argparse.Namespace) -> None:

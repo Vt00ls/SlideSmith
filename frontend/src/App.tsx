@@ -756,7 +756,9 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 <strong>{sourceContract?.has_source_profile ? "已生成" : "-"}</strong>
                 <span>分析目录</span>
                 <strong className="mono">
-                  {typeof sourceContract?.source_profile === "string" ? sourceContract.source_profile : "-"}
+                  {typeof sourceContract?.source_profile === "string" && sourceContract.source_profile.trim() !== ""
+                    ? sourceContract.source_profile.trim()
+                    : "-"}
                 </strong>
               </div>
             </div>

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -9,6 +10,89 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 	"gorm.io/gorm"
 )
+
+func TestReplaceArtifactsByObjectKeyPrefixPopulatesCallerAfterCommit(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Artifact{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	artifacts := []model.Artifact{{
+		Kind:      model.ArtifactKindSourceMarkdown,
+		Name:      "source.md",
+		ObjectKey: "tasks/task-1/source-intake/sources/source.md",
+	}}
+
+	if err := repo.ReplaceArtifactsByObjectKeyPrefix(
+		context.Background(),
+		"task-1",
+		"tasks/task-1/source-intake/",
+		artifacts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if artifacts[0].ID == "" || artifacts[0].CreatedAt.IsZero() || artifacts[0].UpdatedAt.IsZero() {
+		t.Fatalf("caller artifact lacks generated identity: %#v", artifacts[0])
+	}
+	if artifacts[0].TaskID != "task-1" || artifacts[0].Storage != "local" || artifacts[0].MetadataJSON != "{}" {
+		t.Fatalf("caller artifact lacks persisted defaults: %#v", artifacts[0])
+	}
+	var persisted model.Artifact
+	if err := db.First(&persisted, "id = ?", artifacts[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(artifacts[0], persisted) {
+		t.Fatalf("caller artifact = %#v, persisted = %#v", artifacts[0], persisted)
+	}
+}
+
+func TestReplaceArtifactsByObjectKeyPrefixDoesNotMutateCallerOnRollback(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Artifact{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Exec(`
+		CREATE TRIGGER fail_second_replacement
+		BEFORE INSERT ON artifacts
+		WHEN NEW.name = 'fail.md'
+		BEGIN
+			SELECT RAISE(ABORT, 'forced replacement rollback');
+		END;
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	artifacts := []model.Artifact{
+		{Kind: model.ArtifactKindSourceMarkdown, Name: "first.md", ObjectKey: "tasks/task-1/source-intake/sources/first.md"},
+		{Kind: model.ArtifactKindSourceMarkdown, Name: "fail.md", ObjectKey: "tasks/task-1/source-intake/sources/fail.md"},
+	}
+	want := append([]model.Artifact(nil), artifacts...)
+
+	if err := repo.ReplaceArtifactsByObjectKeyPrefix(
+		context.Background(),
+		"task-1",
+		"tasks/task-1/source-intake/",
+		artifacts,
+	); err == nil {
+		t.Fatal("ReplaceArtifactsByObjectKeyPrefix() error = nil, want rollback")
+	}
+	if !reflect.DeepEqual(artifacts, want) {
+		t.Fatalf("caller artifacts mutated on rollback:\n got: %#v\nwant: %#v", artifacts, want)
+	}
+	var count int64
+	if err := db.Model(&model.Artifact{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("persisted artifacts after rollback = %d, want 0", count)
+	}
+}
 
 func TestReplaceArtifactsByObjectKeyPrefixKeepsUploadedSources(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})

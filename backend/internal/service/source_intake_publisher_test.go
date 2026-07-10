@@ -161,6 +161,10 @@ func TestPublishSourceIntakeArtifactsPublishesAndReplacesPersistedIntake(t *test
 	if removedCount != 0 {
 		t.Fatalf("removed intake artifact rows = %d, want 0", removedCount)
 	}
+	removedObjectKey := "tasks/task-intake/source-intake/sources/bravo.MARKDOWN"
+	if _, err := os.Stat(storage.Path(removedObjectKey)); !os.IsNotExist(err) {
+		t.Fatalf("removed intake object %q stat error = %v, want not exist", removedObjectKey, err)
+	}
 }
 
 func TestPublishSourceIntakeArtifactsValidatesInputs(t *testing.T) {
@@ -202,8 +206,12 @@ func TestPublishSourceIntakeArtifactsRollsBackObjectsWhenRepositoryReplaceFails(
 	wantRows := loadPersistedSourceIntakeRows(t, repo, task.ID, prefix)
 
 	mustWriteFile(t, filepath.Join(projectPath, "sources", "alpha.md"), "new alpha\n")
-	mustWriteFile(t, filepath.Join(projectPath, "sources", "bravo.md"), "new bravo\n")
+	if err := os.Remove(filepath.Join(projectPath, "sources", "bravo.md")); err != nil {
+		t.Fatal(err)
+	}
 	mustWriteFile(t, filepath.Join(projectPath, "sources", "charlie.md"), "new charlie\n")
+	deleteSpy := &sourceIntakeDeleteSpyStorage{LocalStorage: storage}
+	service.storage = deleteSpy
 	if err := repo.DB().Exec(`
 		CREATE TRIGGER fail_source_intake_retry_insert
 		BEFORE INSERT ON artifacts
@@ -218,14 +226,113 @@ func TestPublishSourceIntakeArtifactsRollsBackObjectsWhenRepositoryReplaceFails(
 	if _, err := service.publishSourceIntakeArtifacts(ctx, task, projectPath); err == nil {
 		t.Fatal("publishSourceIntakeArtifacts() retry error = nil, want repository failure")
 	}
+	if len(deleteSpy.deleteCalls) == 0 {
+		t.Fatal("stale source intake object was not deleted before repository replacement")
+	}
 	assertPersistedSourceIntakeRowsEqual(t, repo, task.ID, prefix, wantRows)
 	assertSourceIntakeObjectStates(t, storage, wantObjects)
+}
+
+func TestPublishSourceIntakeArtifactsRestoresStaleObjectWhenDeleteFails(t *testing.T) {
+	ctx := context.Background()
+	service, repo, storage := newSourceIntakePublisherTestService(t)
+	task := &model.Task{ID: "task-intake-delete-rollback", Route: model.TaskRouteMain}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+
+	projectPath := filepath.Join(t.TempDir(), "project")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "alpha.md"), "old alpha\n")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "bravo.md"), "old bravo\n")
+	initial, err := service.publishSourceIntakeArtifacts(ctx, task, projectPath)
+	if err != nil {
+		t.Fatalf("initial publishSourceIntakeArtifacts() error = %v", err)
+	}
+	prefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "source-intake")) + "/"
+	objectKeys := make([]string, 0, len(initial))
+	for _, artifact := range initial {
+		objectKeys = append(objectKeys, artifact.ObjectKey)
+	}
+	wantObjects := captureSourceIntakeObjectStates(t, storage, objectKeys)
+	wantRows := loadPersistedSourceIntakeRows(t, repo, task.ID, prefix)
+	if err := os.Remove(filepath.Join(projectPath, "sources", "bravo.md")); err != nil {
+		t.Fatal(err)
+	}
+	deleteSpy := &sourceIntakeDeleteSpyStorage{LocalStorage: storage, failAfterDelete: true}
+	service.storage = deleteSpy
+
+	if _, err := service.publishSourceIntakeArtifacts(ctx, task, projectPath); err == nil {
+		t.Fatal("publishSourceIntakeArtifacts() error = nil, want stale delete failure")
+	}
+	if len(deleteSpy.deleteCalls) != 1 {
+		t.Fatalf("stale delete calls = %#v, want exactly one", deleteSpy.deleteCalls)
+	}
+	assertPersistedSourceIntakeRowsEqual(t, repo, task.ID, prefix, wantRows)
+	assertSourceIntakeObjectStates(t, storage, wantObjects)
+}
+
+func TestPublishSourceIntakeArtifactsDoesNotReadArtifactsAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	service, repo, _ := newSourceIntakePublisherTestService(t)
+	task := &model.Task{ID: "task-intake-no-post-read", Route: model.TaskRouteMain}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	projectPath := filepath.Join(t.TempDir(), "project")
+	mustWriteFile(t, filepath.Join(projectPath, "sources", "alpha.md"), "alpha\n")
+
+	artifactQueries := 0
+	if err := repo.DB().Callback().Query().Before("gorm:query").Register(
+		"test:reject_source_intake_post_commit_read",
+		func(db *gorm.DB) {
+			if db.Statement.Table != "artifacts" {
+				return
+			}
+			artifactQueries++
+			if artifactQueries > 1 {
+				db.AddError(errors.New("forbidden post-commit artifact read"))
+			}
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	artifacts, err := service.publishSourceIntakeArtifacts(ctx, task, projectPath)
+	if err != nil {
+		t.Fatalf("publishSourceIntakeArtifacts() error = %v", err)
+	}
+	if artifactQueries != 1 {
+		t.Fatalf("artifact queries = %d, want one pre-mutation prefix read", artifactQueries)
+	}
+	if len(artifacts) != 1 || artifacts[0].ID == "" || artifacts[0].CreatedAt.IsZero() {
+		t.Fatalf("returned artifacts lack transactional identity: %#v", artifacts)
+	}
 }
 
 type sourceIntakePartialCopyFailStorage struct {
 	*LocalStorage
 	callCount int
 	failAt    int
+}
+
+type sourceIntakeDeleteSpyStorage struct {
+	*LocalStorage
+	deleteCalls     []string
+	failAfterDelete bool
+}
+
+func (s *sourceIntakeDeleteSpyStorage) DeleteObject(ctx context.Context, objectKey string) error {
+	s.deleteCalls = append(s.deleteCalls, objectKey)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Remove(s.Path(objectKey)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if s.failAfterDelete {
+		return errors.New("forced source intake delete failure")
+	}
+	return nil
 }
 
 func (s *sourceIntakePartialCopyFailStorage) CopyFileToObject(ctx context.Context, objectKey, sourcePath string) (*StoredObject, error) {
@@ -319,12 +426,150 @@ func TestPublishSourceIntakeArtifactsCompletesPrepareWithCount(t *testing.T) {
 	t.Fatal("source_prepare phase run not found")
 }
 
+func TestProcessPreparePersistsRuntimeBeforePublishingSourceIntake(t *testing.T) {
+	service, repo, task, _ := templateResolvePrepareService(t)
+	ctx := context.Background()
+	injected := false
+	if err := repo.DB().Callback().Update().Before("gorm:update").Register(
+		"test:fail_source_prepare_runtime_persist_once",
+		func(db *gorm.DB) {
+			candidate, ok := db.Statement.Dest.(*model.Task)
+			if !ok || injected || candidate.LastRuntimeRunID == "" {
+				return
+			}
+			injected = true
+			db.AddError(errors.New("forced runtime metadata save failure"))
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	err := service.processPrepare(ctx, task)
+	if err == nil {
+		t.Fatal("processPrepare() error = nil, want runtime metadata save failure")
+	}
+	if !injected {
+		t.Fatal("runtime metadata save fault was not injected")
+	}
+	updated, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "source_prepare.persist_runtime" {
+		t.Fatalf("task recovery = {status:%q phase:%q}, want failed/source_prepare.persist_runtime", updated.Status, updated.FailurePhase)
+	}
+	prefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "source-intake")) + "/"
+	rows := loadPersistedSourceIntakeRows(t, repo, task.ID, prefix)
+	if len(rows) != 0 {
+		t.Fatalf("source intake rows published before runtime metadata persisted: %#v", rows)
+	}
+	if _, statErr := os.Stat(service.storage.Path(strings.TrimSuffix(prefix, "/"))); !os.IsNotExist(statErr) {
+		t.Fatalf("source intake storage exists before runtime metadata persisted: %v", statErr)
+	}
+	assertSourcePreparePhaseStatus(t, repo, task.ID, PhaseRunStatusFailed)
+}
+
+func TestProcessPrepareRecoversWhenSucceededPhaseSaveFails(t *testing.T) {
+	service, repo, task, _ := templateResolvePrepareService(t)
+	ctx := context.Background()
+	injected := false
+	if err := repo.DB().Callback().Update().Before("gorm:update").Register(
+		"test:fail_source_prepare_success_finalize_once",
+		func(db *gorm.DB) {
+			candidate, ok := db.Statement.Dest.(*model.TaskPhaseRun)
+			if !ok || injected || candidate.Phase != string(PhaseSourcePrepare) || candidate.Status != PhaseRunStatusSucceeded {
+				return
+			}
+			injected = true
+			db.AddError(errors.New("forced source prepare success save failure"))
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	err := service.processPrepare(ctx, task)
+	if err == nil {
+		t.Fatal("processPrepare() error = nil, want phase finalize failure")
+	}
+	if !injected {
+		t.Fatal("source prepare phase finalize fault was not injected")
+	}
+	updated, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "source_prepare.finalize" {
+		t.Fatalf("task recovery = {status:%q phase:%q}, want failed/source_prepare.finalize", updated.Status, updated.FailurePhase)
+	}
+	assertSourcePreparePhaseStatus(t, repo, task.ID, PhaseRunStatusFailed)
+	prefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "source-intake")) + "/"
+	if rows := loadPersistedSourceIntakeRows(t, repo, task.ID, prefix); len(rows) == 0 {
+		t.Fatal("source intake publication should remain committed on finalize recovery")
+	}
+	if _, err := service.RetryTask(ctx, task.ID, retryPhasePrepare); err != nil {
+		t.Fatalf("prepare retry after finalize recovery error = %v", err)
+	}
+}
+
+func assertSourcePreparePhaseStatus(t *testing.T, repo *repository.Repository, taskID, wantStatus string) {
+	t.Helper()
+	phaseRuns, err := repo.ListPhaseRuns(context.Background(), taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phaseRun := range phaseRuns {
+		if phaseRun.Phase == string(PhaseSourcePrepare) {
+			if phaseRun.Status != wantStatus {
+				t.Fatalf("source_prepare phase status = %q, want %q", phaseRun.Status, wantStatus)
+			}
+			return
+		}
+	}
+	t.Fatal("source_prepare phase run not found")
+}
+
 type sourceIntakeCopyFailStorage struct {
 	*LocalStorage
 }
 
 func (s *sourceIntakeCopyFailStorage) CopyFileToObject(context.Context, string, string) (*StoredObject, error) {
 	return nil, errors.New("forced source intake copy failure")
+}
+
+type sourceIntakeCancelCopyStorage struct {
+	*LocalStorage
+	cancel context.CancelFunc
+}
+
+func (s *sourceIntakeCancelCopyStorage) CopyFileToObject(context.Context, string, string) (*StoredObject, error) {
+	s.cancel()
+	return nil, context.Canceled
+}
+
+func TestProcessPrepareRecoversWhenSourceIntakePublishContextIsCanceled(t *testing.T) {
+	service, repo, task, _ := templateResolvePrepareService(t)
+	storage, ok := service.storage.(*LocalStorage)
+	if !ok {
+		t.Fatalf("storage type = %T, want *LocalStorage", service.storage)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	service.storage = &sourceIntakeCancelCopyStorage{LocalStorage: storage, cancel: cancel}
+
+	err := service.processPrepare(ctx, task)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("processPrepare() error = %v, want context cancellation", err)
+	}
+	updated, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "source_prepare.publish_intake" {
+		t.Fatalf("task recovery = {status:%q phase:%q}, want failed/source_prepare.publish_intake", updated.Status, updated.FailurePhase)
+	}
+	assertSourcePreparePhaseStatus(t, repo, task.ID, PhaseRunStatusFailed)
+	if _, err := service.RetryTask(context.Background(), task.ID, retryPhasePrepare); err != nil {
+		t.Fatalf("prepare retry after canceled publication error = %v", err)
+	}
 }
 
 func TestPublishSourceIntakeArtifactsFailureFailsPreparePhase(t *testing.T) {

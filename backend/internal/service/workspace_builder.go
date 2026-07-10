@@ -27,6 +27,7 @@ type TaskWorkspace struct {
 	ProjectPath    string
 	InputPath      string
 	SkillDir       string
+	SourceCount    int
 }
 
 type RuntimeWorkspaceBuilder struct {
@@ -129,6 +130,7 @@ func (b *RuntimeWorkspaceBuilder) Build(ctx context.Context, task *model.Task, s
 		return nil, err
 	}
 	workspace.InputPath = inputPath
+	workspace.SourceCount = len(sourceFiles)
 	if err := writeSourceInputsManifest(workspace, task, sourceFiles); err != nil {
 		return nil, err
 	}

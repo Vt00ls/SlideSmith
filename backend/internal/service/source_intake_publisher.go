@@ -48,7 +48,12 @@ func (s *TaskService) publishSourceIntakeArtifacts(ctx context.Context, task *mo
 		return nil, err
 	}
 	prefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "source-intake")) + "/"
+	previousArtifacts, err := s.repo.ListArtifactsByObjectKeyPrefix(ctx, task.ID, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("load prior source intake artifacts: %w", err)
+	}
 	plans := make([]sourceIntakeArtifactPlan, 0, len(files))
+	currentObjectKeys := make(map[string]struct{}, len(files))
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -63,6 +68,7 @@ func (s *TaskService) publishSourceIntakeArtifacts(ctx context.Context, task *mo
 			return nil, fmt.Errorf("encode source intake metadata for %s: %w", file.ProjectRel, err)
 		}
 		objectKey := prefix + file.ObjectRel
+		currentObjectKeys[objectKey] = struct{}{}
 		snapshot, err := snapshotSourceIntakeObject(objectKey, s.storage.Path(objectKey))
 		if err != nil {
 			return nil, fmt.Errorf("snapshot source intake artifact %s: %w", file.ProjectRel, err)
@@ -74,19 +80,42 @@ func (s *TaskService) publishSourceIntakeArtifacts(ctx context.Context, task *mo
 			Snapshot:     snapshot,
 		})
 	}
+	staleSnapshots := make([]sourceIntakeObjectSnapshot, 0)
+	seenStaleObjectKeys := make(map[string]struct{})
+	for _, previousArtifact := range previousArtifacts {
+		if _, current := currentObjectKeys[previousArtifact.ObjectKey]; current {
+			continue
+		}
+		if _, seen := seenStaleObjectKeys[previousArtifact.ObjectKey]; seen {
+			continue
+		}
+		cleanKey, err := cleanObjectKey(previousArtifact.ObjectKey)
+		if err != nil || cleanKey != previousArtifact.ObjectKey {
+			return nil, fmt.Errorf("invalid prior source intake object key %q", previousArtifact.ObjectKey)
+		}
+		snapshot, err := snapshotSourceIntakeObject(cleanKey, s.storage.Path(cleanKey))
+		if err != nil {
+			return nil, fmt.Errorf("snapshot stale source intake artifact %s: %w", cleanKey, err)
+		}
+		seenStaleObjectKeys[cleanKey] = struct{}{}
+		staleSnapshots = append(staleSnapshots, snapshot)
+	}
+	sort.Slice(staleSnapshots, func(i, j int) bool {
+		return staleSnapshots[i].ObjectKey < staleSnapshots[j].ObjectKey
+	})
 
 	artifacts := make([]model.Artifact, 0, len(plans))
-	touched := 0
+	touched := make([]sourceIntakeObjectSnapshot, 0, len(plans)+len(staleSnapshots))
 	for _, plan := range plans {
 		if err := ctx.Err(); err != nil {
-			return nil, rollbackSourceIntakeObjects(err, plans[:touched])
+			return nil, rollbackSourceIntakeObjects(err, touched)
 		}
-		touched++
+		touched = append(touched, plan.Snapshot)
 		stored, err := s.storage.CopyFileToObject(ctx, plan.ObjectKey, plan.File.SourcePath)
 		if err != nil {
 			return nil, rollbackSourceIntakeObjects(
 				fmt.Errorf("copy source intake artifact %s: %w", plan.File.ProjectRel, err),
-				plans[:touched],
+				touched,
 			)
 		}
 		artifacts = append(artifacts, model.Artifact{
@@ -102,35 +131,25 @@ func (s *TaskService) publishSourceIntakeArtifacts(ctx context.Context, task *mo
 			MetadataJSON:   plan.MetadataJSON,
 		})
 	}
+	for _, snapshot := range staleSnapshots {
+		if err := ctx.Err(); err != nil {
+			return nil, rollbackSourceIntakeObjects(err, touched)
+		}
+		touched = append(touched, snapshot)
+		if err := s.storage.DeleteObject(ctx, snapshot.ObjectKey); err != nil {
+			return nil, rollbackSourceIntakeObjects(
+				fmt.Errorf("delete stale source intake artifact %s: %w", snapshot.ObjectKey, err),
+				touched,
+			)
+		}
+	}
 	if err := s.repo.ReplaceArtifactsByObjectKeyPrefix(ctx, task.ID, prefix, artifacts); err != nil {
 		return nil, rollbackSourceIntakeObjects(
 			fmt.Errorf("persist source intake artifacts: %w", err),
-			plans[:touched],
+			touched,
 		)
 	}
-
-	persisted, err := s.repo.ListArtifacts(ctx, task.ID)
-	if err != nil {
-		return nil, fmt.Errorf("load persisted source intake artifacts: %w", err)
-	}
-	persistedByObjectKey := make(map[string]model.Artifact, len(artifacts))
-	for _, artifact := range persisted {
-		if strings.HasPrefix(artifact.ObjectKey, prefix) {
-			persistedByObjectKey[artifact.ObjectKey] = artifact
-		}
-	}
-	if len(persistedByObjectKey) != len(artifacts) {
-		return nil, fmt.Errorf("persisted source intake artifact count is %d, want %d", len(persistedByObjectKey), len(artifacts))
-	}
-	result := make([]model.Artifact, 0, len(artifacts))
-	for _, artifact := range artifacts {
-		persistedArtifact, ok := persistedByObjectKey[artifact.ObjectKey]
-		if !ok {
-			return nil, fmt.Errorf("persisted source intake artifact %s is missing", artifact.ObjectKey)
-		}
-		result = append(result, persistedArtifact)
-	}
-	return result, nil
+	return artifacts, nil
 }
 
 func snapshotSourceIntakeObject(objectKey, path string) (sourceIntakeObjectSnapshot, error) {
@@ -155,11 +174,11 @@ func snapshotSourceIntakeObject(objectKey, path string) (sourceIntakeObjectSnaps
 	return snapshot, nil
 }
 
-func rollbackSourceIntakeObjects(cause error, plans []sourceIntakeArtifactPlan) error {
+func rollbackSourceIntakeObjects(cause error, snapshots []sourceIntakeObjectSnapshot) error {
 	errs := []error{cause}
-	for i := len(plans) - 1; i >= 0; i-- {
-		if err := restoreSourceIntakeObject(plans[i].Snapshot); err != nil {
-			errs = append(errs, fmt.Errorf("rollback source intake object %s: %w", plans[i].ObjectKey, err))
+	for i := len(snapshots) - 1; i >= 0; i-- {
+		if err := restoreSourceIntakeObject(snapshots[i]); err != nil {
+			errs = append(errs, fmt.Errorf("rollback source intake object %s: %w", snapshots[i].ObjectKey, err))
 		}
 	}
 	return errors.Join(errs...)

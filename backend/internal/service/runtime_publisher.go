@@ -42,7 +42,11 @@ func (p *RuntimeWorkspacePublisher) Publish(ctx context.Context, taskID, workspa
 	if workspacePath == "" {
 		return nil, fmt.Errorf("workspace path is empty")
 	}
-	publishVersion, err := cleanPublishVersion(publishVersion)
+	workspacePath, err := resolveRuntimeWorkspacePath(workspacePath)
+	if err != nil {
+		return nil, err
+	}
+	publishVersion, err = cleanPublishVersion(publishVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +128,7 @@ func cleanPublishVersion(value string) (string, error) {
 
 func readRuntimeArtifactManifest(workspacePath string) (runtimeArtifactManifest, bool, error) {
 	manifestPath := filepath.Join(workspacePath, ".slidesmith", "artifacts.json")
-	return readRuntimeArtifactManifestFile(manifestPath)
+	return readRuntimeArtifactManifestFile(workspacePath, manifestPath)
 }
 
 func readProjectRuntimeArtifactManifest(projectPath string) (runtimeArtifactManifest, bool, error) {
@@ -132,7 +136,7 @@ func readProjectRuntimeArtifactManifest(projectPath string) (runtimeArtifactMani
 		filepath.Join(projectPath, ".slidesmith", "artifacts.json"),
 		filepath.Join(projectPath, ".slidesmith-artifacts.json"),
 	} {
-		manifest, ok, err := readRuntimeArtifactManifestFile(manifestPath)
+		manifest, ok, err := readRuntimeArtifactManifestFile(projectPath, manifestPath)
 		if err != nil || ok {
 			return manifest, ok, err
 		}
@@ -140,11 +144,18 @@ func readProjectRuntimeArtifactManifest(projectPath string) (runtimeArtifactMani
 	return runtimeArtifactManifest{}, false, nil
 }
 
-func readRuntimeArtifactManifestFile(manifestPath string) (runtimeArtifactManifest, bool, error) {
-	raw, err := os.ReadFile(manifestPath)
+func readRuntimeArtifactManifestFile(permittedRoot, manifestPath string) (runtimeArtifactManifest, bool, error) {
+	info, resolvedManifestPath, err := inspectContainedPath(permittedRoot, manifestPath)
 	if os.IsNotExist(err) {
 		return runtimeArtifactManifest{}, false, nil
 	}
+	if err != nil {
+		return runtimeArtifactManifest{}, false, fmt.Errorf("inspect runtime artifact manifest: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return runtimeArtifactManifest{}, false, fmt.Errorf("runtime artifact manifest is not a regular file: %s", manifestPath)
+	}
+	raw, err := os.ReadFile(resolvedManifestPath)
 	if err != nil {
 		return runtimeArtifactManifest{}, false, fmt.Errorf("read runtime artifact manifest: %w", err)
 	}
@@ -155,50 +166,129 @@ func readRuntimeArtifactManifestFile(manifestPath string) (runtimeArtifactManife
 	return manifest, true, nil
 }
 
+func resolveRuntimeWorkspacePath(workspacePath string) (string, error) {
+	absPath, err := filepath.Abs(workspacePath)
+	if err != nil {
+		return "", fmt.Errorf("resolve runtime workspace path: %w", err)
+	}
+	resolvedPath, err := filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve runtime workspace path: %w", err)
+	}
+	info, err := os.Stat(resolvedPath)
+	if err != nil {
+		return "", fmt.Errorf("stat runtime workspace path: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("runtime workspace path is not a directory: %s", resolvedPath)
+	}
+	return resolvedPath, nil
+}
+
 func resolveRuntimeProjectPath(workspacePath, manifestProjectPath string) (string, error) {
 	if manifestProjectPath == "" {
 		return "", nil
 	}
-	if _, err := os.Stat(manifestProjectPath); err == nil {
-		return manifestProjectPath, nil
+	workspacePath, err := resolveRuntimeWorkspacePath(workspacePath)
+	if err != nil {
+		return "", err
 	}
-	workspaceCandidate := filepath.Join(workspacePath, filepath.FromSlash(manifestProjectPath))
-	if _, err := os.Stat(workspaceCandidate); err == nil {
-		return workspaceCandidate, nil
+	manifestCandidate := filepath.FromSlash(manifestProjectPath)
+	if !filepath.IsAbs(manifestCandidate) {
+		manifestCandidate = filepath.Join(workspacePath, manifestCandidate)
+	}
+	resolvedCandidate, found, err := resolveRuntimeProjectCandidate(workspacePath, manifestCandidate)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		return resolvedCandidate, nil
+	}
+	if filepath.IsAbs(filepath.FromSlash(manifestProjectPath)) {
+		return "", fmt.Errorf("runtime project path not found: %s", manifestProjectPath)
 	}
 	projectName := filepath.Base(manifestProjectPath)
 	if projectName == "." || projectName == string(filepath.Separator) {
 		return "", fmt.Errorf("invalid runtime project path %q", manifestProjectPath)
 	}
 	candidate := filepath.Join(workspacePath, "projects", projectName)
-	if _, err := os.Stat(candidate); err == nil {
-		return candidate, nil
+	resolvedCandidate, found, err = resolveRuntimeProjectCandidate(workspacePath, candidate)
+	if err != nil {
+		return "", err
+	}
+	if found {
+		return resolvedCandidate, nil
 	}
 	return "", fmt.Errorf("runtime project path not found: %s or %s", manifestProjectPath, candidate)
 }
 
+func resolveRuntimeProjectCandidate(workspacePath, candidate string) (string, bool, error) {
+	absCandidate, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", false, fmt.Errorf("resolve runtime project path: %w", err)
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(absCandidate)
+	if os.IsNotExist(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("resolve runtime project path: %w", err)
+	}
+	if !pathWithinRoot(workspacePath, resolvedCandidate) {
+		return "", false, fmt.Errorf("runtime project path %s resolves outside runtime workspace %s", candidate, workspacePath)
+	}
+	info, err := os.Stat(resolvedCandidate)
+	if err != nil {
+		return "", false, fmt.Errorf("stat runtime project path: %w", err)
+	}
+	if !info.IsDir() {
+		return "", false, fmt.Errorf("runtime project path is not a directory: %s", resolvedCandidate)
+	}
+	return resolvedCandidate, true, nil
+}
+
 func discoverRuntimeProjectPath(workspacePath string) (string, error) {
+	workspacePath, err := resolveRuntimeWorkspacePath(workspacePath)
+	if err != nil {
+		return "", err
+	}
 	projectsDir := filepath.Join(workspacePath, "projects")
-	entries, err := os.ReadDir(projectsDir)
+	info, resolvedProjectsDir, err := inspectContainedPath(workspacePath, projectsDir)
 	if os.IsNotExist(err) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("runtime projects path is not a directory: %s", projectsDir)
+	}
+	entries, err := os.ReadDir(resolvedProjectsDir)
+	if err != nil {
+		return "", err
+	}
 	var candidates []string
 	for _, entry := range entries {
+		if entry.Type()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("runtime project discovery contains symlink: %s", filepath.Join(resolvedProjectsDir, entry.Name()))
+		}
 		if !entry.IsDir() {
 			continue
 		}
-		candidates = append(candidates, filepath.Join(projectsDir, entry.Name()))
+		candidate, found, err := resolveRuntimeProjectCandidate(workspacePath, filepath.Join(resolvedProjectsDir, entry.Name()))
+		if err != nil {
+			return "", err
+		}
+		if found {
+			candidates = append(candidates, candidate)
+		}
 	}
 	return newestPath(candidates), nil
 }
 
 func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath string, manifest runtimeArtifactManifest, hasManifest bool) ([]publishedRuntimeArtifact, error) {
 	byObjectRel := map[string]publishedRuntimeArtifact{}
-	addFile := func(sourcePath, objectRel string) error {
+	addFile := func(permittedRoot, sourcePath, objectRel string) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -206,7 +296,7 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 		if err != nil {
 			return err
 		}
-		info, err := os.Stat(sourcePath)
+		info, resolvedPath, err := inspectContainedPath(permittedRoot, sourcePath)
 		if os.IsNotExist(err) {
 			return nil
 		}
@@ -214,10 +304,10 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 			return err
 		}
 		if !info.Mode().IsRegular() {
-			return nil
+			return fmt.Errorf("runtime artifact is not a regular file: %s", sourcePath)
 		}
 		byObjectRel[cleanRel] = publishedRuntimeArtifact{
-			SourcePath: sourcePath,
+			SourcePath: resolvedPath,
 			ObjectRel:  cleanRel,
 			Kind:       artifactKindFromRuntimePath(cleanRel),
 		}
@@ -233,7 +323,7 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 			if err != nil {
 				return nil, err
 			}
-			if err := addFile(filepath.Join(projectPath, filepath.FromSlash(cleanRel)), cleanRel); err != nil {
+			if err := addFile(projectPath, filepath.Join(projectPath, filepath.FromSlash(cleanRel)), cleanRel); err != nil {
 				return nil, err
 			}
 		}
@@ -256,7 +346,9 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 		{".slidesmith-artifacts.json", filepath.Join("manifest", "runtime_artifacts.json")},
 	}
 	for _, root := range contractRoots {
-		if err := addArtifactRoot(ctx, projectPath, root.ProjectRel, root.ObjectRel, addFile); err != nil {
+		if err := addArtifactRoot(ctx, projectPath, root.ProjectRel, root.ObjectRel, func(sourcePath, objectRel string) error {
+			return addFile(projectPath, sourcePath, objectRel)
+		}); err != nil {
 			return nil, err
 		}
 	}
@@ -270,7 +362,7 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 		{filepath.Join(".slidesmith", "artifacts.json"), filepath.Join("manifest", "runtime_artifacts.json")},
 	}
 	for _, file := range workspaceFiles {
-		if err := addFile(filepath.Join(workspacePath, file.SourceRel), file.ObjectRel); err != nil {
+		if err := addFile(workspacePath, filepath.Join(workspacePath, file.SourceRel), file.ObjectRel); err != nil {
 			return nil, err
 		}
 	}
@@ -287,7 +379,7 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 
 func addArtifactRoot(ctx context.Context, projectPath, projectRel, objectRel string, addFile func(sourcePath, objectRel string) error) error {
 	sourceRoot := filepath.Join(projectPath, filepath.FromSlash(projectRel))
-	info, err := os.Stat(sourceRoot)
+	info, _, err := inspectContainedPath(projectPath, sourceRoot)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -310,12 +402,15 @@ func addArtifactRoot(ctx context.Context, projectPath, projectRel, objectRel str
 		if entry.IsDir() {
 			return nil
 		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("runtime artifact path contains symlink: %s", path)
+		}
 		info, err := entry.Info()
 		if err != nil {
 			return err
 		}
 		if !info.Mode().IsRegular() {
-			return nil
+			return fmt.Errorf("runtime artifact is not a regular file: %s", path)
 		}
 		rel, err := filepath.Rel(sourceRoot, path)
 		if err != nil {
@@ -323,6 +418,62 @@ func addArtifactRoot(ctx context.Context, projectPath, projectRel, objectRel str
 		}
 		return addFile(path, filepath.ToSlash(filepath.Join(objectRel, rel)))
 	})
+}
+
+func inspectContainedPath(permittedRoot, candidate string) (os.FileInfo, string, error) {
+	rootInputAbs, err := filepath.Abs(permittedRoot)
+	if err != nil {
+		return nil, "", err
+	}
+	candidateInputAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return nil, "", err
+	}
+	if !pathWithinRoot(rootInputAbs, candidateInputAbs) {
+		return nil, "", fmt.Errorf("runtime artifact path %s is outside permitted root %s", candidate, permittedRoot)
+	}
+	rel, err := filepath.Rel(rootInputAbs, candidateInputAbs)
+	if err != nil {
+		return nil, "", err
+	}
+	rootAbs, err := filepath.EvalSymlinks(rootInputAbs)
+	if err != nil {
+		return nil, "", err
+	}
+	candidateAbs := filepath.Join(rootAbs, rel)
+	current := rootAbs
+	if rel != "." {
+		for _, component := range strings.Split(rel, string(filepath.Separator)) {
+			current = filepath.Join(current, component)
+			info, err := os.Lstat(current)
+			if err != nil {
+				return nil, "", err
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return nil, "", fmt.Errorf("runtime artifact path contains symlink component: %s", current)
+			}
+		}
+	}
+	info, err := os.Lstat(candidateAbs)
+	if err != nil {
+		return nil, "", err
+	}
+	resolvedCandidate, err := filepath.EvalSymlinks(candidateAbs)
+	if err != nil {
+		return nil, "", err
+	}
+	if !pathWithinRoot(rootAbs, resolvedCandidate) {
+		return nil, "", fmt.Errorf("runtime artifact path %s resolves outside permitted root %s", candidate, permittedRoot)
+	}
+	return info, resolvedCandidate, nil
+}
+
+func pathWithinRoot(root, candidate string) bool {
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil || filepath.IsAbs(rel) {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func artifactKindFromRuntimePath(path string) string {

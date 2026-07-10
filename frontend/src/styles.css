@@ -445,6 +445,11 @@ select:focus {
   font-weight: 680;
 }
 
+.upload-zone small {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
 .upload-zone small,
 .confirm-heading small {
   color: #68716c;

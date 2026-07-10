@@ -2,12 +2,137 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 )
+
+func TestRuntimeWorkspacePublisherAllowsAbsoluteProjectInsideWorkspace(t *testing.T) {
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, "workspace")
+	project := filepath.Join(workspace, "projects", "inside")
+	mustWriteFile(t, filepath.Join(project, "exports", "result.pptx"), "pptx bytes\n")
+	mustWriteFile(t, filepath.Join(workspace, ".slidesmith", "artifacts.json"), `{"project_path":`+mustJSON(t, project)+`,"artifacts":[]}`+"\n")
+
+	publisher := NewRuntimeWorkspacePublisher(NewLocalStorage(filepath.Join(tmp, "storage")))
+	artifacts, err := publisher.Publish(context.Background(), "task-1", workspace, "v1")
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	if !hasPublishedArtifactObjectRel(artifacts, "exports/result.pptx") {
+		t.Fatalf("published artifacts = %#v, want exports/result.pptx", artifacts)
+	}
+}
+
+func TestRuntimeWorkspacePublisherRejectsAbsoluteProjectOutsideWorkspace(t *testing.T) {
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, "workspace")
+	project := filepath.Join(tmp, "outside-project")
+	mustWriteFile(t, filepath.Join(project, "exports", "result.pptx"), "outside pptx bytes\n")
+	mustWriteFile(t, filepath.Join(workspace, ".slidesmith", "artifacts.json"), `{"project_path":`+mustJSON(t, project)+`,"artifacts":[]}`+"\n")
+
+	publisher := NewRuntimeWorkspacePublisher(NewLocalStorage(filepath.Join(tmp, "storage")))
+	_, err := publisher.Publish(context.Background(), "task-1", workspace, "v1")
+	if err == nil {
+		t.Fatal("Publish() error = nil, want outside-workspace project rejection")
+	}
+	if !strings.Contains(err.Error(), "outside runtime workspace") {
+		t.Fatalf("Publish() error = %q, want outside runtime workspace", err)
+	}
+}
+
+func TestRuntimeWorkspacePublisherRejectsManifestArtifactSymlinkEscape(t *testing.T) {
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, "workspace")
+	project := filepath.Join(workspace, "projects", "task-1")
+	outside := filepath.Join(tmp, "secret.pptx")
+	mustWriteFile(t, outside, "secret host bytes\n")
+	if err := os.MkdirAll(filepath.Join(project, "exports"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(project, "exports", "result.pptx")); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(workspace, ".slidesmith", "artifacts.json"), `{"project_path":"projects/task-1","artifacts":[{"path":"exports/result.pptx"}]}`+"\n")
+
+	publisher := NewRuntimeWorkspacePublisher(NewLocalStorage(filepath.Join(tmp, "storage")))
+	_, err := publisher.Publish(context.Background(), "task-1", workspace, "v1")
+	if err == nil {
+		t.Fatal("Publish() error = nil, want manifest artifact symlink rejection")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Publish() error = %q, want symlink rejection", err)
+	}
+}
+
+func TestRuntimeWorkspacePublisherRejectsFallbackRootSymlinkEscape(t *testing.T) {
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, "workspace")
+	project := filepath.Join(workspace, "projects", "task-1")
+	mustWriteFile(t, filepath.Join(project, "exports", "result.pptx"), "pptx bytes\n")
+	mustWriteFile(t, filepath.Join(tmp, "secret.log"), "secret host bytes\n")
+	if err := os.MkdirAll(filepath.Join(project, "logs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(tmp, "secret.log"), filepath.Join(project, "logs", "leak.log")); err != nil {
+		t.Fatal(err)
+	}
+
+	publisher := NewRuntimeWorkspacePublisher(NewLocalStorage(filepath.Join(tmp, "storage")))
+	_, err := publisher.Publish(context.Background(), "task-1", workspace, "v1")
+	if err == nil {
+		t.Fatal("Publish() error = nil, want fallback-root symlink rejection")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("Publish() error = %q, want symlink rejection", err)
+	}
+}
+
+func TestRuntimeWorkspacePublisherRejectsSymlinkedProjectsDiscoveryRoot(t *testing.T) {
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, "workspace")
+	outsideProjects := filepath.Join(tmp, "outside-projects")
+	project := filepath.Join(outsideProjects, "escaped-project")
+	mustWriteFile(t, filepath.Join(project, "exports", "result.pptx"), "outside pptx bytes\n")
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideProjects, filepath.Join(workspace, "projects")); err != nil {
+		t.Fatal(err)
+	}
+
+	publisher := NewRuntimeWorkspacePublisher(NewLocalStorage(filepath.Join(tmp, "storage")))
+	_, err := publisher.Publish(context.Background(), "task-1", workspace, "v1")
+	if err == nil {
+		t.Fatal("Publish() error = nil, want symlinked projects discovery root rejection")
+	}
+	if !strings.Contains(err.Error(), "symlink") && !strings.Contains(err.Error(), "outside runtime workspace") {
+		t.Fatalf("Publish() error = %q, want projects discovery containment rejection", err)
+	}
+}
+
+func mustJSON(t *testing.T, value string) string {
+	t.Helper()
+	raw, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+func hasPublishedArtifactObjectRel(artifacts []model.Artifact, objectRel string) bool {
+	suffix := "/" + filepath.ToSlash(objectRel)
+	for _, artifact := range artifacts {
+		if strings.HasSuffix(filepath.ToSlash(artifact.ObjectKey), suffix) {
+			return true
+		}
+	}
+	return false
+}
 
 func TestRuntimeWorkspacePublisherPublishesStage5Contract(t *testing.T) {
 	tmp := t.TempDir()
