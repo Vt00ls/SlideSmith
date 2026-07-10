@@ -124,19 +124,28 @@ func (s *TaskService) UploadFile(ctx context.Context, taskID, filename string, r
 	if task.Status != model.TaskStatusCreated && task.Status != model.TaskStatusUploaded {
 		return nil, fmt.Errorf("cannot upload file while task status is %q", task.Status)
 	}
+	sourceInfo := DetectSourceKind(filename)
+	if !sourceInfo.Supported {
+		return nil, fmt.Errorf("unsupported source file %q: %s", filename, sourceInfo.Message)
+	}
+	metadataJSON, err := json.Marshal(SourceArtifactMetadata(sourceInfo))
+	if err != nil {
+		return nil, fmt.Errorf("encode source artifact metadata: %w", err)
+	}
 	stored, err := s.storage.Save(ctx, taskID, model.ArtifactKindSource, filename, reader)
 	if err != nil {
 		return nil, err
 	}
 	artifact := &model.Artifact{
-		TaskID:    taskID,
-		Kind:      model.ArtifactKindSource,
-		Name:      stored.Name,
-		Storage:   "local",
-		ObjectKey: stored.ObjectKey,
-		MimeType:  stored.MimeType,
-		Size:      stored.Size,
-		SHA256:    stored.SHA256,
+		TaskID:       taskID,
+		Kind:         model.ArtifactKindSource,
+		Name:         stored.Name,
+		Storage:      "local",
+		ObjectKey:    stored.ObjectKey,
+		MimeType:     stored.MimeType,
+		Size:         stored.Size,
+		SHA256:       stored.SHA256,
+		MetadataJSON: string(metadataJSON),
 	}
 	if err := s.repo.CreateArtifact(ctx, artifact); err != nil {
 		return nil, err
