@@ -48,6 +48,12 @@ func TestProcessPrepareRecordsTemplateResolvePhase(t *testing.T) {
 	if updated.Status != model.TaskStatusAwaitingAnchorConfirm {
 		t.Fatalf("status = %q, want awaiting_anchor_confirm", updated.Status)
 	}
+	if updated.Route != model.TaskRouteMain {
+		t.Fatalf("route = %q, want %q", updated.Route, model.TaskRouteMain)
+	}
+	if updated.RouteSelectionJSON == "" || updated.RouteSelectionJSON == "{}" {
+		t.Fatalf("route selection was not persisted")
+	}
 
 	phaseRuns, err := repo.ListPhaseRuns(ctx, task.ID)
 	if err != nil {

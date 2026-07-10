@@ -24,6 +24,12 @@ const (
 )
 
 const (
+	TaskRouteMain         = "main"
+	TaskRouteBeautify     = "beautify"
+	TaskRouteTemplateFill = "template-fill"
+)
+
+const (
 	EventTypeStatus       = "status"
 	EventTypeLog          = "log"
 	EventTypeRuntime      = "runtime"
@@ -45,23 +51,28 @@ const (
 )
 
 type Task struct {
-	ID                   string     `json:"id" gorm:"primaryKey;size:64"`
-	Title                string     `json:"title" gorm:"not null;size:255"`
-	Status               string     `json:"status" gorm:"not null;size:64;index"`
-	RuntimeProject       string     `json:"runtime_project" gorm:"not null;size:128;default:''"`
-	LastRuntimeRunID     string     `json:"last_runtime_run_id" gorm:"not null;size:128;default:''"`
-	LastRuntimeSessionID string     `json:"last_runtime_session_id" gorm:"not null;size:128;default:''"`
-	RuntimeWorkspacePath string     `json:"runtime_workspace_path" gorm:"not null;type:text;default:''"`
-	SelectedTemplateID   string     `json:"selected_template_id" gorm:"not null;size:255;default:''"`
-	TemplateLockJSON     string     `json:"template_lock_json" gorm:"not null;type:text;default:'{}'"`
-	ErrorMessage         string     `json:"error_message" gorm:"not null;type:text;default:''"`
-	FailurePhase         string     `json:"failure_phase" gorm:"not null;size:128;default:''"`
-	FailureMetadata      string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
-	CreatedAt            time.Time  `json:"created_at" gorm:"not null"`
-	UpdatedAt            time.Time  `json:"updated_at" gorm:"not null"`
-	StartedAt            *time.Time `json:"started_at,omitempty"`
-	CompletedAt          *time.Time `json:"completed_at,omitempty"`
-	CancelledAt          *time.Time `json:"cancelled_at,omitempty"`
+	ID                      string     `json:"id" gorm:"primaryKey;size:64"`
+	Title                   string     `json:"title" gorm:"not null;size:255"`
+	Status                  string     `json:"status" gorm:"not null;size:64;index"`
+	RuntimeProject          string     `json:"runtime_project" gorm:"not null;size:128;default:''"`
+	LastRuntimeRunID        string     `json:"last_runtime_run_id" gorm:"not null;size:128;default:''"`
+	LastRuntimeSessionID    string     `json:"last_runtime_session_id" gorm:"not null;size:128;default:''"`
+	RuntimeWorkspacePath    string     `json:"runtime_workspace_path" gorm:"not null;type:text;default:''"`
+	SelectedTemplateID      string     `json:"selected_template_id" gorm:"not null;size:255;default:''"`
+	TemplateLockJSON        string     `json:"template_lock_json" gorm:"not null;type:text;default:'{}'"`
+	Route                   string     `json:"route" gorm:"not null;size:64;default:'main';index"`
+	RouteReason             string     `json:"route_reason" gorm:"not null;type:text;default:''"`
+	RouteStandaloneWorkflow string     `json:"route_standalone_workflow" gorm:"not null;size:64;default:''"`
+	RouteSelectionJSON      string     `json:"route_selection_json" gorm:"not null;type:text;default:'{}'"`
+	RouteSelectedAt         *time.Time `json:"route_selected_at,omitempty"`
+	ErrorMessage            string     `json:"error_message" gorm:"not null;type:text;default:''"`
+	FailurePhase            string     `json:"failure_phase" gorm:"not null;size:128;default:''"`
+	FailureMetadata         string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
+	CreatedAt               time.Time  `json:"created_at" gorm:"not null"`
+	UpdatedAt               time.Time  `json:"updated_at" gorm:"not null"`
+	StartedAt               *time.Time `json:"started_at,omitempty"`
+	CompletedAt             *time.Time `json:"completed_at,omitempty"`
+	CancelledAt             *time.Time `json:"cancelled_at,omitempty"`
 }
 
 func (Task) TableName() string {

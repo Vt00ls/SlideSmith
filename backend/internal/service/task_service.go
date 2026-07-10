@@ -94,6 +94,8 @@ func (s *TaskService) CreateTask(ctx context.Context, title, templateID string) 
 		RuntimeProject:     runtimeProjectName(taskID),
 		SelectedTemplateID: templateID,
 		TemplateLockJSON:   templateLockJSON,
+		Route:              model.TaskRouteMain,
+		RouteSelectionJSON: "{}",
 	}
 	if err := s.repo.CreateTask(ctx, task); err != nil {
 		return nil, err
@@ -274,9 +276,26 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 		_ = s.failWithMetadata(ctx, task, "prepare.workspace", err, nil, nil)
 		return err
 	}
-	if _, err := s.runRouteSelect(ctx, task, workspace); err != nil {
+	selection, err := s.runRouteSelect(ctx, task, workspace)
+	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(PhaseRouteSelect), err, nil, map[string]any{
 			"workspace_path": workspace.HostDir,
+		})
+		return err
+	}
+	policy := routeExecutionPolicyFor(selection)
+	if !policy.Executable {
+		err := fmt.Errorf("%s", policy.FailureMessage)
+		_ = s.failWithMetadata(ctx, task, policy.FailurePhase, err, nil, map[string]any{
+			"workspace_path":          workspace.HostDir,
+			"route":                   selection.Route,
+			"route_reason":            selection.Reason,
+			"standalone_workflow":     selection.StandaloneWorkflow,
+			"route_selection":         selection,
+			"route_execution_policy":  policy,
+			"next_spec":               policy.NextSpec,
+			"supported_routes":        policy.SupportedRoutes,
+			"known_routes":            policy.KnownRoutes,
 		})
 		return err
 	}

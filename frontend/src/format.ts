@@ -58,6 +58,12 @@ export const phaseLabel: Record<string, string> = {
   publish: "发布产物",
 };
 
+export const routeLabel: Record<string, string> = {
+  main: "主生成",
+  "template-fill": "模板填充",
+  beautify: "PPTX 美化",
+};
+
 export function formatTime(value?: string) {
   if (!value) {
     return "-";

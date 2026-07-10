@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/glebarez/sqlite"
@@ -60,6 +61,55 @@ func TestSelectRoutePPTXTemplateWithNewContentUsesTemplateFill(t *testing.T) {
 	}
 	if selection.Route != routeTemplateFill || selection.StandaloneWorkflow != routeTemplateFill {
 		t.Fatalf("route = %#v, want template-fill", selection)
+	}
+}
+
+func TestSelectRouteIncludesConfidence(t *testing.T) {
+	service, task := routeSelectTestService(t, "请美化 PPTX，保留页数和文字", []model.Artifact{
+		{Name: "original.pptx", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-1/source/original.pptx"},
+	})
+	selection, err := service.selectRoute(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selection.Route != routeBeautify {
+		t.Fatalf("route = %q, want %q", selection.Route, routeBeautify)
+	}
+	if selection.Confidence != 0.90 {
+		t.Fatalf("confidence = %v, want 0.90", selection.Confidence)
+	}
+}
+
+func TestPersistRouteSelectionUpdatesTask(t *testing.T) {
+	service, task := routeSelectTestService(t, "normal markdown task", []model.Artifact{
+		{Name: "input.md", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-1/source/input.md"},
+	})
+	selection, err := service.selectRoute(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.persistRouteSelection(context.Background(), task, selection); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := service.repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Route != routeMain {
+		t.Fatalf("route = %q, want %q", updated.Route, routeMain)
+	}
+	if updated.RouteSelectionJSON == "" || updated.RouteSelectionJSON == "{}" {
+		t.Fatalf("route_selection_json not persisted: %q", updated.RouteSelectionJSON)
+	}
+	var persisted routeSelection
+	if err := json.Unmarshal([]byte(updated.RouteSelectionJSON), &persisted); err != nil {
+		t.Fatalf("route_selection_json invalid: %v", err)
+	}
+	if persisted.Route != routeMain || persisted.Confidence != 0.60 {
+		t.Fatalf("persisted selection = %#v, want main with 0.60 confidence", persisted)
+	}
+	if updated.RouteSelectedAt == nil {
+		t.Fatal("route_selected_at is nil")
 	}
 }
 
