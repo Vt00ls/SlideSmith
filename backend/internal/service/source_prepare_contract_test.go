@@ -139,6 +139,93 @@ func TestValidateSourcePrepareContractCompletePPTXAnalysis(t *testing.T) {
 	}
 }
 
+func TestValidateSourcePrepareContractReturnsCanonicalDecodedMap(t *testing.T) {
+	projectPath := t.TempDir()
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "content.md"), "# Content\n")
+
+	contract, err := validateSourcePrepareContract(projectPath, model.TaskRouteMain)
+	if err != nil {
+		t.Fatalf("validateSourcePrepareContract() error = %v", err)
+	}
+	for _, field := range []string{
+		"source_count",
+		"normalized_markdown_count",
+		"conversion_profile_count",
+		"pptx_deck_count",
+	} {
+		if _, ok := contract[field].(float64); !ok {
+			t.Fatalf("contract[%q] type = %T, want float64 from canonical JSON decode", field, contract[field])
+		}
+	}
+	for _, field := range []string{"sources", "analysis", "warnings"} {
+		if _, ok := contract[field].([]any); !ok {
+			t.Fatalf("contract[%q] type = %T, want []any from canonical JSON decode", field, contract[field])
+		}
+	}
+	sources := contract["sources"].([]any)
+	if len(sources) != 1 {
+		t.Fatalf("sources length = %d, want 1", len(sources))
+	}
+	if _, ok := sources[0].(map[string]any); !ok {
+		t.Fatalf("sources[0] type = %T, want map[string]any", sources[0])
+	}
+
+	canonicalRaw, err := os.ReadFile(filepath.Join(projectPath, ".slidesmith", "contracts", "source_prepare.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canonical map[string]any
+	if err := json.Unmarshal(canonicalRaw, &canonical); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(contract, canonical) {
+		t.Fatalf("returned contract differs from canonical JSON decode:\nreturned: %#v\ncanonical: %#v", contract, canonical)
+	}
+}
+
+func TestValidateSourcePrepareContractDoesNotPartiallyWriteContracts(t *testing.T) {
+	tests := []struct {
+		name              string
+		canonicalContents string
+	}{
+		{name: "canonical absent"},
+		{name: "canonical unchanged", canonicalContents: "existing canonical\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projectPath := t.TempDir()
+			mustWriteFileNoTest(projectPath, filepath.Join("sources", "content.md"), "# Content\n")
+			canonicalRel := filepath.Join(".slidesmith", "contracts", "source_prepare.json")
+			canonicalPath := filepath.Join(projectPath, canonicalRel)
+			if test.canonicalContents != "" {
+				mustWriteFileNoTest(projectPath, canonicalRel, test.canonicalContents)
+			}
+			compatibilityPath := filepath.Join(projectPath, ".slidesmith", "source_prepare_contract.json")
+			if err := os.MkdirAll(compatibilityPath, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := validateSourcePrepareContract(projectPath, model.TaskRouteMain)
+			if err == nil {
+				t.Fatal("validateSourcePrepareContract() error = nil, want non-regular compatibility target failure")
+			}
+			if test.canonicalContents == "" {
+				if _, statErr := os.Stat(canonicalPath); !os.IsNotExist(statErr) {
+					t.Fatalf("canonical contract was partially created, stat error = %v", statErr)
+				}
+				return
+			}
+			canonicalRaw, readErr := os.ReadFile(canonicalPath)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(canonicalRaw) != test.canonicalContents {
+				t.Fatalf("canonical contract was partially replaced: got %q, want %q", canonicalRaw, test.canonicalContents)
+			}
+		})
+	}
+}
+
 func TestValidateSourcePrepareContractRejectsMissingPPTXSourceProfile(t *testing.T) {
 	projectPath := t.TempDir()
 	mustWriteFileNoTest(projectPath, filepath.Join("sources", "deck.pptx"), "pptx")

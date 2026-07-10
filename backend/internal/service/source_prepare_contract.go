@@ -1,7 +1,10 @@
 package service
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -119,14 +122,148 @@ func validateSourcePrepareContract(projectPath, route string) (map[string]any, e
 		"warnings":                  warnings,
 		"checked_at":                time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if _, err := writeContractReport(absoluteProjectPath, string(PhaseSourcePrepare), contract); err != nil {
-		return nil, fmt.Errorf("write source prepare contract: %w", err)
+	payload, err := json.MarshalIndent(contract, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal source prepare contract: %w", err)
 	}
+	payload = append(payload, '\n')
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		return nil, fmt.Errorf("decode source prepare contract: %w", err)
+	}
+	canonicalPath := filepath.Join(absoluteProjectPath, ".slidesmith", "contracts", "source_prepare.json")
 	compatibilityPath := filepath.Join(absoluteProjectPath, ".slidesmith", "source_prepare_contract.json")
-	if err := writeJSONPretty(compatibilityPath, contract); err != nil {
-		return nil, fmt.Errorf("write source prepare compatibility contract: %w", err)
+	if err := writeSourcePrepareContractPair(canonicalPath, compatibilityPath, payload); err != nil {
+		return nil, err
 	}
-	return contract, nil
+	return decoded, nil
+}
+
+type sourcePrepareContractTargetState struct {
+	existed  bool
+	contents []byte
+	mode     os.FileMode
+}
+
+func writeSourcePrepareContractPair(canonicalPath, compatibilityPath string, payload []byte) error {
+	canonicalState, err := inspectSourcePrepareContractTarget(canonicalPath)
+	if err != nil {
+		return err
+	}
+	compatibilityState, err := inspectSourcePrepareContractTarget(compatibilityPath)
+	if err != nil {
+		return err
+	}
+	if canonicalState.existed {
+		canonicalState.contents, err = os.ReadFile(canonicalPath)
+		if err != nil {
+			return fmt.Errorf("read existing source prepare contract %s: %w", canonicalPath, err)
+		}
+	}
+	for _, targetPath := range []string{canonicalPath, compatibilityPath} {
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			return fmt.Errorf("create source prepare contract directory for %s: %w", targetPath, err)
+		}
+	}
+
+	canonicalTemp, err := stageSourcePrepareContract(canonicalPath, payload, canonicalState.mode)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if canonicalTemp != "" {
+			_ = os.Remove(canonicalTemp)
+		}
+	}()
+	compatibilityTemp, err := stageSourcePrepareContract(compatibilityPath, payload, compatibilityState.mode)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if compatibilityTemp != "" {
+			_ = os.Remove(compatibilityTemp)
+		}
+	}()
+
+	if err := os.Rename(canonicalTemp, canonicalPath); err != nil {
+		return fmt.Errorf("commit source prepare contract %s: %w", canonicalPath, err)
+	}
+	canonicalTemp = ""
+	if err := os.Rename(compatibilityTemp, compatibilityPath); err != nil {
+		commitErr := fmt.Errorf("commit source prepare compatibility contract %s: %w", compatibilityPath, err)
+		if rollbackErr := restoreSourcePrepareContractTarget(canonicalPath, canonicalState); rollbackErr != nil {
+			return errors.Join(commitErr, fmt.Errorf("rollback source prepare contract %s: %w", canonicalPath, rollbackErr))
+		}
+		return commitErr
+	}
+	compatibilityTemp = ""
+	return nil
+}
+
+func inspectSourcePrepareContractTarget(path string) (sourcePrepareContractTargetState, error) {
+	state := sourcePrepareContractTargetState{mode: 0o644}
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return state, nil
+		}
+		return state, fmt.Errorf("inspect source prepare contract target %s: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return state, fmt.Errorf("source prepare contract target is not a regular file: %s", path)
+	}
+	state.existed = true
+	state.mode = info.Mode().Perm()
+	return state, nil
+}
+
+func stageSourcePrepareContract(targetPath string, payload []byte, mode os.FileMode) (string, error) {
+	tempFile, err := os.CreateTemp(filepath.Dir(targetPath), "."+filepath.Base(targetPath)+".tmp-*")
+	if err != nil {
+		return "", fmt.Errorf("stage source prepare contract %s: %w", targetPath, err)
+	}
+	tempPath := tempFile.Name()
+	removeTemp := true
+	defer func() {
+		if tempFile != nil {
+			_ = tempFile.Close()
+		}
+		if removeTemp {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if written, err := tempFile.Write(payload); err != nil {
+		return "", fmt.Errorf("write staged source prepare contract %s: %w", targetPath, err)
+	} else if written != len(payload) {
+		return "", fmt.Errorf("write staged source prepare contract %s: %w", targetPath, io.ErrShortWrite)
+	}
+	if err := tempFile.Chmod(mode.Perm()); err != nil {
+		return "", fmt.Errorf("set staged source prepare contract mode %s: %w", targetPath, err)
+	}
+	if err := tempFile.Sync(); err != nil {
+		return "", fmt.Errorf("sync staged source prepare contract %s: %w", targetPath, err)
+	}
+	if err := tempFile.Close(); err != nil {
+		return "", fmt.Errorf("close staged source prepare contract %s: %w", targetPath, err)
+	}
+	tempFile = nil
+	removeTemp = false
+	return tempPath, nil
+}
+
+func restoreSourcePrepareContractTarget(path string, state sourcePrepareContractTargetState) error {
+	if !state.existed {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	tempPath, err := stageSourcePrepareContract(path, state.contents, state.mode)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tempPath)
+	return os.Rename(tempPath, path)
 }
 
 func scanSourcePrepareFiles(projectPath string) ([]sourcePrepareContractItem, []sourcePrepareFile, []string, error) {
