@@ -26,6 +26,8 @@ func TestNormalizeRetryPhaseSupportsSplitPhases(t *testing.T) {
 		{name: "export explicit", requested: "finalize_export", want: retryPhaseFinalizeExport},
 		{name: "auto svg failure", requested: "auto", failurePhase: "svg_execute.contract", want: retryPhaseSVGExecute},
 		{name: "auto quality failure", requested: "", failurePhase: "quality_check.command", want: retryPhaseQualityCheck},
+		{name: "auto template resolve failure", requested: "auto", failurePhase: string(PhaseTemplateResolve), want: retryPhasePrepare},
+		{name: "omitted template resolve failure", requested: "", failurePhase: string(PhaseTemplateResolve), want: retryPhasePrepare},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

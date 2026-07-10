@@ -83,7 +83,7 @@ func TestProcessPrepareRecoversUnsupportedWorkflowTaskWriteAfterSourcePrepare(t 
 					}
 				}
 			}
-			assertPostSourcePrepareTaskRecovered(t, service, repo, task.ID, "source_prepare.workflow_not_enabled")
+			assertPostSourcePrepareTaskRecovered(t, service, repo, task.ID, "source_prepare.workflow_not_enabled", retryPhasePrepare)
 		})
 	}
 }
@@ -123,7 +123,7 @@ func TestProcessPrepareRecoversAwaitingAnchorTransitionAfterSourcePrepare(t *tes
 			if test.cancel && !errors.Is(ctx.Err(), context.Canceled) {
 				t.Fatalf("context error = %v, want canceled", ctx.Err())
 			}
-			assertPostSourcePrepareTaskRecovered(t, service, repo, task.ID, "source_prepare.awaiting_anchor_confirm")
+			assertPostSourcePrepareTaskRecovered(t, service, repo, task.ID, "source_prepare.awaiting_anchor_confirm", retryPhasePrepare)
 		})
 	}
 }
@@ -154,7 +154,7 @@ func TestProcessPrepareRecoversTemplateResolutionTaskWriteAfterSourcePrepare(t *
 			t.Fatalf("processPrepare() error missing %q: %v", want, err)
 		}
 	}
-	assertPostSourcePrepareTaskRecovered(t, service, repo, task.ID, string(PhaseTemplateResolve))
+	assertPostSourcePrepareTaskRecovered(t, service, repo, task.ID, string(PhaseTemplateResolve), "auto")
 }
 
 func installPostSourcePrepareTaskSaveFault(
@@ -190,6 +190,7 @@ func assertPostSourcePrepareTaskRecovered(
 	repo *repository.Repository,
 	taskID string,
 	wantFailurePhase string,
+	retryPhase string,
 ) {
 	t.Helper()
 	updated, err := repo.GetTask(context.Background(), taskID)
@@ -204,7 +205,11 @@ func assertPostSourcePrepareTaskRecovered(
 	if rows := loadPersistedSourceIntakeRows(t, repo, taskID, prefix); len(rows) == 0 {
 		t.Fatal("source intake publication should remain committed after task-only recovery")
 	}
-	if _, err := service.RetryTask(context.Background(), taskID, retryPhasePrepare); err != nil {
+	retried, err := service.RetryTask(context.Background(), taskID, retryPhase)
+	if err != nil {
 		t.Fatalf("prepare retry after post-source-prepare recovery error = %v", err)
+	}
+	if retried.Status != model.TaskStatusRuntimePreparing {
+		t.Fatalf("retry status = %q, want %q for failure phase %q", retried.Status, model.TaskStatusRuntimePreparing, wantFailurePhase)
 	}
 }

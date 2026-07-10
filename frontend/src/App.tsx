@@ -74,7 +74,12 @@ const templateKindFilters = [
 
 function retryOptionsForFailure(failurePhase: string): Array<{ phase: RetryPhase; label: string }> {
   const value = failurePhase.toLowerCase();
-  if (value.startsWith("prepare") || value.startsWith("source") || value.startsWith("route_select")) {
+  if (
+    value.startsWith("prepare")
+    || value.startsWith("source")
+    || value.startsWith("route_select")
+    || value.startsWith("template_resolve")
+  ) {
     return [{ phase: "prepare", label: "重新准备" }];
   }
   return splitRetryOptions;

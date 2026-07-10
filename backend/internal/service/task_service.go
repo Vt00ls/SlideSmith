@@ -1509,7 +1509,10 @@ func normalizeRetryPhase(requested, failurePhase string) (string, error) {
 func inferRetryPhase(failurePhase string) string {
 	value := strings.ToLower(strings.TrimSpace(failurePhase))
 	switch {
-	case strings.HasPrefix(value, "prepare"), strings.HasPrefix(value, "source"), strings.HasPrefix(value, "route_select"):
+	case strings.HasPrefix(value, "prepare"),
+		strings.HasPrefix(value, "source"),
+		strings.HasPrefix(value, "route_select"),
+		strings.HasPrefix(value, string(PhaseTemplateResolve)):
 		return retryPhasePrepare
 	case strings.HasPrefix(value, string(PhaseSVGExecute)), strings.HasPrefix(value, "svg"):
 		return retryPhaseSVGExecute
