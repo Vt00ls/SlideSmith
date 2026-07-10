@@ -386,6 +386,20 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
 		return err
 	}
+	policy = routeExecutionPolicyFor(selection)
+	if !policy.WorkflowExecutable {
+		err := fmt.Errorf("%s", policy.FailureMessage)
+		_ = s.failWithMetadata(ctx, task, policy.FailurePhase, err, run, map[string]any{
+			"workspace_path":         workspace.HostDir,
+			"project_path":           preparedProjectPath,
+			"route":                  selection.Route,
+			"route_reason":           selection.Reason,
+			"source_contract":        sourceContract,
+			"route_execution_policy": policy,
+			"next_spec":              policy.NextSpec,
+		})
+		return err
+	}
 	templateResolution, err := s.runTemplateResolve(ctx, task, workspace, preparedProjectPath)
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(PhaseTemplateResolve), err, nil, map[string]any{

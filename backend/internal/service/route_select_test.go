@@ -37,6 +37,26 @@ func TestSelectRoutePPTXPreserveTextIntentUsesBeautify(t *testing.T) {
 	}
 }
 
+func TestSelectRoutePresentationOOXMLPreserveTextIntentUsesBeautifyLikePPTX(t *testing.T) {
+	for _, name := range []string{"original.pptx", "original.pptm"} {
+		t.Run(name, func(t *testing.T) {
+			service, task := routeSelectTestService(t, "请美化演示文稿，保留页数和文字", []model.Artifact{
+				{Name: name, Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-1/source/" + name},
+			})
+			selection, err := service.selectRoute(context.Background(), task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selection.Route != routeBeautify || selection.StandaloneWorkflow != routeBeautify {
+				t.Fatalf("route = %#v, want beautify", selection)
+			}
+			if selection.Reason != "pptx source with preserve text/page-count beautify intent" {
+				t.Fatalf("reason = %q, want the pptx beautify reason", selection.Reason)
+			}
+		})
+	}
+}
+
 func TestSelectRoutePPTXAsMaterialStaysMain(t *testing.T) {
 	service, task := routeSelectTestService(t, "把 PPTX 作为素材重构", []model.Artifact{
 		{Name: "material.pptx", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-1/source/material.pptx"},
@@ -61,6 +81,27 @@ func TestSelectRoutePPTXTemplateWithNewContentUsesTemplateFill(t *testing.T) {
 	}
 	if selection.Route != routeTemplateFill || selection.StandaloneWorkflow != routeTemplateFill {
 		t.Fatalf("route = %#v, want template-fill", selection)
+	}
+}
+
+func TestSelectRoutePresentationOOXMLTemplateWithMarkdownUsesTemplateFillLikePPTX(t *testing.T) {
+	for _, name := range []string{"brand_template.pptx", "brand_template.potx"} {
+		t.Run(name, func(t *testing.T) {
+			service, task := routeSelectTestService(t, "use new content", []model.Artifact{
+				{Name: name, Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-1/source/" + name},
+				{Name: "content.md", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-1/source/content.md"},
+			})
+			selection, err := service.selectRoute(context.Background(), task)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if selection.Route != routeTemplateFill || selection.StandaloneWorkflow != routeTemplateFill {
+				t.Fatalf("route = %#v, want template-fill", selection)
+			}
+			if selection.Reason != "pptx template with new content or fill intent" {
+				t.Fatalf("reason = %q, want the pptx template-fill reason", selection.Reason)
+			}
+		})
 	}
 }
 
