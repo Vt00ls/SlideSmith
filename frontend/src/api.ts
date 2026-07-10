@@ -28,6 +28,11 @@ export type Task = {
   runtime_workspace_path: string;
   selected_template_id: string;
   template_lock_json: string;
+  route: "main" | "template-fill" | "beautify" | string;
+  route_reason: string;
+  route_standalone_workflow: string;
+  route_selection_json: string;
+  route_selected_at?: string;
   error_message: string;
   failure_phase: string;
   failure_metadata: string;

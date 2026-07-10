@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
@@ -10,14 +12,15 @@ import (
 )
 
 const (
-	routeMain         = "main"
-	routeBeautify     = "beautify"
-	routeTemplateFill = "template-fill"
+	routeMain         = model.TaskRouteMain
+	routeBeautify     = model.TaskRouteBeautify
+	routeTemplateFill = model.TaskRouteTemplateFill
 )
 
 type routeSelection struct {
 	Route              string                `json:"route"`
 	Reason             string                `json:"reason"`
+	Confidence         float64               `json:"confidence"`
 	StandaloneWorkflow string                `json:"standalone_workflow"`
 	CreatedAt          string                `json:"created_at"`
 	SourceArtifacts    []routeSourceArtifact `json:"source_artifacts"`
@@ -44,12 +47,44 @@ func (s *TaskService) runRouteSelect(ctx context.Context, task *model.Task, work
 	if err == nil {
 		err = writeJSONPretty(filepath.Join(workspace.HostDir, ".slidesmith", "route.json"), selection)
 	}
+	if err == nil {
+		err = s.persistRouteSelection(ctx, task, selection)
+	}
 	if err != nil {
 		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, nil, err)
 		return nil, err
 	}
-	_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, selection, nil)
+	policy := routeExecutionPolicyFor(selection)
+	output := map[string]any{
+		"selection":        selection,
+		"execution_policy": policy,
+	}
+	_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil)
+	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "route_selected", "Route selected for task", map[string]any{
+		"route":               selection.Route,
+		"route_reason":        selection.Reason,
+		"standalone_workflow": selection.StandaloneWorkflow,
+		"executable":          policy.Executable,
+		"next_spec":           policy.NextSpec,
+	})
 	return selection, nil
+}
+
+func (s *TaskService) persistRouteSelection(ctx context.Context, task *model.Task, selection *routeSelection) error {
+	if selection == nil {
+		return fmt.Errorf("route selection is nil")
+	}
+	raw, err := json.Marshal(selection)
+	if err != nil {
+		return err
+	}
+	selectedAt := time.Now().UTC()
+	task.Route = selection.Route
+	task.RouteReason = selection.Reason
+	task.RouteStandaloneWorkflow = selection.StandaloneWorkflow
+	task.RouteSelectionJSON = string(raw)
+	task.RouteSelectedAt = &selectedAt
+	return s.repo.SaveTask(ctx, task)
 }
 
 func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*routeSelection, error) {
@@ -85,16 +120,21 @@ func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*route
 	normalized := strings.ToLower(corpus.String())
 	route := routeMain
 	reason := "default main workflow for markdown/pdf/docx or general source material"
+	confidence := 0.60
 	if hasPPTX && isTemplateFillIntent(normalized, hasNonPPTX) {
 		route = routeTemplateFill
 		reason = "pptx template with new content or fill intent"
+		confidence = 0.90
 	} else if hasPPTX && containsAny(normalized, beautifyIntentKeywords) {
 		route = routeBeautify
 		reason = "pptx source with preserve text/page-count beautify intent"
+		confidence = 0.90
 	} else if hasPPTX && containsAny(normalized, materialRebuildKeywords) {
 		reason = "pptx source requested as reconstruction material"
+		confidence = 0.80
 	} else if hasPPTX {
 		reason = "pptx source without explicit preserve/template-fill intent"
+		confidence = 0.55
 	}
 
 	standaloneWorkflow := ""
@@ -104,6 +144,7 @@ func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*route
 	return &routeSelection{
 		Route:              route,
 		Reason:             reason,
+		Confidence:         confidence,
 		StandaloneWorkflow: standaloneWorkflow,
 		CreatedAt:          time.Now().UTC().Format(time.RFC3339Nano),
 		SourceArtifacts:    sources,

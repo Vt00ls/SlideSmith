@@ -24,7 +24,7 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, Artifact, Confirmation, parseJSON, RetryPhase, RuntimeRun, SpecPreview, Task, TaskEvent, TaskPhaseRun, TaskStatus, TemplateCatalogItem } from "./api";
-import { formatBytes, formatTime, phaseLabel, statusLabel, statusTone } from "./format";
+import { formatBytes, formatTime, phaseLabel, routeLabel, statusLabel, statusTone } from "./format";
 import { go, parseRoute, Route } from "./router";
 
 const activeStatuses: TaskStatus[] = [
@@ -620,6 +620,9 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const svgFinalCount = artifacts.filter((artifact) => artifact.kind === "svg_final").length;
   const latestRun = runtimeRuns[0];
   const failureMetadata = task ? parseJSON<Record<string, unknown>>(task.failure_metadata || "{}", {}) : {};
+  const routeSelection = task ? parseJSON<Record<string, unknown>>(task.route_selection_json || "{}", {}) : {};
+  const taskRoute = task?.route || "main";
+  const routeConfidence = typeof routeSelection.confidence === "number" ? Math.round(routeSelection.confidence * 100) : null;
   const retryOptions = task?.status === "failed" ? retryOptionsForFailure(task.failure_phase || "") : [];
 
   async function retry(phase: RetryPhase) {
@@ -687,6 +690,18 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 <strong className="mono">{task.runtime_project}</strong>
                 <span>模板</span>
                 <strong className="mono">{task.selected_template_id || "-"}</strong>
+                <span>生成路线</span>
+                <strong>{routeLabel[taskRoute] || taskRoute}</strong>
+                <span>路线原因</span>
+                <strong>{task.route_reason || "-"}</strong>
+                <span>独立工作流</span>
+                <strong className="mono">{task.route_standalone_workflow || "-"}</strong>
+                {routeConfidence !== null && (
+                  <>
+                    <span>路线置信度</span>
+                    <strong>{routeConfidence}%</strong>
+                  </>
+                )}
                 <span>最后运行</span>
                 <strong className="mono">{task.last_runtime_run_id || "-"}</strong>
                 <span>SVG 预览</span>
@@ -783,6 +798,9 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                   <span>{task.error_message}</span>
                   {typeof failureMetadata.stderr_tail === "string" && failureMetadata.stderr_tail && (
                     <pre>{failureMetadata.stderr_tail}</pre>
+                  )}
+                  {task.failure_phase === "route_select.unsupported_workflow" && (
+                    <span className="muted">该路线已识别，执行工作流将在后续阶段开放。</span>
                   )}
                 </div>
                 <div className="button-row left">
