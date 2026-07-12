@@ -279,19 +279,19 @@ def _template_fill_has_explicit_same_stem_markdown(project_path: Path, stem: str
         files = payload.get("files", [])
         if not isinstance(files, list):
             raise ValueError("template fill source inputs manifest files must be a list")
+        manifest_names: list[str] = []
         for index, entry in enumerate(files):
             if not isinstance(entry, dict):
                 raise ValueError(f"template fill source inputs manifest files[{index}] must be an object")
-            manifest_names: list[str] = []
             for field in ("name", "upload_path"):
                 value = entry.get(field, "")
                 if not isinstance(value, str):
                     raise ValueError(f"template fill source inputs manifest files[{index}].{field} must be a string")
                 manifest_names.append(Path(value.replace("\\", "/")).name.strip())
-            for name in manifest_names:
-                if name.lower().endswith(".md") and Path(name).stem.casefold() == stem.casefold():
-                    return True
-        return False
+        return any(
+            name.lower().endswith(".md") and Path(name).stem.casefold() == stem.casefold()
+            for name in manifest_names
+        )
     return False
 
 

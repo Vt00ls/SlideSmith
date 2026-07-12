@@ -236,6 +236,24 @@ class TemplateFillRunnerTests(IsolatedRunnerStateTestCase):
         with self.assertRaisesRegex(ValueError, "upload_path must be a string"):
             ppt_runner.discover_template_fill_inputs(project)
 
+    def test_discover_template_fill_inputs_validates_entries_after_provenance_match(self) -> None:
+        project = make_template_fill_project(self.workspace / "projects" / "brand_project")
+        (project / "sources" / "content.md").unlink()
+        (project / "sources" / "brand.md").write_text("# Explicit business content\n", encoding="utf-8")
+        write_json_file(
+            self.workspace / ".slidesmith" / "source_inputs.json",
+            {
+                "schema": "slidesmith.source_inputs.v1",
+                "files": [
+                    {"name": "brand.md", "upload_path": "uploads/task/brand.md"},
+                    {"name": "later.md", "upload_path": 7},
+                ],
+            },
+        )
+
+        with self.assertRaisesRegex(ValueError, r"files\[1\]\.upload_path must be a string"):
+            ppt_runner.discover_template_fill_inputs(project)
+
     def test_discover_template_fill_inputs_rejects_other_or_multiple_presentations_deterministically(self) -> None:
         cases = {
             "other format": ["template.PPTM"],
