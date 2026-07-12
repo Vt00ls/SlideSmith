@@ -28,7 +28,7 @@ func routeExecutionPolicyFor(selection *routeSelection) routeExecutionPolicy {
 		model.TaskRouteTemplateFill,
 		model.TaskRouteBeautify,
 	}
-	supportedRoutes := []string{model.TaskRouteMain}
+	supportedRoutes := []string{model.TaskRouteMain, model.TaskRouteTemplateFill}
 	if selection == nil {
 		return routeExecutionPolicy{
 			Route:           "",
@@ -54,11 +54,7 @@ func routeExecutionPolicyFor(selection *routeSelection) routeExecutionPolicy {
 		return routeExecutionPolicy{
 			Route:              model.TaskRouteTemplateFill,
 			Executable:         true,
-			WorkflowExecutable: false,
-			FailurePhase:       routeFailureWorkflowNotEnabled,
-			FailureMessage:     "route template-fill source intake is complete, but the full workflow is not enabled in SPEC-02",
-			UnsupportedAfter:   PhaseSourcePrepare,
-			NextSpec:           "SPEC-03-Template-Fill-PPTX.md",
+			WorkflowExecutable: true,
 			SupportedRoutes:    supportedRoutes,
 			KnownRoutes:        knownRoutes,
 			NextStatus:         model.TaskStatusSourceConverting,

@@ -38,13 +38,15 @@ func (successfulRoutePrepareAgent) Run(_ context.Context, req AgentRunRequest) (
 	}, nil
 }
 
-func TestProcessPrepareRunsSourcePrepareBeforeBlockingUnsupportedWorkflow(t *testing.T) {
+func TestProcessPrepareDispatchesRouteAfterSourcePrepare(t *testing.T) {
 	tests := []struct {
-		name      string
-		title     string
-		artifacts []model.Artifact
-		wantRoute string
-		wantSpec  string
+		name             string
+		title            string
+		artifacts        []model.Artifact
+		wantRoute        string
+		wantStatus       string
+		wantFailurePhase string
+		wantSpec         string
 	}{
 		{
 			name:  "template-fill",
@@ -53,8 +55,8 @@ func TestProcessPrepareRunsSourcePrepareBeforeBlockingUnsupportedWorkflow(t *tes
 				{Name: "brand_template.pptx", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-route/source/brand_template.pptx"},
 				{Name: "content.md", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-route/source/content.md"},
 			},
-			wantRoute: model.TaskRouteTemplateFill,
-			wantSpec:  "SPEC-03-Template-Fill-PPTX.md",
+			wantRoute:  model.TaskRouteTemplateFill,
+			wantStatus: model.TaskStatusTemplateFillPlanning,
 		},
 		{
 			name:  "beautify",
@@ -62,29 +64,34 @@ func TestProcessPrepareRunsSourcePrepareBeforeBlockingUnsupportedWorkflow(t *tes
 			artifacts: []model.Artifact{
 				{Name: "original.pptx", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-route/source/original.pptx"},
 			},
-			wantRoute: model.TaskRouteBeautify,
-			wantSpec:  "SPEC-04-Beautify-PPTX.md",
+			wantRoute:        model.TaskRouteBeautify,
+			wantStatus:       model.TaskStatusFailed,
+			wantFailurePhase: "source_prepare.workflow_not_enabled",
+			wantSpec:         "SPEC-04-Beautify-PPTX.md",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			service, repo, task, workspaceRoot := routeDispatchPrepareService(t, test.title, test.artifacts)
 			err := service.processPrepare(context.Background(), task)
-			if err == nil {
-				t.Fatal("processPrepare should fail for a workflow not enabled in SPEC-02")
+			if test.wantFailurePhase == "" && err != nil {
+				t.Fatalf("processPrepare() error = %v", err)
+			}
+			if test.wantFailurePhase != "" && err == nil {
+				t.Fatal("processPrepare should fail for a workflow that is not enabled")
 			}
 			updated, err := repo.GetTask(context.Background(), task.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if updated.Status != model.TaskStatusFailed {
-				t.Fatalf("status = %q, want failed", updated.Status)
+			if updated.Status != test.wantStatus {
+				t.Fatalf("status = %q, want %q", updated.Status, test.wantStatus)
 			}
 			if updated.Route != test.wantRoute {
 				t.Fatalf("route = %q, want %q", updated.Route, test.wantRoute)
 			}
-			if updated.FailurePhase != "source_prepare.workflow_not_enabled" {
-				t.Fatalf("failure phase = %q, want source_prepare.workflow_not_enabled", updated.FailurePhase)
+			if updated.FailurePhase != test.wantFailurePhase {
+				t.Fatalf("failure phase = %q, want %q", updated.FailurePhase, test.wantFailurePhase)
 			}
 
 			phaseRuns, err := repo.ListPhaseRuns(context.Background(), task.ID)
@@ -118,34 +125,36 @@ func TestProcessPrepareRunsSourcePrepareBeforeBlockingUnsupportedWorkflow(t *tes
 				t.Fatalf("route_select output missing execution_policy: %s", outputByPhase[string(PhaseRouteSelect)])
 			}
 
-			var metadata map[string]any
-			if err := json.Unmarshal([]byte(updated.FailureMetadata), &metadata); err != nil {
-				t.Fatalf("invalid failure metadata: %v", err)
-			}
 			wantWorkspace := filepath.Join(workspaceRoot, task.RuntimeProject)
 			wantProject := filepath.Join(wantWorkspace, "projects", "task_route_ppt169_20260708")
-			for key, want := range map[string]string{
-				"workspace_path": wantWorkspace,
-				"project_path":   wantProject,
-				"route":          test.wantRoute,
-				"next_spec":      test.wantSpec,
-			} {
-				if metadata[key] != want {
-					t.Fatalf("metadata[%q] = %#v, want %q; metadata=%#v", key, metadata[key], want, metadata)
+			if test.wantFailurePhase != "" {
+				var metadata map[string]any
+				if err := json.Unmarshal([]byte(updated.FailureMetadata), &metadata); err != nil {
+					t.Fatalf("invalid failure metadata: %v", err)
 				}
-			}
-			if metadata["route_reason"] == "" {
-				t.Fatalf("failure metadata missing route_reason: %#v", metadata)
-			}
-			if _, ok := metadata["source_contract"].(map[string]any); !ok {
-				t.Fatalf("failure metadata missing source_contract: %#v", metadata)
-			}
-			policyMetadata, ok := metadata["route_execution_policy"].(map[string]any)
-			if !ok {
-				t.Fatalf("failure metadata missing route_execution_policy: %#v", metadata)
-			}
-			if policyMetadata["workflow_executable"] != false || policyMetadata["unsupported_after"] != string(PhaseSourcePrepare) {
-				t.Fatalf("unexpected policy metadata: %#v", policyMetadata)
+				for key, want := range map[string]string{
+					"workspace_path": wantWorkspace,
+					"project_path":   wantProject,
+					"route":          test.wantRoute,
+					"next_spec":      test.wantSpec,
+				} {
+					if metadata[key] != want {
+						t.Fatalf("metadata[%q] = %#v, want %q; metadata=%#v", key, metadata[key], want, metadata)
+					}
+				}
+				if metadata["route_reason"] == "" {
+					t.Fatalf("failure metadata missing route_reason: %#v", metadata)
+				}
+				if _, ok := metadata["source_contract"].(map[string]any); !ok {
+					t.Fatalf("failure metadata missing source_contract: %#v", metadata)
+				}
+				policyMetadata, ok := metadata["route_execution_policy"].(map[string]any)
+				if !ok {
+					t.Fatalf("failure metadata missing route_execution_policy: %#v", metadata)
+				}
+				if policyMetadata["workflow_executable"] != false || policyMetadata["unsupported_after"] != string(PhaseSourcePrepare) {
+					t.Fatalf("unexpected policy metadata: %#v", policyMetadata)
+				}
 			}
 
 			artifacts, err := repo.ListArtifacts(context.Background(), task.ID)

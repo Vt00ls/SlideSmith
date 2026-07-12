@@ -27,26 +27,29 @@ func TestRouteExecutionPolicyAllowsMain(t *testing.T) {
 	}
 }
 
-func TestRouteExecutionPolicyAllowsTemplateFillIntakeButBlocksWorkflow(t *testing.T) {
+func TestRouteExecutionPolicyAllowsTemplateFillWorkflow(t *testing.T) {
 	policy := routeExecutionPolicyFor(&routeSelection{Route: model.TaskRouteTemplateFill})
 	if !policy.Executable {
-		t.Fatalf("template-fill should be allowed to run source intake: %#v", policy)
+		t.Fatalf("template-fill should be executable: %#v", policy)
 	}
 	policyJSON := routeExecutionPolicyJSON(t, policy)
-	if policyJSON["workflow_executable"] != false {
-		t.Fatalf("template-fill workflow should still be blocked in SPEC2: %#v", policy)
+	if policyJSON["workflow_executable"] != true {
+		t.Fatalf("template-fill workflow should be executable: %#v", policy)
 	}
-	if policy.FailurePhase != "source_prepare.workflow_not_enabled" {
-		t.Fatalf("failure phase = %q, want source_prepare.workflow_not_enabled", policy.FailurePhase)
-	}
-	if policyJSON["unsupported_after"] != string(PhaseSourcePrepare) {
-		t.Fatalf("unsupported after = %#v, want %q", policyJSON["unsupported_after"], PhaseSourcePrepare)
-	}
-	if policy.NextSpec != "SPEC-03-Template-Fill-PPTX.md" {
-		t.Fatalf("next spec = %q", policy.NextSpec)
+	if _, ok := policyJSON["unsupported_after"]; ok || policy.FailurePhase != "" || policy.NextSpec != "" {
+		t.Fatalf("template-fill policy should not carry workflow-block metadata: %#v", policy)
 	}
 	if policy.NextStatus != model.TaskStatusSourceConverting || policy.NextPhase != PhaseSourcePrepare {
 		t.Fatalf("unexpected intake transition: %#v", policy)
+	}
+	wantSupported := []string{model.TaskRouteMain, model.TaskRouteTemplateFill}
+	if len(policy.SupportedRoutes) != len(wantSupported) {
+		t.Fatalf("supported routes = %#v, want %#v", policy.SupportedRoutes, wantSupported)
+	}
+	for index, want := range wantSupported {
+		if policy.SupportedRoutes[index] != want {
+			t.Fatalf("supported routes = %#v, want %#v", policy.SupportedRoutes, wantSupported)
+		}
 	}
 }
 
@@ -102,8 +105,14 @@ func TestRouteExecutionPolicyRejectsUnknownRoute(t *testing.T) {
 	if _, ok := policyJSON["unsupported_after"]; ok || policy.NextSpec != "" || policy.NextStatus != "" || policy.NextPhase != "" {
 		t.Fatalf("unknown route should not have a next workflow phase: %#v", policy)
 	}
-	if len(policy.SupportedRoutes) != 1 || policy.SupportedRoutes[0] != model.TaskRouteMain {
-		t.Fatalf("supported routes = %#v, want main only", policy.SupportedRoutes)
+	wantSupported := []string{model.TaskRouteMain, model.TaskRouteTemplateFill}
+	if len(policy.SupportedRoutes) != len(wantSupported) {
+		t.Fatalf("supported routes = %#v, want %#v", policy.SupportedRoutes, wantSupported)
+	}
+	for index, want := range wantSupported {
+		if policy.SupportedRoutes[index] != want {
+			t.Fatalf("supported routes = %#v, want %#v", policy.SupportedRoutes, wantSupported)
+		}
 	}
 	wantKnown := []string{model.TaskRouteMain, model.TaskRouteTemplateFill, model.TaskRouteBeautify}
 	if len(policy.KnownRoutes) != len(wantKnown) {
