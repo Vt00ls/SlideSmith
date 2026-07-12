@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/slidesmith/slidesmith/backend/internal/config"
@@ -440,6 +441,121 @@ func TestTemplateFillDraftReconciliationReturnsStaleEvidenceCleanupFailure(t *te
 			t.Fatalf("draft cleanup failure fabricated formal phase run: %#v", phaseRun)
 		}
 	}
+}
+
+func TestTemplateFillBlockedCheckCannotDowngradeSuccessorCanonicalPlan(t *testing.T) {
+	agent := &templateFillWorkflowAgent{draftCheckErrors: 2}
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillChecking, agent)
+	agent.projectPath = projectPath
+	mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
+	takeoverRan := installTemplateFillCanonicalMutationTakeover(t, service, repo, task, func() {
+		successorPlan := templateFillContractPlan("confirmed", 1)
+		templateFillContractFirstSlide(successorPlan)["purpose"] = "successor-confirmed-plan"
+		writeTemplateFillWorkflowJSON(projectPath, filepath.Join("analysis", "fill_plan.json"), successorPlan)
+		if _, err := validateTemplateFillPlanContract(projectPath); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	if err := service.ProcessTask(context.Background(), task.ID); err != nil {
+		t.Fatalf("ProcessTask() stale blocked-check error = %v, want clean stop", err)
+	}
+	if !takeoverRan() {
+		t.Fatal("blocked-check canonical mutation takeover hook did not run")
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusTemplateFillChecking || persisted.ExecutionClaimToken != "successor-canonical-owner" {
+		t.Fatalf("stale blocked check changed successor task: %#v", persisted)
+	}
+	_, slides, status, err := readValidatedTemplateFillPlan(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	purpose, _ := slides[0].(map[string]any)["purpose"].(string)
+	if status != "confirmed" || purpose != "successor-confirmed-plan" {
+		t.Fatalf("stale blocked check changed successor plan: status=%q purpose=%q", status, purpose)
+	}
+}
+
+func TestTemplateFillDraftReconciliationCannotDeleteSuccessorCanonicalEvidence(t *testing.T) {
+	agent := &templateFillWorkflowAgent{}
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillChecking, agent)
+	agent.projectPath = projectPath
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	prepareTemplateFillCheckContractReport(t, projectPath)
+	contractPath := filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json")
+	mustWriteFile(t, contractPath, `{"owner":"old"}`+"\n")
+	successorReport := `{"owner":"successor","kind":"report"}` + "\n"
+	successorContract := `{"owner":"successor","kind":"contract"}` + "\n"
+	takeoverRan := installTemplateFillCanonicalMutationTakeover(t, service, repo, task, func() {
+		mustWriteFile(t, filepath.Join(projectPath, "analysis", "check_report.json"), successorReport)
+		mustWriteFile(t, contractPath, successorContract)
+	})
+
+	if err := service.ProcessTask(context.Background(), task.ID); err != nil {
+		t.Fatalf("ProcessTask() stale draft-reconciliation error = %v, want clean stop", err)
+	}
+	if !takeoverRan() {
+		t.Fatal("draft-reconciliation canonical mutation takeover hook did not run")
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusTemplateFillChecking || persisted.ExecutionClaimToken != "successor-canonical-owner" {
+		t.Fatalf("stale draft reconciliation changed successor task: %#v", persisted)
+	}
+	for path, want := range map[string]string{
+		filepath.Join(projectPath, "analysis", "check_report.json"): successorReport,
+		contractPath: successorContract,
+	} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read successor evidence %s: %v", path, err)
+		}
+		if string(raw) != want {
+			t.Fatalf("successor evidence %s = %q, want %q", path, raw, want)
+		}
+	}
+}
+
+func installTemplateFillCanonicalMutationTakeover(
+	t *testing.T,
+	service *TaskService,
+	repo *repository.Repository,
+	task *model.Task,
+	writeSuccessorCanonical func(),
+) func() bool {
+	t.Helper()
+	called := false
+	service.beforeCanonicalMutationPromotion = func(string) error {
+		called = true
+		now := time.Now().UTC()
+		staleClaimedAt := now.Add(-service.taskExecutionLeaseDuration() - time.Minute)
+		if err := repo.DB().Model(&model.Task{}).Where("id = ?", task.ID).Update("execution_claimed_at", staleClaimedAt).Error; err != nil {
+			return err
+		}
+		claimed, err := repo.ClaimTaskExecution(
+			context.Background(),
+			task.ID,
+			model.TaskStatusTemplateFillChecking,
+			"successor-canonical-owner",
+			now,
+			now.Add(-service.taskExecutionLeaseDuration()),
+		)
+		if err != nil {
+			return err
+		}
+		if !claimed {
+			return fmt.Errorf("successor could not take over canonical mutation")
+		}
+		writeSuccessorCanonical()
+		return nil
+	}
+	return func() bool { return called }
 }
 
 func TestTemplateFillFormalCheckRejectsStaleReportAndPlanMutation(t *testing.T) {

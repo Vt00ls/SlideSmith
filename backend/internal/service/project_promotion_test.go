@@ -82,6 +82,34 @@ func TestStagePreparedProjectRejectsSymlinkMember(t *testing.T) {
 	}
 }
 
+func TestStagePreparedProjectRejectsSymlinkedProjectsAncestorOutsideWorkspace(t *testing.T) {
+	service, _, task, canonicalProject, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillApplying, nil)
+	sessionWorkspace := filepath.Join(t.TempDir(), "workspace")
+	outsideProjects := filepath.Join(t.TempDir(), "outside-projects")
+	externalProject := filepath.Join(outsideProjects, filepath.Base(canonicalProject))
+	mustWriteFile(t, filepath.Join(externalProject, "external-secret.txt"), "external secret")
+	if err := os.MkdirAll(sessionWorkspace, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideProjects, filepath.Join(sessionWorkspace, "projects")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	staged, err := service.stagePreparedProject(context.Background(), task, sessionWorkspace, workspacePath)
+	if staged != nil {
+		defer func() { _ = staged.cleanup() }()
+	}
+	if err == nil {
+		if _, statErr := os.Stat(filepath.Join(staged.projectPath, "external-secret.txt")); statErr == nil {
+			t.Fatal("external project bytes reached promotion staging through symlinked projects ancestor")
+		}
+		t.Fatal("stagePreparedProject() error = nil, want outside-workspace ancestor rejection")
+	}
+	if _, statErr := os.Stat(filepath.Join(canonicalProject, "external-secret.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("external project bytes reached canonical project: %v", statErr)
+	}
+}
+
 func TestPromoteStagedProjectRechecksRealDirectoryRoot(t *testing.T) {
 	tests := []struct {
 		name  string

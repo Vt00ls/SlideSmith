@@ -26,6 +26,8 @@ type TaskService struct {
 	templates  *TemplateCatalogService
 	agentCfg   config.AgentComposeConfig
 	machine    *StateMachine
+
+	beforeCanonicalMutationPromotion func(string) error
 }
 
 const (
@@ -234,7 +236,8 @@ func (s *TaskService) SubmitConfirmations(ctx context.Context, taskID string, va
 }
 
 func (s *TaskService) ProcessQueuedTasks(ctx context.Context, limit int) (int, error) {
-	tasks, err := s.repo.ListTasksByStatuses(ctx, []string{
+	staleBefore := time.Now().UTC().Add(-s.taskExecutionLeaseDuration())
+	tasks, err := s.repo.ListClaimableTasksByStatuses(ctx, []string{
 		model.TaskStatusRuntimePreparing,
 		model.TaskStatusSourceConverting,
 		model.TaskStatusTemplateFillPlanning,
@@ -246,7 +249,7 @@ func (s *TaskService) ProcessQueuedTasks(ctx context.Context, limit int) (int, e
 		model.TaskStatusQualityChecking,
 		model.TaskStatusExporting,
 		model.TaskStatusPublishing,
-	}, limit)
+	}, staleBefore, limit)
 	if err != nil {
 		return 0, err
 	}
@@ -810,11 +813,36 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".plan_contract", err, nil, map[string]any{"project_path": projectPath})
 	}
 	if planStatus == "draft" {
-		if cleanupErr := removeTemplateFillFormalCheckEvidence(inputs); cleanupErr != nil {
-			failureErr := s.failWithMetadata(ctx, task, string(PhaseTemplateFillCheck)+".cleanup", cleanupErr, nil, map[string]any{
+		projectPath, err = s.mutateCanonicalProjectClaimed(
+			ctx,
+			task,
+			projectPath,
+			func(stagedProjectPath string) error {
+				stagedInputs, err := discoverTemplateFillInputs(stagedProjectPath)
+				if err != nil {
+					return err
+				}
+				return removeTemplateFillFormalCheckEvidence(stagedInputs)
+			},
+			func(stagedProjectPath string) error {
+				planContract, _, err := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+				if err != nil {
+					return err
+				}
+				if status, _ := planContract["plan_status"].(string); status != "draft" {
+					return fmt.Errorf("template fill reconciled plan status = %q, expected %q", status, "draft")
+				}
+				return requireTemplateFillFormalCheckEvidenceAbsent(stagedProjectPath)
+			},
+		)
+		if errors.Is(err, errTaskStateChanged) {
+			return nil
+		}
+		if err != nil {
+			failureErr := s.failWithMetadata(ctx, task, string(PhaseTemplateFillCheck)+".cleanup", err, nil, map[string]any{
 				"project_path": projectPath,
 			})
-			return errors.Join(cleanupErr, failureErr)
+			return errors.Join(err, failureErr)
 		}
 		transitioned, transitionErr := s.transitionIfCurrent(ctx, task, model.TaskStatusAwaitingTemplateFillConfirm, "Awaiting template fill plan confirmation", map[string]any{
 			"project_path": projectPath,
@@ -951,12 +979,52 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 		message = "Awaiting template fill plan confirmation"
 	}
 	if blocked {
-		if err := setTemplateFillPlanStatus(projectPath, "draft"); err != nil {
+		formalReportSHA256, err := sha256File(inputs.CheckReport)
+		if err != nil {
 			return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".reset_plan", err, runtimeRun, map[string]any{
 				"project_path": projectPath,
 			})
 		}
-		planContract, err = validateTemplateFillPlanContract(projectPath)
+		formalContractPath := filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseTemplateFillCheck)+".json")
+		formalContractSHA256, err := sha256File(formalContractPath)
+		if err != nil {
+			return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".reset_plan", err, runtimeRun, map[string]any{
+				"project_path": projectPath,
+			})
+		}
+		projectPath, err = s.mutateCanonicalProjectClaimed(
+			ctx,
+			task,
+			projectPath,
+			func(stagedProjectPath string) error {
+				return setTemplateFillPlanStatus(stagedProjectPath, "draft")
+			},
+			func(stagedProjectPath string) error {
+				stagedPlanContract, _, err := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+				if err != nil {
+					return err
+				}
+				if status, _ := stagedPlanContract["plan_status"].(string); status != "draft" {
+					return fmt.Errorf("template fill reset plan status = %q, expected %q", status, "draft")
+				}
+				stagedInputs, err := discoverTemplateFillInputs(stagedProjectPath)
+				if err != nil {
+					return err
+				}
+				if err := requireFileSHA256(stagedInputs.CheckReport, formalReportSHA256, "template fill formal check report"); err != nil {
+					return err
+				}
+				stagedContractPath := filepath.Join(stagedProjectPath, ".slidesmith", "contracts", string(PhaseTemplateFillCheck)+".json")
+				if err := requireFileSHA256(stagedContractPath, formalContractSHA256, "template fill formal check contract"); err != nil {
+					return err
+				}
+				planContract = stagedPlanContract
+				return nil
+			},
+		)
+		if errors.Is(err, errTaskStateChanged) {
+			return nil
+		}
 		if err != nil {
 			return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".reset_plan_contract", err, runtimeRun, map[string]any{
 				"project_path": projectPath,
@@ -1401,6 +1469,35 @@ func removeTemplateFillFormalCheckEvidence(inputs TemplateFillInputs) error {
 	return nil
 }
 
+func requireTemplateFillFormalCheckEvidenceAbsent(projectPath string) error {
+	inputs, err := discoverTemplateFillInputs(projectPath)
+	if err != nil {
+		return err
+	}
+	for _, path := range []string{
+		inputs.CheckReport,
+		filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseTemplateFillCheck)+".json"),
+	} {
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("stale formal check evidence still exists: %s", path)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect stale formal check evidence %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func requireFileSHA256(path, expectedSHA256, label string) error {
+	actualSHA256, err := sha256File(path)
+	if err != nil {
+		return fmt.Errorf("hash %s: %w", label, err)
+	}
+	if actualSHA256 != expectedSHA256 {
+		return fmt.Errorf("%s sha256 = %s, expected %s", label, actualSHA256, expectedSHA256)
+	}
+	return nil
+}
+
 func readTemplateFillFormalCheckEvidence(projectPath string, inputs TemplateFillInputs, planSHA256 string) (map[string]any, error) {
 	return readTemplateFillFormalCheckEvidenceForReport(projectPath, inputs, planSHA256, inputs.CheckReport)
 }
@@ -1717,11 +1814,8 @@ func (s *TaskService) processLegacyCommandGenerate(ctx context.Context, task *mo
 	})
 	applyRuntimeRunToPhaseRun(phaseRun, run)
 	if err != nil {
-		recovered, recoverErr := s.tryRecoverGeneratedRuntimeArtifacts(ctx, task, workspace, run, "generate.agent")
+		recovered, recoverErr := s.tryRecoverGeneratedRuntimeArtifacts(ctx, task, workspace, run, phaseRun, "generate.agent")
 		if recovered {
-			output := runtimeRunPhaseOutput(run)
-			output["recovered"] = true
-			_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil)
 			return recoverErr
 		}
 		extra := map[string]any{

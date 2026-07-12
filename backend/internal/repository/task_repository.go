@@ -54,6 +54,23 @@ func (r *Repository) ListTasksByStatuses(ctx context.Context, statuses []string,
 	return tasks, err
 }
 
+func (r *Repository) ListClaimableTasksByStatuses(ctx context.Context, statuses []string, staleBefore time.Time, limit int) ([]model.Task, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	var tasks []model.Task
+	err := taskExecutionClaimEligible(r.db.WithContext(ctx), staleBefore).
+		Where("status IN ?", statuses).
+		Order("updated_at ASC").
+		Limit(limit).
+		Find(&tasks).Error
+	return tasks, err
+}
+
+func taskExecutionClaimEligible(db *gorm.DB, staleBefore time.Time) *gorm.DB {
+	return db.Where("execution_claim_token = '' OR execution_claimed_at IS NULL OR execution_claimed_at < ?", staleBefore)
+}
+
 func (r *Repository) GetTask(ctx context.Context, id string) (*model.Task, error) {
 	var task model.Task
 	err := r.db.WithContext(ctx).First(&task, "id = ?", id).Error
@@ -117,9 +134,8 @@ func (r *Repository) ClaimTaskExecution(
 ) (bool, error) {
 	claimed := false
 	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		result := tx.Model(&model.Task{}).
+		result := taskExecutionClaimEligible(tx.Model(&model.Task{}), staleBefore).
 			Where("id = ? AND status = ?", taskID, expectedStatus).
-			Where("execution_claim_token = '' OR execution_claimed_at IS NULL OR execution_claimed_at < ?", staleBefore).
 			Updates(map[string]any{
 				"execution_claim_token": token,
 				"execution_claimed_at":  claimedAt,

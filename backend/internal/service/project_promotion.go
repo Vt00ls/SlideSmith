@@ -38,7 +38,19 @@ func (s *TaskService) stagePreparedProject(
 		return nil, fmt.Errorf("stage runtime project: runtime project and workspace paths are required")
 	}
 
-	sourceProjectsDir := filepath.Join(runtimeWorkspacePath, "projects")
+	resolvedRuntimeWorkspacePath, err := resolveRuntimeWorkspacePath(runtimeWorkspacePath)
+	if err != nil {
+		return nil, fmt.Errorf("stage runtime project: %w", err)
+	}
+	sourceProjectsDir := filepath.Join(resolvedRuntimeWorkspacePath, "projects")
+	projectsInfo, resolvedSourceProjectsDir, err := inspectContainedPath(resolvedRuntimeWorkspacePath, sourceProjectsDir)
+	if err != nil {
+		return nil, fmt.Errorf("inspect runtime projects path: %w", err)
+	}
+	if !projectsInfo.IsDir() {
+		return nil, fmt.Errorf("runtime projects path is not a directory: %s", sourceProjectsDir)
+	}
+	sourceProjectsDir = resolvedSourceProjectsDir
 	matches, err := filepath.Glob(filepath.Join(sourceProjectsDir, task.RuntimeProject+"_ppt169_*"))
 	if err != nil {
 		return nil, err
@@ -50,20 +62,35 @@ func (s *TaskService) stagePreparedProject(
 	if len(matches) == 0 {
 		return nil, fmt.Errorf("prepared project not found for %s in %s", task.RuntimeProject, sourceProjectsDir)
 	}
-	sourceProject := newestPath(matches)
+	selectedSourceProject := newestPath(matches)
+	sourceInfo, sourceProject, err := inspectContainedPath(resolvedRuntimeWorkspacePath, selectedSourceProject)
+	if err != nil {
+		return nil, fmt.Errorf("inspect prepared project %s: %w", selectedSourceProject, err)
+	}
+	if !sourceInfo.IsDir() {
+		return nil, fmt.Errorf("runtime project source must be a directory: %s", selectedSourceProject)
+	}
+	return s.stageProjectPromotion(ctx, task, sourceProject, targetWorkspaceDir)
+}
+
+func (s *TaskService) stageProjectPromotion(
+	ctx context.Context,
+	task *model.Task,
+	sourceProject string,
+	targetWorkspaceDir string,
+) (*stagedProjectPromotion, error) {
 	if err := requireRealProjectDirectory(sourceProject, "runtime project source"); err != nil {
 		return nil, err
 	}
 	targetProject := filepath.Join(targetWorkspaceDir, "projects", filepath.Base(sourceProject))
 	if sameFilesystemPath(sourceProject, targetProject) {
-		if task.ExecutionClaimToken != "" {
-			return nil, fmt.Errorf("runtime project source must be distinct from canonical target %s", targetProject)
+		if task.ExecutionClaimToken == "" {
+			return &stagedProjectPromotion{
+				noOp:        true,
+				projectPath: sourceProject,
+				targetPath:  targetProject,
+			}, nil
 		}
-		return &stagedProjectPromotion{
-			noOp:        true,
-			projectPath: sourceProject,
-			targetPath:  targetProject,
-		}, nil
 	}
 
 	claimSegment := sanitizePathSegment(task.ExecutionClaimToken)
@@ -94,6 +121,51 @@ func (s *TaskService) stagePreparedProject(
 		return nil, errors.Join(err, staged.cleanup())
 	}
 	return staged, nil
+}
+
+func (s *TaskService) mutateCanonicalProjectClaimed(
+	ctx context.Context,
+	task *model.Task,
+	projectPath string,
+	mutate func(string) error,
+	validate func(string) error,
+) (targetProject string, err error) {
+	if task == nil || task.ExecutionClaimToken == "" {
+		return "", fmt.Errorf("mutate canonical runtime project: claimed task is required")
+	}
+	workspace := s.resolveTaskWorkspace(task)
+	if workspace == nil || !sameFilesystemPath(projectPath, filepath.Join(workspace.HostDir, "projects", filepath.Base(projectPath))) {
+		return "", fmt.Errorf("mutate canonical runtime project: project %s is not canonical", projectPath)
+	}
+	staged, err := s.stageProjectPromotion(ctx, task, projectPath, workspace.HostDir)
+	if err != nil {
+		return "", err
+	}
+	defer func() {
+		if staged.retainRecovery {
+			return
+		}
+		err = errors.Join(err, staged.cleanup())
+	}()
+	if staged.noOp {
+		return "", fmt.Errorf("mutate canonical runtime project: claimed mutation cannot be a no-op")
+	}
+	if mutate != nil {
+		if err := mutate(staged.projectPath); err != nil {
+			return "", err
+		}
+	}
+	if validate != nil {
+		if err := validate(staged.projectPath); err != nil {
+			return "", err
+		}
+	}
+	if s.beforeCanonicalMutationPromotion != nil {
+		if err := s.beforeCanonicalMutationPromotion(staged.projectPath); err != nil {
+			return "", err
+		}
+	}
+	return s.promoteStagedProjectValidated(ctx, task, staged, validate)
 }
 
 func requireRealProjectDirectory(path, label string) error {

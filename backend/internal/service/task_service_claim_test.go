@@ -154,6 +154,69 @@ func TestProcessQueuedTasksTakesOverExpiredSourceConvertingClaim(t *testing.T) {
 	}
 }
 
+func TestProcessQueuedTasksLimitOneSkipsOldestLiveClaim(t *testing.T) {
+	service, repo, oldest, _ := routeDispatchPrepareService(t, "套用公司模板填充新内容", []model.Artifact{
+		{Name: "brand_template.pptx", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-route/source/brand_template.pptx"},
+		{Name: "content.md", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-route/source/content.md"},
+	})
+	ready := &model.Task{
+		ID:                 "task-route-ready",
+		Title:              oldest.Title,
+		Status:             model.TaskStatusRuntimePreparing,
+		RuntimeProject:     oldest.RuntimeProject,
+		Route:              model.TaskRouteMain,
+		RouteSelectionJSON: "{}",
+	}
+	if err := repo.CreateTask(context.Background(), ready); err != nil {
+		t.Fatal(err)
+	}
+	storage, ok := service.storage.(*LocalStorage)
+	if !ok {
+		t.Fatalf("storage = %T, want *LocalStorage", service.storage)
+	}
+	for _, artifact := range []model.Artifact{
+		{TaskID: ready.ID, Name: "brand_template.pptx", Kind: model.ArtifactKindSource, Storage: "local", ObjectKey: "tasks/task-route-ready/source/brand_template.pptx"},
+		{TaskID: ready.ID, Name: "content.md", Kind: model.ArtifactKindSource, Storage: "local", ObjectKey: "tasks/task-route-ready/source/content.md"},
+	} {
+		mustWriteFile(t, storage.Path(artifact.ObjectKey), "source\n")
+		artifact := artifact
+		if err := repo.CreateArtifact(context.Background(), &artifact); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	claimedAt := time.Now().UTC()
+	claimed, err := repo.ClaimTaskExecution(context.Background(), oldest.ID, oldest.Status, "live-foreign-claim", claimedAt, claimedAt.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("claim oldest task = %v, %v", claimed, err)
+	}
+	if err := repo.DB().Model(&model.Task{}).Where("id = ?", oldest.ID).Update("updated_at", claimedAt.Add(-time.Hour)).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	processed, err := service.ProcessQueuedTasks(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("ProcessQueuedTasks() error = %v", err)
+	}
+	if processed != 1 {
+		t.Fatalf("processed = %d, want newer claim-eligible task despite oldest live claim", processed)
+	}
+	oldestAfter, err := repo.GetTask(context.Background(), oldest.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldestAfter.Status != model.TaskStatusRuntimePreparing || oldestAfter.ExecutionClaimToken != "live-foreign-claim" {
+		t.Fatalf("oldest live-claimed task changed: %#v", oldestAfter)
+	}
+	readyAfter, err := repo.GetTask(context.Background(), ready.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readyAfter.Status != model.TaskStatusTemplateFillPlanning {
+		t.Fatalf("newer ready task status = %q, want %q", readyAfter.Status, model.TaskStatusTemplateFillPlanning)
+	}
+}
+
 func TestSyncRuntimeProjectRejectsStaleClaimAfterSuccessorPromotion(t *testing.T) {
 	service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillApplying, nil)
 	oldClaimedAt := time.Now().UTC().Add(-service.taskExecutionLeaseDuration() - time.Minute)

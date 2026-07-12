@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -21,7 +22,14 @@ type generatedRuntimeWorkspace struct {
 	HasManifest        bool
 }
 
-func (s *TaskService) tryRecoverGeneratedRuntimeArtifacts(ctx context.Context, task *model.Task, workspace *TaskWorkspace, run *model.TaskRuntimeRun, reason string) (bool, error) {
+func (s *TaskService) tryRecoverGeneratedRuntimeArtifacts(
+	ctx context.Context,
+	task *model.Task,
+	workspace *TaskWorkspace,
+	run *model.TaskRuntimeRun,
+	phaseRun *model.TaskPhaseRun,
+	reason string,
+) (bool, error) {
 	candidates, err := s.findGeneratedRuntimeWorkspaceCandidates(ctx, task)
 	if err != nil {
 		return false, err
@@ -39,7 +47,22 @@ func (s *TaskService) tryRecoverGeneratedRuntimeArtifacts(ctx context.Context, t
 		}
 	}
 	if err := s.saveTaskIfCurrent(ctx, task, expectedStatus); err != nil {
-		return true, err
+		finishErr := s.finishPhaseRun(
+			context.WithoutCancel(ctx),
+			phaseRun,
+			PhaseRunStatusFailed,
+			runtimeRunPhaseOutput(run),
+			err,
+		)
+		return true, errors.Join(err, finishErr)
+	}
+	recoveredOutput := runtimeRunPhaseOutput(run)
+	recoveredOutput["recovered"] = true
+	recoveredOutput["workspace_path"] = candidate.WorkspacePath
+	recoveredOutput["project_path"] = candidate.ProjectPath
+	recoveredOutput["session_id"] = candidate.SessionID
+	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, recoveredOutput, nil); err != nil {
+		return true, fmt.Errorf("finish recovered spec phase: %w", err)
 	}
 	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "recovered", "Recovered generated artifacts from runtime workspace", map[string]any{
 		"reason":               reason,
