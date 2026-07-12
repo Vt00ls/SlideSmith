@@ -18,9 +18,13 @@ func (a *prepareCommandRecordingAgent) Up(context.Context, AgentRunRequest) erro
 	return nil
 }
 
-func (a *prepareCommandRecordingAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+func (a *prepareCommandRecordingAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
 	a.request = req
-	project := filepath.Join(req.WorkDir, "projects", "task_template_ppt169_20260708")
+	sessionWorkspace, err := distinctTestAgentWorkspace(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	project := filepath.Join(sessionWorkspace, "projects", "task_template_ppt169_20260708")
 	mustWriteFileNoTest(project, filepath.Join("sources", "input.md"), "# Source\n")
 	exitCode := 0
 	return &AgentRunResult{
@@ -28,7 +32,7 @@ func (a *prepareCommandRecordingAgent) Run(_ context.Context, req AgentRunReques
 		SessionID:     "session-prepare",
 		Status:        "succeeded",
 		ExitCode:      &exitCode,
-		WorkspacePath: req.WorkDir,
+		WorkspacePath: sessionWorkspace,
 	}, nil
 }
 

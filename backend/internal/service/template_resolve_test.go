@@ -22,8 +22,12 @@ func (a templateResolvePrepareAgent) Up(context.Context, AgentRunRequest) error 
 	return nil
 }
 
-func (a templateResolvePrepareAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
-	project := filepath.Join(req.WorkDir, "projects", "task_template_ppt169_20260708")
+func (a templateResolvePrepareAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+	sessionWorkspace, err := distinctTestAgentWorkspace(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	project := filepath.Join(sessionWorkspace, "projects", "task_template_ppt169_20260708")
 	mustWriteFileNoTest(project, filepath.Join("sources", "input.md"), "# Source\n")
 	exitCode := 0
 	return &AgentRunResult{
@@ -31,8 +35,21 @@ func (a templateResolvePrepareAgent) Run(_ context.Context, req AgentRunRequest)
 		SessionID:     "session-prepare",
 		Status:        "succeeded",
 		ExitCode:      &exitCode,
-		WorkspacePath: req.WorkDir,
+		WorkspacePath: sessionWorkspace,
 	}, nil
+}
+
+func distinctTestAgentWorkspace(ctx context.Context, req AgentRunRequest) (string, error) {
+	sessionDir, err := os.MkdirTemp(filepath.Dir(req.WorkDir), "agent-session-")
+	if err != nil {
+		return "", err
+	}
+	sessionWorkspace := filepath.Join(sessionDir, "workspace")
+	if err := copyDir(ctx, req.WorkDir, sessionWorkspace); err != nil {
+		_ = os.RemoveAll(sessionDir)
+		return "", err
+	}
+	return sessionWorkspace, nil
 }
 
 func TestProcessPrepareRecordsTemplateResolvePhase(t *testing.T) {

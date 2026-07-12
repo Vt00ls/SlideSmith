@@ -439,8 +439,12 @@ func (sameStemMixedSourcePrepareAgent) Up(context.Context, AgentRunRequest) erro
 	return nil
 }
 
-func (sameStemMixedSourcePrepareAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
-	project := filepath.Join(req.WorkDir, "projects", "task_template_ppt169_20260708")
+func (sameStemMixedSourcePrepareAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+	sessionWorkspace, err := distinctTestAgentWorkspace(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	project := filepath.Join(sessionWorkspace, "projects", "task_template_ppt169_20260708")
 	mustWriteFileNoTest(project, filepath.Join("sources", "foo.pdf"), "pdf")
 	mustWriteFileNoTest(project, filepath.Join("sources", "foo.txt"), "text")
 	mustWriteFileNoTest(project, filepath.Join("sources", "foo.md"), "# PDF conversion\n")
@@ -451,7 +455,7 @@ func (sameStemMixedSourcePrepareAgent) Run(_ context.Context, req AgentRunReques
 		SessionID:     "session-same-stem-mixed",
 		Status:        "succeeded",
 		ExitCode:      &exitCode,
-		WorkspacePath: req.WorkDir,
+		WorkspacePath: sessionWorkspace,
 	}, nil
 }
 
@@ -514,8 +518,12 @@ func (invalidSourcePrepareAgent) Up(context.Context, AgentRunRequest) error {
 	return nil
 }
 
-func (invalidSourcePrepareAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
-	project := filepath.Join(req.WorkDir, "projects", "task_template_ppt169_20260708")
+func (invalidSourcePrepareAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+	sessionWorkspace, err := distinctTestAgentWorkspace(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	project := filepath.Join(sessionWorkspace, "projects", "task_template_ppt169_20260708")
 	mustWriteFileNoTest(project, filepath.Join("sources", "ledger.xls"), "xls")
 	exitCode := 0
 	return &AgentRunResult{
@@ -523,7 +531,7 @@ func (invalidSourcePrepareAgent) Run(_ context.Context, req AgentRunRequest) (*A
 		SessionID:     "session-invalid-prepare",
 		Status:        "succeeded",
 		ExitCode:      &exitCode,
-		WorkspacePath: req.WorkDir,
+		WorkspacePath: sessionWorkspace,
 	}, nil
 }
 

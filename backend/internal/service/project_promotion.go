@@ -70,6 +70,14 @@ func (s *TaskService) stagePreparedProject(
 	if !sourceInfo.IsDir() {
 		return nil, fmt.Errorf("runtime project source must be a directory: %s", selectedSourceProject)
 	}
+	resolvedTargetWorkspaceDir, err := resolveRuntimeWorkspacePath(targetWorkspaceDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve canonical runtime workspace: %w", err)
+	}
+	targetProject := filepath.Join(resolvedTargetWorkspaceDir, "projects", filepath.Base(sourceProject))
+	if sameFilesystemPath(sourceProject, targetProject) {
+		return nil, fmt.Errorf("runtime project source must be distinct from canonical target %s: distinct session workspace required", targetProject)
+	}
 	return s.stageProjectPromotion(ctx, task, sourceProject, targetWorkspaceDir)
 }
 

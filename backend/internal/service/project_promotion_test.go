@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,6 +108,58 @@ func TestStagePreparedProjectRejectsSymlinkedProjectsAncestorOutsideWorkspace(t 
 	}
 	if _, statErr := os.Stat(filepath.Join(canonicalProject, "external-secret.txt")); !os.IsNotExist(statErr) {
 		t.Fatalf("external project bytes reached canonical project: %v", statErr)
+	}
+}
+
+func TestSyncRuntimeProjectRejectsClaimedCanonicalWorkspaceAsSessionSource(t *testing.T) {
+	service, repo, task, canonicalProject, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillApplying, nil)
+	claimedAt := time.Now().UTC()
+	claimed, err := repo.ClaimTaskExecution(context.Background(), task.ID, task.Status, "same-workspace-owner", claimedAt, claimedAt.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("claim same-workspace task = %v, %v", claimed, err)
+	}
+	task.ExecutionClaimToken = "same-workspace-owner"
+	task.ExecutionClaimedAt = &claimedAt
+	mustWriteFile(t, filepath.Join(canonicalProject, "promotion-sentinel.txt"), "canonical")
+	workspace := service.resolveTaskWorkspace(task)
+
+	_, err = service.syncRuntimeProject(context.Background(), task, workspace, workspace.HostDir)
+	if err == nil || !strings.Contains(err.Error(), "distinct session workspace required") {
+		t.Fatalf("syncRuntimeProject() error = %v, want distinct-session rejection", err)
+	}
+	requirePromotionSentinel(t, canonicalProject, "canonical")
+	if _, err := os.Lstat(filepath.Join(workspace.HostDir, ".slidesmith", "project-promotions")); !os.IsNotExist(err) {
+		t.Fatalf("same-workspace sync created promotion staging: %v", err)
+	}
+}
+
+func TestSyncRuntimeProjectValidationRejectsUnclaimedCanonicalWorkspaceBeforeMutation(t *testing.T) {
+	service, _, task, canonicalProject, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillApplying, nil)
+	mustWriteFile(t, filepath.Join(canonicalProject, "promotion-sentinel.txt"), "canonical")
+	workspace := service.resolveTaskWorkspace(task)
+	validationErr := errors.New("forced same-workspace validation failure")
+	validatorCalled := false
+
+	_, err := service.syncRuntimeProjectValidated(
+		context.Background(),
+		task,
+		workspace,
+		workspace.HostDir,
+		func(projectPath string) error {
+			validatorCalled = true
+			mustWriteFile(t, filepath.Join(projectPath, "promotion-sentinel.txt"), "mutated")
+			return validationErr
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "distinct session workspace required") {
+		t.Fatalf("syncRuntimeProjectValidated() error = %v, want distinct-session rejection", err)
+	}
+	if validatorCalled {
+		t.Fatal("same-workspace validation ran against canonical project")
+	}
+	requirePromotionSentinel(t, canonicalProject, "canonical")
+	if _, err := os.Lstat(filepath.Join(workspace.HostDir, ".slidesmith", "project-promotions")); !os.IsNotExist(err) {
+		t.Fatalf("same-workspace validation created promotion staging: %v", err)
 	}
 }
 
