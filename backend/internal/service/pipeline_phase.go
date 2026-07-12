@@ -26,6 +26,13 @@ const (
 )
 
 const (
+	PhaseTemplateFillPlan     PipelinePhase = "template_fill_plan"
+	PhaseTemplateFillCheck    PipelinePhase = "template_fill_check"
+	PhaseTemplateFillApply    PipelinePhase = "template_fill_apply"
+	PhaseTemplateFillValidate PipelinePhase = "template_fill_validate"
+)
+
+const (
 	PhaseRunnerRule              = "rule"
 	PhaseRunnerWorker            = "worker"
 	PhaseRunnerAgent             = "agent"
@@ -61,6 +68,19 @@ var pipelinePhaseOrder = []PipelinePhase{
 	PhasePublish,
 }
 
+var pipelinePhaseOrderByRoute = map[string][]PipelinePhase{
+	model.TaskRouteMain: pipelinePhaseOrder,
+	model.TaskRouteTemplateFill: {
+		PhaseRouteSelect,
+		PhaseSourcePrepare,
+		PhaseTemplateFillPlan,
+		PhaseTemplateFillCheck,
+		PhaseTemplateFillApply,
+		PhaseTemplateFillValidate,
+		PhasePublish,
+	},
+}
+
 var pipelinePhaseRegistry = map[PipelinePhase]PipelinePhaseDefinition{
 	PhaseRouteSelect: {
 		Phase:             PhaseRouteSelect,
@@ -81,6 +101,46 @@ var pipelinePhaseRegistry = map[PipelinePhase]PipelinePhaseDefinition{
 		Retryable:         true,
 		RequiredArtifacts: []string{model.ArtifactKindSource},
 		OutputArtifacts:   []string{"normalized markdown", "source metadata"},
+	},
+	PhaseTemplateFillPlan: {
+		Phase:             PhaseTemplateFillPlan,
+		DisplayName:       "Template Fill Plan",
+		RequiredStatuses:  []string{model.TaskStatusTemplateFillPlanning},
+		NextStatus:        model.TaskStatusAwaitingTemplateFillConfirm,
+		Runner:            PhaseRunnerAgent,
+		Retryable:         true,
+		RequiredArtifacts: []string{model.ArtifactKindPPTXSlideLibrary, model.ArtifactKindSourceMarkdown},
+		OutputArtifacts:   []string{"analysis/fill_plan.json", "analysis/check_report.json"},
+	},
+	PhaseTemplateFillCheck: {
+		Phase:            PhaseTemplateFillCheck,
+		DisplayName:      "Template Fill Check",
+		RequiredStatuses: []string{model.TaskStatusTemplateFillChecking},
+		NextStatus:       model.TaskStatusTemplateFillApplying,
+		Runner:           PhaseRunnerWorker,
+		Retryable:        true,
+		BlockingUserGate: true,
+		OutputArtifacts:  []string{"analysis/check_report.json"},
+	},
+	PhaseTemplateFillApply: {
+		Phase:             PhaseTemplateFillApply,
+		DisplayName:       "Template Fill Apply",
+		RequiredStatuses:  []string{model.TaskStatusTemplateFillApplying},
+		NextStatus:        model.TaskStatusTemplateFillValidating,
+		Runner:            PhaseRunnerWorker,
+		Retryable:         true,
+		RequiredArtifacts: []string{"analysis/fill_plan.json", "analysis/check_report.json"},
+		OutputArtifacts:   []string{"exports/*.pptx"},
+	},
+	PhaseTemplateFillValidate: {
+		Phase:             PhaseTemplateFillValidate,
+		DisplayName:       "Template Fill Validate",
+		RequiredStatuses:  []string{model.TaskStatusTemplateFillValidating},
+		NextStatus:        model.TaskStatusPublishing,
+		Runner:            PhaseRunnerWorker,
+		Retryable:         true,
+		RequiredArtifacts: []string{"exports/*.pptx"},
+		OutputArtifacts:   []string{"validation/readback.md", "validation/validate_report.json"},
 	},
 	PhaseProjectInit: {
 		Phase:            PhaseProjectInit,
@@ -192,8 +252,16 @@ var pipelinePhaseRegistry = map[PipelinePhase]PipelinePhaseDefinition{
 }
 
 func PipelinePhaseDefinitions() []PipelinePhaseDefinition {
-	definitions := make([]PipelinePhaseDefinition, 0, len(pipelinePhaseOrder))
-	for _, phase := range pipelinePhaseOrder {
+	return pipelinePhaseDefinitionsForOrder(pipelinePhaseOrder)
+}
+
+func PipelinePhaseDefinitionsForRoute(route string) []PipelinePhaseDefinition {
+	return pipelinePhaseDefinitionsForOrder(pipelinePhaseOrderByRoute[route])
+}
+
+func pipelinePhaseDefinitionsForOrder(order []PipelinePhase) []PipelinePhaseDefinition {
+	definitions := make([]PipelinePhaseDefinition, 0, len(order))
+	for _, phase := range order {
 		definitions = append(definitions, pipelinePhaseRegistry[phase])
 	}
 	return definitions
@@ -213,9 +281,17 @@ func NormalizePipelinePhase(value string) (PipelinePhase, error) {
 }
 
 func NextPipelinePhase(phase PipelinePhase) (PipelinePhase, bool) {
-	for i, current := range pipelinePhaseOrder {
-		if current == phase && i+1 < len(pipelinePhaseOrder) {
-			return pipelinePhaseOrder[i+1], true
+	return nextPipelinePhaseInOrder(pipelinePhaseOrder, phase)
+}
+
+func NextPipelinePhaseForRoute(route string, phase PipelinePhase) (PipelinePhase, bool) {
+	return nextPipelinePhaseInOrder(pipelinePhaseOrderByRoute[route], phase)
+}
+
+func nextPipelinePhaseInOrder(order []PipelinePhase, phase PipelinePhase) (PipelinePhase, bool) {
+	for i, current := range order {
+		if current == phase && i+1 < len(order) {
+			return order[i+1], true
 		}
 	}
 	return "", false

@@ -24,6 +24,14 @@ const (
 )
 
 const (
+	TaskStatusTemplateFillPlanning        = "template_fill_planning"
+	TaskStatusAwaitingTemplateFillConfirm = "awaiting_template_fill_confirm"
+	TaskStatusTemplateFillChecking        = "template_fill_checking"
+	TaskStatusTemplateFillApplying        = "template_fill_applying"
+	TaskStatusTemplateFillValidating      = "template_fill_validating"
+)
+
+const (
 	TaskRouteMain         = "main"
 	TaskRouteBeautify     = "beautify"
 	TaskRouteTemplateFill = "template-fill"
@@ -53,6 +61,13 @@ const (
 	ArtifactKindLog                     = "log"
 	ArtifactKindManifest                = "manifest"
 	ArtifactKindOther                   = "other"
+)
+
+const (
+	ArtifactKindTemplateFillPlan           = "template_fill_plan"
+	ArtifactKindTemplateFillCheckReport    = "template_fill_check_report"
+	ArtifactKindTemplateFillValidateReport = "template_fill_validate_report"
+	ArtifactKindTemplateFillReadback       = "template_fill_readback"
 )
 
 type Task struct {
