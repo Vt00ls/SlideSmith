@@ -31,7 +31,7 @@ func validateTemplateFillPlanContract(projectPath string) (map[string]any, error
 		"content_source_count": len(inputs.ContentSources),
 		"checked_at":           time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if _, err := writeContractReport(inputs.ProjectPath, string(PhaseTemplateFillPlan), contract); err != nil {
+	if _, err := writeTemplateFillContractReport(inputs.ProjectPath, PhaseTemplateFillPlan, contract); err != nil {
 		return nil, fmt.Errorf("write template fill plan contract: %w", err)
 	}
 	return contract, nil
@@ -67,7 +67,7 @@ func validateTemplateFillCheckContract(projectPath string, requireNoErrors bool)
 		"summary":      summary,
 		"checked_at":   time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if _, err := writeContractReport(inputs.ProjectPath, string(PhaseTemplateFillCheck), contract); err != nil {
+	if _, err := writeTemplateFillContractReport(inputs.ProjectPath, PhaseTemplateFillCheck, contract); err != nil {
 		return nil, fmt.Errorf("write template fill check contract: %w", err)
 	}
 	return contract, nil
@@ -106,7 +106,7 @@ func validateTemplateFillApplyContract(projectPath string) (map[string]any, erro
 		"slide_count":         slideCount,
 		"checked_at":          time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if _, err := writeContractReport(inputs.ProjectPath, string(PhaseTemplateFillApply), contract); err != nil {
+	if _, err := writeTemplateFillContractReport(inputs.ProjectPath, PhaseTemplateFillApply, contract); err != nil {
 		return nil, fmt.Errorf("write template fill apply contract: %w", err)
 	}
 	return contract, nil
@@ -124,7 +124,7 @@ func validateTemplateFillValidateContract(projectPath string) (map[string]any, e
 	if schema, ok := report["schema"].(string); !ok || schema != "template_fill_pptx_validate.v1" {
 		return nil, fmt.Errorf("template fill validate report schema = %#v, expected %q", report["schema"], "template_fill_pptx_validate.v1")
 	}
-	summary, err := templateFillSummary(report, "template fill validate report", "error")
+	summary, err := templateFillSummary(report, "template fill validate report", "ok", "warn", "error")
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +146,7 @@ func validateTemplateFillValidateContract(projectPath string) (map[string]any, e
 		"summary":         summary,
 		"checked_at":      time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	if _, err := writeContractReport(inputs.ProjectPath, string(PhaseTemplateFillValidate), contract); err != nil {
+	if _, err := writeTemplateFillContractReport(inputs.ProjectPath, PhaseTemplateFillValidate, contract); err != nil {
 		return nil, fmt.Errorf("write template fill validate contract: %w", err)
 	}
 	return contract, nil
@@ -358,6 +358,75 @@ func templateFillSummary(report map[string]any, label string, fields ...string) 
 		summary[field] = count
 	}
 	return summary, nil
+}
+
+func writeTemplateFillContractReport(projectPath string, phase PipelinePhase, contract map[string]any) (string, error) {
+	canonicalProjectPath, err := resolveTemplateFillProjectPath(projectPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve template fill contract report project: %w", err)
+	}
+	reportName := string(phase)
+	if reportName == "" || filepath.Base(reportName) != reportName || reportName == "." || reportName == ".." {
+		return "", fmt.Errorf("invalid template fill contract report name: %q", reportName)
+	}
+	reportPath := filepath.Join(canonicalProjectPath, ".slidesmith", "contracts", reportName+".json")
+	if !pathWithinRoot(canonicalProjectPath, reportPath) {
+		return "", fmt.Errorf("template fill contract report path is outside project: %s", reportPath)
+	}
+	if err := prepareTemplateFillContractReportPath(canonicalProjectPath, reportPath); err != nil {
+		return "", err
+	}
+	return writeContractReport(canonicalProjectPath, reportName, contract)
+}
+
+func prepareTemplateFillContractReportPath(projectPath, reportPath string) error {
+	relativePath, err := filepath.Rel(projectPath, reportPath)
+	if err != nil || filepath.IsAbs(relativePath) || relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("template fill contract report path is outside project: %s", reportPath)
+	}
+
+	currentPath := projectPath
+	parentPath := filepath.Dir(relativePath)
+	for _, component := range strings.Split(parentPath, string(filepath.Separator)) {
+		if component == "" || component == "." {
+			continue
+		}
+		if component == ".." {
+			return fmt.Errorf("template fill contract report parent is outside project: %s", reportPath)
+		}
+		currentPath = filepath.Join(currentPath, component)
+		info, err := os.Lstat(currentPath)
+		if os.IsNotExist(err) {
+			if err := os.Mkdir(currentPath, 0o755); err != nil && !os.IsExist(err) {
+				return fmt.Errorf("create template fill contract report parent %s: %w", currentPath, err)
+			}
+			info, err = os.Lstat(currentPath)
+		}
+		if err != nil {
+			return fmt.Errorf("inspect template fill contract report parent %s: %w", currentPath, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("template fill contract report parent contains symlink: %s", currentPath)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("template fill contract report parent is not a directory: %s", currentPath)
+		}
+	}
+
+	info, err := os.Lstat(reportPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect template fill contract report destination %s: %w", reportPath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("template fill contract report destination is a symlink: %s", reportPath)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("template fill contract report destination is not a regular file: %s", reportPath)
+	}
+	return nil
 }
 
 func rejectTemplateFillMainRouteOutputs(projectPath string) error {

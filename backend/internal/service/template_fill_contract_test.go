@@ -85,6 +85,24 @@ func TestValidateTemplateFillPlanContractReportsMissingAndCorruptJSON(t *testing
 			},
 			want: "parse template fill slide library",
 		},
+		{
+			name: "slide library trailing JSON",
+			arrange: func(t *testing.T, projectPath string) {
+				t.Helper()
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+				mustWriteFileNoTest(projectPath, filepath.Join("analysis", "brand.slide_library.json"), `{"slides":[{"slide_index":1}]}`+"\n{}\n")
+			},
+			want: "multiple JSON values",
+		},
+		{
+			name: "slide library non-object JSON",
+			arrange: func(t *testing.T, projectPath string) {
+				t.Helper()
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+				mustWriteFileNoTest(projectPath, filepath.Join("analysis", "brand.slide_library.json"), "[]\n")
+			},
+			want: "JSON object",
+		},
 	}
 
 	for _, test := range tests {
@@ -361,6 +379,11 @@ func TestValidateTemplateFillCheckContractWritesContract(t *testing.T) {
 }
 
 func TestValidateTemplateFillCheckContractReportsMissingAndCorruptJSON(t *testing.T) {
+	validReport := `{
+  "schema": "template_fill_pptx_check.v1",
+  "summary": {"ok": 1, "warn": 0, "error": 0},
+  "results": []
+}`
 	tests := []struct {
 		name    string
 		content string
@@ -368,6 +391,8 @@ func TestValidateTemplateFillCheckContractReportsMissingAndCorruptJSON(t *testin
 	}{
 		{name: "missing", want: "read template fill check report"},
 		{name: "corrupt", content: "{\n", want: "parse template fill check report"},
+		{name: "trailing JSON", content: validReport + "\n{}\n", want: "multiple JSON values"},
+		{name: "non-object JSON", content: "[]\n", want: "JSON object"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -532,6 +557,11 @@ func TestValidateTemplateFillValidateContractWritesContract(t *testing.T) {
 }
 
 func TestValidateTemplateFillValidateContractReportsMissingAndCorruptJSON(t *testing.T) {
+	validReport := `{
+  "schema": "template_fill_pptx_validate.v1",
+  "summary": {"ok": 1, "warn": 0, "error": 0},
+  "results": []
+}`
 	tests := []struct {
 		name    string
 		content string
@@ -539,6 +569,8 @@ func TestValidateTemplateFillValidateContractReportsMissingAndCorruptJSON(t *tes
 	}{
 		{name: "missing", want: "read template fill validate report"},
 		{name: "corrupt", content: "{\n", want: "parse template fill validate report"},
+		{name: "trailing JSON", content: validReport + "\n{}\n", want: "multiple JSON values"},
+		{name: "non-object JSON", content: "[]\n", want: "JSON object"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -609,6 +641,58 @@ func TestValidateTemplateFillValidateContractRequiresValidReportReadbackAndNoErr
 	}
 }
 
+func TestValidateTemplateFillValidateContractRequiresStrictSummaryCounts(t *testing.T) {
+	invalidValues := []struct {
+		name   string
+		mutate func(summary map[string]any, field string)
+	}{
+		{
+			name: "missing",
+			mutate: func(summary map[string]any, field string) {
+				delete(summary, field)
+			},
+		},
+		{
+			name: "string",
+			mutate: func(summary map[string]any, field string) {
+				summary[field] = "0"
+			},
+		},
+		{
+			name: "fractional",
+			mutate: func(summary map[string]any, field string) {
+				summary[field] = 0.5
+			},
+		},
+		{
+			name: "negative",
+			mutate: func(summary map[string]any, field string) {
+				summary[field] = -1
+			},
+		},
+	}
+	for _, field := range []string{"ok", "warn", "error"} {
+		for _, invalid := range invalidValues {
+			t.Run(field+"/"+invalid.name, func(t *testing.T) {
+				projectPath := templateFillContractProject(t)
+				summary := map[string]any{"ok": 1, "warn": 0, "error": 0}
+				invalid.mutate(summary, field)
+				report := map[string]any{
+					"schema":  "template_fill_pptx_validate.v1",
+					"summary": summary,
+					"results": []any{},
+				}
+				mustWriteTemplateFillContractJSON(t, projectPath, filepath.Join("validation", "validate_report.json"), report)
+				mustWriteFileNoTest(projectPath, filepath.Join("validation", "readback.md"), "## Slide 1\n")
+
+				_, err := validateTemplateFillValidateContract(projectPath)
+				requireTemplateFillContractError(t, err, "summary."+field)
+				requireTemplateFillPathNotExists(t, filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_validate.json"))
+			})
+		}
+	}
+}
+
 func TestValidateTemplateFillCheckAndValidateContractsRejectMainRouteOutputs(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -661,6 +745,183 @@ func TestValidateTemplateFillCheckAndValidateContractsRejectMainRouteOutputs(t *
 			err := test.validate(projectPath)
 			requireTemplateFillContractError(t, err, filepath.Base(test.relativePath))
 		})
+	}
+}
+
+func TestValidateTemplateFillContractsRejectUnsafeReportPaths(t *testing.T) {
+	for _, contractCase := range templateFillContractValidationCases() {
+		t.Run(contractCase.name+"/contracts symlink", func(t *testing.T) {
+			projectPath := templateFillContractProject(t)
+			contractCase.prepare(t, projectPath)
+			outsidePath := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(projectPath, ".slidesmith"), 0o755); err != nil {
+				t.Fatalf("mkdir .slidesmith: %v", err)
+			}
+			if err := os.Symlink(outsidePath, filepath.Join(projectPath, ".slidesmith", "contracts")); err != nil {
+				t.Fatalf("symlink contracts directory: %v", err)
+			}
+
+			err := contractCase.validate(projectPath)
+			requireTemplateFillContractError(t, err, "contract report")
+			requireTemplateFillPathNotExists(t, filepath.Join(outsidePath, string(contractCase.phase)+".json"))
+		})
+
+		t.Run(contractCase.name+"/destination symlink", func(t *testing.T) {
+			projectPath := templateFillContractProject(t)
+			contractCase.prepare(t, projectPath)
+			contractsPath := filepath.Join(projectPath, ".slidesmith", "contracts")
+			if err := os.MkdirAll(contractsPath, 0o755); err != nil {
+				t.Fatalf("mkdir contracts: %v", err)
+			}
+			outsidePath := t.TempDir()
+			outsideReport := filepath.Join(outsidePath, "outside.json")
+			mustWriteFileNoTest(outsidePath, "outside.json", "sentinel\n")
+			reportPath := filepath.Join(contractsPath, string(contractCase.phase)+".json")
+			if err := os.Symlink(outsideReport, reportPath); err != nil {
+				t.Fatalf("symlink contract report: %v", err)
+			}
+
+			err := contractCase.validate(projectPath)
+			requireTemplateFillContractError(t, err, "contract report")
+			raw, readErr := os.ReadFile(outsideReport)
+			if readErr != nil {
+				t.Fatalf("read outside report: %v", readErr)
+			}
+			if string(raw) != "sentinel\n" {
+				t.Fatalf("outside report was overwritten through destination symlink: %q", raw)
+			}
+		})
+	}
+}
+
+func TestValidateTemplateFillContractsDoNotWriteSuccessReportOnValidationFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		phase    PipelinePhase
+		arrange  func(t *testing.T, projectPath string)
+		validate func(projectPath string) error
+	}{
+		{
+			name:  "plan",
+			phase: PhaseTemplateFillPlan,
+			arrange: func(t *testing.T, projectPath string) {
+				plan := templateFillContractPlan("draft", 1)
+				plan["schema"] = "template_fill_pptx_plan.v0"
+				mustWriteTemplateFillContractJSON(t, projectPath, filepath.Join("analysis", "fill_plan.json"), plan)
+			},
+			validate: func(projectPath string) error {
+				_, err := validateTemplateFillPlanContract(projectPath)
+				return err
+			},
+		},
+		{
+			name:  "check",
+			phase: PhaseTemplateFillCheck,
+			arrange: func(t *testing.T, projectPath string) {
+				report := map[string]any{
+					"schema":  "template_fill_pptx_check.v1",
+					"summary": map[string]any{"ok": 1, "warn": "0", "error": 0},
+					"results": []any{},
+				}
+				mustWriteTemplateFillContractJSON(t, projectPath, filepath.Join("analysis", "check_report.json"), report)
+			},
+			validate: func(projectPath string) error {
+				_, err := validateTemplateFillCheckContract(projectPath, false)
+				return err
+			},
+		},
+		{
+			name:  "apply",
+			phase: PhaseTemplateFillApply,
+			arrange: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+				mustWritePPTXNoTest(projectPath, filepath.Join("exports", "result.pptx"), 1)
+			},
+			validate: func(projectPath string) error {
+				_, err := validateTemplateFillApplyContract(projectPath)
+				return err
+			},
+		},
+		{
+			name:  "validate",
+			phase: PhaseTemplateFillValidate,
+			arrange: func(t *testing.T, projectPath string) {
+				report := map[string]any{
+					"schema":  "template_fill_pptx_validate.v1",
+					"summary": map[string]any{"ok": 0, "warn": 0, "error": 1},
+					"results": []any{},
+				}
+				mustWriteTemplateFillContractJSON(t, projectPath, filepath.Join("validation", "validate_report.json"), report)
+				mustWriteFileNoTest(projectPath, filepath.Join("validation", "readback.md"), "## Slide 1\n")
+			},
+			validate: func(projectPath string) error {
+				_, err := validateTemplateFillValidateContract(projectPath)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projectPath := templateFillContractProject(t)
+			test.arrange(t, projectPath)
+			if err := test.validate(projectPath); err == nil {
+				t.Fatalf("validation error = nil")
+			}
+			requireTemplateFillPathNotExists(t, filepath.Join(projectPath, ".slidesmith", "contracts", string(test.phase)+".json"))
+		})
+	}
+}
+
+type templateFillContractValidationCase struct {
+	name     string
+	phase    PipelinePhase
+	prepare  func(t *testing.T, projectPath string)
+	validate func(projectPath string) error
+}
+
+func templateFillContractValidationCases() []templateFillContractValidationCase {
+	return []templateFillContractValidationCase{
+		{
+			name:  "plan",
+			phase: PhaseTemplateFillPlan,
+			prepare: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+			},
+			validate: func(projectPath string) error {
+				_, err := validateTemplateFillPlanContract(projectPath)
+				return err
+			},
+		},
+		{
+			name:    "check",
+			phase:   PhaseTemplateFillCheck,
+			prepare: prepareTemplateFillCheckContractReport,
+			validate: func(projectPath string) error {
+				_, err := validateTemplateFillCheckContract(projectPath, false)
+				return err
+			},
+		},
+		{
+			name:  "apply",
+			phase: PhaseTemplateFillApply,
+			prepare: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
+				mustWritePPTXNoTest(projectPath, filepath.Join("exports", "result.pptx"), 1)
+			},
+			validate: func(projectPath string) error {
+				_, err := validateTemplateFillApplyContract(projectPath)
+				return err
+			},
+		},
+		{
+			name:    "validate",
+			phase:   PhaseTemplateFillValidate,
+			prepare: prepareTemplateFillValidateContractReport,
+			validate: func(projectPath string) error {
+				_, err := validateTemplateFillValidateContract(projectPath)
+				return err
+			},
+		},
 	}
 }
 
@@ -765,6 +1026,16 @@ func requireFileExists(t *testing.T, path string) {
 	}
 	if !info.Mode().IsRegular() {
 		t.Fatalf("%s is not a regular file", path)
+	}
+}
+
+func requireTemplateFillPathNotExists(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		if err != nil {
+			t.Fatalf("lstat %s: %v", path, err)
+		}
+		t.Fatalf("path exists unexpectedly: %s", path)
 	}
 }
 
