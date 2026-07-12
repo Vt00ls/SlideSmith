@@ -203,10 +203,11 @@ func resolveTemplateFillProjectPath(projectPath string) (string, error) {
 	if !info.IsDir() {
 		return "", fmt.Errorf("template fill project path must be a directory: %s", absolutePath)
 	}
-	if _, err := filepath.EvalSymlinks(absolutePath); err != nil {
+	resolvedPath, err := filepath.EvalSymlinks(absolutePath)
+	if err != nil {
 		return "", fmt.Errorf("resolve template fill project path: %w", err)
 	}
-	return filepath.Clean(absolutePath), nil
+	return filepath.Clean(resolvedPath), nil
 }
 
 func templateFillHasExplicitSameStemMarkdown(projectPath, stem string) (bool, error) {

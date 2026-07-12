@@ -19,16 +19,17 @@ func TestDiscoverTemplateFillInputsFindsSingleDeckAndContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("discoverTemplateFillInputs() error = %v", err)
 	}
+	canonicalProjectPath := mustCanonicalTemplateFillTestPath(t, projectPath)
 	want := TemplateFillInputs{
-		ProjectPath:    projectPath,
-		SourcePPTX:     filepath.Join(projectPath, "sources", "brand_template.pptx"),
-		SlideLibrary:   filepath.Join(projectPath, "analysis", "brand_template.slide_library.json"),
-		FillPlan:       filepath.Join(projectPath, "analysis", "fill_plan.json"),
-		CheckReport:    filepath.Join(projectPath, "analysis", "check_report.json"),
-		ValidateReport: filepath.Join(projectPath, "validation", "validate_report.json"),
-		Readback:       filepath.Join(projectPath, "validation", "readback.md"),
-		ExportBase:     filepath.Join(projectPath, "exports", filepath.Base(projectPath)+"_template_fill.pptx"),
-		ContentSources: []string{filepath.Join(projectPath, "sources", "content.md")},
+		ProjectPath:    canonicalProjectPath,
+		SourcePPTX:     filepath.Join(canonicalProjectPath, "sources", "brand_template.pptx"),
+		SlideLibrary:   filepath.Join(canonicalProjectPath, "analysis", "brand_template.slide_library.json"),
+		FillPlan:       filepath.Join(canonicalProjectPath, "analysis", "fill_plan.json"),
+		CheckReport:    filepath.Join(canonicalProjectPath, "analysis", "check_report.json"),
+		ValidateReport: filepath.Join(canonicalProjectPath, "validation", "validate_report.json"),
+		Readback:       filepath.Join(canonicalProjectPath, "validation", "readback.md"),
+		ExportBase:     filepath.Join(canonicalProjectPath, "exports", filepath.Base(canonicalProjectPath)+"_template_fill.pptx"),
+		ContentSources: []string{filepath.Join(canonicalProjectPath, "sources", "content.md")},
 	}
 	if !reflect.DeepEqual(inputs, want) {
 		t.Fatalf("inputs = %#v, want %#v", inputs, want)
@@ -47,10 +48,11 @@ func TestDiscoverTemplateFillInputsSortsReadableContentCaseInsensitively(t *test
 	if err != nil {
 		t.Fatalf("discoverTemplateFillInputs() error = %v", err)
 	}
+	canonicalProjectPath := mustCanonicalTemplateFillTestPath(t, projectPath)
 	want := []string{
-		filepath.Join(projectPath, "sources", "alpha.markdown"),
-		filepath.Join(projectPath, "sources", "middle.TEXT"),
-		filepath.Join(projectPath, "sources", "zeta.TSV"),
+		filepath.Join(canonicalProjectPath, "sources", "alpha.markdown"),
+		filepath.Join(canonicalProjectPath, "sources", "middle.TEXT"),
+		filepath.Join(canonicalProjectPath, "sources", "zeta.TSV"),
 	}
 	if !reflect.DeepEqual(inputs.ContentSources, want) {
 		t.Fatalf("ContentSources = %#v, want %#v", inputs.ContentSources, want)
@@ -75,9 +77,45 @@ func TestDiscoverTemplateFillInputsPreservesExplicitSameStemMarkdown(t *testing.
 	if err != nil {
 		t.Fatalf("discoverTemplateFillInputs() error = %v", err)
 	}
-	want := []string{filepath.Join(projectPath, "sources", "brand.md")}
+	canonicalProjectPath := mustCanonicalTemplateFillTestPath(t, projectPath)
+	want := []string{filepath.Join(canonicalProjectPath, "sources", "brand.md")}
 	if !reflect.DeepEqual(inputs.ContentSources, want) {
 		t.Fatalf("ContentSources = %#v, want explicitly uploaded same-stem Markdown %#v", inputs.ContentSources, want)
+	}
+}
+
+func TestDiscoverTemplateFillInputsCanonicalizesIntermediateProjectSymlink(t *testing.T) {
+	realWorkspacePath := t.TempDir()
+	realProjectPath := filepath.Join(realWorkspacePath, "projects", "brand_project")
+	mustWriteFileNoTest(realProjectPath, filepath.Join("sources", "brand.pptx"), "pptx")
+	mustWriteFileNoTest(realProjectPath, filepath.Join("sources", "content.md"), "# Content\n")
+	mustWriteFileNoTest(realProjectPath, filepath.Join("analysis", "brand.slide_library.json"), `{"slides":[]}`+"\n")
+
+	aliasRoot := t.TempDir()
+	aliasWorkspacePath := filepath.Join(aliasRoot, "workspace-alias")
+	if err := os.Symlink(realWorkspacePath, aliasWorkspacePath); err != nil {
+		t.Fatal(err)
+	}
+	aliasedProjectPath := filepath.Join(aliasWorkspacePath, "projects", "brand_project")
+
+	inputs, err := discoverTemplateFillInputs(aliasedProjectPath)
+	if err != nil {
+		t.Fatalf("discoverTemplateFillInputs() error = %v", err)
+	}
+	canonicalProjectPath := mustCanonicalTemplateFillTestPath(t, realProjectPath)
+	want := TemplateFillInputs{
+		ProjectPath:    canonicalProjectPath,
+		SourcePPTX:     filepath.Join(canonicalProjectPath, "sources", "brand.pptx"),
+		SlideLibrary:   filepath.Join(canonicalProjectPath, "analysis", "brand.slide_library.json"),
+		FillPlan:       filepath.Join(canonicalProjectPath, "analysis", "fill_plan.json"),
+		CheckReport:    filepath.Join(canonicalProjectPath, "analysis", "check_report.json"),
+		ValidateReport: filepath.Join(canonicalProjectPath, "validation", "validate_report.json"),
+		Readback:       filepath.Join(canonicalProjectPath, "validation", "readback.md"),
+		ExportBase:     filepath.Join(canonicalProjectPath, "exports", "brand_project_template_fill.pptx"),
+		ContentSources: []string{filepath.Join(canonicalProjectPath, "sources", "content.md")},
+	}
+	if !reflect.DeepEqual(inputs, want) {
+		t.Fatalf("inputs = %#v, want canonical paths %#v", inputs, want)
 	}
 }
 
@@ -129,8 +167,12 @@ func TestDiscoverTemplateFillInputsRejectsOtherPresentationFormats(t *testing.T)
 		files []string
 		count string
 	}{
-		{name: "non pptx presentation", files: []string{"template.PPTM"}, count: "found 1"},
-		{name: "pptx beside non pptx presentation", files: []string{"a.pptx", "b.potx"}, count: "found 2"},
+		{name: "pptm", files: []string{"template.PPTM"}, count: "found 1"},
+		{name: "ppsx", files: []string{"template.ppsx"}, count: "found 1"},
+		{name: "ppsm", files: []string{"template.PPSM"}, count: "found 1"},
+		{name: "potx", files: []string{"template.potx"}, count: "found 1"},
+		{name: "potm", files: []string{"template.POTM"}, count: "found 1"},
+		{name: "pptx beside non pptx presentation", files: []string{"a.pptx", "b.potm"}, count: "found 2"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -274,4 +316,13 @@ func TestDiscoverTemplateFillInputsRejectsSymlinkedOutputPaths(t *testing.T) {
 			}
 		})
 	}
+}
+
+func mustCanonicalTemplateFillTestPath(t *testing.T, path string) string {
+	t.Helper()
+	canonicalPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("EvalSymlinks(%q) error = %v", path, err)
+	}
+	return canonicalPath
 }
