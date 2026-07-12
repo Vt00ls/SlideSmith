@@ -50,6 +50,8 @@ EVENTS_PATH = STATE_DIR / "events.ndjson"
 STATUS_PATH = STATE_DIR / "status.json"
 ARTIFACTS_PATH = STATE_DIR / "artifacts.json"
 TEXT_SOURCE_SUFFIXES = {".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml"}
+PRESENTATION_SOURCE_SUFFIXES = {".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm"}
+TEMPLATE_FILL_CONTENT_SOURCE_SUFFIXES = {".md", ".markdown", ".txt", ".text", ".csv", ".tsv"}
 
 PRESENTATION_MAIN_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
 MACRO_PRESENTATION_MAIN_CONTENT_TYPE = "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml"
@@ -206,6 +208,167 @@ def project_path_from_args(args: argparse.Namespace) -> Path:
     if matches:
         return matches[0].resolve()
     return direct.resolve()
+
+
+def _contained_relative_path(root: Path, path: Path, label: str) -> Path:
+    try:
+        return path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} is outside project: {path}") from exc
+
+
+def _reject_symlink_components(root: Path, path: Path, label: str) -> None:
+    relative = _contained_relative_path(root, path, label)
+    current = root
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError(f"{label} must be regular and non-symlinked: {relative.as_posix()}")
+
+
+def _require_template_fill_regular_file(
+    project_path: Path,
+    path: Path,
+    label: str,
+    *,
+    nonempty: bool = False,
+) -> None:
+    relative = _contained_relative_path(project_path, path, label)
+    _reject_symlink_components(project_path, path, label)
+    if not path.is_file():
+        raise ValueError(f"{label} must be a non-empty regular file: {relative.as_posix()}" if nonempty else f"{label} must be a regular file: {relative.as_posix()}")
+    if nonempty and path.stat().st_size == 0:
+        raise ValueError(f"{label} must be a non-empty regular file: {relative.as_posix()}")
+
+
+def _validate_template_fill_output_path(project_path: Path, path: Path) -> None:
+    relative = _contained_relative_path(project_path, path, "template fill output path")
+    _reject_symlink_components(project_path, path, "template fill output path")
+    current = project_path
+    for component in relative.parts[:-1]:
+        current = current / component
+        if not current.exists():
+            return
+        if not current.is_dir():
+            raise ValueError(f"template fill output parent must be a directory: {relative.as_posix()}")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"template fill output path must be a regular file: {relative.as_posix()}")
+
+
+def _template_fill_has_explicit_same_stem_markdown(project_path: Path, stem: str) -> bool:
+    manifest_paths: list[tuple[Path, Path]] = [(project_path, project_path / ".slidesmith" / "source_inputs.json")]
+    projects_dir = project_path.parent
+    if projects_dir.name == "projects":
+        workspace = projects_dir.parent
+        manifest_paths.insert(0, (workspace, workspace / ".slidesmith" / "source_inputs.json"))
+
+    for permitted_root, manifest_path in manifest_paths:
+        _reject_symlink_components(permitted_root, manifest_path, "template fill source inputs manifest")
+        if not manifest_path.exists():
+            continue
+        if not manifest_path.is_file():
+            raise ValueError(f"template fill source inputs manifest must be a regular non-symlinked file: {manifest_path}")
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"parse template fill source inputs manifest: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("template fill source inputs manifest must be a JSON object")
+        if payload.get("schema") != "slidesmith.source_inputs.v1":
+            raise ValueError(f"unsupported template fill source inputs manifest schema: {payload.get('schema')!r}")
+        files = payload.get("files", [])
+        if not isinstance(files, list):
+            raise ValueError("template fill source inputs manifest files must be a list")
+        for index, entry in enumerate(files):
+            if not isinstance(entry, dict):
+                raise ValueError(f"template fill source inputs manifest files[{index}] must be an object")
+            manifest_names: list[str] = []
+            for field in ("name", "upload_path"):
+                value = entry.get(field, "")
+                if not isinstance(value, str):
+                    raise ValueError(f"template fill source inputs manifest files[{index}].{field} must be a string")
+                manifest_names.append(Path(value.replace("\\", "/")).name.strip())
+            for name in manifest_names:
+                if name.lower().endswith(".md") and Path(name).stem.casefold() == stem.casefold():
+                    return True
+        return False
+    return False
+
+
+def discover_template_fill_inputs(project_path: Path) -> dict[str, Any]:
+    requested_path = Path(project_path).expanduser()
+    absolute_path = Path(os.path.abspath(requested_path))
+    if absolute_path.is_symlink():
+        raise ValueError(f"template fill project path must be non-symlinked: {absolute_path}")
+    if not absolute_path.exists():
+        raise FileNotFoundError(f"template fill project path not found: {absolute_path}")
+    if not absolute_path.is_dir():
+        raise ValueError(f"template fill project path must be a directory: {absolute_path}")
+    project_path = absolute_path.resolve()
+
+    sources_path = project_path / "sources"
+    _reject_symlink_components(project_path, sources_path, "template fill sources directory")
+    if not sources_path.is_dir():
+        raise ValueError("template fill requires sources directory: sources")
+    try:
+        entries = sorted(sources_path.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise ValueError(f"read template fill sources directory: {exc}") from exc
+
+    presentations: list[Path] = []
+    for entry in entries:
+        if entry.suffix.lower() not in PRESENTATION_SOURCE_SUFFIXES:
+            continue
+        _require_template_fill_regular_file(project_path, entry, "template fill presentation input")
+        presentations.append(entry)
+    if len(presentations) != 1 or presentations[0].suffix.lower() != ".pptx":
+        relative_paths = sorted(path.relative_to(project_path).as_posix() for path in presentations)
+        message = f"template fill requires exactly one source PPTX, found {len(presentations)} presentation files"
+        if relative_paths:
+            message += ": " + ", ".join(relative_paths)
+        raise ValueError(message)
+
+    source_pptx = presentations[0]
+    slide_library = project_path / "analysis" / f"{source_pptx.stem}.slide_library.json"
+    try:
+        _require_template_fill_regular_file(
+            project_path,
+            slide_library,
+            "template fill requires slide library",
+            nonempty=True,
+        )
+    except ValueError as exc:
+        relative = slide_library.relative_to(project_path).as_posix()
+        raise ValueError(f"template fill requires slide library: {relative}: {exc}") from exc
+
+    explicit_same_stem_markdown = _template_fill_has_explicit_same_stem_markdown(project_path, source_pptx.stem)
+    content_sources: list[Path] = []
+    for entry in entries:
+        extension = entry.suffix.lower()
+        if extension not in TEMPLATE_FILL_CONTENT_SOURCE_SUFFIXES:
+            continue
+        if extension == ".md" and entry.stem.casefold() == source_pptx.stem.casefold() and not explicit_same_stem_markdown:
+            continue
+        _require_template_fill_regular_file(project_path, entry, "template fill content source")
+        content_sources.append(entry)
+    content_sources.sort(key=lambda path: str(path))
+    if not content_sources:
+        raise ValueError("template fill requires content source beside template PPTX")
+
+    inputs: dict[str, Any] = {
+        "project_path": project_path,
+        "source_pptx": source_pptx,
+        "slide_library": slide_library,
+        "fill_plan": project_path / "analysis" / "fill_plan.json",
+        "check_report": project_path / "analysis" / "check_report.json",
+        "validate_report": project_path / "validation" / "validate_report.json",
+        "readback": project_path / "validation" / "readback.md",
+        "export_base": project_path / "exports" / f"{project_path.name}_template_fill.pptx",
+        "content_sources": content_sources,
+    }
+    for key in ("fill_plan", "check_report", "validate_report", "readback", "export_base"):
+        _validate_template_fill_output_path(project_path, inputs[key])
+    return inputs
 
 
 def load_source_manifest(path: Path) -> list[Path]:
@@ -1296,6 +1459,218 @@ def escape_xml(value: str) -> str:
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _template_fill_project_path(args: argparse.Namespace) -> Path:
+    value = str(getattr(args, "project_path", "") or "").strip()
+    if not value:
+        raise ValueError("--project-path is required")
+    return Path(value).expanduser()
+
+
+def _read_template_fill_report(
+    project_path: Path,
+    path: Path,
+    expected_schema: str,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    try:
+        _require_template_fill_regular_file(project_path, path, label, nonempty=True)
+    except ValueError as exc:
+        raise RuntimeError(f"{label} was not newly produced: {exc}") from exc
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"parse {label}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} root must be a JSON object")
+    if payload.get("schema") != expected_schema:
+        raise ValueError(f"{label} schema = {payload.get('schema')!r}, expected {expected_schema!r}")
+    raw_summary = payload.get("summary")
+    if not isinstance(raw_summary, dict):
+        raise ValueError(f"{label} summary must be an object")
+    summary: dict[str, int] = {}
+    for field in ("ok", "warn", "error"):
+        value = raw_summary.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{label} summary.{field} must be a non-negative integer")
+        summary[field] = value
+    return payload, summary
+
+
+def _template_fill_failure(command: str, completed: subprocess.CompletedProcess[str]) -> RuntimeError:
+    details = (completed.stderr or completed.stdout or "").strip()
+    suffix = f": {details}" if details else ""
+    return RuntimeError(f"template fill {command} failed with exit {completed.returncode}{suffix}")
+
+
+def template_fill_check(args: argparse.Namespace) -> dict[str, int]:
+    inputs = discover_template_fill_inputs(_template_fill_project_path(args))
+    project_path = inputs["project_path"]
+    check_report = inputs["check_report"]
+    set_status("template_fill_checking", project_path=str(project_path))
+    check_report.unlink(missing_ok=True)
+
+    completed = run_command(
+        [
+            "python3",
+            str(script_path("template_fill_pptx.py")),
+            "check-plan",
+            str(inputs["slide_library"]),
+            str(inputs["fill_plan"]),
+            "-o",
+            str(check_report),
+        ],
+        check=False,
+    )
+    _, summary = _read_template_fill_report(
+        project_path,
+        check_report,
+        "template_fill_pptx_check.v1",
+        "template fill check report",
+    )
+    if completed.returncode not in (0, 1):
+        raise _template_fill_failure("check", completed)
+
+    summary_text = f"ok={summary['ok']} warn={summary['warn']} error={summary['error']}"
+    emit_event(
+        "template_fill_check",
+        "Template fill check completed",
+        summary_text,
+        "warning" if summary["error"] else "completed",
+        {"summary": summary, "exit_code": completed.returncode, "check_report": str(check_report)},
+    )
+    set_status(
+        "template_fill_checking",
+        "completed",
+        project_path=str(project_path),
+        check_report=str(check_report),
+        summary=summary,
+    )
+    return summary
+
+
+def _timestamped_template_fill_export_pattern(export_base: Path) -> re.Pattern[str]:
+    return re.compile(rf"^{re.escape(export_base.stem)}_\d{{8}}_\d{{6}}\.pptx$")
+
+
+def _matching_template_fill_export_names(export_base: Path) -> set[str]:
+    exports_dir = export_base.parent
+    if not exports_dir.exists():
+        return set()
+    pattern = _timestamped_template_fill_export_pattern(export_base)
+    return {path.name for path in exports_dir.iterdir() if pattern.fullmatch(path.name)}
+
+
+def template_fill_apply(args: argparse.Namespace) -> Path:
+    inputs = discover_template_fill_inputs(_template_fill_project_path(args))
+    project_path = inputs["project_path"]
+    export_base = inputs["export_base"]
+    set_status("template_fill_applying", project_path=str(project_path))
+    existing_exports = _matching_template_fill_export_names(export_base)
+    transition = str(getattr(args, "transition", "fade") or "fade")
+
+    completed = run_command(
+        [
+            "python3",
+            str(script_path("template_fill_pptx.py")),
+            "apply",
+            str(inputs["source_pptx"]),
+            str(inputs["fill_plan"]),
+            "-o",
+            str(export_base),
+            "--transition",
+            transition,
+        ],
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise _template_fill_failure("apply", completed)
+
+    pattern = _timestamped_template_fill_export_pattern(export_base)
+    new_exports = [
+        path
+        for path in export_base.parent.iterdir()
+        if path.name not in existing_exports
+        and pattern.fullmatch(path.name)
+        and not path.is_symlink()
+        and path.is_file()
+        and path.stat().st_size > 0
+    ] if export_base.parent.is_dir() else []
+    if not new_exports:
+        raise RuntimeError(f"template fill apply did not produce a new timestamped PPTX for {export_base.name}")
+    export_path = max(new_exports, key=lambda path: path.name)
+    emit_event(
+        "template_fill_apply",
+        "Template fill apply completed",
+        str(export_path),
+        "completed",
+        {"export": str(export_path), "transition": transition},
+    )
+    set_status(
+        "template_fill_applying",
+        "completed",
+        project_path=str(project_path),
+        export=str(export_path),
+    )
+    return export_path
+
+
+def template_fill_validate(args: argparse.Namespace) -> dict[str, int]:
+    inputs = discover_template_fill_inputs(_template_fill_project_path(args))
+    project_path = inputs["project_path"]
+    readback = inputs["readback"]
+    validate_report = inputs["validate_report"]
+    set_status("template_fill_validating", project_path=str(project_path))
+    readback.unlink(missing_ok=True)
+    validate_report.unlink(missing_ok=True)
+
+    completed = run_command(
+        [
+            "python3",
+            str(script_path("template_fill_pptx.py")),
+            "validate",
+            str(project_path),
+        ],
+        check=False,
+    )
+    _, summary = _read_template_fill_report(
+        project_path,
+        validate_report,
+        "template_fill_pptx_validate.v1",
+        "template fill validate report",
+    )
+    try:
+        _require_template_fill_regular_file(
+            project_path,
+            readback,
+            "template fill validation readback",
+            nonempty=True,
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"template fill validation readback was not newly produced: {exc}") from exc
+    if completed.returncode != 0:
+        raise _template_fill_failure("validate", completed)
+    if summary["error"] != 0:
+        raise RuntimeError(f"template fill validate report summary.error = {summary['error']}")
+
+    summary_text = f"ok={summary['ok']} warn={summary['warn']} error={summary['error']}"
+    emit_event(
+        "template_fill_validate",
+        "Template fill validation completed",
+        summary_text,
+        "warning" if summary["warn"] else "completed",
+        {"summary": summary, "validate_report": str(validate_report), "readback": str(readback)},
+    )
+    set_status(
+        "template_fill_validating",
+        "completed",
+        project_path=str(project_path),
+        validate_report=str(validate_report),
+        readback=str(readback),
+        summary=summary,
+    )
+    return summary
+
+
 def publish(args: argparse.Namespace) -> None:
     project_path = project_path_from_args(args)
     publish_project(project_path)
@@ -1317,6 +1692,7 @@ def publish_project(project_path: Path) -> None:
         project_path / "svg_output",
         project_path / "svg_final",
         project_path / "exports",
+        project_path / "validation",
         project_path / "logs",
     ]
     artifacts: list[dict[str, Any]] = []
@@ -1362,6 +1738,16 @@ def build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--project", default="")
     publish_parser.add_argument("--project-path", default="")
 
+    template_fill_check_parser = sub.add_parser("template-fill-check")
+    template_fill_check_parser.add_argument("--project-path", required=True)
+
+    template_fill_apply_parser = sub.add_parser("template-fill-apply")
+    template_fill_apply_parser.add_argument("--project-path", required=True)
+    template_fill_apply_parser.add_argument("--transition", default="fade")
+
+    template_fill_validate_parser = sub.add_parser("template-fill-validate")
+    template_fill_validate_parser.add_argument("--project-path", required=True)
+
     return parser
 
 
@@ -1378,6 +1764,12 @@ def main() -> None:
             generate(args)
         elif args.command == "publish":
             publish(args)
+        elif args.command == "template-fill-check":
+            template_fill_check(args)
+        elif args.command == "template-fill-apply":
+            template_fill_apply(args)
+        elif args.command == "template-fill-validate":
+            template_fill_validate(args)
         else:
             parser.error(f"unsupported command: {args.command}")
     except Exception as exc:
