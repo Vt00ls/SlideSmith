@@ -88,6 +88,8 @@ type Task struct {
 	ErrorMessage            string     `json:"error_message" gorm:"not null;type:text;default:''"`
 	FailurePhase            string     `json:"failure_phase" gorm:"not null;size:128;default:''"`
 	FailureMetadata         string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
+	ExecutionClaimToken     string     `json:"-" gorm:"not null;size:64;default:''"`
+	ExecutionClaimedAt      *time.Time `json:"-"`
 	CreatedAt               time.Time  `json:"created_at" gorm:"not null"`
 	UpdatedAt               time.Time  `json:"updated_at" gorm:"not null"`
 	StartedAt               *time.Time `json:"started_at,omitempty"`

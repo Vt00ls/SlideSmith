@@ -30,6 +30,7 @@ func (s *TaskService) tryRecoverGeneratedRuntimeArtifacts(ctx context.Context, t
 		return false, nil
 	}
 	candidate := candidates[0]
+	expectedStatus := task.Status
 	task.RuntimeWorkspacePath = candidate.WorkspacePath
 	task.LastRuntimeSessionID = candidate.SessionID
 	if run != nil {
@@ -37,7 +38,7 @@ func (s *TaskService) tryRecoverGeneratedRuntimeArtifacts(ctx context.Context, t
 			task.LastRuntimeRunID = run.ExternalRunID
 		}
 	}
-	if err := s.repo.SaveTask(ctx, task); err != nil {
+	if err := s.saveTaskIfCurrent(ctx, task, expectedStatus); err != nil {
 		return true, err
 	}
 	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "recovered", "Recovered generated artifacts from runtime workspace", map[string]any{

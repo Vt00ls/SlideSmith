@@ -1,6 +1,8 @@
 package service
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,11 +40,25 @@ func validateTemplateFillPlanContract(projectPath string) (map[string]any, error
 }
 
 func validateTemplateFillCheckContract(projectPath string, requireNoErrors bool) (map[string]any, error) {
+	return validateTemplateFillCheckContractForPlan(projectPath, requireNoErrors, "", "")
+}
+
+func validateTemplateFillCheckContractForPlan(projectPath string, requireNoErrors bool, expectedStatus, expectedSHA256 string) (map[string]any, error) {
 	inputs, err := discoverTemplateFillInputs(projectPath)
 	if err != nil {
 		return nil, err
 	}
-	report, err := readTemplateFillJSONObject(inputs.CheckReport, "template fill check report")
+	_, _, planStatus, planSHA256, err := readValidatedTemplateFillPlanWithSHA256(inputs.ProjectPath)
+	if err != nil {
+		return nil, err
+	}
+	if expectedStatus != "" && planStatus != expectedStatus {
+		return nil, fmt.Errorf("template fill check plan status = %q, expected %q", planStatus, expectedStatus)
+	}
+	if expectedSHA256 != "" && planSHA256 != expectedSHA256 {
+		return nil, fmt.Errorf("template fill check plan sha256 changed: got %s, expected %s", planSHA256, expectedSHA256)
+	}
+	report, checkReportSHA256, err := readTemplateFillJSONObjectWithSHA256(inputs.CheckReport, "template fill check report")
 	if err != nil {
 		return nil, err
 	}
@@ -61,11 +77,14 @@ func validateTemplateFillCheckContract(projectPath string, requireNoErrors bool)
 	}
 
 	contract := map[string]any{
-		"phase":        string(PhaseTemplateFillCheck),
-		"project_path": inputs.ProjectPath,
-		"check_report": inputs.CheckReport,
-		"summary":      summary,
-		"checked_at":   time.Now().UTC().Format(time.RFC3339Nano),
+		"phase":               string(PhaseTemplateFillCheck),
+		"project_path":        inputs.ProjectPath,
+		"check_report":        inputs.CheckReport,
+		"plan_status":         planStatus,
+		"plan_sha256":         planSHA256,
+		"check_report_sha256": checkReportSHA256,
+		"summary":             summary,
+		"checked_at":          time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if _, err := writeTemplateFillContractReport(inputs.ProjectPath, PhaseTemplateFillCheck, contract); err != nil {
 		return nil, fmt.Errorf("write template fill check contract: %w", err)
@@ -161,105 +180,120 @@ func templateFillExpectedSlideCount(projectPath string) (int, error) {
 }
 
 func readValidatedTemplateFillPlan(projectPath string) (TemplateFillInputs, []any, string, error) {
+	inputs, slides, status, _, err := readValidatedTemplateFillPlanWithSHA256(projectPath)
+	return inputs, slides, status, err
+}
+
+func readValidatedTemplateFillPlanWithSHA256(projectPath string) (TemplateFillInputs, []any, string, string, error) {
 	inputs, err := discoverTemplateFillInputs(projectPath)
 	if err != nil {
-		return TemplateFillInputs{}, nil, "", err
+		return TemplateFillInputs{}, nil, "", "", err
 	}
-	plan, err := readTemplateFillJSONObject(inputs.FillPlan, "template fill plan")
+	plan, planSHA256, err := readTemplateFillJSONObjectWithSHA256(inputs.FillPlan, "template fill plan")
 	if err != nil {
-		return TemplateFillInputs{}, nil, "", err
+		return TemplateFillInputs{}, nil, "", "", err
 	}
 	if schema, ok := plan["schema"].(string); !ok || schema != "template_fill_pptx_plan.v1" {
-		return TemplateFillInputs{}, nil, "", fmt.Errorf("template fill plan schema = %#v, expected %q", plan["schema"], "template_fill_pptx_plan.v1")
+		return TemplateFillInputs{}, nil, "", "", fmt.Errorf("template fill plan schema = %#v, expected %q", plan["schema"], "template_fill_pptx_plan.v1")
 	}
 	status, ok := plan["status"].(string)
 	if !ok || (status != "draft" && status != "confirmed") {
-		return TemplateFillInputs{}, nil, "", fmt.Errorf("template fill plan status = %#v, expected %q or %q", plan["status"], "draft", "confirmed")
+		return TemplateFillInputs{}, nil, "", "", fmt.Errorf("template fill plan status = %#v, expected %q or %q", plan["status"], "draft", "confirmed")
 	}
 	if err := validateTemplateFillSourcePPTX(plan["source_pptx"], inputs); err != nil {
-		return TemplateFillInputs{}, nil, "", err
+		return TemplateFillInputs{}, nil, "", "", err
 	}
 
 	slides, ok := plan["slides"].([]any)
 	if !ok || len(slides) == 0 {
-		return TemplateFillInputs{}, nil, "", fmt.Errorf("template fill plan slides must be a non-empty array")
+		return TemplateFillInputs{}, nil, "", "", fmt.Errorf("template fill plan slides must be a non-empty array")
 	}
 	sourceSlides, err := readTemplateFillSlideIndexes(inputs.SlideLibrary)
 	if err != nil {
-		return TemplateFillInputs{}, nil, "", err
+		return TemplateFillInputs{}, nil, "", "", err
 	}
 	for index, rawSlide := range slides {
 		slide, ok := rawSlide.(map[string]any)
 		if !ok {
-			return TemplateFillInputs{}, nil, "", fmt.Errorf("template fill plan slides[%d] must be an object", index)
+			return TemplateFillInputs{}, nil, "", "", fmt.Errorf("template fill plan slides[%d] must be an object", index)
 		}
 		sourceSlide, err := templateFillPositiveInteger(slide["source_slide"], fmt.Sprintf("template fill plan slides[%d].source_slide", index))
 		if err != nil {
-			return TemplateFillInputs{}, nil, "", err
+			return TemplateFillInputs{}, nil, "", "", err
 		}
 		if _, ok := sourceSlides[sourceSlide]; !ok {
-			return TemplateFillInputs{}, nil, "", fmt.Errorf("template fill plan slides[%d].source_slide %d is not present in slide library", index, sourceSlide)
+			return TemplateFillInputs{}, nil, "", "", fmt.Errorf("template fill plan slides[%d].source_slide %d is not present in slide library", index, sourceSlide)
 		}
 		if err := requireTemplateFillNonEmptyString(slide, "purpose", fmt.Sprintf("template fill plan slides[%d]", index)); err != nil {
-			return TemplateFillInputs{}, nil, "", err
+			return TemplateFillInputs{}, nil, "", "", err
 		}
 		layout, ok := slide["layout_rationale"].(map[string]any)
 		if !ok {
-			return TemplateFillInputs{}, nil, "", fmt.Errorf("template fill plan slides[%d].layout_rationale must be an object", index)
+			return TemplateFillInputs{}, nil, "", "", fmt.Errorf("template fill plan slides[%d].layout_rationale must be an object", index)
 		}
 		for _, field := range []string{"layout_pattern", "why_fit", "risk"} {
 			if err := requireTemplateFillNonEmptyString(layout, field, fmt.Sprintf("template fill plan slides[%d].layout_rationale", index)); err != nil {
-				return TemplateFillInputs{}, nil, "", err
+				return TemplateFillInputs{}, nil, "", "", err
 			}
 		}
 		for _, field := range []string{"replacements", "table_edits", "chart_edits"} {
 			if value, exists := slide[field]; exists {
 				if _, ok := value.([]any); !ok {
-					return TemplateFillInputs{}, nil, "", fmt.Errorf("template fill plan slides[%d].%s must be an array", index, field)
+					return TemplateFillInputs{}, nil, "", "", fmt.Errorf("template fill plan slides[%d].%s must be an array", index, field)
 				}
 			}
 		}
 		if value, exists := slide["notes"]; exists {
 			if _, ok := value.(string); !ok {
-				return TemplateFillInputs{}, nil, "", fmt.Errorf("template fill plan slides[%d].notes must be a string", index)
+				return TemplateFillInputs{}, nil, "", "", fmt.Errorf("template fill plan slides[%d].notes must be a string", index)
 			}
 		}
 	}
-	return inputs, slides, status, nil
+	return inputs, slides, status, planSHA256, nil
 }
 
 func readTemplateFillJSONObject(path, label string) (map[string]any, error) {
+	object, _, err := readTemplateFillJSONObjectWithSHA256(path, label)
+	return object, err
+}
+
+func readTemplateFillJSONObjectWithSHA256(path, label string) (map[string]any, string, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", label, err)
+		return nil, "", fmt.Errorf("read %s: %w", label, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("read %s: path is not a regular non-symlinked file: %s", label, path)
+		return nil, "", fmt.Errorf("read %s: path is not a regular non-symlinked file: %s", label, path)
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", label, err)
+		return nil, "", fmt.Errorf("read %s: %w", label, err)
 	}
 	defer file.Close()
+	raw, err := io.ReadAll(file)
+	if err != nil {
+		return nil, "", fmt.Errorf("read %s: %w", label, err)
+	}
 
-	decoder := json.NewDecoder(file)
+	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var value any
 	if err := decoder.Decode(&value); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", label, err)
+		return nil, "", fmt.Errorf("parse %s: %w", label, err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
-			return nil, fmt.Errorf("parse %s: multiple JSON values", label)
+			return nil, "", fmt.Errorf("parse %s: multiple JSON values", label)
 		}
-		return nil, fmt.Errorf("parse %s: %w", label, err)
+		return nil, "", fmt.Errorf("parse %s: %w", label, err)
 	}
 	object, ok := value.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf("parse %s: root must be a JSON object", label)
+		return nil, "", fmt.Errorf("parse %s: root must be a JSON object", label)
 	}
-	return object, nil
+	digest := sha256.Sum256(raw)
+	return object, fmt.Sprintf("%x", digest), nil
 }
 
 func validateTemplateFillSourcePPTX(value any, inputs TemplateFillInputs) error {

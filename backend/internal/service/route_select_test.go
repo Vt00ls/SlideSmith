@@ -125,6 +125,10 @@ func TestPersistRouteSelectionUpdatesTask(t *testing.T) {
 	service, task := routeSelectTestService(t, "normal markdown task", []model.Artifact{
 		{Name: "input.md", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-1/source/input.md"},
 	})
+	task.Status = model.TaskStatusSourceConverting
+	if err := service.repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
 	selection, err := service.selectRoute(context.Background(), task)
 	if err != nil {
 		t.Fatal(err)

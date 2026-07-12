@@ -290,3 +290,229 @@ func TestCreatePhaseRunIncrementsAttemptsAndListsChronologically(t *testing.T) {
 		t.Fatalf("phase runs should be chronological, got %#v", runs)
 	}
 }
+
+func TestSaveTaskIfStatusUsesCompareAndSwapAndPreservesExecutionClaim(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Task{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	ctx := context.Background()
+
+	task := &model.Task{
+		ID:             "task-cas",
+		Title:          "CAS",
+		Status:         model.TaskStatusTemplateFillChecking,
+		RuntimeProject: "task_cas",
+	}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claimed, err := repo.ClaimTaskExecution(ctx, task.ID, task.Status, "claim-1", now, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatal("initial execution claim was not acquired")
+	}
+
+	loaded, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded.Status = model.TaskStatusTemplateFillApplying
+	loaded.LastRuntimeRunID = "runtime-1"
+	saved, err := repo.SaveTaskIfStatus(ctx, loaded, model.TaskStatusTemplateFillChecking, "claim-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved {
+		t.Fatal("expected-status save did not update task")
+	}
+	persisted, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusTemplateFillApplying || persisted.LastRuntimeRunID != "runtime-1" {
+		t.Fatalf("CAS task fields = %#v", persisted)
+	}
+	if persisted.ExecutionClaimToken != "claim-1" || persisted.ExecutionClaimedAt == nil {
+		t.Fatalf("task CAS cleared durable claim: %#v", persisted)
+	}
+}
+
+func TestSaveTaskIfStatusCannotResurrectCancelledTask(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Task{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	ctx := context.Background()
+	task := &model.Task{
+		ID:             "task-cancel-race",
+		Title:          "Cancel race",
+		Status:         model.TaskStatusTemplateFillApplying,
+		RuntimeProject: "task_cancel_race",
+	}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelledAt := time.Now().UTC()
+	if err := db.Model(&model.Task{}).Where("id = ?", task.ID).Updates(map[string]any{
+		"status":       model.TaskStatusCancelled,
+		"cancelled_at": cancelledAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	stale.LastRuntimeRunID = "late-runtime"
+	saved, err := repo.SaveTaskIfStatus(ctx, stale, model.TaskStatusTemplateFillApplying, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved {
+		t.Fatal("stale expected-status save overwrote cancellation")
+	}
+	persisted, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusCancelled || persisted.LastRuntimeRunID != "" || persisted.CancelledAt == nil {
+		t.Fatalf("cancelled task was resurrected: %#v", persisted)
+	}
+}
+
+func TestSaveTaskIfStatusRejectsWorkerWhoseStaleClaimWasReplaced(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Task{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	ctx := context.Background()
+	task := &model.Task{
+		ID:             "task-fenced-worker",
+		Title:          "Fenced worker",
+		Status:         model.TaskStatusTemplateFillApplying,
+		RuntimeProject: "task_fenced_worker",
+	}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	oldClaimedAt := now.Add(-2 * time.Hour)
+	claimed, err := repo.ClaimTaskExecution(ctx, task.ID, task.Status, "old-token", oldClaimedAt, oldClaimedAt.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("old claim = %v, error = %v", claimed, err)
+	}
+	staleWorker, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = repo.ClaimTaskExecution(ctx, task.ID, task.Status, "new-token", now, now.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("new claim = %v, error = %v", claimed, err)
+	}
+	staleWorker.LastRuntimeRunID = "late-old-worker-result"
+	saved, err := repo.SaveTaskIfStatus(ctx, staleWorker, task.Status, "old-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved {
+		t.Fatal("old worker persisted after its claim was fenced")
+	}
+	persisted, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ExecutionClaimToken != "new-token" || persisted.LastRuntimeRunID != "" {
+		t.Fatalf("stale worker changed task after takeover: %#v", persisted)
+	}
+	released, err := repo.ReleaseTaskExecution(ctx, task.ID, "old-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released {
+		t.Fatal("old worker released successor's claim")
+	}
+	persisted, err = repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ExecutionClaimToken != "new-token" {
+		t.Fatalf("successor claim was cleared by old worker: %#v", persisted)
+	}
+}
+
+func TestTaskExecutionClaimIsExclusiveReleasableAndStaleRecoverable(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Task{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	ctx := context.Background()
+	task := &model.Task{
+		ID:             "task-lease",
+		Title:          "Lease",
+		Status:         model.TaskStatusTemplateFillPlanning,
+		RuntimeProject: "task_lease",
+	}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	claimed, err := repo.ClaimTaskExecution(ctx, task.ID, task.Status, "claim-1", now, now.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("claim-1 = %v, error = %v", claimed, err)
+	}
+	claimed, err = repo.ClaimTaskExecution(ctx, task.ID, task.Status, "claim-2", now.Add(time.Minute), now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed {
+		t.Fatal("second worker acquired a live claim")
+	}
+	released, err := repo.ReleaseTaskExecution(ctx, task.ID, "claim-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released {
+		t.Fatal("non-owner release cleared another worker's claim")
+	}
+	released, err = repo.ReleaseTaskExecution(ctx, task.ID, "claim-1")
+	if err != nil || !released {
+		t.Fatalf("owner release = %v, error = %v", released, err)
+	}
+
+	oldClaimedAt := now.Add(-2 * time.Hour)
+	claimed, err = repo.ClaimTaskExecution(ctx, task.ID, task.Status, "stale-claim", oldClaimedAt, oldClaimedAt.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("stale initial claim = %v, error = %v", claimed, err)
+	}
+	claimed, err = repo.ClaimTaskExecution(ctx, task.ID, task.Status, "recovered-claim", now, now.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("stale recovery claim = %v, error = %v", claimed, err)
+	}
+	persisted, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ExecutionClaimToken != "recovered-claim" || persisted.ExecutionClaimedAt == nil || !persisted.ExecutionClaimedAt.Equal(now) {
+		t.Fatalf("recovered claim = %#v", persisted)
+	}
+}

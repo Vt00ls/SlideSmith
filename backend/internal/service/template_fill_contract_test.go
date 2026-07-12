@@ -1,6 +1,7 @@
 package service
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,27 @@ import (
 	"testing"
 	"time"
 )
+
+func TestReadTemplateFillJSONObjectWithSHA256HashesValidatedBytes(t *testing.T) {
+	projectPath := t.TempDir()
+	raw := []byte("{\n  \"schema\": \"example.v1\",\n  \"value\": 7\n}\n")
+	path := filepath.Join(projectPath, "report.json")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	object, digest, err := readTemplateFillJSONObjectWithSHA256(path, "test report")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if object["schema"] != "example.v1" {
+		t.Fatalf("object = %#v", object)
+	}
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256(raw))
+	if digest != wantDigest {
+		t.Fatalf("digest = %q, want %q", digest, wantDigest)
+	}
+}
 
 func TestValidateTemplateFillPlanContractWritesContract(t *testing.T) {
 	projectPath := templateFillContractProject(t)
@@ -351,6 +373,7 @@ func TestTemplateFillExpectedSlideCountReadsValidatedPlan(t *testing.T) {
 
 func TestValidateTemplateFillCheckContractWritesContract(t *testing.T) {
 	projectPath := templateFillContractProject(t)
+	mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
 	mustWriteFileNoTest(projectPath, filepath.Join("analysis", "check_report.json"), `{
   "schema": "template_fill_pptx_check.v1",
   "summary": {"ok": 2, "warn": 1, "error": 0},
@@ -373,6 +396,15 @@ func TestValidateTemplateFillCheckContractWritesContract(t *testing.T) {
 	}
 	if got := templateFillContractSummaryCount(t, contract, "warn"); got != 1 {
 		t.Fatalf("summary.warn = %d, want 1", got)
+	}
+	if contract["plan_status"] != "confirmed" {
+		t.Fatalf("plan_status = %#v, want confirmed", contract["plan_status"])
+	}
+	for _, field := range []string{"plan_sha256", "check_report_sha256"} {
+		value, ok := contract[field].(string)
+		if !ok || len(value) != 64 {
+			t.Fatalf("%s = %#v, want SHA-256 digest", field, contract[field])
+		}
 	}
 	requireTemplateFillCheckedAt(t, contract)
 	requireFileExists(t, filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json"))
@@ -397,6 +429,7 @@ func TestValidateTemplateFillCheckContractReportsMissingAndCorruptJSON(t *testin
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			projectPath := templateFillContractProject(t)
+			mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
 			if test.content != "" {
 				mustWriteFileNoTest(projectPath, filepath.Join("analysis", "check_report.json"), test.content)
 			}
@@ -425,6 +458,7 @@ func TestValidateTemplateFillCheckContractValidatesSummaryAndErrorGate(t *testin
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			projectPath := templateFillContractProject(t)
+			mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
 			report := map[string]any{"schema": test.schema, "summary": test.summary, "results": []any{}}
 			mustWriteTemplateFillContractJSON(t, projectPath, filepath.Join("analysis", "check_report.json"), report)
 			_, err := validateTemplateFillCheckContract(projectPath, test.requireNoErrors)
@@ -434,6 +468,7 @@ func TestValidateTemplateFillCheckContractValidatesSummaryAndErrorGate(t *testin
 
 	t.Run("errors allowed at plan gate", func(t *testing.T) {
 		projectPath := templateFillContractProject(t)
+		mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
 		report := map[string]any{
 			"schema":  "template_fill_pptx_check.v1",
 			"summary": map[string]any{"ok": 0, "warn": 0, "error": 1},
@@ -818,6 +853,7 @@ func TestValidateTemplateFillContractsDoNotWriteSuccessReportOnValidationFailure
 			name:  "check",
 			phase: PhaseTemplateFillCheck,
 			arrange: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
 				report := map[string]any{
 					"schema":  "template_fill_pptx_check.v1",
 					"summary": map[string]any{"ok": 1, "warn": "0", "error": 0},
@@ -927,6 +963,12 @@ func templateFillContractValidationCases() []templateFillContractValidationCase 
 
 func prepareTemplateFillCheckContractReport(t *testing.T, projectPath string) {
 	t.Helper()
+	fillPlanPath := filepath.Join(projectPath, "analysis", "fill_plan.json")
+	if _, err := os.Lstat(fillPlanPath); os.IsNotExist(err) {
+		mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	} else if err != nil {
+		t.Fatalf("inspect template fill plan: %v", err)
+	}
 	mustWriteFileNoTest(projectPath, filepath.Join("analysis", "check_report.json"), `{
   "schema": "template_fill_pptx_check.v1",
   "summary": {"ok": 1, "warn": 0, "error": 0},

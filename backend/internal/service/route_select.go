@@ -84,7 +84,14 @@ func (s *TaskService) persistRouteSelection(ctx context.Context, task *model.Tas
 	task.RouteStandaloneWorkflow = selection.StandaloneWorkflow
 	task.RouteSelectionJSON = string(raw)
 	task.RouteSelectedAt = &selectedAt
-	return s.repo.SaveTask(ctx, task)
+	saved, err := s.repo.SaveTaskIfStatus(ctx, task, model.TaskStatusSourceConverting, task.ExecutionClaimToken)
+	if err != nil {
+		return err
+	}
+	if !saved {
+		return errTaskStateChanged
+	}
+	return nil
 }
 
 func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*routeSelection, error) {

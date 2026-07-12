@@ -70,6 +70,63 @@ func (r *Repository) SaveTask(ctx context.Context, task *model.Task) error {
 	return r.db.WithContext(ctx).Save(task).Error
 }
 
+func (r *Repository) SaveTaskIfStatus(ctx context.Context, task *model.Task, expectedStatus, expectedClaimToken string) (bool, error) {
+	now := time.Now().UTC()
+	task.UpdatedAt = now
+	if expectedClaimToken != "" {
+		task.ExecutionClaimedAt = &now
+	}
+	result := r.db.WithContext(ctx).
+		Model(&model.Task{}).
+		Where("id = ? AND status = ? AND execution_claim_token = ?", task.ID, expectedStatus, expectedClaimToken).
+		Select("*").
+		Omit("id", "created_at", "execution_claim_token").
+		Updates(task)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
+}
+
+func (r *Repository) ClaimTaskExecution(
+	ctx context.Context,
+	taskID string,
+	expectedStatus string,
+	token string,
+	claimedAt time.Time,
+	staleBefore time.Time,
+) (bool, error) {
+	result := r.db.WithContext(ctx).
+		Model(&model.Task{}).
+		Where("id = ? AND status = ?", taskID, expectedStatus).
+		Where("execution_claim_token = '' OR execution_claimed_at IS NULL OR execution_claimed_at < ?", staleBefore).
+		Updates(map[string]any{
+			"execution_claim_token": token,
+			"execution_claimed_at":  claimedAt,
+			"updated_at":            claimedAt,
+		})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
+}
+
+func (r *Repository) ReleaseTaskExecution(ctx context.Context, taskID, token string) (bool, error) {
+	now := time.Now().UTC()
+	result := r.db.WithContext(ctx).
+		Model(&model.Task{}).
+		Where("id = ? AND execution_claim_token = ?", taskID, token).
+		Updates(map[string]any{
+			"execution_claim_token": "",
+			"execution_claimed_at":  nil,
+			"updated_at":            now,
+		})
+	if result.Error != nil {
+		return false, result.Error
+	}
+	return result.RowsAffected == 1, nil
+}
+
 func (r *Repository) AppendEvent(ctx context.Context, event *model.TaskEvent) error {
 	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var maxSeq int64

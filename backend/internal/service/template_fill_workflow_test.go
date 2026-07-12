@@ -19,12 +19,15 @@ import (
 
 type templateFillWorkflowAgent struct {
 	projectPath                 string
+	sessionRoot                 string
 	requests                    []AgentRunRequest
 	draftCheckErrors            int
 	validateErrors              int
 	applySlideCount             int
 	invalidPlan                 bool
 	planStatus                  string
+	noOpCheck                   bool
+	mutatePlanDuringCheck       bool
 	failPhase                   string
 	onPhase                     func(string) error
 	checkSawPlan                bool
@@ -35,8 +38,27 @@ func (a *templateFillWorkflowAgent) Up(context.Context, AgentRunRequest) error {
 	return nil
 }
 
-func (a *templateFillWorkflowAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+func (a *templateFillWorkflowAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
 	a.requests = append(a.requests, req)
+	if err := os.MkdirAll(a.sessionRoot, 0o755); err != nil {
+		return nil, err
+	}
+	sessionDir, err := os.MkdirTemp(a.sessionRoot, "session-")
+	if err != nil {
+		return nil, err
+	}
+	sessionWorkspace := filepath.Join(sessionDir, "workspace")
+	if err := copyDir(ctx, req.WorkDir, sessionWorkspace); err != nil {
+		return nil, err
+	}
+	projectRel, err := filepath.Rel(req.WorkDir, a.projectPath)
+	if err != nil {
+		return nil, err
+	}
+	if projectRel == ".." || strings.HasPrefix(projectRel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("template fill project %q is outside work dir %q", a.projectPath, req.WorkDir)
+	}
+	sessionProjectPath := filepath.Join(sessionWorkspace, projectRel)
 	if a.onPhase != nil {
 		if err := a.onPhase(req.Phase); err != nil {
 			return nil, err
@@ -46,16 +68,16 @@ func (a *templateFillWorkflowAgent) Run(_ context.Context, req AgentRunRequest) 
 		exitCode := 1
 		return &AgentRunResult{
 			RunID:         "run-" + req.Phase,
-			SessionID:     "session-" + req.Phase,
+			SessionID:     filepath.Base(sessionDir),
 			Status:        "failed",
 			ExitCode:      &exitCode,
-			WorkspacePath: req.WorkDir,
+			WorkspacePath: sessionWorkspace,
 			StderrTail:    "injected runtime failure",
 		}, fmt.Errorf("injected %s failure", req.Phase)
 	}
 	switch req.Phase {
 	case string(PhaseTemplateFillPlan):
-		if _, err := os.Stat(filepath.Join(a.projectPath, "analysis", "check_report.json")); err == nil {
+		if _, err := os.Stat(filepath.Join(sessionProjectPath, "analysis", "check_report.json")); err == nil {
 			a.checkReportPresentAfterPlan = true
 		}
 		planStatus := a.planStatus
@@ -66,29 +88,36 @@ func (a *templateFillWorkflowAgent) Run(_ context.Context, req AgentRunRequest) 
 		if a.invalidPlan {
 			plan["schema"] = "template_fill_pptx_plan.invalid"
 		}
-		writeTemplateFillWorkflowJSON(a.projectPath, filepath.Join("analysis", "fill_plan.json"), plan)
+		writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("analysis", "fill_plan.json"), plan)
 	case string(PhaseTemplateFillCheck):
-		if _, err := os.Stat(filepath.Join(a.projectPath, "analysis", "fill_plan.json")); err == nil {
+		if _, err := os.Stat(filepath.Join(sessionProjectPath, "analysis", "fill_plan.json")); err == nil {
 			a.checkSawPlan = true
 		}
-		writeTemplateFillWorkflowJSON(a.projectPath, filepath.Join("analysis", "check_report.json"), map[string]any{
-			"schema": "template_fill_pptx_check.v1",
-			"summary": map[string]any{
-				"ok":    1,
-				"warn":  0,
-				"error": a.draftCheckErrors,
-			},
-			"results": []any{},
-		})
+		if !a.noOpCheck {
+			writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("analysis", "check_report.json"), map[string]any{
+				"schema": "template_fill_pptx_check.v1",
+				"summary": map[string]any{
+					"ok":    1,
+					"warn":  0,
+					"error": a.draftCheckErrors,
+				},
+				"results": []any{},
+			})
+		}
+		if a.mutatePlanDuringCheck {
+			plan := templateFillContractPlan("confirmed", 1)
+			templateFillContractFirstSlide(plan)["purpose"] = "mutated-during-check"
+			writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("analysis", "fill_plan.json"), plan)
+		}
 	case string(PhaseTemplateFillApply):
 		slideCount := a.applySlideCount
 		if slideCount == 0 {
 			slideCount = 1
 		}
-		mustWritePPTXNoTest(a.projectPath, filepath.Join("exports", "result.pptx"), slideCount)
+		mustWritePPTXNoTest(sessionProjectPath, filepath.Join("exports", "result.pptx"), slideCount)
 	case string(PhaseTemplateFillValidate):
-		mustWriteFileNoTest(a.projectPath, filepath.Join("validation", "readback.md"), "## Slide 1\n")
-		writeTemplateFillWorkflowJSON(a.projectPath, filepath.Join("validation", "validate_report.json"), map[string]any{
+		mustWriteFileNoTest(sessionProjectPath, filepath.Join("validation", "readback.md"), "## Slide 1\n")
+		writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("validation", "validate_report.json"), map[string]any{
 			"schema": "template_fill_pptx_validate.v1",
 			"summary": map[string]any{
 				"ok":    1,
@@ -103,10 +132,10 @@ func (a *templateFillWorkflowAgent) Run(_ context.Context, req AgentRunRequest) 
 	exitCode := 0
 	return &AgentRunResult{
 		RunID:         "run-" + req.Phase,
-		SessionID:     "session-" + req.Phase,
+		SessionID:     filepath.Base(sessionDir),
 		Status:        "succeeded",
 		ExitCode:      &exitCode,
-		WorkspacePath: req.WorkDir,
+		WorkspacePath: sessionWorkspace,
 	}, nil
 }
 
@@ -153,7 +182,7 @@ func TestTemplateFillPlanPromptUsesWorkspaceRelativePathsAndHardRules(t *testing
 
 func TestProcessQueuedTasksRunsTemplateFillPlanThenSeparateDraftCheck(t *testing.T) {
 	agent := &templateFillWorkflowAgent{draftCheckErrors: 1}
-	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillPlanning, agent)
+	service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillPlanning, agent)
 	agent.projectPath = projectPath
 
 	processed, err := service.ProcessQueuedTasks(context.Background(), 1)
@@ -221,6 +250,9 @@ func TestProcessQueuedTasksRunsTemplateFillPlanThenSeparateDraftCheck(t *testing
 	runtimeByPhase := map[string]model.TaskRuntimeRun{}
 	for _, runtimeRun := range runtimeRuns {
 		runtimeByPhase[runtimeRun.Phase] = runtimeRun
+		if sameFilesystemPath(runtimeRun.WorkspacePath, workspacePath) {
+			t.Fatalf("runtime phase %s used persistent workspace instead of distinct session: %#v", runtimeRun.Phase, runtimeRun)
+		}
 	}
 	planRuntimeRun, hasPlan := runtimeByPhase[string(PhaseTemplateFillPlan)]
 	if !hasPlan {
@@ -243,12 +275,6 @@ func TestProcessTemplateFillCheckReturnsDraftAndBlockedConfirmedPlansToGate(t *t
 		wantBlockingErrors bool
 		wantBlockedEvent   bool
 	}{
-		{
-			name:           "draft errors remain user-fixable",
-			planStatus:     "draft",
-			checkErrors:    2,
-			wantPlanStatus: "draft",
-		},
 		{
 			name:               "confirmed errors return plan to draft",
 			planStatus:         "confirmed",
@@ -314,9 +340,131 @@ func TestProcessTemplateFillCheckReturnsDraftAndBlockedConfirmedPlansToGate(t *t
 	}
 }
 
-func TestProcessQueuedTasksRunsConfirmedTemplateFillCheckApplyAndValidate(t *testing.T) {
+func TestTemplateFillCheckingReconcilesDraftToGateWithoutFormalRun(t *testing.T) {
 	agent := &templateFillWorkflowAgent{}
 	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillChecking, agent)
+	agent.projectPath = projectPath
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	prepareTemplateFillCheckContractReport(t, projectPath)
+	mustWriteFile(t, filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json"), "{}\n")
+
+	if err := service.ProcessTask(context.Background(), task.ID); err != nil {
+		t.Fatalf("ProcessTask() error = %v", err)
+	}
+	updated, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusAwaitingTemplateFillConfirm {
+		t.Fatalf("status = %q, want user gate", updated.Status)
+	}
+	if len(agent.requests) != 0 {
+		t.Fatalf("draft inconsistency invoked formal checker: %#v", agent.requests)
+	}
+	phaseRuns, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phaseRun := range phaseRuns {
+		if phaseRun.Phase == string(PhaseTemplateFillCheck) {
+			t.Fatalf("draft reconciliation fabricated formal phase run: %#v", phaseRun)
+		}
+	}
+	for _, stalePath := range []string{
+		filepath.Join(projectPath, "analysis", "check_report.json"),
+		filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json"),
+	} {
+		if _, err := os.Stat(stalePath); !os.IsNotExist(err) {
+			t.Fatalf("draft reconciliation retained stale formal evidence %s: %v", stalePath, err)
+		}
+	}
+}
+
+func TestTemplateFillDraftReconciliationReturnsStaleEvidenceCleanupFailure(t *testing.T) {
+	agent := &templateFillWorkflowAgent{}
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillChecking, agent)
+	agent.projectPath = projectPath
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	prepareTemplateFillCheckContractReport(t, projectPath)
+	staleContractPath := filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json")
+	mustWriteFile(t, filepath.Join(staleContractPath, "keep"), "stale\n")
+
+	err := service.ProcessTask(context.Background(), task.ID)
+	if err == nil || !strings.Contains(err.Error(), "remove stale formal check evidence") {
+		t.Fatalf("ProcessTask() error = %v, want stale-evidence cleanup failure", err)
+	}
+	updated, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "template_fill_check.cleanup" {
+		t.Fatalf("cleanup failure task = %#v", updated)
+	}
+	if len(agent.requests) != 0 {
+		t.Fatalf("draft cleanup failure invoked runtime: %#v", agent.requests)
+	}
+	phaseRuns, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phaseRun := range phaseRuns {
+		if phaseRun.Phase == string(PhaseTemplateFillCheck) {
+			t.Fatalf("draft cleanup failure fabricated formal phase run: %#v", phaseRun)
+		}
+	}
+}
+
+func TestTemplateFillFormalCheckRejectsStaleReportAndPlanMutation(t *testing.T) {
+	tests := []struct {
+		name             string
+		configure        func(*templateFillWorkflowAgent)
+		wantFailurePhase string
+	}{
+		{
+			name: "no-op checker cannot reuse draft report",
+			configure: func(agent *templateFillWorkflowAgent) {
+				agent.noOpCheck = true
+			},
+			wantFailurePhase: "template_fill_check.fresh_report",
+		},
+		{
+			name: "plan changed during checker run",
+			configure: func(agent *templateFillWorkflowAgent) {
+				agent.mutatePlanDuringCheck = true
+			},
+			wantFailurePhase: "template_fill_check.plan_changed",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := &templateFillWorkflowAgent{}
+			test.configure(agent)
+			service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillChecking, agent)
+			agent.projectPath = projectPath
+			mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
+			prepareTemplateFillCheckContractReport(t, projectPath)
+
+			if err := service.ProcessTask(context.Background(), task.ID); err == nil {
+				t.Fatal("ProcessTask() error = nil, want formal freshness failure")
+			}
+			updated, err := repo.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.Status != model.TaskStatusFailed || updated.FailurePhase != test.wantFailurePhase {
+				t.Fatalf("formal check failure task = %#v", updated)
+			}
+			phaseRun := requireSingleTemplateFillPhaseRun(t, repo, task.ID, PhaseTemplateFillCheck)
+			if phaseRun.Status != PhaseRunStatusFailed {
+				t.Fatalf("formal freshness phase run = %#v", phaseRun)
+			}
+		})
+	}
+}
+
+func TestProcessQueuedTasksRunsConfirmedTemplateFillCheckApplyAndValidate(t *testing.T) {
+	agent := &templateFillWorkflowAgent{}
+	service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillChecking, agent)
 	agent.projectPath = projectPath
 	mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
 
@@ -366,7 +514,22 @@ func TestProcessQueuedTasksRunsConfirmedTemplateFillCheckApplyAndValidate(t *tes
 		if phaseRun.Status != PhaseRunStatusSucceeded || phaseRun.Runner != PhaseRunnerWorker || phaseRun.RuntimeRunID == "" {
 			t.Fatalf("phase %s run = %#v", phase, phaseRun)
 		}
+		if sameFilesystemPath(phaseRun.WorkspacePath, workspacePath) {
+			t.Fatalf("phase %s did not run in a distinct session workspace: %#v", phase, phaseRun)
+		}
 		requireFileExists(t, filepath.Join(projectPath, ".slidesmith", "contracts", string(phase)+".json"))
+	}
+	checkContract := readTemplateFillContractReport(t, filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json"))
+	if checkContract["plan_status"] != "confirmed" {
+		t.Fatalf("formal check plan status = %#v", checkContract["plan_status"])
+	}
+	planSHA, ok := checkContract["plan_sha256"].(string)
+	if !ok || len(planSHA) != 64 {
+		t.Fatalf("formal check plan_sha256 = %#v", checkContract["plan_sha256"])
+	}
+	checkPhaseRun := requireSingleTemplateFillPhaseRun(t, repo, task.ID, PhaseTemplateFillCheck)
+	if !strings.Contains(checkPhaseRun.OutputJSON, `"plan_status":"confirmed"`) || !strings.Contains(checkPhaseRun.OutputJSON, `"plan_sha256":"`+planSHA+`"`) {
+		t.Fatalf("formal check phase evidence missing plan digest/status: %s", checkPhaseRun.OutputJSON)
 	}
 }
 
@@ -464,8 +627,8 @@ func TestTemplateFillApplyDoesNotOverwriteCancelledTask(t *testing.T) {
 		return err
 	}
 
-	if err := service.ProcessTask(context.Background(), task.ID); err == nil {
-		t.Fatal("ProcessTask() error = nil, want cancelled runtime error")
+	if err := service.ProcessTask(context.Background(), task.ID); err != nil {
+		t.Fatalf("ProcessTask() cancellation loss error = %v", err)
 	}
 	updated, err := repo.GetTask(context.Background(), task.ID)
 	if err != nil {
@@ -494,6 +657,7 @@ func TestTemplateFillApplyRejectsCheckErrorsBeforeRuntimeCommand(t *testing.T) {
 		},
 		"results": []any{},
 	})
+	writeTemplateFillFormalCheckEvidence(t, projectPath)
 
 	if err := service.ProcessTask(context.Background(), task.ID); err == nil {
 		t.Fatal("ProcessTask() error = nil, want apply preflight failure")
@@ -511,6 +675,40 @@ func TestTemplateFillApplyRejectsCheckErrorsBeforeRuntimeCommand(t *testing.T) {
 	phaseRun := requireSingleTemplateFillPhaseRun(t, repo, task.ID, PhaseTemplateFillApply)
 	if phaseRun.Status != PhaseRunStatusFailed {
 		t.Fatalf("apply preflight phase run = %#v", phaseRun)
+	}
+}
+
+func TestTemplateFillApplyRejectsDraftPlanBeforeRuntimeOrExportMutation(t *testing.T) {
+	agent := &templateFillWorkflowAgent{}
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillApplying, agent)
+	agent.projectPath = projectPath
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	prepareTemplateFillCheckContractReport(t, projectPath)
+	mustWriteFile(t, filepath.Join(projectPath, "exports", "sentinel.txt"), "preserve\n")
+
+	if err := service.ProcessTask(context.Background(), task.ID); err == nil {
+		t.Fatal("ProcessTask() error = nil, want draft apply preflight failure")
+	}
+	if len(agent.requests) != 0 {
+		t.Fatalf("draft plan invoked mutating apply runtime: %#v", agent.requests)
+	}
+	updated, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "template_fill_apply.plan_contract" {
+		t.Fatalf("draft apply task = %#v", updated)
+	}
+	phaseRun := requireSingleTemplateFillPhaseRun(t, repo, task.ID, PhaseTemplateFillApply)
+	if phaseRun.Status != PhaseRunStatusFailed {
+		t.Fatalf("draft apply phase run = %#v", phaseRun)
+	}
+	raw, err := os.ReadFile(filepath.Join(projectPath, "exports", "sentinel.txt"))
+	if err != nil || string(raw) != "preserve\n" {
+		t.Fatalf("apply preflight mutated sentinel: %q, error=%v", raw, err)
+	}
+	if _, err := os.Stat(filepath.Join(projectPath, "exports", "result.pptx")); !os.IsNotExist(err) {
+		t.Fatalf("draft apply created result.pptx: %v", err)
 	}
 }
 
@@ -611,6 +809,60 @@ func TestTemplateFillWorkerInputFailuresRecordTheirPhaseRuns(t *testing.T) {
 	}
 }
 
+func TestTemplateFillPreflightFailuresAlwaysFinishPhaseRuns(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    string
+		phase     PipelinePhase
+		disabled  bool
+		removeDir bool
+		wantPhase string
+	}{
+		{name: "plan agent disabled", status: model.TaskStatusTemplateFillPlanning, phase: PhaseTemplateFillPlan, disabled: true, wantPhase: "template_fill_plan.agent_disabled"},
+		{name: "check agent disabled", status: model.TaskStatusTemplateFillChecking, phase: PhaseTemplateFillCheck, disabled: true, wantPhase: "template_fill_check.agent_disabled"},
+		{name: "apply agent disabled", status: model.TaskStatusTemplateFillApplying, phase: PhaseTemplateFillApply, disabled: true, wantPhase: "template_fill_apply.agent_disabled"},
+		{name: "validate agent disabled", status: model.TaskStatusTemplateFillValidating, phase: PhaseTemplateFillValidate, disabled: true, wantPhase: "template_fill_validate.agent_disabled"},
+		{name: "plan project missing", status: model.TaskStatusTemplateFillPlanning, phase: PhaseTemplateFillPlan, removeDir: true, wantPhase: "template_fill_plan.project"},
+		{name: "check project missing", status: model.TaskStatusTemplateFillChecking, phase: PhaseTemplateFillCheck, removeDir: true, wantPhase: "template_fill_check.project"},
+		{name: "apply project missing", status: model.TaskStatusTemplateFillApplying, phase: PhaseTemplateFillApply, removeDir: true, wantPhase: "template_fill_apply.project"},
+		{name: "validate project missing", status: model.TaskStatusTemplateFillValidating, phase: PhaseTemplateFillValidate, removeDir: true, wantPhase: "template_fill_validate.project"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := &templateFillWorkflowAgent{}
+			service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, test.status, agent)
+			agent.projectPath = projectPath
+			prepareTemplateFillWorkflowPhase(t, projectPath, test.status)
+			if test.disabled {
+				service.agentCfg.Enabled = false
+			}
+			if test.removeDir {
+				if err := os.RemoveAll(projectPath); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			if err := service.ProcessTask(context.Background(), task.ID); err == nil {
+				t.Fatal("ProcessTask() error = nil, want preflight failure")
+			}
+			updated, err := repo.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.Status != model.TaskStatusFailed || updated.FailurePhase != test.wantPhase {
+				t.Fatalf("preflight task = %#v", updated)
+			}
+			phaseRun := requireSingleTemplateFillPhaseRun(t, repo, task.ID, test.phase)
+			if phaseRun.Status != PhaseRunStatusFailed || phaseRun.FinishedAt == nil {
+				t.Fatalf("preflight phase run = %#v", phaseRun)
+			}
+			if len(agent.requests) != 0 {
+				t.Fatalf("preflight failure invoked runtime: %#v", agent.requests)
+			}
+		})
+	}
+}
+
 func newTemplateFillWorkflowService(t *testing.T, status string, agent AgentComposeClient) (*TaskService, *repository.Repository, *model.Task, string, string) {
 	t.Helper()
 	tmp := t.TempDir()
@@ -658,6 +910,9 @@ func newTemplateFillWorkflowService(t *testing.T, status string, agent AgentComp
 	if agent == nil {
 		agent = &templateFillWorkflowAgent{projectPath: projectPath}
 	}
+	if workflowAgent, ok := agent.(*templateFillWorkflowAgent); ok {
+		workflowAgent.sessionRoot = filepath.Join(tmp, "agent-sessions")
+	}
 	service := NewTaskService(
 		repo,
 		storage,
@@ -690,12 +945,25 @@ func prepareTemplateFillWorkflowPhase(t *testing.T, projectPath, status string) 
 	case model.TaskStatusTemplateFillApplying:
 		mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
 		prepareTemplateFillCheckContractReport(t, projectPath)
+		writeTemplateFillFormalCheckEvidence(t, projectPath)
 	case model.TaskStatusTemplateFillValidating:
 		mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
 		prepareTemplateFillCheckContractReport(t, projectPath)
+		writeTemplateFillFormalCheckEvidence(t, projectPath)
 		mustWritePPTXNoTest(projectPath, filepath.Join("exports", "result.pptx"), 1)
 	default:
 		t.Fatalf("unsupported template fill test status %q", status)
+	}
+}
+
+func writeTemplateFillFormalCheckEvidence(t *testing.T, projectPath string) {
+	t.Helper()
+	planSHA256, err := sha256File(filepath.Join(projectPath, "analysis", "fill_plan.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateTemplateFillCheckContractForPlan(projectPath, false, "confirmed", planSHA256); err != nil {
+		t.Fatal(err)
 	}
 }
 
