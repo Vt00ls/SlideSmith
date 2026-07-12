@@ -418,14 +418,38 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 	})
 	applyRuntimeRunToPhaseRun(phaseRun, run)
 	if err != nil {
+		if errors.Is(err, errTaskStateChanged) {
+			return s.recoverSourcePrepareFailure(
+				ctx,
+				task,
+				phaseRun,
+				string(PhaseSourcePrepare)+".runtime",
+				err,
+				run,
+				runtimeRunPhaseOutput(run),
+				map[string]any{"workspace_path": workspace.HostDir},
+			)
+		}
 		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
 		_ = s.failWithMetadata(ctx, task, string(PhaseSourcePrepare)+".agent", err, run, nil)
 		return err
 	}
 	var preparedProjectPath string
 	if run.WorkspacePath != "" {
-		projectPath, err := s.syncPreparedProject(ctx, task.ID, task.RuntimeProject, run.WorkspacePath, workspace.HostDir)
+		projectPath, err := s.syncPreparedProject(ctx, task, run.WorkspacePath, workspace.HostDir)
 		if err != nil {
+			if errors.Is(err, errTaskStateChanged) {
+				return s.recoverSourcePrepareFailure(
+					ctx,
+					task,
+					phaseRun,
+					string(PhaseSourcePrepare)+".sync",
+					err,
+					run,
+					runtimeRunPhaseOutput(run),
+					map[string]any{"workspace_path": run.WorkspacePath},
+				)
+			}
 			_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
 			_ = s.failWithMetadata(ctx, task, string(PhaseSourcePrepare)+".sync", err, run, map[string]any{"workspace_path": run.WorkspacePath})
 			return err
@@ -625,23 +649,37 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 			"project_path":   projectPath,
 		})
 	}
-	projectPath, err = s.syncRuntimeProject(ctx, task, workspace, planRun.WorkspacePath)
+	planPreflightFailure := false
+	validatedPlanSHA256 := ""
+	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, planRun.WorkspacePath, func(stagedProjectPath string) error {
+		stagedPlanContract, stagedPlanSHA256, stagedErr := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+		if stagedErr != nil {
+			planPreflightFailure = true
+			return stagedErr
+		}
+		if planStatus, _ := stagedPlanContract["plan_status"].(string); planStatus != "draft" {
+			planPreflightFailure = true
+			return fmt.Errorf("template fill generated plan status = %q, expected %q", planStatus, "draft")
+		}
+		validatedPlanSHA256 = stagedPlanSHA256
+		return nil
+	})
 	if err != nil {
-		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillPlan)+".sync", err, planRun, map[string]any{
+		failurePhase := string(PhaseTemplateFillPlan) + ".sync"
+		if planPreflightFailure {
+			failurePhase = string(PhaseTemplateFillPlan) + ".contract"
+		}
+		return s.failTemplateFillPhase(ctx, task, phaseRun, failurePhase, err, planRun, map[string]any{
 			"workspace_path": planRun.WorkspacePath,
 			"project_path":   projectPath,
 		})
 	}
-	_, _, generatedPlanStatus, err := readValidatedTemplateFillPlan(projectPath)
-	if err == nil && generatedPlanStatus != "draft" {
-		err = fmt.Errorf("template fill generated plan status = %q, expected %q", generatedPlanStatus, "draft")
+	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	if err == nil {
+		if planStatus, _ := planContract["plan_status"].(string); planStatus != "draft" || canonicalPlanSHA256 != validatedPlanSHA256 {
+			err = fmt.Errorf("template fill canonical plan no longer matches validated draft snapshot")
+		}
 	}
-	if err != nil {
-		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillPlan)+".contract", err, planRun, map[string]any{
-			"project_path": projectPath,
-		})
-	}
-	planContract, err := validateTemplateFillPlanContract(projectPath)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillPlan)+".contract", err, planRun, map[string]any{
 			"project_path": projectPath,
@@ -667,14 +705,52 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 			"command":      draftCheckCommand,
 		})
 	}
-	projectPath, err = s.syncRuntimeProject(ctx, task, workspace, draftCheckRun.WorkspacePath)
+	draftCheckFailurePhase := ""
+	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, draftCheckRun.WorkspacePath, func(stagedProjectPath string) error {
+		stagedInputs, stagedErr := discoverTemplateFillInputs(stagedProjectPath)
+		if stagedErr != nil {
+			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.contract"
+			return stagedErr
+		}
+		stagedPlanSHA256, stagedErr := sha256File(stagedInputs.FillPlan)
+		if stagedErr != nil {
+			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.plan_changed"
+			return stagedErr
+		}
+		if stagedPlanSHA256 != validatedPlanSHA256 {
+			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.plan_changed"
+			return fmt.Errorf("template fill plan changed during draft check: got %s, expected %s", stagedPlanSHA256, validatedPlanSHA256)
+		}
+		if _, stagedErr := validateTemplateFillCheckContractForPlan(stagedProjectPath, false, "draft", validatedPlanSHA256); stagedErr != nil {
+			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.contract"
+			return stagedErr
+		}
+		return nil
+	})
 	if err != nil {
-		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillPlan)+".draft_check.sync", err, draftCheckRun, map[string]any{
+		failurePhase := string(PhaseTemplateFillPlan) + ".draft_check.sync"
+		if draftCheckFailurePhase != "" {
+			failurePhase = draftCheckFailurePhase
+		}
+		return s.failTemplateFillPhase(ctx, task, phaseRun, failurePhase, err, draftCheckRun, map[string]any{
 			"workspace_path": draftCheckRun.WorkspacePath,
 			"project_path":   projectPath,
+			"plan_sha256":    validatedPlanSHA256,
 		})
 	}
-	draftCheckContract, err := validateTemplateFillCheckContract(projectPath, false)
+	planContract, canonicalPlanSHA256, err = validateTemplateFillPlanContractSnapshot(projectPath)
+	if err == nil {
+		if planStatus, _ := planContract["plan_status"].(string); planStatus != "draft" || canonicalPlanSHA256 != validatedPlanSHA256 {
+			err = fmt.Errorf("template fill canonical plan changed after draft check promotion")
+		}
+	}
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillPlan)+".draft_check.plan_changed", err, draftCheckRun, map[string]any{
+			"project_path": projectPath,
+			"plan_sha256":  validatedPlanSHA256,
+		})
+	}
+	draftCheckContract, err := validateTemplateFillCheckContractForPlan(projectPath, false, "draft", validatedPlanSHA256)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillPlan)+".draft_check.contract", err, draftCheckRun, map[string]any{
 			"project_path": projectPath,
@@ -764,26 +840,14 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			"project_path": projectPath,
 		})
 	}
-	planContract, err := validateTemplateFillPlanContract(projectPath)
+	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".plan_contract", err, nil, map[string]any{
 			"project_path": projectPath,
-		})
-	}
-	planSHA256, err := sha256File(inputs.FillPlan)
-	if err != nil {
-		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".plan_contract", err, nil, map[string]any{
-			"project_path": projectPath,
-		})
-	}
-	if err := removeTemplateFillFormalCheckEvidence(inputs); err != nil {
-		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".cleanup", err, nil, map[string]any{
-			"project_path": projectPath,
-			"plan_sha256":  planSHA256,
 		})
 	}
 	projectRel := s.projectRel(task, projectPath)
-	command := fmt.Sprintf("python3 scripts/ppt_runner.py template-fill-check --project-path %s", shellArg(projectRel))
+	command := templateFillFormalCheckCommand(projectRel)
 	runtimeRun, err := s.runAgent(ctx, task, string(PhaseTemplateFillCheck), AgentRunRequest{
 		Command:     command,
 		WorkDir:     workspace.HostDir,
@@ -802,11 +866,41 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			"command":      command,
 		})
 	}
-	projectPath, err = s.syncRuntimeProject(ctx, task, workspace, runtimeRun.WorkspacePath)
+	preflightFailurePhase := ""
+	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
+		stagedInputs, stagedErr := discoverTemplateFillInputs(stagedProjectPath)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".inputs"
+			return stagedErr
+		}
+		if stagedErr := requireNonEmptyFile(stagedInputs.CheckReport); stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".fresh_report"
+			return stagedErr
+		}
+		checkedPlanSHA256, stagedErr := sha256File(stagedInputs.FillPlan)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".plan_changed"
+			return stagedErr
+		}
+		if checkedPlanSHA256 != planSHA256 {
+			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".plan_changed"
+			return fmt.Errorf("template fill plan changed during formal check: got %s, expected %s", checkedPlanSHA256, planSHA256)
+		}
+		if _, stagedErr := validateTemplateFillCheckContractForPlan(stagedProjectPath, false, "confirmed", planSHA256); stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".contract"
+			return stagedErr
+		}
+		return nil
+	})
 	if err != nil {
-		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".sync", err, runtimeRun, map[string]any{
+		failurePhase := string(PhaseTemplateFillCheck) + ".sync"
+		if preflightFailurePhase != "" {
+			failurePhase = preflightFailurePhase
+		}
+		return s.failTemplateFillPhase(ctx, task, phaseRun, failurePhase, err, runtimeRun, map[string]any{
 			"workspace_path": runtimeRun.WorkspacePath,
 			"project_path":   projectPath,
+			"plan_sha256":    planSHA256,
 		})
 	}
 	inputs, err = discoverTemplateFillInputs(projectPath)
@@ -821,19 +915,19 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			"plan_sha256":  planSHA256,
 		})
 	}
-	checkedPlanSHA256, err := sha256File(inputs.FillPlan)
+	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".plan_changed", err, runtimeRun, map[string]any{
 			"project_path": projectPath,
 			"plan_sha256":  planSHA256,
 		})
 	}
-	if checkedPlanSHA256 != planSHA256 {
-		cause := fmt.Errorf("template fill plan changed during formal check: got %s, expected %s", checkedPlanSHA256, planSHA256)
+	if canonicalPlanSHA256 != planSHA256 {
+		cause := fmt.Errorf("template fill canonical plan changed after formal check promotion: got %s, expected %s", canonicalPlanSHA256, planSHA256)
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".plan_changed", cause, runtimeRun, map[string]any{
 			"project_path":        projectPath,
 			"plan_sha256":         planSHA256,
-			"checked_plan_sha256": checkedPlanSHA256,
+			"checked_plan_sha256": canonicalPlanSHA256,
 		})
 	}
 	checkContract, err := validateTemplateFillCheckContractForPlan(projectPath, false, "confirmed", planSHA256)
@@ -923,18 +1017,12 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 			"project_path": projectPath,
 		})
 	}
-	planContract, err := validateTemplateFillPlanContract(projectPath)
+	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
 	if err == nil {
 		if planStatus, _ := planContract["plan_status"].(string); planStatus != "confirmed" {
 			err = fmt.Errorf("template fill apply plan status = %q, expected %q", planStatus, "confirmed")
 		}
 	}
-	if err != nil {
-		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillApply)+".plan_contract", err, nil, map[string]any{
-			"project_path": projectPath,
-		})
-	}
-	planSHA256, err := sha256File(inputs.FillPlan)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillApply)+".plan_contract", err, nil, map[string]any{
 			"project_path": projectPath,
@@ -947,6 +1035,7 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 			"plan_sha256":  planSHA256,
 		})
 	}
+	expectedCheckReportSHA256, _ := checkContract["check_report_sha256"].(string)
 	projectRel := s.projectRel(task, projectPath)
 	command := fmt.Sprintf("python3 scripts/ppt_runner.py template-fill-apply --project-path %s --transition fade", shellArg(projectRel))
 	runtimeRun, err := s.runAgent(ctx, task, string(PhaseTemplateFillApply), AgentRunRequest{
@@ -967,11 +1056,85 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 			"command":      command,
 		})
 	}
-	projectPath, err = s.syncRuntimeProject(ctx, task, workspace, runtimeRun.WorkspacePath)
+	preflightFailurePhase := ""
+	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
+		stagedInputs, stagedErr := discoverTemplateFillInputs(stagedProjectPath)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".inputs"
+			return stagedErr
+		}
+		stagedPlanSHA256, stagedErr := sha256File(stagedInputs.FillPlan)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".plan_changed"
+			return stagedErr
+		}
+		if stagedPlanSHA256 != planSHA256 {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".plan_changed"
+			return fmt.Errorf("template fill plan changed during apply: got %s, expected %s", stagedPlanSHA256, planSHA256)
+		}
+		stagedPlanContract, validatedPlanSHA256, stagedErr := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".plan_contract"
+			return stagedErr
+		}
+		if planStatus, _ := stagedPlanContract["plan_status"].(string); planStatus != "confirmed" || validatedPlanSHA256 != planSHA256 {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".plan_changed"
+			return fmt.Errorf("template fill apply staged plan no longer matches confirmed snapshot")
+		}
+		stagedCheckContract, stagedErr := readTemplateFillFormalCheckEvidenceForReport(stagedProjectPath, stagedInputs, planSHA256, inputs.CheckReport)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".check_contract"
+			return stagedErr
+		}
+		if stagedReportSHA256, _ := stagedCheckContract["check_report_sha256"].(string); stagedReportSHA256 != expectedCheckReportSHA256 {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".check_contract"
+			return fmt.Errorf("template fill apply check report sha256 = %q, expected %q", stagedReportSHA256, expectedCheckReportSHA256)
+		}
+		if _, stagedErr := validateTemplateFillApplyContract(stagedProjectPath); stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".contract"
+			return stagedErr
+		}
+		return nil
+	})
 	if err != nil {
-		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillApply)+".sync", err, runtimeRun, map[string]any{
+		failurePhase := string(PhaseTemplateFillApply) + ".sync"
+		if preflightFailurePhase != "" {
+			failurePhase = preflightFailurePhase
+		}
+		return s.failTemplateFillPhase(ctx, task, phaseRun, failurePhase, err, runtimeRun, map[string]any{
 			"workspace_path": runtimeRun.WorkspacePath,
 			"project_path":   projectPath,
+			"plan_sha256":    planSHA256,
+		})
+	}
+	inputs, err = discoverTemplateFillInputs(projectPath)
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillApply)+".inputs", err, runtimeRun, map[string]any{
+			"project_path": projectPath,
+		})
+	}
+	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	if err == nil {
+		if planStatus, _ := planContract["plan_status"].(string); planStatus != "confirmed" || canonicalPlanSHA256 != planSHA256 {
+			err = fmt.Errorf("template fill apply canonical plan no longer matches confirmed snapshot")
+		}
+	}
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillApply)+".plan_changed", err, runtimeRun, map[string]any{
+			"project_path": projectPath,
+			"plan_sha256":  planSHA256,
+		})
+	}
+	checkContract, err = readTemplateFillFormalCheckEvidence(projectPath, inputs, planSHA256)
+	if err == nil {
+		if canonicalReportSHA256, _ := checkContract["check_report_sha256"].(string); canonicalReportSHA256 != expectedCheckReportSHA256 {
+			err = fmt.Errorf("template fill apply canonical check report sha256 = %q, expected %q", canonicalReportSHA256, expectedCheckReportSHA256)
+		}
+	}
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillApply)+".check_contract", err, runtimeRun, map[string]any{
+			"project_path": projectPath,
+			"plan_sha256":  planSHA256,
 		})
 	}
 	applyContract, err := validateTemplateFillApplyContract(projectPath)
@@ -1031,6 +1194,31 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 			"project_path": projectPath,
 		})
 	}
+	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	if err == nil {
+		if planStatus, _ := planContract["plan_status"].(string); planStatus != "confirmed" {
+			err = fmt.Errorf("template fill validate plan status = %q, expected %q", planStatus, "confirmed")
+		}
+	}
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".plan_contract", err, nil, map[string]any{
+			"project_path": projectPath,
+		})
+	}
+	checkContract, err := readTemplateFillFormalCheckEvidence(projectPath, inputs, planSHA256)
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".check_contract", err, nil, map[string]any{
+			"project_path": projectPath,
+			"plan_sha256":  planSHA256,
+		})
+	}
+	expectedCheckReportSHA256, _ := checkContract["check_report_sha256"].(string)
+	applyContract, err := validateTemplateFillApplyContract(projectPath)
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".apply_contract", err, nil, map[string]any{
+			"project_path": projectPath,
+		})
+	}
 	projectRel := s.projectRel(task, projectPath)
 	command := fmt.Sprintf("python3 scripts/ppt_runner.py template-fill-validate --project-path %s", shellArg(projectRel))
 	runtimeRun, err := s.runAgent(ctx, task, string(PhaseTemplateFillValidate), AgentRunRequest{
@@ -1051,11 +1239,95 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 			"command":      command,
 		})
 	}
-	projectPath, err = s.syncRuntimeProject(ctx, task, workspace, runtimeRun.WorkspacePath)
+	preflightFailurePhase := ""
+	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
+		stagedInputs, stagedErr := discoverTemplateFillInputs(stagedProjectPath)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".inputs"
+			return stagedErr
+		}
+		stagedPlanSHA256, stagedErr := sha256File(stagedInputs.FillPlan)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".plan_changed"
+			return stagedErr
+		}
+		if stagedPlanSHA256 != planSHA256 {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".plan_changed"
+			return fmt.Errorf("template fill plan changed during validate: got %s, expected %s", stagedPlanSHA256, planSHA256)
+		}
+		stagedPlanContract, validatedPlanSHA256, stagedErr := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".plan_contract"
+			return stagedErr
+		}
+		if planStatus, _ := stagedPlanContract["plan_status"].(string); planStatus != "confirmed" || validatedPlanSHA256 != planSHA256 {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".plan_changed"
+			return fmt.Errorf("template fill validate staged plan no longer matches confirmed snapshot")
+		}
+		stagedCheckContract, stagedErr := readTemplateFillFormalCheckEvidenceForReport(stagedProjectPath, stagedInputs, planSHA256, inputs.CheckReport)
+		if stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".check_contract"
+			return stagedErr
+		}
+		if stagedReportSHA256, _ := stagedCheckContract["check_report_sha256"].(string); stagedReportSHA256 != expectedCheckReportSHA256 {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".check_contract"
+			return fmt.Errorf("template fill validate check report sha256 = %q, expected %q", stagedReportSHA256, expectedCheckReportSHA256)
+		}
+		if _, stagedErr := validateTemplateFillApplyContract(stagedProjectPath); stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".apply_contract"
+			return stagedErr
+		}
+		if _, stagedErr := validateTemplateFillValidateContract(stagedProjectPath); stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".contract"
+			return stagedErr
+		}
+		return nil
+	})
 	if err != nil {
-		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".sync", err, runtimeRun, map[string]any{
+		failurePhase := string(PhaseTemplateFillValidate) + ".sync"
+		if preflightFailurePhase != "" {
+			failurePhase = preflightFailurePhase
+		}
+		return s.failTemplateFillPhase(ctx, task, phaseRun, failurePhase, err, runtimeRun, map[string]any{
 			"workspace_path": runtimeRun.WorkspacePath,
 			"project_path":   projectPath,
+			"plan_sha256":    planSHA256,
+		})
+	}
+	inputs, err = discoverTemplateFillInputs(projectPath)
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".inputs", err, runtimeRun, map[string]any{
+			"project_path": projectPath,
+		})
+	}
+	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	if err == nil {
+		if planStatus, _ := planContract["plan_status"].(string); planStatus != "confirmed" || canonicalPlanSHA256 != planSHA256 {
+			err = fmt.Errorf("template fill validate canonical plan no longer matches confirmed snapshot")
+		}
+	}
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".plan_changed", err, runtimeRun, map[string]any{
+			"project_path": projectPath,
+			"plan_sha256":  planSHA256,
+		})
+	}
+	checkContract, err = readTemplateFillFormalCheckEvidence(projectPath, inputs, planSHA256)
+	if err == nil {
+		if canonicalReportSHA256, _ := checkContract["check_report_sha256"].(string); canonicalReportSHA256 != expectedCheckReportSHA256 {
+			err = fmt.Errorf("template fill validate canonical check report sha256 = %q, expected %q", canonicalReportSHA256, expectedCheckReportSHA256)
+		}
+	}
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".check_contract", err, runtimeRun, map[string]any{
+			"project_path": projectPath,
+			"plan_sha256":  planSHA256,
+		})
+	}
+	applyContract, err = validateTemplateFillApplyContract(projectPath)
+	if err != nil {
+		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".apply_contract", err, runtimeRun, map[string]any{
+			"project_path": projectPath,
 		})
 	}
 	validateContract, err := validateTemplateFillValidateContract(projectPath)
@@ -1066,6 +1338,9 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 	}
 	output := runtimeRunPhaseOutput(runtimeRun)
 	output["project_path"] = projectPath
+	output["plan_contract"] = planContract
+	output["check_contract"] = checkContract
+	output["apply_contract"] = applyContract
 	output["contract"] = validateContract
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".phase_run", err, runtimeRun, map[string]any{
@@ -1093,6 +1368,17 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 	return nil
 }
 
+func templateFillFormalCheckCommand(projectRel string) string {
+	checkReportRel := filepath.ToSlash(filepath.Join(projectRel, "analysis", "check_report.json"))
+	checkContractRel := filepath.ToSlash(filepath.Join(projectRel, ".slidesmith", "contracts", string(PhaseTemplateFillCheck)+".json"))
+	return fmt.Sprintf(
+		"rm -f %s %s && python3 scripts/ppt_runner.py template-fill-check --project-path %s",
+		shellArg(checkReportRel),
+		shellArg(checkContractRel),
+		shellArg(projectRel),
+	)
+}
+
 func templateFillCheckErrorCount(contract map[string]any) int {
 	summary, ok := contract["summary"].(map[string]any)
 	if !ok {
@@ -1116,6 +1402,10 @@ func removeTemplateFillFormalCheckEvidence(inputs TemplateFillInputs) error {
 }
 
 func readTemplateFillFormalCheckEvidence(projectPath string, inputs TemplateFillInputs, planSHA256 string) (map[string]any, error) {
+	return readTemplateFillFormalCheckEvidenceForReport(projectPath, inputs, planSHA256, inputs.CheckReport)
+}
+
+func readTemplateFillFormalCheckEvidenceForReport(projectPath string, inputs TemplateFillInputs, planSHA256, expectedReportPath string) (map[string]any, error) {
 	contractPath := filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseTemplateFillCheck)+".json")
 	contract, err := readTemplateFillJSONObject(contractPath, "template fill formal check contract")
 	if err != nil {
@@ -1130,8 +1420,8 @@ func readTemplateFillFormalCheckEvidence(projectPath string, inputs TemplateFill
 	if checkedPlanSHA, _ := contract["plan_sha256"].(string); checkedPlanSHA != planSHA256 {
 		return nil, fmt.Errorf("template fill formal check plan sha256 = %q, expected %q", checkedPlanSHA, planSHA256)
 	}
-	if reportPath, _ := contract["check_report"].(string); reportPath != inputs.CheckReport {
-		return nil, fmt.Errorf("template fill formal check report = %q, expected %q", reportPath, inputs.CheckReport)
+	if reportPath, _ := contract["check_report"].(string); reportPath != expectedReportPath {
+		return nil, fmt.Errorf("template fill formal check report = %q, expected %q", reportPath, expectedReportPath)
 	}
 	summary, err := templateFillSummary(contract, "template fill formal check contract", "ok", "warn", "error")
 	if err != nil {
@@ -2618,44 +2908,67 @@ func (s *TaskService) resolveTaskWorkspace(task *model.Task) *TaskWorkspace {
 	return s.workspaces.Resolve(task)
 }
 
-func (s *TaskService) syncPreparedProject(ctx context.Context, taskID, runtimeProject, workspacePath, targetWorkspaceDir string) (string, error) {
-	if runtimeProject == "" || workspacePath == "" {
+func (s *TaskService) syncPreparedProject(ctx context.Context, task *model.Task, workspacePath, targetWorkspaceDir string) (string, error) {
+	return s.syncPreparedProjectValidated(ctx, task, workspacePath, targetWorkspaceDir, nil)
+}
+
+func (s *TaskService) syncPreparedProjectValidated(
+	ctx context.Context,
+	task *model.Task,
+	workspacePath string,
+	targetWorkspaceDir string,
+	validate func(string) error,
+) (targetProject string, err error) {
+	if task == nil || task.RuntimeProject == "" || workspacePath == "" {
 		return "", nil
 	}
-	sourceProjectsDir := filepath.Join(workspacePath, "projects")
-	matches, err := filepath.Glob(filepath.Join(sourceProjectsDir, runtimeProject+"_ppt169_*"))
+	staged, err := s.stagePreparedProject(ctx, task, workspacePath, targetWorkspaceDir)
 	if err != nil {
 		return "", err
 	}
-	direct := filepath.Join(sourceProjectsDir, runtimeProject)
-	if _, err := os.Stat(direct); err == nil {
-		matches = append(matches, direct)
+	defer func() {
+		if staged.retainRecovery {
+			return
+		}
+		err = errors.Join(err, staged.cleanup())
+	}()
+	if validate != nil {
+		if err := validate(staged.projectPath); err != nil {
+			return "", err
+		}
 	}
-	if len(matches) == 0 {
-		return "", fmt.Errorf("prepared project not found for %s in %s", runtimeProject, sourceProjectsDir)
+	targetProject = staged.targetPath
+	if !staged.noOp {
+		targetProject, err = s.promoteStagedProjectValidated(ctx, task, staged, validate)
+		if err != nil {
+			return targetProject, err
+		}
 	}
-	sourceProject := newestPath(matches)
-	targetProject := filepath.Join(targetWorkspaceDir, "projects", filepath.Base(sourceProject))
-	if sameFilesystemPath(sourceProject, targetProject) {
-		return targetProject, nil
-	}
-	if err := os.RemoveAll(targetProject); err != nil {
-		return "", err
-	}
-	if err := copyDir(ctx, sourceProject, targetProject); err != nil {
-		return "", err
-	}
-	return targetProject, s.event(ctx, taskID, model.EventTypeRuntime, "workspace_synced", "Prepared runtime project synced to task workspace", map[string]any{
-		"source": sourceProject,
-		"target": targetProject,
-	})
+	return targetProject, nil
 }
 
 func (s *TaskService) syncRuntimeProject(ctx context.Context, task *model.Task, workspace *TaskWorkspace, runtimeWorkspacePath string) (string, error) {
+	return s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeWorkspacePath, nil)
+}
+
+func (s *TaskService) syncRuntimeProjectValidated(
+	ctx context.Context,
+	task *model.Task,
+	workspace *TaskWorkspace,
+	runtimeWorkspacePath string,
+	validate func(string) error,
+) (string, error) {
 	if strings.TrimSpace(runtimeWorkspacePath) == "" || workspace == nil {
-		return s.findPersistentProjectPath(task)
+		projectPath, err := s.findPersistentProjectPath(task)
+		if err != nil {
+			return "", err
+		}
+		if validate != nil {
+			return "", fmt.Errorf("validated runtime project promotion requires a distinct session workspace")
+		}
+		return projectPath, nil
 	}
-	return s.syncPreparedProject(ctx, task.ID, task.RuntimeProject, runtimeWorkspacePath, workspace.HostDir)
+	return s.syncPreparedProjectValidated(ctx, task, runtimeWorkspacePath, workspace.HostDir, validate)
 }
 
 func (s *TaskService) findPersistentProjectPath(task *model.Task) (string, error) {
@@ -2763,24 +3076,30 @@ func (s *TaskService) runAgent(ctx context.Context, task *model.Task, phase stri
 	if commandForRecord == "" && req.Prompt != "" {
 		commandForRecord = "[prompt]\n" + req.Prompt
 	}
+	claimToken, taskStatus := taskRunOwnership(task)
 	run := &model.TaskRuntimeRun{
-		ID:        uuid.NewString(),
-		TaskID:    task.ID,
-		Runtime:   "agent-compose",
-		Agent:     s.agentCfg.Agent,
-		Phase:     phase,
-		Command:   commandForRecord,
-		Status:    "running",
-		StartedAt: &started,
+		ID:                  uuid.NewString(),
+		TaskID:              task.ID,
+		ExecutionClaimToken: claimToken,
+		TaskStatus:          taskStatus,
+		Runtime:             "agent-compose",
+		Agent:               s.agentCfg.Agent,
+		Phase:               phase,
+		Command:             commandForRecord,
+		Status:              "running",
+		StartedAt:           &started,
 	}
 	if err := s.repo.CreateRuntimeRun(ctx, run); err != nil {
+		if errors.Is(err, repository.ErrTaskExecutionClaimLost) {
+			return nil, errTaskStateChanged
+		}
 		return nil, err
 	}
 	if err := s.agent.Up(ctx, req); err != nil {
 		finished := time.Now().UTC()
 		run.FinishedAt = &finished
 		setRuntimeRunFailure(run, phase+".runtime_up", err)
-		_ = s.repo.SaveRuntimeRun(ctx, run)
+		_ = s.saveRuntimeRun(ctx, run)
 		return run, err
 	}
 	result, err := s.agent.Run(ctx, req)
@@ -2801,11 +3120,11 @@ func (s *TaskService) runAgent(ctx context.Context, task *model.Task, phase stri
 	}
 	if err != nil {
 		setRuntimeRunFailure(run, phase+".agent", err)
-		_ = s.repo.SaveRuntimeRun(ctx, run)
+		_ = s.saveRuntimeRun(ctx, run)
 		return run, err
 	}
-	if err := s.repo.SaveRuntimeRun(ctx, run); err != nil {
-		return nil, err
+	if err := s.saveRuntimeRun(ctx, run); err != nil {
+		return run, err
 	}
 	_ = s.event(ctx, task.ID, model.EventTypeRuntime, run.Status, "Agent Compose run finished", map[string]any{
 		"phase":      phase,
@@ -2813,6 +3132,15 @@ func (s *TaskService) runAgent(ctx context.Context, task *model.Task, phase stri
 		"session_id": run.ExternalSessionID,
 	})
 	return run, nil
+}
+
+func (s *TaskService) saveRuntimeRun(ctx context.Context, run *model.TaskRuntimeRun) error {
+	err := s.repo.SaveRuntimeRun(ctx, run)
+	if !errors.Is(err, repository.ErrTaskExecutionClaimLost) {
+		return err
+	}
+	_, abandonErr := s.repo.AbandonRuntimeRun(context.WithoutCancel(ctx), run, "task execution ownership changed before runtime completion")
+	return errors.Join(errTaskStateChanged, abandonErr)
 }
 
 func setRuntimeRunFailure(run *model.TaskRuntimeRun, phase string, cause error) {

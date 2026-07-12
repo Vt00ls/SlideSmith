@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -291,12 +292,180 @@ func TestCreatePhaseRunIncrementsAttemptsAndListsChronologically(t *testing.T) {
 	}
 }
 
+func newClaimAttemptRepository(t *testing.T) (*Repository, *model.Task, *model.TaskPhaseRun, *model.TaskRuntimeRun) {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Task{}, &model.TaskPhaseRun{}, &model.TaskRuntimeRun{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	ctx := context.Background()
+	task := &model.Task{ID: "task-attempt-owner", Title: "attempt owner", Status: model.TaskStatusTemplateFillApplying}
+	if err := repo.CreateTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	claimedAt := time.Now().UTC().Add(-2 * time.Hour)
+	claimed, err := repo.ClaimTaskExecution(ctx, task.ID, task.Status, "old-claim", claimedAt, claimedAt.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("claim old worker = %v, %v", claimed, err)
+	}
+	phaseRun := &model.TaskPhaseRun{
+		TaskID:              task.ID,
+		Phase:               "template_fill_apply",
+		Runner:              "worker",
+		Status:              "running",
+		ExecutionClaimToken: "old-claim",
+		TaskStatus:          task.Status,
+		StartedAt:           &claimedAt,
+	}
+	if err := repo.CreatePhaseRun(ctx, phaseRun); err != nil {
+		t.Fatal(err)
+	}
+	runtimeRun := &model.TaskRuntimeRun{
+		TaskID:              task.ID,
+		Phase:               "template_fill_apply",
+		Command:             "apply",
+		Status:              "running",
+		ExecutionClaimToken: "old-claim",
+		TaskStatus:          task.Status,
+		StartedAt:           &claimedAt,
+	}
+	if err := repo.CreateRuntimeRun(ctx, runtimeRun); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.DB().Model(&model.Task{}).
+		Where("id = ? AND execution_claim_token = ?", task.ID, "old-claim").
+		Updates(map[string]any{"execution_claimed_at": claimedAt, "updated_at": claimedAt}).Error; err != nil {
+		t.Fatal(err)
+	}
+	return repo, task, phaseRun, runtimeRun
+}
+
+func claimSuccessorForAttemptTest(t *testing.T, repo *Repository, task *model.Task) {
+	t.Helper()
+	now := time.Now().UTC()
+	claimed, err := repo.ClaimTaskExecution(context.Background(), task.ID, task.Status, "successor-claim", now, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !claimed {
+		t.Fatal("successor did not take over expired claim")
+	}
+}
+
+func TestClaimTaskExecutionAbandonsRunningPhaseAndRuntimeAttempts(t *testing.T) {
+	repo, task, phaseRun, runtimeRun := newClaimAttemptRepository(t)
+	claimSuccessorForAttemptTest(t, repo, task)
+
+	phaseRuns, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(phaseRuns) != 1 || phaseRuns[0].ID != phaseRun.ID || phaseRuns[0].Status != "failed" || phaseRuns[0].FinishedAt == nil {
+		t.Fatalf("takeover did not abandon phase run: %#v", phaseRuns)
+	}
+	if !strings.Contains(phaseRuns[0].FailureMetadata, "execution_claim_takeover") {
+		t.Fatalf("takeover phase metadata = %q", phaseRuns[0].FailureMetadata)
+	}
+	runtimeRuns, err := repo.ListRuntimeRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runtimeRuns) != 1 || runtimeRuns[0].ID != runtimeRun.ID || runtimeRuns[0].Status != "failed" || runtimeRuns[0].FinishedAt == nil {
+		t.Fatalf("takeover did not abandon runtime run: %#v", runtimeRuns)
+	}
+	if !strings.Contains(runtimeRuns[0].FailureMetadata, "execution_claim_takeover") {
+		t.Fatalf("takeover runtime metadata = %q", runtimeRuns[0].FailureMetadata)
+	}
+}
+
+func TestStaleClaimCannotCreateOwnedAttemptsAfterTakeover(t *testing.T) {
+	repo, task, _, _ := newClaimAttemptRepository(t)
+	claimSuccessorForAttemptTest(t, repo, task)
+
+	now := time.Now().UTC()
+	phaseRun := &model.TaskPhaseRun{
+		TaskID:              task.ID,
+		Phase:               "template_fill_apply",
+		Runner:              "worker",
+		Status:              "running",
+		ExecutionClaimToken: "old-claim",
+		TaskStatus:          task.Status,
+		StartedAt:           &now,
+	}
+	if err := repo.CreatePhaseRun(context.Background(), phaseRun); err == nil {
+		t.Fatal("stale phase creation error = nil")
+	}
+	runtimeRun := &model.TaskRuntimeRun{
+		TaskID:              task.ID,
+		Phase:               "template_fill_apply",
+		Command:             "apply",
+		Status:              "running",
+		ExecutionClaimToken: "old-claim",
+		TaskStatus:          task.Status,
+		StartedAt:           &now,
+	}
+	if err := repo.CreateRuntimeRun(context.Background(), runtimeRun); err == nil {
+		t.Fatal("stale runtime creation error = nil")
+	}
+
+	phaseRuns, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(phaseRuns) != 1 {
+		t.Fatalf("stale worker created phase run: %#v", phaseRuns)
+	}
+	runtimeRuns, err := repo.ListRuntimeRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runtimeRuns) != 1 {
+		t.Fatalf("stale worker created runtime run: %#v", runtimeRuns)
+	}
+}
+
+func TestAbandonedAttemptsRejectStaleCompletion(t *testing.T) {
+	repo, task, phaseRun, runtimeRun := newClaimAttemptRepository(t)
+	claimSuccessorForAttemptTest(t, repo, task)
+
+	finishedAt := time.Now().UTC()
+	phaseRun.Status = "succeeded"
+	phaseRun.FinishedAt = &finishedAt
+	if err := repo.SavePhaseRun(context.Background(), phaseRun); err == nil {
+		t.Fatal("stale phase completion error = nil")
+	}
+	runtimeRun.Status = "succeeded"
+	runtimeRun.FinishedAt = &finishedAt
+	if err := repo.SaveRuntimeRun(context.Background(), runtimeRun); err == nil {
+		t.Fatal("stale runtime completion error = nil")
+	}
+
+	phaseRuns, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(phaseRuns) != 1 || phaseRuns[0].Status != "failed" {
+		t.Fatalf("stale worker overwrote abandoned phase evidence: %#v", phaseRuns)
+	}
+	runtimeRuns, err := repo.ListRuntimeRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runtimeRuns) != 1 || runtimeRuns[0].Status != "failed" {
+		t.Fatalf("stale worker overwrote abandoned runtime evidence: %#v", runtimeRuns)
+	}
+}
+
 func TestSaveTaskIfStatusUsesCompareAndSwapAndPreservesExecutionClaim(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&model.Task{}); err != nil {
+	if err := db.AutoMigrate(&model.Task{}, &model.TaskPhaseRun{}, &model.TaskRuntimeRun{}); err != nil {
 		t.Fatal(err)
 	}
 	repo := New(db)
@@ -397,7 +566,7 @@ func TestSaveTaskIfStatusRejectsWorkerWhoseStaleClaimWasReplaced(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&model.Task{}); err != nil {
+	if err := db.AutoMigrate(&model.Task{}, &model.TaskPhaseRun{}, &model.TaskRuntimeRun{}); err != nil {
 		t.Fatal(err)
 	}
 	repo := New(db)
@@ -461,7 +630,7 @@ func TestTaskExecutionClaimIsExclusiveReleasableAndStaleRecoverable(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&model.Task{}); err != nil {
+	if err := db.AutoMigrate(&model.Task{}, &model.TaskPhaseRun{}, &model.TaskRuntimeRun{}); err != nil {
 		t.Fatal(err)
 	}
 	repo := New(db)

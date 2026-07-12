@@ -112,7 +112,8 @@ func TestTemplateFillRuntimeResultCASDoesNotResurrectCancellation(t *testing.T) 
 }
 
 type sourcePrepareCASAgent struct {
-	arm func()
+	arm         func()
+	sessionRoot string
 }
 
 func (a sourcePrepareCASAgent) Up(context.Context, AgentRunRequest) error {
@@ -120,7 +121,7 @@ func (a sourcePrepareCASAgent) Up(context.Context, AgentRunRequest) error {
 }
 
 func (a sourcePrepareCASAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
-	result, err := (successfulRoutePrepareAgent{}).Run(ctx, req)
+	result, err := (successfulRoutePrepareAgent{sessionRoot: a.sessionRoot}).Run(ctx, req)
 	if a.arm != nil {
 		a.arm()
 	}
@@ -142,7 +143,10 @@ func TestSourcePrepareCASPreservesCancellationAtResultAndRouteTransitionBoundari
 				{Name: "content.md", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-route/source/content.md"},
 			})
 			hook := installCancelBeforeTaskUpdate(t, repo.DB(), task.ID)
-			service.agent = sourcePrepareCASAgent{arm: func() { hook.Arm(test.updateNumber) }}
+			service.agent = sourcePrepareCASAgent{
+				arm:         func() { hook.Arm(test.updateNumber) },
+				sessionRoot: t.TempDir(),
+			}
 
 			if err := service.processPrepare(context.Background(), task); err != nil {
 				t.Fatalf("processPrepare() cancellation loss error = %v", err)

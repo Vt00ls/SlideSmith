@@ -32,6 +32,36 @@ func TestReadTemplateFillJSONObjectWithSHA256HashesValidatedBytes(t *testing.T) 
 	}
 }
 
+func TestValidateTemplateFillPlanContractReturnsValidatedSnapshotDigest(t *testing.T) {
+	projectPath := templateFillContractProject(t)
+	mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
+	planPath := filepath.Join(projectPath, "analysis", "fill_plan.json")
+	validatedBytes, err := os.ReadFile(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	contract, err := validateTemplateFillPlanContract(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := templateFillContractPlan("confirmed", 1)
+	templateFillContractFirstSlide(replacement)["purpose"] = "replacement-after-validated-snapshot"
+	mustWriteTemplateFillContractJSON(t, projectPath, filepath.Join("analysis", "fill_plan.json"), replacement)
+
+	wantDigest := fmt.Sprintf("%x", sha256.Sum256(validatedBytes))
+	if contract["plan_sha256"] != wantDigest {
+		t.Fatalf("plan_sha256 = %#v, want validated snapshot digest %q", contract["plan_sha256"], wantDigest)
+	}
+	currentDigest, err := sha256File(planPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentDigest == wantDigest {
+		t.Fatal("replacement did not change the on-disk plan digest")
+	}
+}
+
 func TestValidateTemplateFillPlanContractWritesContract(t *testing.T) {
 	projectPath := templateFillContractProject(t)
 	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)

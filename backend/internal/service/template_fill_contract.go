@@ -14,12 +14,17 @@ import (
 )
 
 func validateTemplateFillPlanContract(projectPath string) (map[string]any, error) {
-	inputs, slides, status, err := readValidatedTemplateFillPlan(projectPath)
+	contract, _, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	return contract, err
+}
+
+func validateTemplateFillPlanContractSnapshot(projectPath string) (map[string]any, string, error) {
+	inputs, slides, status, planSHA256, err := readValidatedTemplateFillPlanWithSHA256(projectPath)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := rejectTemplateFillMainRouteOutputs(inputs.ProjectPath); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	contract := map[string]any{
@@ -29,14 +34,15 @@ func validateTemplateFillPlanContract(projectPath string) (map[string]any, error
 		"slide_library":        inputs.SlideLibrary,
 		"fill_plan":            inputs.FillPlan,
 		"plan_status":          status,
+		"plan_sha256":          planSHA256,
 		"planned_slide_count":  len(slides),
 		"content_source_count": len(inputs.ContentSources),
 		"checked_at":           time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if _, err := writeTemplateFillContractReport(inputs.ProjectPath, PhaseTemplateFillPlan, contract); err != nil {
-		return nil, fmt.Errorf("write template fill plan contract: %w", err)
+		return nil, "", fmt.Errorf("write template fill plan contract: %w", err)
 	}
-	return contract, nil
+	return contract, planSHA256, nil
 }
 
 func validateTemplateFillCheckContract(projectPath string, requireNoErrors bool) (map[string]any, error) {

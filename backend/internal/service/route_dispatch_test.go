@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -14,14 +15,27 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-type successfulRoutePrepareAgent struct{}
+type successfulRoutePrepareAgent struct {
+	sessionRoot string
+}
 
 func (successfulRoutePrepareAgent) Up(context.Context, AgentRunRequest) error {
 	return nil
 }
 
-func (successfulRoutePrepareAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
-	project := filepath.Join(req.WorkDir, "projects", "task_route_ppt169_20260708")
+func (a successfulRoutePrepareAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+	if err := os.MkdirAll(a.sessionRoot, 0o755); err != nil {
+		return nil, err
+	}
+	sessionDir, err := os.MkdirTemp(a.sessionRoot, "route-session-")
+	if err != nil {
+		return nil, err
+	}
+	sessionWorkspace := filepath.Join(sessionDir, "workspace")
+	if err := copyDir(ctx, req.WorkDir, sessionWorkspace); err != nil {
+		return nil, err
+	}
+	project := filepath.Join(sessionWorkspace, "projects", "task_route_ppt169_20260708")
 	mustWriteFileNoTest(project, filepath.Join("sources", "deck.pptx"), "pptx")
 	mustWriteFileNoTest(project, filepath.Join("sources", "deck.md"), "# Deck\n")
 	mustWriteFileNoTest(project, filepath.Join("sources", "content.md"), "# Content\n")
@@ -34,7 +48,7 @@ func (successfulRoutePrepareAgent) Run(_ context.Context, req AgentRunRequest) (
 		SessionID:     "session-route-prepare",
 		Status:        "succeeded",
 		ExitCode:      &exitCode,
-		WorkspacePath: req.WorkDir,
+		WorkspacePath: sessionWorkspace,
 	}, nil
 }
 
@@ -242,7 +256,7 @@ func routeDispatchPrepareService(t *testing.T, title string, artifacts []model.A
 	service := NewTaskService(
 		repo,
 		storage,
-		successfulRoutePrepareAgent{},
+		successfulRoutePrepareAgent{sessionRoot: filepath.Join(tmp, "sessions")},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
 			Enabled:           true,

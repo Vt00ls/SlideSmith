@@ -28,6 +28,9 @@ type templateFillWorkflowAgent struct {
 	planStatus                  string
 	noOpCheck                   bool
 	mutatePlanDuringCheck       bool
+	mutatePlanDuringApply       bool
+	mutatePlanDuringValidate    bool
+	mutateReportDuringValidate  bool
 	failPhase                   string
 	onPhase                     func(string) error
 	checkSawPlan                bool
@@ -59,6 +62,10 @@ func (a *templateFillWorkflowAgent) Run(ctx context.Context, req AgentRunRequest
 		return nil, fmt.Errorf("template fill project %q is outside work dir %q", a.projectPath, req.WorkDir)
 	}
 	sessionProjectPath := filepath.Join(sessionWorkspace, projectRel)
+	if req.Phase == string(PhaseTemplateFillCheck) && strings.HasPrefix(strings.TrimSpace(req.Command), "rm -f ") {
+		_ = os.Remove(filepath.Join(sessionProjectPath, "analysis", "check_report.json"))
+		_ = os.Remove(filepath.Join(sessionProjectPath, ".slidesmith", "contracts", "template_fill_check.json"))
+	}
 	if a.onPhase != nil {
 		if err := a.onPhase(req.Phase); err != nil {
 			return nil, err
@@ -115,6 +122,11 @@ func (a *templateFillWorkflowAgent) Run(ctx context.Context, req AgentRunRequest
 			slideCount = 1
 		}
 		mustWritePPTXNoTest(sessionProjectPath, filepath.Join("exports", "result.pptx"), slideCount)
+		if a.mutatePlanDuringApply {
+			plan := templateFillContractPlan("confirmed", 1)
+			templateFillContractFirstSlide(plan)["purpose"] = "mutated-during-apply"
+			writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("analysis", "fill_plan.json"), plan)
+		}
 	case string(PhaseTemplateFillValidate):
 		mustWriteFileNoTest(sessionProjectPath, filepath.Join("validation", "readback.md"), "## Slide 1\n")
 		writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("validation", "validate_report.json"), map[string]any{
@@ -126,6 +138,22 @@ func (a *templateFillWorkflowAgent) Run(ctx context.Context, req AgentRunRequest
 			},
 			"results": []any{},
 		})
+		if a.mutatePlanDuringValidate {
+			plan := templateFillContractPlan("confirmed", 1)
+			templateFillContractFirstSlide(plan)["purpose"] = "mutated-during-validate"
+			writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("analysis", "fill_plan.json"), plan)
+		}
+		if a.mutateReportDuringValidate {
+			writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("analysis", "check_report.json"), map[string]any{
+				"schema": "template_fill_pptx_check.v1",
+				"summary": map[string]any{
+					"ok":    2,
+					"warn":  0,
+					"error": 0,
+				},
+				"results": []any{},
+			})
+		}
 	default:
 		return nil, fmt.Errorf("unexpected template fill phase %q", req.Phase)
 	}
@@ -434,6 +462,13 @@ func TestTemplateFillFormalCheckRejectsStaleReportAndPlanMutation(t *testing.T) 
 			},
 			wantFailurePhase: "template_fill_check.plan_changed",
 		},
+		{
+			name: "checker command failure",
+			configure: func(agent *templateFillWorkflowAgent) {
+				agent.failPhase = string(PhaseTemplateFillCheck)
+			},
+			wantFailurePhase: "template_fill_check.command",
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -443,6 +478,19 @@ func TestTemplateFillFormalCheckRejectsStaleReportAndPlanMutation(t *testing.T) 
 			agent.projectPath = projectPath
 			mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
 			prepareTemplateFillCheckContractReport(t, projectPath)
+			writeTemplateFillFormalCheckEvidence(t, projectPath)
+			canonicalPlanBefore, err := os.ReadFile(filepath.Join(projectPath, "analysis", "fill_plan.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonicalReportBefore, err := os.ReadFile(filepath.Join(projectPath, "analysis", "check_report.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonicalContractBefore, err := os.ReadFile(filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			if err := service.ProcessTask(context.Background(), task.ID); err == nil {
 				t.Fatal("ProcessTask() error = nil, want formal freshness failure")
@@ -457,6 +505,24 @@ func TestTemplateFillFormalCheckRejectsStaleReportAndPlanMutation(t *testing.T) 
 			phaseRun := requireSingleTemplateFillPhaseRun(t, repo, task.ID, PhaseTemplateFillCheck)
 			if phaseRun.Status != PhaseRunStatusFailed {
 				t.Fatalf("formal freshness phase run = %#v", phaseRun)
+			}
+			canonicalPlanAfter, err := os.ReadFile(filepath.Join(projectPath, "analysis", "fill_plan.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(canonicalPlanAfter) != string(canonicalPlanBefore) {
+				t.Fatalf("rejected formal session overwrote canonical plan\nbefore=%s\nafter=%s", canonicalPlanBefore, canonicalPlanAfter)
+			}
+			canonicalReportAfter, err := os.ReadFile(filepath.Join(projectPath, "analysis", "check_report.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonicalContractAfter, err := os.ReadFile(filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(canonicalReportAfter) != string(canonicalReportBefore) || string(canonicalContractAfter) != string(canonicalContractBefore) {
+				t.Fatal("rejected formal session changed canonical formal evidence")
 			}
 		})
 	}
@@ -492,7 +558,7 @@ func TestProcessQueuedTasksRunsConfirmedTemplateFillCheckApplyAndValidate(t *tes
 
 	projectRel := service.projectRel(task, projectPath)
 	wantCommands := map[string]string{
-		string(PhaseTemplateFillCheck):    fmt.Sprintf("python3 scripts/ppt_runner.py template-fill-check --project-path %s", shellArg(projectRel)),
+		string(PhaseTemplateFillCheck):    templateFillFormalCheckCommand(projectRel),
 		string(PhaseTemplateFillApply):    fmt.Sprintf("python3 scripts/ppt_runner.py template-fill-apply --project-path %s --transition fade", shellArg(projectRel)),
 		string(PhaseTemplateFillValidate): fmt.Sprintf("python3 scripts/ppt_runner.py template-fill-validate --project-path %s", shellArg(projectRel)),
 	}
@@ -709,6 +775,158 @@ func TestTemplateFillApplyRejectsDraftPlanBeforeRuntimeOrExportMutation(t *testi
 	}
 	if _, err := os.Stat(filepath.Join(projectPath, "exports", "result.pptx")); !os.IsNotExist(err) {
 		t.Fatalf("draft apply created result.pptx: %v", err)
+	}
+}
+
+func TestTemplateFillApplyRejectsSessionPlanMutationBeforeCanonicalPromotion(t *testing.T) {
+	agent := &templateFillWorkflowAgent{mutatePlanDuringApply: true}
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillApplying, agent)
+	agent.projectPath = projectPath
+	prepareTemplateFillWorkflowPhase(t, projectPath, model.TaskStatusTemplateFillApplying)
+	canonicalPlanBefore, err := os.ReadFile(filepath.Join(projectPath, "analysis", "fill_plan.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(projectPath, "exports", "sentinel.txt"), "preserve\n")
+
+	if err := service.ProcessTask(context.Background(), task.ID); err == nil {
+		t.Fatal("ProcessTask() error = nil, want session plan mutation failure")
+	}
+	updated, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "template_fill_apply.plan_changed" {
+		t.Fatalf("apply session mutation task = %#v", updated)
+	}
+	canonicalPlanAfter, err := os.ReadFile(filepath.Join(projectPath, "analysis", "fill_plan.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(canonicalPlanAfter) != string(canonicalPlanBefore) {
+		t.Fatalf("rejected apply session overwrote canonical plan\nbefore=%s\nafter=%s", canonicalPlanBefore, canonicalPlanAfter)
+	}
+	if _, err := os.Stat(filepath.Join(projectPath, "exports", "result.pptx")); !os.IsNotExist(err) {
+		t.Fatalf("rejected apply session promoted result.pptx: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(projectPath, "exports", "sentinel.txt"))
+	if err != nil || string(raw) != "preserve\n" {
+		t.Fatalf("rejected apply session changed canonical sentinel: %q, error=%v", raw, err)
+	}
+}
+
+func TestTemplateFillPlanRejectsInvalidSessionBeforeCanonicalPromotion(t *testing.T) {
+	agent := &templateFillWorkflowAgent{invalidPlan: true}
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillPlanning, agent)
+	agent.projectPath = projectPath
+
+	if err := service.ProcessTask(context.Background(), task.ID); err == nil {
+		t.Fatal("ProcessTask() error = nil, want invalid plan failure")
+	}
+	updated, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "template_fill_plan.contract" {
+		t.Fatalf("invalid plan task = %#v", updated)
+	}
+	if _, err := os.Stat(filepath.Join(projectPath, "analysis", "fill_plan.json")); !os.IsNotExist(err) {
+		t.Fatalf("invalid plan session changed canonical plan: %v", err)
+	}
+}
+
+func TestTemplateFillDraftCheckRejectsSessionPlanMutationBeforeCanonicalPromotion(t *testing.T) {
+	agent := &templateFillWorkflowAgent{mutatePlanDuringCheck: true}
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillPlanning, agent)
+	agent.projectPath = projectPath
+
+	if err := service.ProcessTask(context.Background(), task.ID); err == nil {
+		t.Fatal("ProcessTask() error = nil, want draft-check plan mutation failure")
+	}
+	updated, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "template_fill_plan.draft_check.plan_changed" {
+		t.Fatalf("draft-check mutation task = %#v", updated)
+	}
+	_, slides, status, err := readValidatedTemplateFillPlan(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	purpose, _ := slides[0].(map[string]any)["purpose"].(string)
+	if status != "draft" || purpose != "slide-1" {
+		t.Fatalf("rejected draft-check session changed canonical plan: status=%q purpose=%q", status, purpose)
+	}
+	if _, err := os.Stat(filepath.Join(projectPath, "analysis", "check_report.json")); !os.IsNotExist(err) {
+		t.Fatalf("rejected draft-check session promoted report: %v", err)
+	}
+}
+
+func TestTemplateFillValidateRejectsFormalEvidenceMutationBeforeCanonicalPromotion(t *testing.T) {
+	tests := []struct {
+		name             string
+		configure        func(*templateFillWorkflowAgent)
+		wantFailurePhase string
+	}{
+		{
+			name: "plan changed",
+			configure: func(agent *templateFillWorkflowAgent) {
+				agent.mutatePlanDuringValidate = true
+			},
+			wantFailurePhase: "template_fill_validate.plan_changed",
+		},
+		{
+			name: "formal report changed",
+			configure: func(agent *templateFillWorkflowAgent) {
+				agent.mutateReportDuringValidate = true
+			},
+			wantFailurePhase: "template_fill_validate.check_contract",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := &templateFillWorkflowAgent{}
+			test.configure(agent)
+			service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillValidating, agent)
+			agent.projectPath = projectPath
+			prepareTemplateFillWorkflowPhase(t, projectPath, model.TaskStatusTemplateFillValidating)
+			canonicalPlanBefore, err := os.ReadFile(filepath.Join(projectPath, "analysis", "fill_plan.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonicalReportBefore, err := os.ReadFile(filepath.Join(projectPath, "analysis", "check_report.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := service.ProcessTask(context.Background(), task.ID); err == nil {
+				t.Fatal("ProcessTask() error = nil, want validate evidence mutation failure")
+			}
+			updated, err := repo.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if updated.Status != model.TaskStatusFailed || updated.FailurePhase != test.wantFailurePhase {
+				t.Fatalf("validate evidence mutation task = %#v", updated)
+			}
+			canonicalPlanAfter, err := os.ReadFile(filepath.Join(projectPath, "analysis", "fill_plan.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			canonicalReportAfter, err := os.ReadFile(filepath.Join(projectPath, "analysis", "check_report.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(canonicalPlanAfter) != string(canonicalPlanBefore) || string(canonicalReportAfter) != string(canonicalReportBefore) {
+				t.Fatal("rejected validate session changed canonical formal evidence")
+			}
+			for _, relativePath := range []string{filepath.Join("validation", "readback.md"), filepath.Join("validation", "validate_report.json")} {
+				if _, err := os.Stat(filepath.Join(projectPath, relativePath)); !os.IsNotExist(err) {
+					t.Fatalf("rejected validate session promoted %s: %v", relativePath, err)
+				}
+			}
+		})
 	}
 }
 

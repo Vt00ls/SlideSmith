@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -14,6 +16,7 @@ import (
 
 type blockingTemplateFillCheckAgent struct {
 	projectPath string
+	sessionRoot string
 	calls       atomic.Int32
 	firstReady  chan struct{}
 	release     chan struct{}
@@ -31,7 +34,7 @@ func (a *blockingTemplateFillCheckAgent) Up(context.Context, AgentRunRequest) er
 	return nil
 }
 
-func (a *blockingTemplateFillCheckAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+func (a *blockingTemplateFillCheckAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
 	if req.Phase != string(PhaseTemplateFillCheck) {
 		return nil, fmt.Errorf("unexpected phase %q", req.Phase)
 	}
@@ -40,7 +43,20 @@ func (a *blockingTemplateFillCheckAgent) Run(_ context.Context, req AgentRunRequ
 		close(a.firstReady)
 		<-a.release
 	}
-	writeTemplateFillWorkflowJSON(a.projectPath, filepath.Join("analysis", "check_report.json"), map[string]any{
+	sessionDir, err := os.MkdirTemp(a.sessionRoot, "claim-session-")
+	if err != nil {
+		return nil, err
+	}
+	sessionWorkspace := filepath.Join(sessionDir, "workspace")
+	if err := copyDir(ctx, req.WorkDir, sessionWorkspace); err != nil {
+		return nil, err
+	}
+	projectRel, err := filepath.Rel(req.WorkDir, a.projectPath)
+	if err != nil {
+		return nil, err
+	}
+	sessionProjectPath := filepath.Join(sessionWorkspace, projectRel)
+	writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("analysis", "check_report.json"), map[string]any{
 		"schema":  "template_fill_pptx_check.v1",
 		"summary": map[string]any{"ok": 1, "warn": 0, "error": 0},
 		"results": []any{},
@@ -51,14 +67,15 @@ func (a *blockingTemplateFillCheckAgent) Run(_ context.Context, req AgentRunRequ
 		SessionID:     fmt.Sprintf("session-check-%d", call),
 		Status:        "succeeded",
 		ExitCode:      &exitCode,
-		WorkspacePath: req.WorkDir,
+		WorkspacePath: sessionWorkspace,
 	}, nil
 }
 
 func TestProcessTaskDurableClaimAllowsOnlyOneNonIdempotentRuntime(t *testing.T) {
 	agent := &blockingTemplateFillCheckAgent{
-		firstReady: make(chan struct{}),
-		release:    make(chan struct{}),
+		firstReady:  make(chan struct{}),
+		release:     make(chan struct{}),
+		sessionRoot: t.TempDir(),
 	}
 	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillChecking, agent)
 	agent.projectPath = projectPath
@@ -134,5 +151,70 @@ func TestProcessQueuedTasksTakesOverExpiredSourceConvertingClaim(t *testing.T) {
 	}
 	if updated.ExecutionClaimToken != "" || updated.ExecutionClaimedAt != nil {
 		t.Fatalf("takeover worker did not release claim: %#v", updated)
+	}
+}
+
+func TestSyncRuntimeProjectRejectsStaleClaimAfterSuccessorPromotion(t *testing.T) {
+	service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillApplying, nil)
+	oldClaimedAt := time.Now().UTC().Add(-service.taskExecutionLeaseDuration() - time.Minute)
+	claimed, err := repo.ClaimTaskExecution(context.Background(), task.ID, task.Status, "old-claim", oldClaimedAt, oldClaimedAt.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("claim old worker = %v, %v", claimed, err)
+	}
+	oldTask := *task
+	oldTask.ExecutionClaimToken = "old-claim"
+	oldTask.ExecutionClaimedAt = &oldClaimedAt
+
+	successorClaimedAt := time.Now().UTC()
+	claimed, err = repo.ClaimTaskExecution(context.Background(), task.ID, task.Status, "successor-claim", successorClaimedAt, successorClaimedAt.Add(-service.taskExecutionLeaseDuration()))
+	if err != nil || !claimed {
+		t.Fatalf("claim successor worker = %v, %v", claimed, err)
+	}
+	successorTask := *task
+	successorTask.ExecutionClaimToken = "successor-claim"
+	successorTask.ExecutionClaimedAt = &successorClaimedAt
+
+	makeSession := func(name, purpose string) string {
+		sessionWorkspace := filepath.Join(t.TempDir(), name, "workspace")
+		if err := copyDir(context.Background(), workspacePath, sessionWorkspace); err != nil {
+			t.Fatal(err)
+		}
+		plan := templateFillContractPlan("confirmed", 1)
+		templateFillContractFirstSlide(plan)["purpose"] = purpose
+		writeTemplateFillWorkflowJSON(filepath.Join(sessionWorkspace, "projects", filepath.Base(projectPath)), filepath.Join("analysis", "fill_plan.json"), plan)
+		return sessionWorkspace
+	}
+	successorSession := makeSession("successor", "successor-plan")
+	oldSession := makeSession("old", "stale-plan")
+	workspace := service.resolveTaskWorkspace(&successorTask)
+	if _, err := service.syncRuntimeProject(context.Background(), &successorTask, workspace, successorSession); err != nil {
+		t.Fatalf("successor promotion error = %v", err)
+	}
+	if _, err := service.syncRuntimeProject(context.Background(), &oldTask, workspace, oldSession); !errors.Is(err, errTaskStateChanged) {
+		t.Fatalf("stale promotion error = %v, want task state changed", err)
+	}
+
+	_, slides, _, err := readValidatedTemplateFillPlan(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	purpose, _ := slides[0].(map[string]any)["purpose"].(string)
+	if purpose != "successor-plan" {
+		t.Fatalf("canonical plan purpose = %q, want successor-plan", purpose)
+	}
+	info, err := os.Lstat(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("canonical project is not a real directory: %v", info.Mode())
+	}
+	promotionRoot := filepath.Join(workspacePath, ".slidesmith", "project-promotions")
+	entries, err := os.ReadDir(promotionRoot)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("promotion staging leaked entries: %#v", entries)
 	}
 }

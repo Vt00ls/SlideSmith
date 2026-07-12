@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"time"
 
@@ -76,16 +77,34 @@ func (r *Repository) SaveTaskIfStatus(ctx context.Context, task *model.Task, exp
 	if expectedClaimToken != "" {
 		task.ExecutionClaimedAt = &now
 	}
-	result := r.db.WithContext(ctx).
-		Model(&model.Task{}).
-		Where("id = ? AND status = ? AND execution_claim_token = ?", task.ID, expectedStatus, expectedClaimToken).
-		Select("*").
-		Omit("id", "created_at", "execution_claim_token").
-		Updates(task)
-	if result.Error != nil {
-		return false, result.Error
+	saved := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.Task{}).
+			Where("id = ? AND status = ? AND execution_claim_token = ?", task.ID, expectedStatus, expectedClaimToken).
+			Select("*").
+			Omit("id", "created_at", "execution_claim_token").
+			Updates(task)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+		if task.Status != expectedStatus && expectedClaimToken != "" {
+			if err := abandonRunningTaskAttempts(tx, task.ID, now, "task_status_changed", map[string]any{
+				"previous_status": expectedStatus,
+				"current_status":  task.Status,
+			}); err != nil {
+				return err
+			}
+		}
+		saved = true
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	return result.RowsAffected == 1, nil
+	return saved, nil
 }
 
 func (r *Repository) ClaimTaskExecution(
@@ -96,19 +115,103 @@ func (r *Repository) ClaimTaskExecution(
 	claimedAt time.Time,
 	staleBefore time.Time,
 ) (bool, error) {
-	result := r.db.WithContext(ctx).
-		Model(&model.Task{}).
-		Where("id = ? AND status = ?", taskID, expectedStatus).
-		Where("execution_claim_token = '' OR execution_claimed_at IS NULL OR execution_claimed_at < ?", staleBefore).
-		Updates(map[string]any{
-			"execution_claim_token": token,
-			"execution_claimed_at":  claimedAt,
-			"updated_at":            claimedAt,
-		})
-	if result.Error != nil {
-		return false, result.Error
+	claimed := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		result := tx.Model(&model.Task{}).
+			Where("id = ? AND status = ?", taskID, expectedStatus).
+			Where("execution_claim_token = '' OR execution_claimed_at IS NULL OR execution_claimed_at < ?", staleBefore).
+			Updates(map[string]any{
+				"execution_claim_token": token,
+				"execution_claimed_at":  claimedAt,
+				"updated_at":            claimedAt,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+		if err := abandonRunningTaskAttempts(tx, taskID, claimedAt, "execution_claim_takeover", nil); err != nil {
+			return err
+		}
+		claimed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
 	}
-	return result.RowsAffected == 1, nil
+	return claimed, nil
+}
+
+func (r *Repository) RenewTaskExecutionClaim(ctx context.Context, taskID, expectedStatus, token string) (bool, error) {
+	return r.commitWithTaskExecutionClaim(ctx, taskID, expectedStatus, token, nil)
+}
+
+func (r *Repository) commitWithTaskExecutionClaim(
+	ctx context.Context,
+	taskID string,
+	expectedStatus string,
+	token string,
+	commit func(*gorm.DB) error,
+) (bool, error) {
+	matched := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := time.Now().UTC()
+		result := tx.Model(&model.Task{}).
+			Where("id = ? AND status = ? AND execution_claim_token = ?", taskID, expectedStatus, token).
+			Updates(map[string]any{
+				"execution_claimed_at": now,
+				"updated_at":           now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+		matched = true
+		if commit == nil {
+			return nil
+		}
+		return commit(tx)
+	})
+	if err != nil {
+		return false, err
+	}
+	return matched, nil
+}
+
+func (r *Repository) commitWithTaskExecutionClaimAnyStatus(
+	ctx context.Context,
+	taskID string,
+	token string,
+	commit func(*gorm.DB) error,
+) (bool, error) {
+	matched := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		now := time.Now().UTC()
+		result := tx.Model(&model.Task{}).
+			Where("id = ? AND execution_claim_token = ?", taskID, token).
+			Updates(map[string]any{
+				"execution_claimed_at": now,
+				"updated_at":           now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return nil
+		}
+		matched = true
+		if commit == nil {
+			return nil
+		}
+		return commit(tx)
+	})
+	if err != nil {
+		return false, err
+	}
+	return matched, nil
 }
 
 func (r *Repository) ReleaseTaskExecution(ctx context.Context, taskID, token string) (bool, error) {
@@ -312,12 +415,91 @@ func (r *Repository) CreateRuntimeRun(ctx context.Context, run *model.TaskRuntim
 	}
 	run.CreatedAt = now
 	run.UpdatedAt = now
-	return r.db.WithContext(ctx).Create(run).Error
+	owned, err := validateRunOwnership(run.ExecutionClaimToken, run.TaskStatus)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return r.db.WithContext(ctx).Create(run).Error
+	}
+	matched, err := r.commitWithTaskExecutionClaim(ctx, run.TaskID, run.TaskStatus, run.ExecutionClaimToken, func(tx *gorm.DB) error {
+		return tx.Create(run).Error
+	})
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return ErrTaskExecutionClaimLost
+	}
+	return nil
 }
 
 func (r *Repository) SaveRuntimeRun(ctx context.Context, run *model.TaskRuntimeRun) error {
 	run.UpdatedAt = time.Now().UTC()
-	return r.db.WithContext(ctx).Save(run).Error
+	owned, err := validateRunOwnership(run.ExecutionClaimToken, run.TaskStatus)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return r.db.WithContext(ctx).Save(run).Error
+	}
+	matched, err := r.commitWithTaskExecutionClaim(ctx, run.TaskID, run.TaskStatus, run.ExecutionClaimToken, func(tx *gorm.DB) error {
+		result := tx.Model(&model.TaskRuntimeRun{}).
+			Where("id = ? AND status = ? AND execution_claim_token = ? AND task_status = ?", run.ID, "running", run.ExecutionClaimToken, run.TaskStatus).
+			Select("*").
+			Omit("id", "created_at", "execution_claim_token", "task_status").
+			Updates(run)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrTaskExecutionClaimLost
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return ErrTaskExecutionClaimLost
+	}
+	return nil
+}
+
+func (r *Repository) AbandonRuntimeRun(ctx context.Context, run *model.TaskRuntimeRun, reason string) (bool, error) {
+	if run == nil || run.ExecutionClaimToken == "" {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	metadataRaw, err := json.Marshal(map[string]any{
+		"reason":       reason,
+		"abandoned_at": now.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return false, err
+	}
+	abandoned := false
+	matched, err := r.commitWithTaskExecutionClaimAnyStatus(ctx, run.TaskID, run.ExecutionClaimToken, func(tx *gorm.DB) error {
+		result := tx.Model(&model.TaskRuntimeRun{}).
+			Where("id = ? AND task_id = ? AND status = ? AND execution_claim_token = ?", run.ID, run.TaskID, "running", run.ExecutionClaimToken).
+			Updates(map[string]any{
+				"status":           "failed",
+				"finished_at":      now,
+				"error_message":    reason,
+				"failure_phase":    "execution_claim_lost",
+				"failure_metadata": string(metadataRaw),
+				"updated_at":       now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		abandoned = result.RowsAffected == 1
+		return nil
+	})
+	if err != nil || !matched {
+		return false, err
+	}
+	return abandoned, nil
 }
 
 func (r *Repository) ListRuntimeRuns(ctx context.Context, taskID string) ([]model.TaskRuntimeRun, error) {
@@ -334,17 +516,6 @@ func (r *Repository) CreatePhaseRun(ctx context.Context, run *model.TaskPhaseRun
 	if run.ID == "" {
 		run.ID = uuid.NewString()
 	}
-	if run.Attempt <= 0 {
-		var maxAttempt int
-		if err := r.db.WithContext(ctx).
-			Model(&model.TaskPhaseRun{}).
-			Where("task_id = ? AND phase = ?", run.TaskID, run.Phase).
-			Select("COALESCE(MAX(attempt), 0)").
-			Scan(&maxAttempt).Error; err != nil {
-			return err
-		}
-		run.Attempt = maxAttempt + 1
-	}
 	if run.InputJSON == "" {
 		run.InputJSON = "{}"
 	}
@@ -356,12 +527,150 @@ func (r *Repository) CreatePhaseRun(ctx context.Context, run *model.TaskPhaseRun
 	}
 	run.CreatedAt = now
 	run.UpdatedAt = now
-	return r.db.WithContext(ctx).Create(run).Error
+	owned, err := validateRunOwnership(run.ExecutionClaimToken, run.TaskStatus)
+	if err != nil {
+		return err
+	}
+	create := func(db *gorm.DB) error {
+		if run.Attempt <= 0 {
+			var maxAttempt int
+			if err := db.Model(&model.TaskPhaseRun{}).
+				Where("task_id = ? AND phase = ?", run.TaskID, run.Phase).
+				Select("COALESCE(MAX(attempt), 0)").
+				Scan(&maxAttempt).Error; err != nil {
+				return err
+			}
+			run.Attempt = maxAttempt + 1
+		}
+		return db.Create(run).Error
+	}
+	if !owned {
+		return create(r.db.WithContext(ctx))
+	}
+	matched, err := r.commitWithTaskExecutionClaim(ctx, run.TaskID, run.TaskStatus, run.ExecutionClaimToken, create)
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return ErrTaskExecutionClaimLost
+	}
+	return nil
 }
 
 func (r *Repository) SavePhaseRun(ctx context.Context, run *model.TaskPhaseRun) error {
 	run.UpdatedAt = time.Now().UTC()
-	return r.db.WithContext(ctx).Save(run).Error
+	owned, err := validateRunOwnership(run.ExecutionClaimToken, run.TaskStatus)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return r.db.WithContext(ctx).Save(run).Error
+	}
+	matched, err := r.commitWithTaskExecutionClaim(ctx, run.TaskID, run.TaskStatus, run.ExecutionClaimToken, func(tx *gorm.DB) error {
+		result := tx.Model(&model.TaskPhaseRun{}).
+			Where("id = ? AND status = ? AND execution_claim_token = ? AND task_status = ?", run.ID, "running", run.ExecutionClaimToken, run.TaskStatus).
+			Select("*").
+			Omit("id", "created_at", "execution_claim_token", "task_status").
+			Updates(run)
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return ErrTaskExecutionClaimLost
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return ErrTaskExecutionClaimLost
+	}
+	return nil
+}
+
+func (r *Repository) AbandonPhaseRun(ctx context.Context, run *model.TaskPhaseRun, reason string) (bool, error) {
+	if run == nil || run.ExecutionClaimToken == "" {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	metadataRaw, err := json.Marshal(map[string]any{
+		"reason":       reason,
+		"abandoned_at": now.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return false, err
+	}
+	abandoned := false
+	matched, err := r.commitWithTaskExecutionClaimAnyStatus(ctx, run.TaskID, run.ExecutionClaimToken, func(tx *gorm.DB) error {
+		result := tx.Model(&model.TaskPhaseRun{}).
+			Where("id = ? AND task_id = ? AND status = ? AND execution_claim_token = ?", run.ID, run.TaskID, "running", run.ExecutionClaimToken).
+			Updates(map[string]any{
+				"status":           "failed",
+				"finished_at":      now,
+				"error_message":    reason,
+				"failure_metadata": string(metadataRaw),
+				"updated_at":       now,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		abandoned = result.RowsAffected == 1
+		return nil
+	})
+	if err != nil || !matched {
+		return false, err
+	}
+	return abandoned, nil
+}
+
+func abandonRunningTaskAttempts(tx *gorm.DB, taskID string, finishedAt time.Time, reason string, extra map[string]any) error {
+	metadata := map[string]any{
+		"reason":       reason,
+		"abandoned_at": finishedAt.Format(time.RFC3339Nano),
+	}
+	for key, value := range extra {
+		metadata[key] = value
+	}
+	metadataRaw, err := json.Marshal(metadata)
+	if err != nil {
+		return err
+	}
+	message := fmt.Sprintf("worker attempt abandoned: %s", reason)
+	if err := tx.Model(&model.TaskPhaseRun{}).
+		Where("task_id = ? AND status = ?", taskID, "running").
+		Updates(map[string]any{
+			"status":           "failed",
+			"finished_at":      finishedAt,
+			"error_message":    message,
+			"failure_metadata": string(metadataRaw),
+			"updated_at":       finishedAt,
+		}).Error; err != nil {
+		return err
+	}
+	if err := tx.Model(&model.TaskRuntimeRun{}).
+		Where("task_id = ? AND status = ?", taskID, "running").
+		Updates(map[string]any{
+			"status":           "failed",
+			"finished_at":      finishedAt,
+			"error_message":    message,
+			"failure_phase":    reason,
+			"failure_metadata": string(metadataRaw),
+			"updated_at":       finishedAt,
+		}).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateRunOwnership(claimToken, taskStatus string) (bool, error) {
+	if claimToken == "" && taskStatus == "" {
+		return false, nil
+	}
+	if claimToken == "" || taskStatus == "" {
+		return false, fmt.Errorf("run ownership requires both execution claim token and task status")
+	}
+	return true, nil
 }
 
 func (r *Repository) ListPhaseRuns(ctx context.Context, taskID string) ([]model.TaskPhaseRun, error) {
@@ -507,3 +816,4 @@ func (r *Repository) SubmitConfirmations(ctx context.Context, taskID string, val
 }
 
 var ErrNotFound = errors.New("not found")
+var ErrTaskExecutionClaimLost = errors.New("task execution claim lost")
