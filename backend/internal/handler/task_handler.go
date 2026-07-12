@@ -161,6 +161,62 @@ func (h *TaskHandler) GetSpecPreview(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, gin.H{"data": spec})
 }
 
+func (h *TaskHandler) GetTemplateFillPlan(ctx *gin.Context) {
+	preview, err := h.tasks.GetTemplateFillPlan(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": preview})
+}
+
+func (h *TaskHandler) SaveTemplateFillPlan(ctx *gin.Context) {
+	var req struct {
+		Plan map[string]any `json:"plan"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	if req.Plan == nil {
+		errorJSON(ctx, http.StatusBadRequest, errors.New("template fill plan is required"))
+		return
+	}
+	preview, err := h.tasks.SaveTemplateFillPlan(ctx.Request.Context(), ctx.Param("id"), req.Plan)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": preview})
+}
+
+func (h *TaskHandler) CheckTemplateFillPlan(ctx *gin.Context) {
+	task, err := h.tasks.CheckTemplateFillPlan(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) ConfirmTemplateFillPlan(ctx *gin.Context) {
+	task, err := h.tasks.ConfirmTemplateFillPlan(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) RegenerateTemplateFillPlan(ctx *gin.Context) {
+	task, err := h.tasks.RegenerateTemplateFillPlan(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
 func (h *TaskHandler) ListEvents(ctx *gin.Context) {
 	afterSeq, _ := strconv.ParseInt(ctx.DefaultQuery("after_seq", "0"), 10, 64)
 	limit, _ := strconv.Atoi(ctx.DefaultQuery("limit", "200"))

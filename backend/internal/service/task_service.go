@@ -28,6 +28,7 @@ type TaskService struct {
 	machine    *StateMachine
 
 	beforeCanonicalMutationPromotion func(string) error
+	beforeTemplateFillAPITransition  func(string)
 }
 
 const (
@@ -2587,6 +2588,17 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID string) (*model.Tas
 	task, err := s.repo.GetTask(ctx, taskID)
 	if err != nil {
 		return nil, err
+	}
+	if task.Route == model.TaskRouteTemplateFill {
+		unlock, err := s.lockTemplateFillAPI(ctx, task)
+		if err != nil {
+			return nil, err
+		}
+		defer unlock()
+		task, err = s.repo.GetTask(ctx, taskID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	now := time.Now().UTC()
 	task.CancelledAt = &now
