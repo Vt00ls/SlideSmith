@@ -365,6 +365,15 @@ func (r *Repository) ListArtifactsByPublishVersion(ctx context.Context, taskID, 
 	return artifacts, err
 }
 
+func (r *Repository) DeleteArtifactsByPublishVersion(ctx context.Context, taskID, publishVersion string) error {
+	if publishVersion == "" {
+		return fmt.Errorf("publish version is empty")
+	}
+	return r.db.WithContext(ctx).
+		Where("task_id = ? AND publish_version = ?", taskID, publishVersion).
+		Delete(&model.Artifact{}).Error
+}
+
 func (r *Repository) latestPublishVersion(ctx context.Context, taskID string) (string, error) {
 	var artifact model.Artifact
 	err := r.db.WithContext(ctx).

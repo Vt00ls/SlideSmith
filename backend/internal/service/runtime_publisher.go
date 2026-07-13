@@ -39,8 +39,37 @@ func NewRuntimeWorkspacePublisher(storage StorageService) *RuntimeWorkspacePubli
 }
 
 func (p *RuntimeWorkspacePublisher) Publish(ctx context.Context, taskID, workspacePath, publishVersion string) ([]model.Artifact, error) {
+	return p.publish(ctx, taskID, workspacePath, "", publishVersion)
+}
+
+func (p *RuntimeWorkspacePublisher) PublishProject(ctx context.Context, taskID, workspacePath, projectPath, publishVersion string) ([]model.Artifact, error) {
+	if strings.TrimSpace(projectPath) == "" {
+		return nil, fmt.Errorf("project path is empty")
+	}
+	return p.publish(ctx, taskID, workspacePath, projectPath, publishVersion)
+}
+
+func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspacePath, exactProjectPath, publishVersion string) ([]model.Artifact, error) {
 	if workspacePath == "" {
 		return nil, fmt.Errorf("workspace path is empty")
+	}
+	exactProjectRelativePath := ""
+	if exactProjectPath != "" {
+		workspaceInputPath, err := filepath.Abs(workspacePath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve workspace input path: %w", err)
+		}
+		projectInputPath, err := filepath.Abs(exactProjectPath)
+		if err != nil {
+			return nil, fmt.Errorf("resolve exact project input path: %w", err)
+		}
+		if !pathWithinRoot(workspaceInputPath, projectInputPath) {
+			return nil, fmt.Errorf("exact runtime project path %s is outside workspace %s", exactProjectPath, workspacePath)
+		}
+		exactProjectRelativePath, err = filepath.Rel(workspaceInputPath, projectInputPath)
+		if err != nil {
+			return nil, err
+		}
 	}
 	workspacePath, err := resolveRuntimeWorkspacePath(workspacePath)
 	if err != nil {
@@ -55,7 +84,26 @@ func (p *RuntimeWorkspacePublisher) Publish(ctx context.Context, taskID, workspa
 		return nil, err
 	}
 	projectPath := ""
-	if hasManifest {
+	if exactProjectPath != "" {
+		exactProjectPath = filepath.Join(workspacePath, exactProjectRelativePath)
+		projectInfo, resolvedProjectPath, inspectErr := inspectContainedPath(workspacePath, exactProjectPath)
+		if inspectErr != nil {
+			return nil, fmt.Errorf("inspect exact runtime project path: %w", inspectErr)
+		}
+		if !projectInfo.IsDir() {
+			return nil, fmt.Errorf("exact runtime project path is not a directory: %s", exactProjectPath)
+		}
+		projectPath = resolvedProjectPath
+		if hasManifest && strings.TrimSpace(manifest.ProjectPath) != "" {
+			manifestProjectPath, resolveErr := resolveRuntimeProjectPath(workspacePath, manifest.ProjectPath)
+			if resolveErr != nil {
+				return nil, resolveErr
+			}
+			if !sameFilesystemPath(manifestProjectPath, projectPath) {
+				return nil, fmt.Errorf("runtime artifact manifest project %s does not match exact project %s", manifestProjectPath, projectPath)
+			}
+		}
+	} else if hasManifest {
 		projectPath, err = resolveRuntimeProjectPath(workspacePath, manifest.ProjectPath)
 		if err != nil {
 			return nil, err
@@ -484,13 +532,13 @@ func artifactKindFromRuntimePath(path string) string {
 		return model.ArtifactKindSource
 	case lowerPath == "analysis/source_profile.json":
 		return model.ArtifactKindSourceProfile
-	case lowerPath == "analysis/fill_plan.json":
+	case path == "analysis/fill_plan.json":
 		return model.ArtifactKindTemplateFillPlan
-	case lowerPath == "analysis/check_report.json":
+	case path == "analysis/check_report.json":
 		return model.ArtifactKindTemplateFillCheckReport
-	case lowerPath == "validation/validate_report.json":
+	case path == "validation/validate_report.json":
 		return model.ArtifactKindTemplateFillValidateReport
-	case lowerPath == "validation/readback.md":
+	case path == "validation/readback.md":
 		return model.ArtifactKindTemplateFillReadback
 	case strings.HasPrefix(lowerPath, "analysis/") && strings.HasSuffix(lowerPath, ".identity.json"):
 		return model.ArtifactKindPPTXIdentity

@@ -594,6 +594,45 @@ func TestProcessTaskContinuesFromPublishRetryAfterPlatformArtifactsDeleted(t *te
 	}
 }
 
+func TestMainRoutePublishStillPrefersRuntimeWorkspaceCandidate(t *testing.T) {
+	service, repo, task, canonicalProject := retryTestService(t)
+	mustWriteRetryProjectFiles(canonicalProject)
+	mustWriteFileNoTest(canonicalProject, "design_spec.md", "# canonical workspace\n")
+
+	runtimeWorkspace := filepath.Join(t.TempDir(), "runtime-workspace")
+	runtimeProject := filepath.Join(runtimeWorkspace, "projects", task.RuntimeProject+"_ppt169_20260713")
+	mustWriteRetryProjectFiles(runtimeProject)
+	mustWriteFileNoTest(runtimeProject, "design_spec.md", "# runtime workspace\n")
+	task.Status = model.TaskStatusPublishing
+	task.Route = model.TaskRouteMain
+	task.RuntimeWorkspacePath = runtimeWorkspace
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := service.ProcessTask(context.Background(), task.ID); err != nil {
+		t.Fatalf("ProcessTask() error = %v", err)
+	}
+	artifacts, err := repo.ListArtifacts(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, artifact := range artifacts {
+		if artifact.Kind != model.ArtifactKindDesignSpec {
+			continue
+		}
+		raw, readErr := os.ReadFile(service.storage.Path(artifact.ObjectKey))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if string(raw) != "# runtime workspace\n" {
+			t.Fatalf("published design spec = %q, want runtime-workspace candidate", raw)
+		}
+		return
+	}
+	t.Fatalf("published artifacts missing design spec: %#v", artifacts)
+}
+
 func TestProcessTaskCompletesTemplateFillPublishRetry(t *testing.T) {
 	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
 	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)

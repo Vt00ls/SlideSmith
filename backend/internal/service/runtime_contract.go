@@ -162,8 +162,9 @@ func buildPublishedArtifactsContract(projectPath string, storage StorageService,
 	pptxCount := 0
 	requiredTemplateFillArtifacts := map[string]bool{}
 	if route == model.TaskRouteTemplateFill {
-		for _, kind := range templateFillRequiredPublishedArtifactKinds() {
-			requiredTemplateFillArtifacts[kind] = false
+		requiredTemplateFillArtifacts, err = validateTemplateFillPublishedArtifactBindings(artifacts, publishVersion)
+		if err != nil {
+			return nil, err
 		}
 	}
 	for _, artifact := range artifacts {
@@ -184,9 +185,6 @@ func buildPublishedArtifactsContract(projectPath string, storage StorageService,
 			}
 			report["slide_count"] = slideCount
 			pptxCount++
-		}
-		if _, required := requiredTemplateFillArtifacts[artifact.Kind]; required {
-			requiredTemplateFillArtifacts[artifact.Kind] = true
 		}
 		artifactReports = append(artifactReports, report)
 	}
@@ -232,12 +230,110 @@ func expectedPublishedSlideCount(projectPath, route string) (int, error) {
 }
 
 func templateFillRequiredPublishedArtifactKinds() []string {
-	return []string{
-		model.ArtifactKindTemplateFillPlan,
-		model.ArtifactKindTemplateFillCheckReport,
-		model.ArtifactKindTemplateFillValidateReport,
-		model.ArtifactKindTemplateFillReadback,
+	kinds := make([]string, 0, len(templateFillRequiredPublishedArtifacts()))
+	for _, requirement := range templateFillRequiredPublishedArtifacts() {
+		kinds = append(kinds, requirement.Kind)
 	}
+	return kinds
+}
+
+type templateFillPublishedArtifactRequirement struct {
+	RelativePath string
+	Kind         string
+}
+
+func templateFillRequiredPublishedArtifacts() []templateFillPublishedArtifactRequirement {
+	return []templateFillPublishedArtifactRequirement{
+		{RelativePath: "analysis/fill_plan.json", Kind: model.ArtifactKindTemplateFillPlan},
+		{RelativePath: "analysis/check_report.json", Kind: model.ArtifactKindTemplateFillCheckReport},
+		{RelativePath: "validation/validate_report.json", Kind: model.ArtifactKindTemplateFillValidateReport},
+		{RelativePath: "validation/readback.md", Kind: model.ArtifactKindTemplateFillReadback},
+	}
+}
+
+func validateTemplateFillPublishedArtifactBindings(artifacts []model.Artifact, publishVersion string) (map[string]bool, error) {
+	requiredByPath := make(map[string]string, len(templateFillRequiredPublishedArtifacts()))
+	requiredPathByKind := make(map[string]string, len(templateFillRequiredPublishedArtifacts()))
+	foundByKind := make(map[string]bool, len(templateFillRequiredPublishedArtifacts()))
+	for _, requirement := range templateFillRequiredPublishedArtifacts() {
+		requiredByPath[requirement.RelativePath] = requirement.Kind
+		requiredPathByKind[requirement.Kind] = requirement.RelativePath
+		foundByKind[requirement.Kind] = false
+	}
+
+	seenPaths := make(map[string]bool, len(artifacts))
+	pptxCount := 0
+	for _, artifact := range artifacts {
+		relativePath, err := exactPublishedArtifactRelativePath(artifact, publishVersion)
+		if err != nil {
+			return nil, err
+		}
+		if seenPaths[relativePath] {
+			return nil, fmt.Errorf("duplicate published artifact relative path %s", relativePath)
+		}
+		seenPaths[relativePath] = true
+
+		if expectedKind, required := requiredByPath[relativePath]; required {
+			if artifact.Kind != expectedKind {
+				return nil, fmt.Errorf("template fill artifact %s has kind %q, expected %q", relativePath, artifact.Kind, expectedKind)
+			}
+			foundByKind[expectedKind] = true
+		} else if expectedPath, reservedKind := requiredPathByKind[artifact.Kind]; reservedKind {
+			return nil, fmt.Errorf("template fill artifact kind %q must use exact relative path %s, got %s", artifact.Kind, expectedPath, relativePath)
+		}
+
+		isPPTXPath := isExactTemplateFillPPTXRelativePath(relativePath)
+		if artifact.Kind == model.ArtifactKindPPTX && !isPPTXPath {
+			return nil, fmt.Errorf("template fill PPTX artifact must use exact relative path exports/*.pptx, got %s", relativePath)
+		}
+		if isPPTXPath {
+			if artifact.Kind != model.ArtifactKindPPTX {
+				return nil, fmt.Errorf("template fill artifact %s has kind %q, expected %q", relativePath, artifact.Kind, model.ArtifactKindPPTX)
+			}
+			pptxCount++
+		}
+	}
+
+	for _, requirement := range templateFillRequiredPublishedArtifacts() {
+		if !foundByKind[requirement.Kind] {
+			return nil, fmt.Errorf("published artifacts missing exact template fill artifact %s with kind %s", requirement.RelativePath, requirement.Kind)
+		}
+	}
+	if pptxCount == 0 {
+		return nil, fmt.Errorf("published artifacts missing exact Template Fill exports/*.pptx artifact")
+	}
+	return foundByKind, nil
+}
+
+func exactPublishedArtifactRelativePath(artifact model.Artifact, publishVersion string) (string, error) {
+	objectKey := strings.TrimSpace(artifact.ObjectKey)
+	if objectKey == "" || objectKey != filepath.ToSlash(objectKey) {
+		return "", fmt.Errorf("template fill artifact object key is not canonical: %q", artifact.ObjectKey)
+	}
+	if strings.TrimSpace(artifact.TaskID) == "" {
+		return "", fmt.Errorf("template fill artifact %s has empty task id", objectKey)
+	}
+	prefix := filepath.ToSlash(filepath.Join("tasks", artifact.TaskID, "artifacts", publishVersion)) + "/"
+	if !strings.HasPrefix(objectKey, prefix) {
+		return "", fmt.Errorf("template fill artifact object key %s is outside exact publish prefix %s", objectKey, prefix)
+	}
+	relativePath := strings.TrimPrefix(objectKey, prefix)
+	cleanRelativePath, err := cleanArtifactRel(relativePath)
+	if err != nil {
+		return "", err
+	}
+	if cleanRelativePath != relativePath {
+		return "", fmt.Errorf("template fill artifact relative path is not canonical: %s", relativePath)
+	}
+	return relativePath, nil
+}
+
+func isExactTemplateFillPPTXRelativePath(relativePath string) bool {
+	if !strings.HasPrefix(relativePath, "exports/") {
+		return false
+	}
+	name := strings.TrimPrefix(relativePath, "exports/")
+	return name != "" && !strings.Contains(name, "/") && strings.HasSuffix(name, ".pptx")
 }
 
 func buildFinalTaskContract(projectPath string, publishContract map[string]any) map[string]any {

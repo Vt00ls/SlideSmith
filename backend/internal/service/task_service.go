@@ -2432,21 +2432,29 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 			ProjectPath: projectPath,
 		})
 	}
-	if task.Route == model.TaskRouteTemplateFill && workspace != nil {
-		addRoot(workspace.HostDir, "task_workspace", "", "")
-	}
-	addRoot(task.RuntimeWorkspacePath, "task_runtime_workspace", task.LastRuntimeSessionID, "")
-	if task.Route != model.TaskRouteTemplateFill && workspace != nil {
-		addRoot(workspace.HostDir, "task_workspace", "", "")
-	}
-	if candidates, err := s.findGeneratedRuntimeWorkspaceCandidates(ctx, task); err == nil {
-		for _, candidate := range candidates {
-			addRoot(candidate.WorkspacePath, "agent_compose_session", candidate.SessionID, candidate.ProjectPath)
+	if task.Route == model.TaskRouteTemplateFill {
+		if workspace == nil {
+			return nil, fmt.Errorf("task workspace is empty")
 		}
+		canonicalProjectPath, err := s.findPersistentProjectPath(task)
+		if err != nil {
+			return nil, fmt.Errorf("resolve canonical Template Fill project: %w", err)
+		}
+		addRoot(workspace.HostDir, "task_workspace", "", canonicalProjectPath)
 	} else {
-		_ = s.event(ctx, task.ID, model.EventTypeRuntime, "recovery_scan_failed", "Runtime recovery scan failed", map[string]any{
-			"error": err.Error(),
-		})
+		addRoot(task.RuntimeWorkspacePath, "task_runtime_workspace", task.LastRuntimeSessionID, "")
+		if workspace != nil {
+			addRoot(workspace.HostDir, "task_workspace", "", "")
+		}
+		if candidates, err := s.findGeneratedRuntimeWorkspaceCandidates(ctx, task); err == nil {
+			for _, candidate := range candidates {
+				addRoot(candidate.WorkspacePath, "agent_compose_session", candidate.SessionID, candidate.ProjectPath)
+			}
+		} else {
+			_ = s.event(ctx, task.ID, model.EventTypeRuntime, "recovery_scan_failed", "Runtime recovery scan failed", map[string]any{
+				"error": err.Error(),
+			})
+		}
 	}
 	if len(roots) == 0 {
 		return nil, fmt.Errorf("runtime workspace path is empty")
@@ -2455,7 +2463,13 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 	var lastErr error
 	publishVersion := publishVersionName()
 	for _, root := range roots {
-		published, err := s.publisher.Publish(ctx, task.ID, root.Path, publishVersion)
+		var published []model.Artifact
+		var err error
+		if task.Route == model.TaskRouteTemplateFill {
+			published, err = s.publisher.PublishProject(ctx, task.ID, root.Path, root.ProjectPath, publishVersion)
+		} else {
+			published, err = s.publisher.Publish(ctx, task.ID, root.Path, publishVersion)
+		}
 		if err != nil {
 			lastErr = err
 			continue
@@ -2508,13 +2522,16 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 		}
 		persisted, err := s.repo.ListArtifactsByPublishVersion(ctx, task.ID, publishVersion)
 		if err != nil {
-			return nil, err
+			cause := fmt.Errorf("list persisted publish artifacts: %w", err)
+			return nil, errors.Join(cause, s.cleanupFailedPublishVersion(ctx, task.ID, publishVersion, published))
 		}
 		if len(persisted) != len(published) {
-			return nil, fmt.Errorf("persisted artifact count = %d, expected %d", len(persisted), len(published))
+			cause := fmt.Errorf("persisted artifact count = %d, expected %d", len(persisted), len(published))
+			return nil, errors.Join(cause, s.cleanupFailedPublishVersion(ctx, task.ID, publishVersion, append(published, persisted...)))
 		}
 		if _, err := buildPublishedArtifactsContract(projectPath, s.storage, persisted, publishVersion, task.Route); err != nil {
-			return nil, fmt.Errorf("final persisted artifact check failed: %w", err)
+			cause := fmt.Errorf("final persisted artifact check failed: %w", err)
+			return nil, errors.Join(cause, s.cleanupFailedPublishVersion(ctx, task.ID, publishVersion, append(published, persisted...)))
 		}
 		contract := map[string]any{
 			"publish":                  publishContract,
@@ -2537,6 +2554,28 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 		return contract, nil
 	}
 	return nil, fmt.Errorf("publish runtime artifacts: %w", lastErr)
+}
+
+func (s *TaskService) cleanupFailedPublishVersion(ctx context.Context, taskID, publishVersion string, artifacts []model.Artifact) error {
+	cleanupCtx := context.WithoutCancel(ctx)
+	var cleanupErr error
+	if err := s.repo.DeleteArtifactsByPublishVersion(cleanupCtx, taskID, publishVersion); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish version %s rows: %w", publishVersion, err))
+	}
+
+	prefix := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts", publishVersion)) + "/"
+	seenObjectKeys := make(map[string]bool, len(artifacts))
+	for _, artifact := range artifacts {
+		objectKey := filepath.ToSlash(strings.TrimSpace(artifact.ObjectKey))
+		if objectKey == "" || seenObjectKeys[objectKey] || !strings.HasPrefix(objectKey, prefix) {
+			continue
+		}
+		seenObjectKeys[objectKey] = true
+		if err := s.storage.DeleteObject(cleanupCtx, objectKey); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish object %s: %w", objectKey, err))
+		}
+	}
+	return cleanupErr
 }
 
 func (s *TaskService) copyContractReportArtifact(ctx context.Context, taskID, projectPath, publishVersion, name string) (model.Artifact, error) {

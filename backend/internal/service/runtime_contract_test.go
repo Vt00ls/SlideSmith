@@ -251,6 +251,87 @@ func TestBuildPublishedArtifactsContractRejectsTemplateFillPublishVersionMismatc
 	}
 }
 
+func TestBuildPublishedArtifactsContractRejectsInvalidTemplateFillPathKindBindings(t *testing.T) {
+	type mutation func(*testing.T, *LocalStorage, []model.Artifact, string) []model.Artifact
+	relocate := func(relativePath string) mutation {
+		return func(t *testing.T, storage *LocalStorage, artifacts []model.Artifact, version string) []model.Artifact {
+			t.Helper()
+			lowerRelativePath := strings.ToLower(relativePath)
+			index := templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindTemplateFillPlan)
+			if strings.Contains(lowerRelativePath, "check_report") {
+				index = templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindTemplateFillCheckReport)
+			} else if strings.Contains(lowerRelativePath, "validate_report") {
+				index = templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindTemplateFillValidateReport)
+			} else if strings.Contains(lowerRelativePath, "readback") {
+				index = templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindTemplateFillReadback)
+			} else if strings.HasPrefix(lowerRelativePath, "exports/") {
+				index = templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindPPTX)
+			}
+			relocatePublishedArtifactForTest(t, storage, &artifacts[index], version, relativePath)
+			return artifacts
+		}
+	}
+	tests := []struct {
+		name   string
+		mutate mutation
+	}{
+		{
+			name: "swapped intermediate kinds",
+			mutate: func(t *testing.T, _ *LocalStorage, artifacts []model.Artifact, _ string) []model.Artifact {
+				t.Helper()
+				plan := templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindTemplateFillPlan)
+				check := templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindTemplateFillCheckReport)
+				artifacts[plan].Kind, artifacts[check].Kind = artifacts[check].Kind, artifacts[plan].Kind
+				return artifacts
+			},
+		},
+		{
+			name: "duplicate canonical row",
+			mutate: func(t *testing.T, _ *LocalStorage, artifacts []model.Artifact, _ string) []model.Artifact {
+				t.Helper()
+				plan := templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindTemplateFillPlan)
+				return append(artifacts, artifacts[plan])
+			},
+		},
+		{name: "plan case variant", mutate: relocate("analysis/Fill_Plan.json")},
+		{name: "plan near match", mutate: relocate("analysis/fill_plan.json.bak")},
+		{name: "check report case variant", mutate: relocate("analysis/Check_Report.json")},
+		{name: "check report near match", mutate: relocate("analysis/check_report.json.bak")},
+		{name: "validate report case variant", mutate: relocate("validation/Validate_Report.json")},
+		{name: "validate report near match", mutate: relocate("validation/validate_report.json.bak")},
+		{name: "readback case variant", mutate: relocate("validation/Readback.md")},
+		{name: "readback near match", mutate: relocate("validation/readback.md.bak")},
+		{name: "pptx case variant", mutate: relocate("exports/result.PPTX")},
+		{name: "pptx nested near match", mutate: relocate("exports/nested/result.pptx")},
+		{
+			name: "swapped readback and pptx kinds",
+			mutate: func(t *testing.T, _ *LocalStorage, artifacts []model.Artifact, _ string) []model.Artifact {
+				t.Helper()
+				readback := templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindTemplateFillReadback)
+				pptx := templateFillPublishedArtifactIndexForTest(t, artifacts, model.ArtifactKindPPTX)
+				artifacts[readback].Kind, artifacts[pptx].Kind = artifacts[pptx].Kind, artifacts[readback].Kind
+				return artifacts
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tmp := t.TempDir()
+			projectPath := filepath.Join(tmp, "project")
+			prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+			storage := NewLocalStorage(filepath.Join(tmp, "storage"))
+			version := "v20260712T150000Z"
+			artifacts := copyTemplateFillPublishedArtifactsForTest(t, storage, projectPath, version)
+			artifacts = test.mutate(t, storage, artifacts, version)
+
+			if _, err := buildPublishedArtifactsContract(projectPath, storage, artifacts, version, model.TaskRouteTemplateFill); err == nil {
+				t.Fatal("buildPublishedArtifactsContract() error = nil, want exact path-kind rejection")
+			}
+		})
+	}
+}
+
 func prepareTemplateFillPublishedProjectForTest(t *testing.T, projectPath string, slideCount int) {
 	t.Helper()
 	mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand.pptx"), "pptx\n")
@@ -272,6 +353,10 @@ func prepareTemplateFillPublishedProjectForTest(t *testing.T, projectPath string
 }
 
 func copyTemplateFillPublishedArtifactsForTest(t *testing.T, storage StorageService, projectPath, version string) []model.Artifact {
+	return copyTemplateFillPublishedArtifactsForTaskTest(t, storage, projectPath, "task-1", version)
+}
+
+func copyTemplateFillPublishedArtifactsForTaskTest(t *testing.T, storage StorageService, projectPath, taskID, version string) []model.Artifact {
 	t.Helper()
 	items := []struct {
 		Rel  string
@@ -285,13 +370,13 @@ func copyTemplateFillPublishedArtifactsForTest(t *testing.T, storage StorageServ
 	}
 	artifacts := make([]model.Artifact, 0, len(items))
 	for _, item := range items {
-		objectKey := filepath.ToSlash(filepath.Join("tasks", "task-1", "artifacts", version, item.Rel))
+		objectKey := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts", version, item.Rel))
 		stored, err := storage.CopyFileToObject(context.Background(), objectKey, filepath.Join(projectPath, filepath.FromSlash(item.Rel)))
 		if err != nil {
 			t.Fatal(err)
 		}
 		artifacts = append(artifacts, model.Artifact{
-			TaskID:         "task-1",
+			TaskID:         taskID,
 			Kind:           item.Kind,
 			Name:           stored.Name,
 			ObjectKey:      stored.ObjectKey,
@@ -301,6 +386,42 @@ func copyTemplateFillPublishedArtifactsForTest(t *testing.T, storage StorageServ
 		})
 	}
 	return artifacts
+}
+
+func templateFillPublishedArtifactIndexForTest(t *testing.T, artifacts []model.Artifact, kind string) int {
+	t.Helper()
+	for index := range artifacts {
+		if artifacts[index].Kind == kind {
+			return index
+		}
+	}
+	t.Fatalf("published artifacts missing kind %q: %#v", kind, artifacts)
+	return -1
+}
+
+func relocatePublishedArtifactForTest(t *testing.T, storage *LocalStorage, artifact *model.Artifact, version, relativePath string) {
+	t.Helper()
+	staging, err := storage.CopyFileToObject(
+		context.Background(),
+		filepath.ToSlash(filepath.Join("test-staging", strings.ReplaceAll(relativePath, "/", "_"))),
+		storage.Path(artifact.ObjectKey),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := storage.CopyFileToObject(
+		context.Background(),
+		filepath.ToSlash(filepath.Join("tasks", artifact.TaskID, "artifacts", version, filepath.FromSlash(relativePath))),
+		storage.Path(staging.ObjectKey),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact.Name = stored.Name
+	artifact.ObjectKey = stored.ObjectKey
+	artifact.MimeType = stored.MimeType
+	artifact.Size = stored.Size
+	artifact.SHA256 = stored.SHA256
 }
 
 func templateFillRequiredPublishedArtifactKindsForTest() []string {

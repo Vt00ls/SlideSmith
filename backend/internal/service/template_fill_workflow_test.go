@@ -822,11 +822,291 @@ func TestTemplateFillPublishRejectsMissingKindBeforePersistence(t *testing.T) {
 	}
 }
 
-func TestTemplateFillPublishRechecksRequiredKindsAfterPersistence(t *testing.T) {
+func TestTemplateFillPublishDoesNotFallBackFromCanonicalProject(t *testing.T) {
+	tests := []struct {
+		name               string
+		breakCanonical     func(*testing.T, string)
+		configureFallbacks func(*testing.T, *TaskService, *repository.Repository, *model.Task)
+	}{
+		{
+			name: "missing canonical does not use runtime workspace",
+			breakCanonical: func(t *testing.T, projectPath string) {
+				t.Helper()
+				if err := os.RemoveAll(projectPath); err != nil {
+					t.Fatal(err)
+				}
+			},
+			configureFallbacks: func(t *testing.T, service *TaskService, repo *repository.Repository, task *model.Task) {
+				t.Helper()
+				staleWorkspace := filepath.Join(t.TempDir(), "stale-runtime")
+				staleProject := filepath.Join(staleWorkspace, "projects", task.RuntimeProject+"_ppt169_20260712")
+				prepareTemplateFillPublishedProjectForTest(t, staleProject, 2)
+				task.RuntimeWorkspacePath = staleWorkspace
+				task.LastRuntimeSessionID = "stale-runtime-session"
+				if err := repo.SaveTask(context.Background(), task); err != nil {
+					t.Fatal(err)
+				}
+				service.agentCfg.SessionDataRoot = ""
+			},
+		},
+		{
+			name: "rejected canonical does not use recovery session",
+			breakCanonical: func(t *testing.T, projectPath string) {
+				t.Helper()
+				if err := os.Remove(filepath.Join(projectPath, "validation", "readback.md")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			configureFallbacks: func(t *testing.T, service *TaskService, repo *repository.Repository, task *model.Task) {
+				t.Helper()
+				recoveryRoot := t.TempDir()
+				recoveryProject := filepath.Join(
+					recoveryRoot,
+					"sessions",
+					"stale-recovery-session",
+					"workspace",
+					"projects",
+					task.RuntimeProject+"_ppt169_20260712",
+				)
+				prepareTemplateFillPublishedProjectForTest(t, recoveryProject, 2)
+				mustWriteFileNoTest(recoveryProject, filepath.Join(".slidesmith", "artifacts.json"), `{"project_path":".","artifacts":[]}`+"\n")
+				task.RuntimeWorkspacePath = ""
+				task.LastRuntimeSessionID = "canonical-session"
+				if err := repo.SaveTask(context.Background(), task); err != nil {
+					t.Fatal(err)
+				}
+				service.agentCfg.SessionDataRoot = recoveryRoot
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+			prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+			test.breakCanonical(t, projectPath)
+			test.configureFallbacks(t, service, repo, task)
+
+			err := service.ProcessTask(context.Background(), task.ID)
+			if err == nil {
+				t.Fatal("ProcessTask() error = nil, want canonical-only Template Fill publish failure")
+			}
+			updated, getErr := repo.GetTask(context.Background(), task.ID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "publish" {
+				t.Fatalf("failed canonical-only Template Fill publish = %#v", updated)
+			}
+			if updated.LastRuntimeSessionID != task.LastRuntimeSessionID {
+				t.Fatalf("runtime session changed from %q to fallback %q", task.LastRuntimeSessionID, updated.LastRuntimeSessionID)
+			}
+			var publishedCount int64
+			if err := repo.DB().Model(&model.Artifact{}).Where("task_id = ? AND publish_version <> ''", task.ID).Count(&publishedCount).Error; err != nil {
+				t.Fatal(err)
+			}
+			if publishedCount != 0 {
+				t.Fatalf("canonical-only rejection stored %d published artifacts, want 0", publishedCount)
+			}
+		})
+	}
+}
+
+func TestTemplateFillPublishRejectsInvalidBindingsAfterPersistenceAndCleansFailedVersion(t *testing.T) {
+	tests := []struct {
+		name             string
+		trigger          string
+		wantError        string
+		preservePrevious bool
+	}{
+		{
+			name: "wrong canonical kind",
+			trigger: `
+				CREATE TRIGGER corrupt_template_fill_readback_kind
+				AFTER INSERT ON artifacts
+				WHEN NEW.kind = 'template_fill_readback'
+				BEGIN
+					UPDATE artifacts SET kind = 'other' WHERE id = NEW.id;
+				END;
+			`,
+			wantError:        "validation/readback.md",
+			preservePrevious: true,
+		},
+		{
+			name: "swapped canonical kinds",
+			trigger: `
+				CREATE TRIGGER swap_template_fill_validation_kinds
+				AFTER INSERT ON artifacts
+				WHEN NEW.kind = 'template_fill_readback'
+				BEGIN
+					UPDATE artifacts SET kind = 'template_fill_readback'
+					WHERE task_id = NEW.task_id AND publish_version = NEW.publish_version
+					  AND kind = 'template_fill_validate_report';
+					UPDATE artifacts SET kind = 'template_fill_validate_report' WHERE id = NEW.id;
+				END;
+			`,
+			wantError: "validation/readback.md",
+		},
+		{
+			name: "duplicate canonical path",
+			trigger: `
+				CREATE TRIGGER duplicate_template_fill_plan
+				AFTER INSERT ON artifacts
+				WHEN NEW.object_key LIKE '%/contracts/final.json'
+				BEGIN
+					INSERT INTO artifacts (
+						id, task_id, kind, name, storage, object_key, mime_type, size,
+						sha256, publish_version, metadata_json, created_at, updated_at
+					)
+					SELECT id || '-duplicate', task_id, kind, name, storage, object_key, mime_type, size,
+						sha256, publish_version, metadata_json, created_at, updated_at
+					FROM artifacts
+					WHERE task_id = NEW.task_id AND publish_version = NEW.publish_version
+					  AND object_key LIKE '%/analysis/fill_plan.json';
+					DELETE FROM artifacts
+					WHERE task_id = NEW.task_id AND publish_version = NEW.publish_version
+					  AND object_key LIKE '%/analysis/check_report.json';
+				END;
+			`,
+			wantError: "duplicate",
+		},
+		{
+			name: "case variant canonical path",
+			trigger: `
+				CREATE TRIGGER case_variant_template_fill_plan
+				AFTER INSERT ON artifacts
+				WHEN NEW.kind = 'template_fill_plan'
+				BEGIN
+					UPDATE artifacts
+					SET object_key = replace(object_key, '/analysis/fill_plan.json', '/analysis/Fill_Plan.json')
+					WHERE id = NEW.id;
+				END;
+			`,
+			wantError: "analysis/fill_plan.json",
+		},
+		{
+			name: "near match canonical path",
+			trigger: `
+				CREATE TRIGGER near_match_template_fill_readback
+				AFTER INSERT ON artifacts
+				WHEN NEW.kind = 'template_fill_readback'
+				BEGIN
+					UPDATE artifacts SET object_key = object_key || '.bak' WHERE id = NEW.id;
+				END;
+			`,
+			wantError: "validation/readback.md",
+		},
+		{
+			name: "case variant pptx path",
+			trigger: `
+				CREATE TRIGGER case_variant_template_fill_pptx
+				AFTER INSERT ON artifacts
+				WHEN NEW.kind = 'pptx'
+				BEGIN
+					UPDATE artifacts
+					SET object_key = substr(object_key, 1, length(object_key) - 5) || '.PPTX'
+					WHERE id = NEW.id;
+				END;
+			`,
+			wantError: "exports/*.pptx",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+			prepareTemplateFillPublishedProjectForTest(t, projectPath, 3)
+			storage, ok := service.storage.(*LocalStorage)
+			if !ok {
+				t.Fatalf("storage = %T, want *LocalStorage", service.storage)
+			}
+
+			var previous []model.Artifact
+			const previousVersion = "v20260712T120000Z"
+			if test.preservePrevious {
+				previous = copyTemplateFillPublishedArtifactsForTaskTest(t, storage, projectPath, task.ID, previousVersion)
+				if _, err := buildPublishedArtifactsContract(projectPath, storage, previous, previousVersion, model.TaskRouteTemplateFill); err != nil {
+					t.Fatalf("previous version is not valid: %v", err)
+				}
+				previousPrefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "artifacts", previousVersion)) + "/"
+				if err := repo.ReplaceArtifactsByObjectKeyPrefix(context.Background(), task.ID, previousPrefix, previous); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			tracking := &publishCleanupTrackingStorage{StorageService: storage}
+			service.storage = tracking
+			service.publisher = NewRuntimeWorkspacePublisher(tracking)
+			if err := repo.DB().Exec(test.trigger).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			err := service.ProcessTask(context.Background(), task.ID)
+			if err == nil {
+				t.Fatal("ProcessTask() error = nil, want post-persistence binding rejection")
+			}
+			if !strings.Contains(err.Error(), "final persisted artifact check failed") || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("ProcessTask() error = %q, want post-persistence %q rejection", err, test.wantError)
+			}
+			updated, getErr := repo.GetTask(context.Background(), task.ID)
+			if getErr != nil {
+				t.Fatal(getErr)
+			}
+			if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "publish" {
+				t.Fatalf("failed template fill persisted recheck = %#v", updated)
+			}
+
+			failedVersion := singlePublishVersionForTest(t, tracking.copiedObjectKeys)
+			failedRows, listErr := repo.ListArtifactsByPublishVersion(context.Background(), task.ID, failedVersion)
+			if listErr != nil {
+				t.Fatal(listErr)
+			}
+			if len(failedRows) != 0 {
+				t.Fatalf("failed publish version %s retained rows: %#v", failedVersion, failedRows)
+			}
+			for _, objectKey := range tracking.copiedObjectKeys {
+				if _, statErr := os.Stat(storage.Path(objectKey)); !os.IsNotExist(statErr) {
+					t.Fatalf("failed publish object %s remains, err=%v", objectKey, statErr)
+				}
+			}
+
+			if test.preservePrevious {
+				persistedPrevious, listErr := repo.ListArtifactsByPublishVersion(context.Background(), task.ID, previousVersion)
+				if listErr != nil {
+					t.Fatal(listErr)
+				}
+				if len(persistedPrevious) != len(previous) {
+					t.Fatalf("previous version rows = %d, want %d", len(persistedPrevious), len(previous))
+				}
+				for _, artifact := range previous {
+					if _, statErr := os.Stat(storage.Path(artifact.ObjectKey)); statErr != nil {
+						t.Fatalf("previous version object %s was removed: %v", artifact.ObjectKey, statErr)
+					}
+				}
+				latest, listErr := repo.ListArtifacts(context.Background(), task.ID)
+				if listErr != nil {
+					t.Fatal(listErr)
+				}
+				if len(latest) != len(previous) {
+					t.Fatalf("latest visible artifacts = %#v, want preserved previous version", latest)
+				}
+			}
+		})
+	}
+}
+
+func TestTemplateFillPublishSurfacesObjectCleanupFailureAndContinuesCompensation(t *testing.T) {
 	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
-	prepareTemplateFillPublishedProjectForTest(t, projectPath, 3)
+	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+	storage := service.storage.(*LocalStorage)
+	tracking := &publishCleanupTrackingStorage{
+		StorageService:     storage,
+		failDeleteContains: "/analysis/fill_plan.json",
+	}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
 	if err := repo.DB().Exec(`
-		CREATE TRIGGER corrupt_template_fill_readback_kind
+		CREATE TRIGGER corrupt_template_fill_readback_kind_for_cleanup
 		AFTER INSERT ON artifacts
 		WHEN NEW.kind = 'template_fill_readback'
 		BEGIN
@@ -837,18 +1117,31 @@ func TestTemplateFillPublishRechecksRequiredKindsAfterPersistence(t *testing.T) 
 	}
 
 	err := service.ProcessTask(context.Background(), task.ID)
-	if err == nil {
-		t.Fatal("ProcessTask() error = nil, want post-persistence readback rejection")
+	if err == nil || !strings.Contains(err.Error(), "injected publish object cleanup failure") {
+		t.Fatalf("ProcessTask() error = %v, want surfaced object cleanup failure", err)
 	}
-	if !strings.Contains(err.Error(), "final persisted artifact check failed") || !strings.Contains(err.Error(), model.ArtifactKindTemplateFillReadback) {
-		t.Fatalf("ProcessTask() error = %q, want route-aware persisted readback rejection", err)
+	failedVersion := singlePublishVersionForTest(t, tracking.copiedObjectKeys)
+	failedRows, listErr := repo.ListArtifactsByPublishVersion(context.Background(), task.ID, failedVersion)
+	if listErr != nil {
+		t.Fatal(listErr)
 	}
-	updated, getErr := repo.GetTask(context.Background(), task.ID)
-	if getErr != nil {
-		t.Fatal(getErr)
+	if len(failedRows) != 0 {
+		t.Fatalf("failed publish rows remain after object cleanup error: %#v", failedRows)
 	}
-	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "publish" {
-		t.Fatalf("failed template fill persisted recheck = %#v", updated)
+	if len(tracking.deletedObjectKeys) != len(tracking.copiedObjectKeys) {
+		t.Fatalf("object cleanup attempts = %d, want %d: %#v", len(tracking.deletedObjectKeys), len(tracking.copiedObjectKeys), tracking.deletedObjectKeys)
+	}
+	for _, objectKey := range tracking.copiedObjectKeys {
+		_, statErr := os.Stat(storage.Path(objectKey))
+		if strings.Contains(objectKey, tracking.failDeleteContains) {
+			if statErr != nil {
+				t.Fatalf("injected failed-delete object %s unexpectedly missing: %v", objectKey, statErr)
+			}
+			continue
+		}
+		if !os.IsNotExist(statErr) {
+			t.Fatalf("cleanup skipped object %s after another delete failed, err=%v", objectKey, statErr)
+		}
 	}
 }
 
@@ -1396,6 +1689,48 @@ func newTemplateFillWorkflowService(t *testing.T, status string, agent AgentComp
 		},
 	)
 	return service, repo, task, projectPath, workspacePath
+}
+
+type publishCleanupTrackingStorage struct {
+	StorageService
+	copiedObjectKeys   []string
+	deletedObjectKeys  []string
+	failDeleteContains string
+}
+
+func (s *publishCleanupTrackingStorage) CopyFileToObject(ctx context.Context, objectKey, sourcePath string) (*StoredObject, error) {
+	stored, err := s.StorageService.CopyFileToObject(ctx, objectKey, sourcePath)
+	if err == nil {
+		s.copiedObjectKeys = append(s.copiedObjectKeys, stored.ObjectKey)
+	}
+	return stored, err
+}
+
+func (s *publishCleanupTrackingStorage) DeleteObject(ctx context.Context, objectKey string) error {
+	s.deletedObjectKeys = append(s.deletedObjectKeys, objectKey)
+	if s.failDeleteContains != "" && strings.Contains(objectKey, s.failDeleteContains) {
+		return fmt.Errorf("injected publish object cleanup failure for %s", objectKey)
+	}
+	return s.StorageService.DeleteObject(ctx, objectKey)
+}
+
+func singlePublishVersionForTest(t *testing.T, objectKeys []string) string {
+	t.Helper()
+	versions := map[string]bool{}
+	for _, objectKey := range objectKeys {
+		parts := strings.Split(filepath.ToSlash(objectKey), "/")
+		if len(parts) < 5 || parts[0] != "tasks" || parts[2] != "artifacts" {
+			t.Fatalf("unexpected published object key %q", objectKey)
+		}
+		versions[parts[3]] = true
+	}
+	if len(versions) != 1 {
+		t.Fatalf("published object versions = %#v, want exactly one", versions)
+	}
+	for version := range versions {
+		return version
+	}
+	return ""
 }
 
 func writeTemplateFillWorkflowJSON(root, relativePath string, value any) {
