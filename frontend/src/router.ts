@@ -4,6 +4,7 @@ export type Route =
   | { name: "task"; id: string }
   | { name: "confirm"; id: string }
   | { name: "spec"; id: string }
+  | { name: "templateFill"; id: string }
   | { name: "preview"; id: string };
 
 export function parseRoute(): Route {
@@ -21,6 +22,9 @@ export function parseRoute(): Route {
     }
     if (parts[2] === "spec") {
       return { name: "spec", id: parts[1] };
+    }
+    if (parts[2] === "template-fill") {
+      return { name: "templateFill", id: parts[1] };
     }
     if (parts[2] === "preview") {
       return { name: "preview", id: parts[1] };
@@ -46,6 +50,8 @@ export function routeToHash(route: Route) {
       return `#/tasks/${route.id}/confirm`;
     case "spec":
       return `#/tasks/${route.id}/spec`;
+    case "templateFill":
+      return `#/tasks/${route.id}/template-fill`;
     case "preview":
       return `#/tasks/${route.id}/preview`;
   }

@@ -23,7 +23,21 @@ import {
   Upload,
   XCircle,
 } from "lucide-react";
-import { api, Artifact, Confirmation, parseJSON, RetryPhase, RuntimeRun, SpecPreview, Task, TaskEvent, TaskPhaseRun, TaskStatus, TemplateCatalogItem } from "./api";
+import {
+  api,
+  Artifact,
+  Confirmation,
+  parseJSON,
+  RetryPhase,
+  RuntimeRun,
+  SpecPreview,
+  Task,
+  TaskEvent,
+  TaskPhaseRun,
+  TaskStatus,
+  TemplateCatalogItem,
+  TemplateFillPlanPreview,
+} from "./api";
 import { artifactKindLabel, formatBytes, formatTime, phaseLabel, routeLabel, statusLabel, statusTone } from "./format";
 import { go, parseRoute, Route } from "./router";
 
@@ -32,6 +46,10 @@ const activeStatuses: TaskStatus[] = [
   "source_converting",
   "realization_deriving",
   "spec_generating",
+  "template_fill_planning",
+  "template_fill_checking",
+  "template_fill_applying",
+  "template_fill_validating",
   "image_acquiring",
   "svg_generating",
   "quality_checking",
@@ -46,7 +64,7 @@ function isConfirmationStatus(status?: TaskStatus) {
 }
 
 function isWaitingStatus(status?: TaskStatus) {
-  return isConfirmationStatus(status) || status === "awaiting_spec_confirm";
+  return isConfirmationStatus(status) || status === "awaiting_spec_confirm" || status === "awaiting_template_fill_confirm";
 }
 
 const splitRetryOptions: Array<{ phase: RetryPhase; label: string }> = [
@@ -55,6 +73,17 @@ const splitRetryOptions: Array<{ phase: RetryPhase; label: string }> = [
   { phase: "quality_check", label: "重跑质检" },
   { phase: "finalize_export", label: "重新导出" },
   { phase: "publish", label: "重新发布" },
+];
+
+const templateFillPlanInputRecoveryNote = "如果上传了多个 PPTX，SPEC3 没有源文件删除 API，重试无法修正输入集合；请新建一个修正后的任务，仅包含恰好一个上传的 .pptx 和至少一份可读内容。";
+
+const templateFillPlanStatuses: TaskStatus[] = [
+  "awaiting_template_fill_confirm",
+  "template_fill_checking",
+  "template_fill_applying",
+  "template_fill_validating",
+  "completed",
+  "failed",
 ];
 
 const templateSelectionKey = "slidesmith.newTask.templateId";
@@ -72,8 +101,121 @@ const templateKindFilters = [
   { value: "brand", label: "品牌" },
 ];
 
-function retryOptionsForFailure(failurePhase: string): Array<{ phase: RetryPhase; label: string }> {
+function numberFromSummary(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function templateFillText(value: unknown) {
+  if (typeof value === "string") {
+    return value.trim() || "-";
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? String(value) : "-";
+  }
+  if (typeof value === "boolean" || typeof value === "bigint") {
+    return String(value);
+  }
+  return "-";
+}
+
+function templateFillSlideRows(plan: Record<string, unknown>) {
+  const slides = Array.isArray(plan.slides) ? plan.slides : [];
+  return slides.map((item, index) => {
+    const slide = item && typeof item === "object" ? item as Record<string, unknown> : {};
+    const rationale = slide.layout_rationale && typeof slide.layout_rationale === "object"
+      ? slide.layout_rationale as Record<string, unknown>
+      : {};
+    return {
+      index: index + 1,
+      sourceSlide: templateFillText(slide.source_slide),
+      purpose: templateFillText(slide.purpose),
+      layoutPattern: templateFillText(rationale.layout_pattern),
+      whyFit: templateFillText(rationale.why_fit),
+      risk: templateFillText(rationale.risk),
+      notes: typeof slide.notes === "string" && slide.notes.trim() !== "" ? "有" : "无",
+      replacements: Array.isArray(slide.replacements) ? slide.replacements.length : 0,
+      tableEdits: Array.isArray(slide.table_edits) ? slide.table_edits.length : 0,
+      chartEdits: Array.isArray(slide.chart_edits) ? slide.chart_edits.length : 0,
+    };
+  });
+}
+
+function templateFillCheckRows(report: Record<string, unknown>) {
+  const results = Array.isArray(report.results) ? report.results : [];
+  const normalized = results.flatMap((item) => {
+    const row = item && typeof item === "object" ? item as Record<string, unknown> : {};
+    const status = typeof row.status === "string" ? row.status.trim().toUpperCase() : "";
+    if (status !== "ERROR" && status !== "WARN") {
+      return [];
+    }
+    return [{
+      status,
+      code: templateFillText(row.code),
+      planSlide: templateFillText(row.plan_slide),
+      sourceSlide: templateFillText(row.source_slide),
+      message: templateFillText(row.message),
+    }];
+  });
+  return [
+    ...normalized.filter((row) => row.status === "ERROR"),
+    ...normalized.filter((row) => row.status === "WARN"),
+  ];
+}
+
+function templateFillActionState({
+  canEdit,
+  canConfirm,
+  taskStatus,
+  busy,
+  dirty,
+  checkErrorCount,
+}: {
+  canEdit: boolean;
+  canConfirm: boolean;
+  taskStatus?: TaskStatus;
+  busy: boolean;
+  dirty: boolean;
+  checkErrorCount: number;
+  checkWarningCount?: number;
+}) {
+  const hint = dirty
+    ? "JSON 已修改，请先保存后再检查或确认。"
+    : checkErrorCount > 0
+      ? `存在 ${checkErrorCount} 个检查错误，请修正并保存后再确认。`
+      : "";
+  return {
+    saveDisabled: !canEdit || busy,
+    checkDisabled: taskStatus !== "awaiting_template_fill_confirm" || busy || dirty,
+    confirmDisabled: !canConfirm || busy || checkErrorCount > 0 || dirty,
+    hint,
+  };
+}
+
+function retryOptionsForFailure(failurePhase: string, taskRoute = "main"): Array<{ phase: RetryPhase; label: string }> {
   const value = failurePhase.toLowerCase();
+  if (taskRoute === "template-fill") {
+    if (value.startsWith("template_fill_plan.inputs")) {
+      return [
+        { phase: "prepare", label: "重新准备" },
+        { phase: "template_fill_plan", label: "重建填充计划" },
+      ];
+    }
+    if (value.startsWith("template_fill_plan")) {
+      return [{ phase: "template_fill_plan", label: "重建填充计划" }];
+    }
+    if (value.startsWith("template_fill_check")) {
+      return [{ phase: "template_fill_check", label: "重新检查计划" }];
+    }
+    if (value.startsWith("template_fill_apply")) {
+      return [{ phase: "template_fill_apply", label: "重新填充 PPTX" }];
+    }
+    if (value.startsWith("template_fill_validate")) {
+      return [{ phase: "template_fill_validate", label: "重新校验结果" }];
+    }
+    if (value.startsWith("publish")) {
+      return [{ phase: "publish", label: "重新发布" }];
+    }
+  }
   if (
     value.startsWith("prepare")
     || value.startsWith("source")
@@ -82,7 +224,51 @@ function retryOptionsForFailure(failurePhase: string): Array<{ phase: RetryPhase
   ) {
     return [{ phase: "prepare", label: "重新准备" }];
   }
+  if (taskRoute === "template-fill") {
+    return [];
+  }
   return splitRetryOptions;
+}
+
+function retryGuidanceForFailure(failurePhase: string) {
+  return failurePhase.toLowerCase().startsWith("template_fill_plan.inputs") ? templateFillPlanInputRecoveryNote : "";
+}
+
+function canOpenTemplateFillPlan(task?: Pick<Task, "route" | "status">) {
+  return !!task && task.route === "template-fill" && templateFillPlanStatuses.includes(task.status);
+}
+
+function completedTaskRoute(taskId: string, taskRoute: string): Route {
+  return taskRoute === "template-fill"
+    ? { name: "templateFill", id: taskId }
+    : { name: "preview", id: taskId };
+}
+
+function visibleTaskArtifacts<T>(artifacts: T[], taskRoute: string) {
+  return taskRoute === "template-fill" ? artifacts : artifacts.slice(0, 8);
+}
+
+function templateFillNextPhase(status: TaskStatus) {
+  switch (status) {
+    case "template_fill_planning":
+      return "计划审查";
+    case "awaiting_template_fill_confirm":
+      return "计划检查";
+    case "template_fill_checking":
+      return "PPTX 填充";
+    case "template_fill_applying":
+      return "结果校验";
+    case "template_fill_validating":
+      return "发布产物";
+    case "publishing":
+      return "完成";
+    case "completed":
+      return "已完成";
+    case "failed":
+      return "恢复失败阶段";
+    default:
+      return "填充计划";
+  }
 }
 
 function retryPhaseIcon(phase: RetryPhase, active: boolean) {
@@ -94,6 +280,14 @@ function retryPhaseIcon(phase: RetryPhase, active: boolean) {
       return <RefreshCw size={16} />;
     case "spec_generate":
       return <FileText size={16} />;
+    case "template_fill_plan":
+      return <FileText size={16} />;
+    case "template_fill_check":
+      return <ListChecks size={16} />;
+    case "template_fill_apply":
+      return <Presentation size={16} />;
+    case "template_fill_validate":
+      return <CheckCircle2 size={16} />;
     case "svg_execute":
       return <Play size={16} />;
     case "quality_check":
@@ -147,6 +341,7 @@ export function App() {
         {route.name === "task" && <TaskDetailPage taskId={route.id} />}
         {route.name === "confirm" && <ConfirmPage taskId={route.id} />}
         {route.name === "spec" && <SpecPreviewPage taskId={route.id} />}
+        {route.name === "templateFill" && <TemplateFillPlanPage taskId={route.id} />}
         {route.name === "preview" && <PreviewPage taskId={route.id} />}
       </main>
     </div>
@@ -602,6 +797,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [runtimeRuns, setRuntimeRuns] = useState<RuntimeRun[]>([]);
   const [phaseRuns, setPhaseRuns] = useState<TaskPhaseRun[]>([]);
+  const [templateFillPreview, setTemplateFillPreview] = useState<TemplateFillPlanPreview | null>(null);
   const [retrying, setRetrying] = useState<RetryPhase | "">("");
   const [error, setError] = useState("");
 
@@ -620,6 +816,15 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
       setRuntimeRuns(nextRuntimeRuns);
       setPhaseRuns(nextPhaseRuns);
       setError("");
+      if (nextTask.route === "template-fill") {
+        try {
+          setTemplateFillPreview(await api.getTemplateFillPlan(taskId));
+        } catch {
+          setTemplateFillPreview(null);
+        }
+      } else {
+        setTemplateFillPreview(null);
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -643,7 +848,9 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const sourceContract = sourcePrepareOutput.source_contract as Record<string, unknown> | undefined;
   const taskRoute = task?.route || "main";
   const routeConfidence = typeof routeSelection.confidence === "number" ? Math.round(routeSelection.confidence * 100) : null;
-  const retryOptions = task?.status === "failed" ? retryOptionsForFailure(task.failure_phase || "") : [];
+  const retryOptions = task?.status === "failed" ? retryOptionsForFailure(task.failure_phase || "", taskRoute) : [];
+  const retryGuidance = task?.status === "failed" ? retryGuidanceForFailure(task.failure_phase || "") : "";
+  const displayedArtifacts = visibleTaskArtifacts(artifacts, taskRoute);
 
   async function retry(phase: RetryPhase) {
     if (!task || retrying) {
@@ -685,10 +892,16 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 <span>审查规格</span>
               </button>
             )}
-            {task?.status === "completed" && (
-              <button className="primary-button" onClick={() => go({ name: "preview", id: task.id })}>
+            {task?.status === "completed" && task.route !== "template-fill" && (
+              <button className="primary-button" onClick={() => go(completedTaskRoute(task.id, task.route))}>
                 <Eye size={17} />
                 <span>预览</span>
+              </button>
+            )}
+            {task && canOpenTemplateFillPlan(task) && (
+              <button className="primary-button" onClick={() => go({ name: "templateFill", id: task.id })}>
+                <ListChecks size={17} />
+                <span>打开填充计划</span>
               </button>
             )}
           </>
@@ -774,7 +987,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 <span>产物</span>
               </div>
               <div className="artifact-list">
-                {artifacts.slice(0, 8).map((artifact) => (
+                {displayedArtifacts.map((artifact) => (
                   <span className="artifact-chip" key={artifact.id}>
                     {artifactKindLabel[artifact.kind] || artifact.kind}
                     <small>{artifact.name}</small>
@@ -783,10 +996,12 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 {artifacts.length === 0 && <span className="muted">-</span>}
               </div>
               <div className="button-row">
-                <button className="secondary-button" disabled={svgFinalCount === 0} onClick={() => go({ name: "preview", id: task.id })}>
-                  <Eye size={16} />
-                  <span>SVG</span>
-                </button>
+                {taskRoute !== "template-fill" && (
+                  <button className="secondary-button" disabled={svgFinalCount === 0} onClick={() => go({ name: "preview", id: task.id })}>
+                    <Eye size={16} />
+                    <span>SVG</span>
+                  </button>
+                )}
                 <a className={pptx ? "secondary-button" : "secondary-button disabled"} href={pptx ? api.pptxDownloadUrl(task.id) : undefined}>
                   <Download size={16} />
                   <span>PPTX</span>
@@ -814,6 +1029,37 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                     <span>打开规格</span>
                   </button>
                 </div>
+              </div>
+            )}
+
+            {taskRoute === "template-fill" && (
+              <div className="status-panel template-fill-gate-panel">
+                <div className="section-title">
+                  <ListChecks size={17} />
+                  <span>模板填充</span>
+                </div>
+                <div className="kv-grid">
+                  <span>下一阶段</span>
+                  <strong>{templateFillNextPhase(task.status)}</strong>
+                  <span className="mono">analysis/fill_plan.json</span>
+                  <strong>{templateFillPreview ? "已生成" : "-"}</strong>
+                  <span>检查错误</span>
+                  <strong>{templateFillPreview ? numberFromSummary(templateFillPreview.summary.check_error) : "-"}</strong>
+                  <span>检查警告</span>
+                  <strong>{templateFillPreview ? numberFromSummary(templateFillPreview.summary.check_warn) : "-"}</strong>
+                  <span>输出页数</span>
+                  <strong>{templateFillPreview ? numberFromSummary(templateFillPreview.summary.planned_slide_count) : "-"}</strong>
+                  <span>Workspace</span>
+                  <strong className="mono">{task.runtime_workspace_path || "-"}</strong>
+                </div>
+                {canOpenTemplateFillPlan(task) && (
+                  <div className="button-row left">
+                    <button className="primary-button" onClick={() => go({ name: "templateFill", id: task.id })}>
+                      <FileText size={16} />
+                      <span>打开填充计划</span>
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -851,6 +1097,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                   {task.failure_phase === "route_select.unsupported_workflow" && (
                     <span className="muted">该路线已识别，执行工作流将在后续阶段开放。</span>
                   )}
+                  {retryGuidance && <span className="template-fill-recovery-note">{retryGuidance}</span>}
                 </div>
                 <div className="button-row left">
                   {retryOptions.map((option) => (
@@ -932,6 +1179,300 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   );
 }
 
+function TemplateFillPlanPage({ taskId }: { taskId: string }) {
+  const [task, setTask] = useState<Task | null>(null);
+  const [preview, setPreview] = useState<TemplateFillPlanPreview | null>(null);
+  const [planText, setPlanText] = useState("");
+  const [savedPlanText, setSavedPlanText] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<"regenerate" | "save" | "check" | "confirm" | "">("");
+  const [error, setError] = useState("");
+
+  function adoptPreview(next: TemplateFillPlanPreview) {
+    const canonicalText = JSON.stringify(next.plan, null, 2);
+    setPreview(next);
+    setPlanText(canonicalText);
+    setSavedPlanText(canonicalText);
+  }
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const nextTask = await api.getTask(taskId);
+      setTask(nextTask);
+      adoptPreview(await api.getTemplateFillPlan(taskId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [taskId]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const dirty = planText !== savedPlanText;
+  const checkErrorCount = preview ? numberFromSummary(preview.summary.check_error) : 0;
+  const checkWarnCount = preview ? numberFromSummary(preview.summary.check_warn) : 0;
+  const actionState = templateFillActionState({
+    canEdit: !!preview?.can_edit,
+    canConfirm: !!preview?.can_confirm,
+    taskStatus: task?.status,
+    busy: !!busy,
+    dirty,
+    checkErrorCount,
+    checkWarningCount: checkWarnCount,
+  });
+  const slideRows = preview ? templateFillSlideRows(preview.plan) : [];
+  const checkRows = preview ? templateFillCheckRows(preview.check_report) : [];
+  const canRegenerate = task?.status === "awaiting_template_fill_confirm" || task?.status === "failed";
+  const recoveryGuidance = task ? retryGuidanceForFailure(task.failure_phase || "") : "";
+  const sourcePptxName = preview
+    ? templateFillText(preview.summary.source_pptx_name) !== "-"
+      ? templateFillText(preview.summary.source_pptx_name)
+      : preview.inputs.source_pptx.replace(/\\/g, "/").split("/").filter(Boolean).pop() || "-"
+    : "-";
+
+  async function regeneratePlan() {
+    if (!canRegenerate || busy) {
+      return;
+    }
+    setBusy("regenerate");
+    setError("");
+    try {
+      await api.regenerateTemplateFillPlan(taskId);
+      go({ name: "task", id: taskId });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function savePlan() {
+    if (actionState.saveDisabled) {
+      return;
+    }
+    setBusy("save");
+    setError("");
+    try {
+      const parsed = JSON.parse(planText) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("JSON 根节点必须是对象。");
+      }
+      const saved = await api.saveTemplateFillPlan(taskId, parsed as Record<string, unknown>);
+      adoptPreview(saved);
+      adoptPreview(await api.getTemplateFillPlan(taskId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function checkPlan() {
+    if (actionState.checkDisabled) {
+      return;
+    }
+    setBusy("check");
+    setError("");
+    try {
+      setTask(await api.checkTemplateFillPlan(taskId));
+      setPreview((current) => current ? {
+        ...current,
+        check_report: {},
+        summary: {
+          ...current.summary,
+          check_ok: 0,
+          check_warn: 0,
+          check_error: 0,
+        },
+        can_confirm: false,
+      } : current);
+      adoptPreview(await api.getTemplateFillPlan(taskId));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function confirmPlan() {
+    if (actionState.confirmDisabled) {
+      return;
+    }
+    setBusy("confirm");
+    setError("");
+    try {
+      await api.confirmTemplateFillPlan(taskId);
+      go({ name: "task", id: taskId });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <section className="page template-fill-page">
+      <PageHeader
+        title="填充计划审查"
+        subtitle={task?.title || taskId}
+        actions={
+          <>
+            <button className="secondary-button" onClick={() => go({ name: "task", id: taskId })}>
+              <ArrowLeft size={16} />
+              <span>返回</span>
+            </button>
+            <button className="secondary-button" disabled={!canRegenerate || !!busy} onClick={() => void regeneratePlan()}>
+              {busy === "regenerate" ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
+              <span>重新生成计划</span>
+            </button>
+            <button className="secondary-button" disabled={actionState.saveDisabled} onClick={() => void savePlan()}>
+              {busy === "save" ? <Loader2 className="spin" size={16} /> : <FileText size={16} />}
+              <span>保存 JSON</span>
+            </button>
+            <button
+              className="secondary-button"
+              disabled={actionState.checkDisabled}
+              title={dirty ? actionState.hint : undefined}
+              onClick={() => void checkPlan()}
+            >
+              {busy === "check" ? <Loader2 className="spin" size={16} /> : <ListChecks size={16} />}
+              <span>检查计划</span>
+            </button>
+            <button
+              className="primary-button"
+              disabled={actionState.confirmDisabled}
+              title={actionState.hint || undefined}
+              onClick={() => void confirmPlan()}
+            >
+              {busy === "confirm" ? <Loader2 className="spin" size={17} /> : <Play size={17} />}
+              <span>确认并导出{checkErrorCount > 0 ? `（${checkErrorCount} 个错误）` : ""}</span>
+            </button>
+          </>
+        }
+      />
+
+      {actionState.hint && (
+        <div className={checkErrorCount > 0 && !dirty ? "template-fill-action-hint bad" : "template-fill-action-hint"} role="status">
+          {actionState.hint}
+        </div>
+      )}
+      {error && <InlineState icon={<XCircle size={18} />} text={error} bad />}
+      {recoveryGuidance && <div className="template-fill-action-hint bad">{recoveryGuidance}</div>}
+      {loading && !preview && <InlineState icon={<Loader2 className="spin" size={18} />} text="加载填充计划" />}
+
+      {preview && (
+        <>
+          <div className="template-fill-summary">
+            <StatusPill status={task?.status || "awaiting_template_fill_confirm"} />
+            <span className="summary-chip">
+              计划状态
+              <strong>{templateFillText(preview.summary.plan_status)}</strong>
+            </span>
+            <span className="summary-chip">
+              计划页数
+              <strong>{numberFromSummary(preview.summary.planned_slide_count)}</strong>
+            </span>
+            <span className="summary-chip">
+              检查通过
+              <strong>{numberFromSummary(preview.summary.check_ok)}</strong>
+            </span>
+            <span className="summary-chip">
+              警告
+              <strong>{checkWarnCount}</strong>
+            </span>
+            <span className="summary-chip">
+              错误
+              <strong>{checkErrorCount}</strong>
+            </span>
+            <span className="summary-chip source-pptx-chip">
+              上传的 PPTX
+              <strong>{sourcePptxName}</strong>
+            </span>
+            <p className="template-fill-source-note">
+              模板填充由本任务上传的 PPTX 驱动，而不是创建任务时选择的目录模板。
+            </p>
+          </div>
+
+          <div className="template-fill-layout">
+            <section className="plan-preview-surface" aria-labelledby="template-fill-plan-preview-title">
+              <div className="section-title" id="template-fill-plan-preview-title">
+                <LayoutList size={17} />
+                <span>逐页计划</span>
+              </div>
+              <div className="plan-slide-list">
+                {slideRows.map((row) => (
+                  <article className="plan-slide-row" key={row.index}>
+                    <div className="plan-slide-heading">
+                      <span>输出 {String(row.index).padStart(2, "0")}</span>
+                      <strong>{row.purpose}</strong>
+                    </div>
+                    <dl className="plan-slide-details">
+                      <div><dt>源页</dt><dd>{row.sourceSlide}</dd></div>
+                      <div><dt>版式</dt><dd>{row.layoutPattern}</dd></div>
+                      <div className="wide"><dt>适配原因</dt><dd>{row.whyFit}</dd></div>
+                      <div className="wide"><dt>风险</dt><dd>{row.risk}</dd></div>
+                      <div><dt>备注</dt><dd>{row.notes}</dd></div>
+                      <div><dt>替换</dt><dd>{row.replacements}</dd></div>
+                      <div><dt>表格编辑</dt><dd>{row.tableEdits}</dd></div>
+                      <div><dt>图表编辑</dt><dd>{row.chartEdits}</dd></div>
+                    </dl>
+                  </article>
+                ))}
+                {slideRows.length === 0 && <InlineState icon={<Clock3 size={18} />} text="暂无计划页" />}
+              </div>
+            </section>
+
+            <section className="plan-editor-surface" aria-labelledby="template-fill-json-title">
+              <div className="section-title" id="template-fill-json-title">
+                <FileText size={17} />
+                <span>计划 JSON</span>
+              </div>
+              <div className="plan-file-meta">
+                <span className="mono">{preview.plan_file.name}</span>
+                <span>{formatBytes(preview.plan_file.size)}</span>
+                <span>{formatTime(preview.plan_file.updated_at)}</span>
+              </div>
+              <span className="plan-file-path mono">{preview.plan_file.path}</span>
+              <textarea
+                className="plan-json-editor"
+                aria-label="填充计划 JSON"
+                readOnly={!preview.can_edit || !!busy}
+                spellCheck={false}
+                value={planText}
+                onChange={(event) => setPlanText(event.target.value)}
+              />
+            </section>
+          </div>
+
+          <section className="check-report-surface" aria-labelledby="template-fill-report-title">
+            <div className="section-title" id="template-fill-report-title">
+              <ListChecks size={17} />
+              <span>计划检查报告</span>
+            </div>
+            <div className="check-report-list">
+              {checkRows.map((row, index) => (
+                <div className={`check-report-row ${row.status === "ERROR" ? "bad" : "warn"}`} key={`${row.status}-${row.code}-${index}`}>
+                  <strong>{row.status}</strong>
+                  <span className="mono">{row.code}</span>
+                  <span>计划页 {row.planSlide}</span>
+                  <span>源页 {row.sourceSlide}</span>
+                  <span>{row.message}</span>
+                </div>
+              ))}
+              {checkRows.length === 0 && <InlineState icon={<CheckCircle2 size={18} />} text="暂无 ERROR / WARN" />}
+            </div>
+          </section>
+        </>
+      )}
+    </section>
+  );
+}
+
 function ConfirmPage({ taskId }: { taskId: string }) {
   const [task, setTask] = useState<Task | null>(null);
   const [confirmations, setConfirmations] = useState<Confirmation[]>([]);
@@ -968,7 +1509,7 @@ function ConfirmPage({ taskId }: { taskId: string }) {
       } else if (nextTask.status === "awaiting_spec_confirm") {
         go({ name: "spec", id: taskId });
       } else if (nextTask.status === "completed") {
-        go({ name: "preview", id: taskId });
+        go(completedTaskRoute(nextTask.id, nextTask.route));
       } else {
         go({ name: "task", id: taskId });
       }
@@ -1160,6 +1701,10 @@ function PreviewPage({ taskId }: { taskId: string }) {
     async function load() {
       try {
         const [nextTask, nextArtifacts] = await Promise.all([api.getTask(taskId), api.listArtifacts(taskId)]);
+        if (nextTask.route === "template-fill") {
+          go({ name: "templateFill", id: nextTask.id });
+          return;
+        }
         const svg = nextArtifacts.filter((artifact) => artifact.kind === "svg_final");
         setTask(nextTask);
         setArtifacts(nextArtifacts);
@@ -1347,7 +1892,7 @@ function IconButton({ label, children, onClick }: { label: string; children: Rea
 
 function InlineState({ icon, text, bad = false }: { icon: React.ReactNode; text: string; bad?: boolean }) {
   return (
-    <div className={bad ? "inline-state bad" : "inline-state"}>
+    <div className={bad ? "inline-state bad" : "inline-state"} role={bad ? "alert" : "status"}>
       {icon}
       <span>{text}</span>
     </div>
