@@ -2,9 +2,12 @@ package service
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/slidesmith/slidesmith/backend/internal/config"
@@ -39,6 +42,381 @@ func TestNormalizeRetryPhaseSupportsSplitPhases(t *testing.T) {
 				t.Fatalf("normalizeRetryPhase() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestNormalizeRetryPhaseTemplateFillAliases(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested string
+		failure   string
+		want      string
+	}{
+		{name: "plan canonical", requested: "template_fill_plan", want: retryPhaseTemplateFillPlan},
+		{name: "plan fill alias", requested: "fill_plan", want: retryPhaseTemplateFillPlan},
+		{name: "plan short alias", requested: "plan", want: retryPhaseTemplateFillPlan},
+		{name: "plan status alias", requested: "template_fill_planning", want: retryPhaseTemplateFillPlan},
+		{name: "check canonical", requested: "template_fill_check", want: retryPhaseTemplateFillCheck},
+		{name: "check fill alias", requested: "fill_check", want: retryPhaseTemplateFillCheck},
+		{name: "check short alias", requested: "check", want: retryPhaseTemplateFillCheck},
+		{name: "check status alias", requested: "template_fill_checking", want: retryPhaseTemplateFillCheck},
+		{name: "apply canonical", requested: "template_fill_apply", want: retryPhaseTemplateFillApply},
+		{name: "apply fill alias", requested: "fill_apply", want: retryPhaseTemplateFillApply},
+		{name: "apply short alias", requested: "apply", want: retryPhaseTemplateFillApply},
+		{name: "apply status alias", requested: "template_fill_applying", want: retryPhaseTemplateFillApply},
+		{name: "validate canonical", requested: "template_fill_validate", want: retryPhaseTemplateFillValidate},
+		{name: "validate fill alias", requested: "fill_validate", want: retryPhaseTemplateFillValidate},
+		{name: "validate short alias", requested: "validate", want: retryPhaseTemplateFillValidate},
+		{name: "validate status alias", requested: "template_fill_validating", want: retryPhaseTemplateFillValidate},
+		{name: "publish canonical", requested: "publish", want: retryPhasePublish},
+		{name: "publish status alias", requested: "publishing", want: retryPhasePublish},
+		{name: "publish artifact alias", requested: "artifact_publish", want: retryPhasePublish},
+		{name: "auto plan", requested: "auto", failure: "template_fill_plan.contract", want: retryPhaseTemplateFillPlan},
+		{name: "omitted check", failure: "template_fill_check.command", want: retryPhaseTemplateFillCheck},
+		{name: "auto apply", requested: "auto", failure: "template_fill_apply.contract", want: retryPhaseTemplateFillApply},
+		{name: "auto validate", requested: "auto", failure: "template_fill_validate.command", want: retryPhaseTemplateFillValidate},
+		{name: "auto publish", requested: "auto", failure: "publish.contract", want: retryPhasePublish},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := normalizeRetryPhase(test.requested, test.failure)
+			if err != nil {
+				t.Fatalf("normalizeRetryPhase(%q, %q) error = %v", test.requested, test.failure, err)
+			}
+			if got != test.want {
+				t.Fatalf("normalizeRetryPhase(%q, %q) = %q, want %q", test.requested, test.failure, got, test.want)
+			}
+		})
+	}
+}
+
+func TestRetryTemplateFillPhaseCleanupMatrixAndStatuses(t *testing.T) {
+	tests := []struct {
+		name       string
+		phase      string
+		wantStatus string
+		removed    []string
+	}{
+		{
+			name:       "plan",
+			phase:      string(PhaseTemplateFillPlan),
+			wantStatus: model.TaskStatusTemplateFillPlanning,
+			removed: []string{
+				"analysis/fill_plan.json",
+				"analysis/check_report.json",
+				".slidesmith/contracts/template_fill_plan.json",
+				".slidesmith/contracts/template_fill_check.json",
+				".slidesmith/contracts/template_fill_apply.json",
+				".slidesmith/contracts/template_fill_validate.json",
+				".slidesmith/contracts/publish.json",
+				".slidesmith/contracts/final.json",
+				"exports/result.pptx",
+				"validation/validate_report.json",
+				"validation/readback.md",
+			},
+		},
+		{
+			name:       "check",
+			phase:      string(PhaseTemplateFillCheck),
+			wantStatus: model.TaskStatusTemplateFillChecking,
+			removed: []string{
+				"analysis/check_report.json",
+				".slidesmith/contracts/template_fill_check.json",
+				".slidesmith/contracts/template_fill_apply.json",
+				".slidesmith/contracts/template_fill_validate.json",
+				".slidesmith/contracts/publish.json",
+				".slidesmith/contracts/final.json",
+				"exports/result.pptx",
+				"validation/validate_report.json",
+				"validation/readback.md",
+			},
+		},
+		{
+			name:       "apply",
+			phase:      string(PhaseTemplateFillApply),
+			wantStatus: model.TaskStatusTemplateFillApplying,
+			removed: []string{
+				".slidesmith/contracts/template_fill_apply.json",
+				".slidesmith/contracts/template_fill_validate.json",
+				".slidesmith/contracts/publish.json",
+				".slidesmith/contracts/final.json",
+				"exports/result.pptx",
+				"validation/validate_report.json",
+				"validation/readback.md",
+			},
+		},
+		{
+			name:       "validate",
+			phase:      string(PhaseTemplateFillValidate),
+			wantStatus: model.TaskStatusTemplateFillValidating,
+			removed: []string{
+				".slidesmith/contracts/template_fill_validate.json",
+				".slidesmith/contracts/publish.json",
+				".slidesmith/contracts/final.json",
+				"validation/validate_report.json",
+				"validation/readback.md",
+			},
+		},
+		{
+			name:       "publish",
+			phase:      string(PhasePublish),
+			wantStatus: model.TaskStatusPublishing,
+			removed: []string{
+				".slidesmith/contracts/publish.json",
+				".slidesmith/contracts/final.json",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+			task.FailurePhase = test.phase + ".contract"
+			task.ErrorMessage = "phase failed"
+			task.FailureMetadata = `{"phase":"` + test.phase + `.contract"}`
+			if err := repo.SaveTask(context.Background(), task); err != nil {
+				t.Fatal(err)
+			}
+			allPaths := writeTemplateFillRetryEvidence(projectPath)
+			removed := retryRelativePathSet(test.removed)
+
+			updated, err := service.RetryTask(context.Background(), task.ID, test.phase)
+			if err != nil {
+				t.Fatalf("RetryTask(%q) error = %v", test.phase, err)
+			}
+			if updated.Status != test.wantStatus {
+				t.Fatalf("status = %q, want %q", updated.Status, test.wantStatus)
+			}
+			for _, relativePath := range allPaths {
+				path := filepath.Join(projectPath, filepath.FromSlash(relativePath))
+				if removed[relativePath] {
+					assertPathMissing(t, path)
+				} else {
+					assertPathExists(t, path)
+				}
+			}
+			persisted, err := repo.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Status != test.wantStatus {
+				t.Fatalf("persisted status = %q, want %q", persisted.Status, test.wantStatus)
+			}
+			if persisted.FailurePhase != "" || persisted.ErrorMessage != "" || persisted.FailureMetadata != "{}" {
+				t.Fatalf("failure fields not cleared: phase=%q error=%q metadata=%q", persisted.FailurePhase, persisted.ErrorMessage, persisted.FailureMetadata)
+			}
+			if persisted.ExecutionClaimToken != "" || persisted.ExecutionClaimedAt != nil {
+				t.Fatalf("retry leaked execution claim: token=%q claimed_at=%v", persisted.ExecutionClaimToken, persisted.ExecutionClaimedAt)
+			}
+		})
+	}
+}
+
+func TestRetryTemplateFillPhasesRejectOtherRoutesWithoutMutation(t *testing.T) {
+	for _, route := range []string{model.TaskRouteMain, model.TaskRouteBeautify} {
+		t.Run(route, func(t *testing.T) {
+			service, repo, task, projectPath := retryTestService(t)
+			task.Route = route
+			if err := repo.SaveTask(context.Background(), task); err != nil {
+				t.Fatal(err)
+			}
+			mustWriteRetryProjectFiles(projectPath)
+			preserved := filepath.Join(projectPath, "exports", "stale.pptx")
+
+			if _, err := service.RetryTask(context.Background(), task.ID, string(PhaseTemplateFillApply)); err == nil || !strings.Contains(err.Error(), "route") {
+				t.Fatalf("RetryTask() error = %v, want route rejection", err)
+			}
+			assertPathExists(t, preserved)
+			persisted, err := repo.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Status != model.TaskStatusFailed || persisted.FailurePhase != task.FailurePhase {
+				t.Fatalf("rejected retry mutated task = %#v", persisted)
+			}
+		})
+	}
+}
+
+func TestRetryTemplateFillRouteRejectsMainPipelinePhaseWithoutMutation(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+	task.FailurePhase = "quality_check.command"
+	task.ErrorMessage = "wrong pipeline"
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	allPaths := writeTemplateFillRetryEvidence(projectPath)
+
+	if _, err := service.RetryTask(context.Background(), task.ID, string(PhaseQualityCheck)); err == nil || !strings.Contains(err.Error(), "route") {
+		t.Fatalf("RetryTask() error = %v, want route rejection", err)
+	}
+	for _, relativePath := range allPaths {
+		assertPathExists(t, filepath.Join(projectPath, filepath.FromSlash(relativePath)))
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusFailed || persisted.FailurePhase != "quality_check.command" {
+		t.Fatalf("rejected retry mutated task = %#v", persisted)
+	}
+}
+
+func TestRetryMainAndBeautifyQualityRecoveryRemainsUnchanged(t *testing.T) {
+	for _, route := range []string{model.TaskRouteMain, model.TaskRouteBeautify} {
+		t.Run(route, func(t *testing.T) {
+			service, repo, task, projectPath := retryTestService(t)
+			task.Route = route
+			if err := repo.SaveTask(context.Background(), task); err != nil {
+				t.Fatal(err)
+			}
+			mustWriteRetryProjectFiles(projectPath)
+
+			updated, err := service.RetryTask(context.Background(), task.ID, string(PhaseQualityCheck))
+			if err != nil {
+				t.Fatalf("RetryTask() error = %v", err)
+			}
+			if updated.Status != model.TaskStatusQualityChecking {
+				t.Fatalf("status = %q, want %q", updated.Status, model.TaskStatusQualityChecking)
+			}
+			assertPathExists(t, filepath.Join(projectPath, "svg_output", "01.svg"))
+			assertPathMissing(t, filepath.Join(projectPath, "exports"))
+		})
+	}
+}
+
+func TestRetryTemplateFillCleanupDoesNotFollowSymlinks(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+	task.FailurePhase = "template_fill_apply.command"
+	task.ErrorMessage = "apply failed"
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	allPaths := writeTemplateFillRetryEvidence(projectPath)
+	exportsPath := filepath.Join(projectPath, "exports")
+	if err := os.RemoveAll(exportsPath); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	outsideSentinel := filepath.Join(outside, "outside.pptx")
+	if err := os.WriteFile(outsideSentinel, []byte("outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, exportsPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.RetryTask(context.Background(), task.ID, string(PhaseTemplateFillApply)); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("RetryTask() error = %v, want no-follow rejection", err)
+	}
+	assertPathExists(t, outsideSentinel)
+	if info, err := os.Lstat(exportsPath); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("unsafe symlink changed: info=%v err=%v", info, err)
+	}
+	for _, relativePath := range allPaths {
+		if relativePath == "exports/result.pptx" {
+			continue
+		}
+		assertPathExists(t, filepath.Join(projectPath, filepath.FromSlash(relativePath)))
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusFailed || persisted.ExecutionClaimToken != "" || persisted.ExecutionClaimedAt != nil {
+		t.Fatalf("failed no-follow retry mutated task or leaked claim = %#v", persisted)
+	}
+}
+
+func TestRetryTemplateFillActiveClaimFencesCleanup(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+	task.FailurePhase = "template_fill_plan.command"
+	task.ErrorMessage = "plan failed"
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	allPaths := writeTemplateFillRetryEvidence(projectPath)
+	now := time.Now().UTC()
+	claimed, err := repo.ClaimTaskExecution(context.Background(), task.ID, model.TaskStatusFailed, "active-worker-claim", now, now.Add(-time.Hour))
+	if err != nil || !claimed {
+		t.Fatalf("ClaimTaskExecution() = %v, %v", claimed, err)
+	}
+
+	if _, err := service.RetryTask(context.Background(), task.ID, string(PhaseTemplateFillPlan)); !errors.Is(err, errTaskStateChanged) {
+		t.Fatalf("RetryTask() error = %v, want errTaskStateChanged", err)
+	}
+	for _, relativePath := range allPaths {
+		assertPathExists(t, filepath.Join(projectPath, filepath.FromSlash(relativePath)))
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusFailed || persisted.ExecutionClaimToken != "active-worker-claim" {
+		t.Fatalf("fenced retry changed active claim = %#v", persisted)
+	}
+}
+
+func TestRetryTemplateFillRestoresOutputsWhenDBTransitionFails(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+	task.FailurePhase = "template_fill_apply.contract"
+	task.ErrorMessage = "apply failed"
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	allPaths := writeTemplateFillRetryEvidence(projectPath)
+	injected := errors.New("injected retry transition failure")
+	installTemplateFillTransitionFailure(t, repo.DB(), model.TaskStatusTemplateFillApplying, injected)
+
+	if _, err := service.RetryTask(context.Background(), task.ID, string(PhaseTemplateFillApply)); !errors.Is(err, injected) {
+		t.Fatalf("RetryTask() error = %v, want injected failure", err)
+	}
+	for _, relativePath := range allPaths {
+		assertPathExists(t, filepath.Join(projectPath, filepath.FromSlash(relativePath)))
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusFailed || persisted.FailurePhase != "template_fill_apply.contract" {
+		t.Fatalf("failed transition mutated task = %#v", persisted)
+	}
+	if persisted.ExecutionClaimToken != "" || persisted.ExecutionClaimedAt != nil {
+		t.Fatalf("failed transition leaked execution claim = %#v", persisted)
+	}
+}
+
+func TestRetryTemplateFillCASLossRestoresOutputsAndPreservesNewStatus(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+	task.FailurePhase = "template_fill_check.contract"
+	task.ErrorMessage = "check failed"
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	allPaths := writeTemplateFillRetryEvidence(projectPath)
+	service.beforeTemplateFillAPICommit = func(targetStatus string) {
+		if targetStatus != model.TaskStatusTemplateFillChecking {
+			return
+		}
+		if err := repo.DB().Model(&model.Task{}).Where("id = ?", task.ID).Update("status", model.TaskStatusCancelled).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := service.RetryTask(context.Background(), task.ID, string(PhaseTemplateFillCheck)); !errors.Is(err, errTaskStateChanged) {
+		t.Fatalf("RetryTask() error = %v, want errTaskStateChanged", err)
+	}
+	for _, relativePath := range allPaths {
+		assertPathExists(t, filepath.Join(projectPath, filepath.FromSlash(relativePath)))
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusCancelled {
+		t.Fatalf("CAS loss overwrote newer status: %#v", persisted)
+	}
+	if persisted.ExecutionClaimToken != "" || persisted.ExecutionClaimedAt != nil {
+		t.Fatalf("CAS loss leaked execution claim = %#v", persisted)
 	}
 }
 
@@ -277,6 +655,43 @@ func mustWriteRetryProjectFiles(projectPath string) {
 	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "quality_report.json"), `{"errors":1}`+"\n")
 	mustWriteFileNoTest(projectPath, filepath.Join("svg_final", "01.svg"), `<svg></svg>`+"\n")
 	mustWritePPTXNoTest(projectPath, filepath.Join("exports", "stale.pptx"), 3)
+}
+
+func writeTemplateFillRetryEvidence(projectPath string) []string {
+	paths := []string{
+		"sources/brand.pptx",
+		"sources/content.md",
+		"analysis/source_profile.json",
+		"analysis/brand.identity.json",
+		"analysis/brand.slide_library.json",
+		".slidesmith/contracts/source_prepare.json",
+		".slidesmith/route.json",
+		"analysis/fill_plan.json",
+		"analysis/check_report.json",
+		".slidesmith/contracts/template_fill_plan.json",
+		".slidesmith/contracts/template_fill_check.json",
+		".slidesmith/contracts/template_fill_apply.json",
+		".slidesmith/contracts/template_fill_validate.json",
+		".slidesmith/contracts/publish.json",
+		".slidesmith/contracts/final.json",
+		"exports/result.pptx",
+		"validation/validate_report.json",
+		"validation/readback.md",
+		".slidesmith/artifacts.json",
+		".slidesmith-artifacts.json",
+	}
+	for _, relativePath := range paths {
+		mustWriteFileNoTest(projectPath, filepath.FromSlash(relativePath), relativePath+"\n")
+	}
+	return paths
+}
+
+func retryRelativePathSet(paths []string) map[string]bool {
+	result := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		result[path] = true
+	}
+	return result
 }
 
 func assertPathExists(t *testing.T, path string) {

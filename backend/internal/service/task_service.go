@@ -32,12 +32,16 @@ type TaskService struct {
 }
 
 const (
-	retryPhasePrepare        = "prepare"
-	retryPhaseSpecGenerate   = "spec_generate"
-	retryPhaseSVGExecute     = "svg_execute"
-	retryPhaseQualityCheck   = "quality_check"
-	retryPhaseFinalizeExport = "finalize_export"
-	retryPhasePublish        = "publish"
+	retryPhasePrepare              = "prepare"
+	retryPhaseSpecGenerate         = "spec_generate"
+	retryPhaseSVGExecute           = "svg_execute"
+	retryPhaseQualityCheck         = "quality_check"
+	retryPhaseFinalizeExport       = "finalize_export"
+	retryPhaseTemplateFillPlan     = "template_fill_plan"
+	retryPhaseTemplateFillCheck    = "template_fill_check"
+	retryPhaseTemplateFillApply    = "template_fill_apply"
+	retryPhaseTemplateFillValidate = "template_fill_validate"
+	retryPhasePublish              = "publish"
 
 	sourcePrepareAwaitingAnchorFailure = "source_prepare.awaiting_anchor_confirm"
 	taskExecutionLeaseBuffer           = 5 * time.Minute
@@ -2240,6 +2244,133 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 	return nil
 }
 
+func cleanupTemplateFillOutputsForRetry(projectPath string, phase PipelinePhase) error {
+	paths, err := templateFillRetryOutputPaths(projectPath, phase)
+	if err != nil {
+		return err
+	}
+	if err := inspectTemplateFillRetryCleanupPaths(projectPath, paths); err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if err := os.RemoveAll(path); err != nil {
+			return fmt.Errorf("remove template fill retry output %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func requireTemplateFillRetryOutputsAbsent(projectPath string, phase PipelinePhase) error {
+	paths, err := templateFillRetryOutputPaths(projectPath, phase)
+	if err != nil {
+		return err
+	}
+	if err := inspectTemplateFillRetryCleanupPaths(projectPath, paths); err != nil {
+		return err
+	}
+	for _, path := range paths {
+		if _, err := os.Lstat(path); err == nil {
+			return fmt.Errorf("template fill retry output still exists: %s", path)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect template fill retry output %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+func templateFillRetryOutputPaths(projectPath string, phase PipelinePhase) ([]string, error) {
+	contractPath := func(contract PipelinePhase) string {
+		return filepath.Join(projectPath, ".slidesmith", "contracts", string(contract)+".json")
+	}
+	publishContract := contractPath(PhasePublish)
+	finalContract := filepath.Join(projectPath, ".slidesmith", "contracts", "final.json")
+	switch phase {
+	case PhaseTemplateFillPlan:
+		return []string{
+			filepath.Join(projectPath, "analysis", "fill_plan.json"),
+			filepath.Join(projectPath, "analysis", "check_report.json"),
+			contractPath(PhaseTemplateFillPlan),
+			contractPath(PhaseTemplateFillCheck),
+			contractPath(PhaseTemplateFillApply),
+			contractPath(PhaseTemplateFillValidate),
+			publishContract,
+			finalContract,
+			filepath.Join(projectPath, "exports"),
+			filepath.Join(projectPath, "validation"),
+		}, nil
+	case PhaseTemplateFillCheck:
+		return []string{
+			filepath.Join(projectPath, "analysis", "check_report.json"),
+			contractPath(PhaseTemplateFillCheck),
+			contractPath(PhaseTemplateFillApply),
+			contractPath(PhaseTemplateFillValidate),
+			publishContract,
+			finalContract,
+			filepath.Join(projectPath, "exports"),
+			filepath.Join(projectPath, "validation"),
+		}, nil
+	case PhaseTemplateFillApply:
+		return []string{
+			contractPath(PhaseTemplateFillApply),
+			contractPath(PhaseTemplateFillValidate),
+			publishContract,
+			finalContract,
+			filepath.Join(projectPath, "exports"),
+			filepath.Join(projectPath, "validation"),
+		}, nil
+	case PhaseTemplateFillValidate:
+		return []string{
+			contractPath(PhaseTemplateFillValidate),
+			publishContract,
+			finalContract,
+			filepath.Join(projectPath, "validation"),
+		}, nil
+	case PhasePublish:
+		return []string{publishContract, finalContract}, nil
+	default:
+		return nil, fmt.Errorf("unsupported template fill cleanup phase %q", phase)
+	}
+}
+
+func inspectTemplateFillRetryCleanupPaths(projectPath string, paths []string) error {
+	if err := requireRealProjectDirectory(projectPath, "template fill retry project"); err != nil {
+		return err
+	}
+	root, err := filepath.Abs(projectPath)
+	if err != nil {
+		return fmt.Errorf("resolve template fill retry project: %w", err)
+	}
+	for _, path := range paths {
+		candidate, err := filepath.Abs(path)
+		if err != nil {
+			return fmt.Errorf("resolve template fill retry output %s: %w", path, err)
+		}
+		relativePath, err := filepath.Rel(root, candidate)
+		if err != nil || relativePath == "." || !pathWithinRoot(root, candidate) {
+			return fmt.Errorf("template fill retry output %s is outside project %s", path, projectPath)
+		}
+		current := root
+		parts := strings.Split(relativePath, string(filepath.Separator))
+		for index, part := range parts {
+			current = filepath.Join(current, part)
+			info, err := os.Lstat(current)
+			if os.IsNotExist(err) {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("inspect template fill retry output %s: %w", current, err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("template fill retry output must not contain a symlink: %s", current)
+			}
+			if index < len(parts)-1 && !info.IsDir() {
+				return fmt.Errorf("template fill retry output parent must be a directory: %s", current)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *TaskService) processPublish(ctx context.Context, task *model.Task, workspace *TaskWorkspace, payload map[string]any) error {
 	if workspace == nil {
 		workspace = s.resolveTaskWorkspace(task)
@@ -2621,6 +2752,23 @@ func (s *TaskService) RetryTask(ctx context.Context, taskID, phase string) (*mod
 		return nil, err
 	}
 	switch phase {
+	case retryPhaseTemplateFillPlan:
+		return s.retryTemplateFillPhase(ctx, task, PhaseTemplateFillPlan, model.TaskStatusTemplateFillPlanning)
+	case retryPhaseTemplateFillCheck:
+		return s.retryTemplateFillPhase(ctx, task, PhaseTemplateFillCheck, model.TaskStatusTemplateFillChecking)
+	case retryPhaseTemplateFillApply:
+		return s.retryTemplateFillPhase(ctx, task, PhaseTemplateFillApply, model.TaskStatusTemplateFillApplying)
+	case retryPhaseTemplateFillValidate:
+		return s.retryTemplateFillPhase(ctx, task, PhaseTemplateFillValidate, model.TaskStatusTemplateFillValidating)
+	case retryPhasePublish:
+		if task.Route == model.TaskRouteTemplateFill {
+			return s.retryTemplateFillPhase(ctx, task, PhasePublish, model.TaskStatusPublishing)
+		}
+	}
+	if task.Route == model.TaskRouteTemplateFill && phase != retryPhasePrepare {
+		return nil, fmt.Errorf("retry phase %q is not valid for task route %q", phase, task.Route)
+	}
+	switch phase {
 	case retryPhasePrepare:
 		return s.retryPrepare(ctx, task)
 	case retryPhaseSpecGenerate:
@@ -2755,6 +2903,73 @@ func (s *TaskService) retryPipelinePhase(ctx context.Context, task *model.Task, 
 	return task, nil
 }
 
+func (s *TaskService) retryTemplateFillPhase(ctx context.Context, task *model.Task, phase PipelinePhase, status string) (_ *model.Task, resultErr error) {
+	if err := requireTemplateFillRoute(task); err != nil {
+		return nil, err
+	}
+	unlock, err := s.lockTemplateFillAPI(ctx, task)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	task, err = s.reloadTemplateFillAPITask(ctx, task.ID)
+	if err != nil {
+		return nil, err
+	}
+	if task.Status != model.TaskStatusFailed {
+		return nil, fmt.Errorf("only failed tasks can be retried")
+	}
+	if err := s.sweepTemplateFillAPISessions(task); err != nil {
+		return nil, err
+	}
+	if err := s.sweepCommittedTemplateFillPromotions(ctx, task); err != nil {
+		return nil, err
+	}
+	releaseClaim, err := s.claimTemplateFillAPI(ctx, task)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, releaseClaim())
+	}()
+	projectPath, err := s.findPersistentProjectPath(task)
+	if err != nil {
+		return nil, fmt.Errorf("cannot retry %s before prepared project exists: %w", phase, err)
+	}
+	session, err := s.newTemplateFillAPISession(ctx, task, projectPath)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		resultErr = errors.Join(resultErr, session.cleanup())
+	}()
+	if err := cleanupTemplateFillOutputsForRetry(session.candidateProject, phase); err != nil {
+		return nil, fmt.Errorf("cleanup before retry %s: %w", phase, err)
+	}
+	validateClean := func(candidate string) error {
+		return requireTemplateFillRetryOutputsAbsent(candidate, phase)
+	}
+	exchange, err := s.beginTemplateFillProjectExchange(ctx, task, session, status, validateClean)
+	if err != nil {
+		return nil, err
+	}
+	if s.beforeTemplateFillAPICommit != nil {
+		s.beforeTemplateFillAPICommit(status)
+	}
+	if err := s.transitionTemplateFillAtGate(ctx, task, status, "Retry queued from "+string(phase), map[string]any{
+		"retry_phase":  string(phase),
+		"project_path": projectPath,
+	}); err != nil {
+		return nil, errors.Join(err, exchange.rollback())
+	}
+	exchange.commitAfterDB(ctx)
+	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", "Template fill phase retry queued for worker", map[string]any{
+		"retry_phase":  string(phase),
+		"project_path": projectPath,
+	})
+	return task, nil
+}
+
 func (s *TaskService) retryPublish(ctx context.Context, task *model.Task) (*model.Task, error) {
 	if _, err := s.findPersistentProjectPath(task); err != nil {
 		return nil, fmt.Errorf("cannot retry publish before prepared project exists: %w", err)
@@ -2782,6 +2997,14 @@ func normalizeRetryPhase(requested, failurePhase string) (string, error) {
 		return retryPhaseQualityCheck, nil
 	case "export", "exporting", "finalize", "finalize_export":
 		return retryPhaseFinalizeExport, nil
+	case "template_fill_plan", "fill_plan", "plan", "template_fill_planning":
+		return retryPhaseTemplateFillPlan, nil
+	case "template_fill_check", "fill_check", "check", "template_fill_checking":
+		return retryPhaseTemplateFillCheck, nil
+	case "template_fill_apply", "fill_apply", "apply", "template_fill_applying":
+		return retryPhaseTemplateFillApply, nil
+	case "template_fill_validate", "fill_validate", "validate", "template_fill_validating":
+		return retryPhaseTemplateFillValidate, nil
 	case "publish", "publishing", "artifact_publish":
 		return retryPhasePublish, nil
 	default:
@@ -2803,6 +3026,14 @@ func inferRetryPhase(failurePhase string) string {
 		return retryPhaseQualityCheck
 	case strings.HasPrefix(value, string(PhaseFinalizeExport)), strings.HasPrefix(value, "export"), strings.HasPrefix(value, "finalize"):
 		return retryPhaseFinalizeExport
+	case strings.HasPrefix(value, string(PhaseTemplateFillPlan)):
+		return retryPhaseTemplateFillPlan
+	case strings.HasPrefix(value, string(PhaseTemplateFillCheck)):
+		return retryPhaseTemplateFillCheck
+	case strings.HasPrefix(value, string(PhaseTemplateFillApply)):
+		return retryPhaseTemplateFillApply
+	case strings.HasPrefix(value, string(PhaseTemplateFillValidate)):
+		return retryPhaseTemplateFillValidate
 	case strings.HasPrefix(value, "publish"):
 		return retryPhasePublish
 	default:
