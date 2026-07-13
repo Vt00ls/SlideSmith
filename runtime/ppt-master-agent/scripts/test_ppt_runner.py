@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -541,6 +544,240 @@ def read_events() -> list[dict[str, object]]:
         for line in ppt_runner.EVENTS_PATH.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+@unittest.skipUnless(
+    os.environ.get("SLIDESMITH_RUN_REAL_TEMPLATE_FILL_SMOKE") == "1",
+    "set SLIDESMITH_RUN_REAL_TEMPLATE_FILL_SMOKE=1 for the real Template Fill smoke",
+)
+class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
+    def test_check_apply_validate(self) -> None:
+        fixture_value = os.environ.get("SLIDESMITH_TEMPLATE_FILL_SMOKE_PPTX", "").strip()
+        content_value = os.environ.get("SLIDESMITH_TEMPLATE_FILL_SMOKE_CONTENT", "").strip()
+        self.assertTrue(fixture_value, "SLIDESMITH_TEMPLATE_FILL_SMOKE_PPTX is required")
+        self.assertTrue(content_value, "SLIDESMITH_TEMPLATE_FILL_SMOKE_CONTENT is required")
+
+        fixture = Path(fixture_value).expanduser()
+        content_source = Path(content_value).expanduser()
+        expected_sources = {
+            fixture: (105_402, "ddcaef381c298e0c5f4d1c636731044ed513e30166c07e79dae70ff5896227a3"),
+            content_source: (12_239, "c823b8ff8e5733d7e0a778256cd0d03cf7b71da3cd8bb2cf15a70d5431d72906"),
+        }
+
+        def sha256(path: Path) -> str:
+            digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return digest.hexdigest()
+
+        source_digests_before: dict[Path, str] = {}
+        for path, (expected_size, expected_digest) in expected_sources.items():
+            self.assertFalse(path.is_symlink(), f"smoke source must not be a symlink: {path}")
+            self.assertTrue(path.is_file(), f"smoke source must be a regular file: {path}")
+            self.assertEqual(path.stat().st_size, expected_size, path)
+            source_digests_before[path] = sha256(path)
+            self.assertEqual(source_digests_before[path], expected_digest, path)
+
+        temporary = tempfile.TemporaryDirectory()
+        root = Path(temporary.name)
+        workspace = root / "workspace"
+        project = workspace / "projects" / "spec3_template_fill_smoke"
+        try:
+            sources_dir = project / "sources"
+            analysis_dir = project / "analysis"
+            sources_dir.mkdir(parents=True)
+            analysis_dir.mkdir(parents=True)
+            copied_fixture = sources_dir / fixture.name
+            copied_content = sources_dir / content_source.name
+            shutil.copy2(fixture, copied_fixture)
+            shutil.copy2(content_source, copied_content)
+            self.assertEqual(sha256(copied_fixture), source_digests_before[fixture])
+            self.assertEqual(sha256(copied_content), source_digests_before[content_source])
+
+            environment = os.environ.copy()
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            environment["WORKSPACE"] = str(workspace)
+            analyzer = ppt_runner.SCRIPTS_DIR / "template_fill_pptx.py"
+            slide_library = analysis_dir / f"{copied_fixture.stem}.slide_library.json"
+            analyze = subprocess.run(
+                [
+                    sys.executable,
+                    str(analyzer),
+                    "analyze",
+                    str(copied_fixture),
+                    "-o",
+                    str(slide_library),
+                ],
+                cwd=RUNNER_PATH.parent.parent,
+                env=environment,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=180,
+            )
+            self.assertEqual(analyze.returncode, 0, analyze.stdout + analyze.stderr)
+            self.assertTrue(slide_library.is_file())
+            self.assertGreater(slide_library.stat().st_size, 0)
+
+            fill_plan = analysis_dir / "fill_plan.json"
+            write_json_file(
+                fill_plan,
+                {
+                    "schema": "template_fill_pptx_plan.v1",
+                    "status": "confirmed",
+                    "source_pptx": f"sources/{copied_fixture.name}",
+                    "accepted_warnings": [],
+                    "slides": [
+                        {
+                            "source_slide": 1,
+                            "purpose": "automated Template Fill smoke cover",
+                            "layout_rationale": {
+                                "layout_pattern": "blueprint cover",
+                                "why_fit": "A short source-grounded label fits the native cover slot.",
+                                "risk": "Low; one short editable text replacement.",
+                            },
+                            "transition": "fade",
+                            "replacements": [
+                                {"slot_id": "s01_sh10", "text": "Cluster topology"}
+                            ],
+                            "table_edits": [],
+                            "chart_edits": [],
+                        }
+                    ],
+                },
+            )
+            plan = json.loads(fill_plan.read_text(encoding="utf-8"))
+            self.assertEqual(plan["status"], "confirmed")
+            self.assertEqual(len(plan["slides"]), 1)
+            plan_digest = sha256(fill_plan)
+
+            def run_phase(*arguments: str) -> subprocess.CompletedProcess[str]:
+                completed = subprocess.run(
+                    [sys.executable, str(RUNNER_PATH), *arguments],
+                    cwd=RUNNER_PATH.parent.parent,
+                    env=environment,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=180,
+                )
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    f"{' '.join(arguments)}\n{completed.stdout}{completed.stderr}",
+                )
+                return completed
+
+            check_report = analysis_dir / "check_report.json"
+            self.assertFalse(check_report.exists())
+            run_phase("template-fill-check", "--project-path", str(project))
+            self.assertEqual(sha256(fill_plan), plan_digest)
+            self.assertTrue(check_report.is_file())
+            check = json.loads(check_report.read_text(encoding="utf-8"))
+            self.assertEqual(check.get("schema"), "template_fill_pptx_check.v1")
+            self.assertEqual(check.get("summary", {}).get("error"), 0)
+            check_digest = sha256(check_report)
+
+            exports_dir = project / "exports"
+            export_pattern = re.compile(
+                r"^spec3_template_fill_smoke_template_fill_\d{8}_\d{6}\.pptx$"
+            )
+            exports_before = (
+                {path.name for path in exports_dir.iterdir() if export_pattern.fullmatch(path.name)}
+                if exports_dir.is_dir()
+                else set()
+            )
+            run_phase(
+                "template-fill-apply",
+                "--project-path",
+                str(project),
+                "--transition",
+                "fade",
+            )
+            self.assertEqual(sha256(fill_plan), plan_digest)
+            self.assertEqual(sha256(check_report), check_digest)
+            exports_after = {
+                path.name
+                for path in exports_dir.iterdir()
+                if export_pattern.fullmatch(path.name)
+            }
+            new_exports = exports_after - exports_before
+            self.assertEqual(len(new_exports), 1, sorted(new_exports))
+            export = exports_dir / new_exports.pop()
+            self.assertFalse(export.is_symlink())
+            self.assertTrue(export.is_file())
+            self.assertGreater(export.stat().st_size, 0)
+            self.assertFalse(
+                (exports_dir / "spec3_template_fill_smoke_template_fill.pptx").exists()
+            )
+
+            validate_report = project / "validation" / "validate_report.json"
+            readback = project / "validation" / "readback.md"
+            self.assertFalse(validate_report.exists())
+            self.assertFalse(readback.exists())
+            run_phase("template-fill-validate", "--project-path", str(project))
+            self.assertEqual(sha256(fill_plan), plan_digest)
+            self.assertEqual(sha256(check_report), check_digest)
+            self.assertTrue(validate_report.is_file())
+            validate = json.loads(validate_report.read_text(encoding="utf-8"))
+            self.assertEqual(validate.get("schema"), "template_fill_pptx_validate.v1")
+            self.assertEqual(validate.get("summary", {}).get("error"), 0)
+            self.assertTrue(readback.is_file())
+            self.assertGreater(readback.stat().st_size, 0)
+            self.assertIn("Cluster topology", readback.read_text(encoding="utf-8"))
+
+            with zipfile.ZipFile(export) as package:
+                slide_entries = [
+                    name
+                    for name in package.namelist()
+                    if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+                ]
+            final_plan = json.loads(fill_plan.read_text(encoding="utf-8"))
+            self.assertEqual(len(slide_entries), len(final_plan["slides"]))
+            self.assertEqual(len(slide_entries), 1)
+
+            for forbidden in (project / "design_spec.md", project / "spec_lock.md"):
+                self.assertFalse(forbidden.exists(), forbidden)
+            for svg_dir in (project / "svg_output", project / "svg_final"):
+                svg_files = (
+                    [path for path in svg_dir.rglob("*") if path.suffix.casefold() == ".svg"]
+                    if svg_dir.exists()
+                    else []
+                )
+                self.assertFalse(svg_files, svg_files)
+
+            state_dir = workspace / ".slidesmith"
+            self.assertTrue((state_dir / "events.ndjson").is_file())
+            self.assertTrue((state_dir / "status.json").is_file())
+            state_dirs = [path.resolve() for path in root.rglob(".slidesmith")]
+            self.assertEqual(state_dirs, [state_dir.resolve()])
+            for state_file in state_dir.rglob("*"):
+                self.assertTrue(state_file.resolve().is_relative_to(workspace.resolve()))
+
+            self.assertEqual(sha256(copied_fixture), source_digests_before[fixture])
+            self.assertEqual(sha256(copied_content), source_digests_before[content_source])
+            for path, digest in source_digests_before.items():
+                self.assertFalse(path.is_symlink(), path)
+                self.assertTrue(path.is_file(), path)
+                self.assertEqual(sha256(path), digest, path)
+            print(
+                "real Template Fill smoke: "
+                f"plan_sha256={plan_digest} "
+                f"check_report_sha256={check_digest} "
+                f"export={export.name} "
+                f"export_bytes={export.stat().st_size} "
+                f"validate_errors={validate['summary']['error']} "
+                f"readback_bytes={readback.stat().st_size} "
+                f"slides={len(slide_entries)}"
+            )
+        except BaseException:
+            retained = Path(tempfile.mkdtemp(prefix="slidesmith-template-fill-smoke-failed-"))
+            shutil.copytree(root, retained, dirs_exist_ok=True)
+            print(f"retained failed Template Fill smoke at {retained}", file=sys.stderr)
+            raise
+        finally:
+            temporary.cleanup()
 
 
 @unittest.skipUnless(
