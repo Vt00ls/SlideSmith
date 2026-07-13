@@ -390,12 +390,66 @@ func TestConfirmTemplateFillPlanRestoresPlanWhenDBTransitionFails(t *testing.T) 
 	}
 }
 
+func TestConfirmTemplateFillPlanRestoresPlanWhenDatabaseRemainsUnavailable(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	planPath := filepath.Join(projectPath, "analysis", "fill_plan.json")
+	wantPlan := mustReadTemplateFillPreviewFile(t, planPath)
+	injected := errors.New("database unavailable after canonical exchange")
+	installTemplateFillPersistentDatabaseFailure(t, repo.DB(), model.TaskStatusTemplateFillChecking, injected)
+
+	if _, err := service.ConfirmTemplateFillPlan(context.Background(), task.ID); !errors.Is(err, injected) {
+		t.Fatalf("ConfirmTemplateFillPlan() error = %v, want database unavailable", err)
+	}
+	if got := mustReadTemplateFillPreviewFile(t, planPath); !bytes.Equal(got, wantPlan) {
+		t.Fatalf("plan was not restored without DB-backed rollback\ngot: %s\nwant: %s", got, wantPlan)
+	}
+}
+
+func TestFailedTemplateFillCheckTaskCanSaveAndConfirmAgain(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+	task.FailurePhase = "template_fill_check.contract"
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	writeTemplateFillPreviewCheckReport(t, projectPath, 0, 0, 3)
+
+	preview, err := service.SaveTemplateFillPlan(context.Background(), task.ID, templateFillContractPlan("confirmed", 1))
+	if err != nil {
+		t.Fatalf("SaveTemplateFillPlan() error = %v", err)
+	}
+	if !preview.CanEdit || !preview.CanConfirm {
+		t.Fatalf("saved failed-check preview = can_edit %v can_confirm %v, want true/true", preview.CanEdit, preview.CanConfirm)
+	}
+	updated, err := service.ConfirmTemplateFillPlan(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("ConfirmTemplateFillPlan() error = %v", err)
+	}
+	if updated.Status != model.TaskStatusTemplateFillChecking {
+		t.Fatalf("status = %q, want template_fill_checking", updated.Status)
+	}
+}
+
+func TestConfirmTemplateFillPlanRejectsNonCheckFailedTask(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+	task.FailurePhase = "template_fill_plan.contract"
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+
+	if _, err := service.ConfirmTemplateFillPlan(context.Background(), task.ID); err == nil {
+		t.Fatal("ConfirmTemplateFillPlan() error = nil for non-check failed task")
+	}
+}
+
 func TestConfirmTemplateFillPlanSerializesConcurrentSaveThroughTransition(t *testing.T) {
 	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
 	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
 	confirmAtPromotion := make(chan struct{})
 	releaseConfirm := make(chan struct{})
-	service.beforeTemplateFillAPITransition = func(targetStatus string) {
+	service.beforeTemplateFillAPICommit = func(targetStatus string) {
 		if targetStatus == model.TaskStatusTemplateFillChecking {
 			close(confirmAtPromotion)
 			<-releaseConfirm
@@ -451,7 +505,7 @@ func TestGetTemplateFillPlanSerializesWithConfirmTransaction(t *testing.T) {
 	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
 	confirmAtTransition := make(chan struct{})
 	releaseConfirm := make(chan struct{})
-	service.beforeTemplateFillAPITransition = func(targetStatus string) {
+	service.beforeTemplateFillAPICommit = func(targetStatus string) {
 		if targetStatus == model.TaskStatusTemplateFillChecking {
 			close(confirmAtTransition)
 			<-releaseConfirm
@@ -514,7 +568,7 @@ func TestConfirmTemplateFillPlanSerializesCancellationThroughTransition(t *testi
 	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
 	confirmAtTransition := make(chan struct{})
 	releaseConfirm := make(chan struct{})
-	service.beforeTemplateFillAPITransition = func(targetStatus string) {
+	service.beforeTemplateFillAPICommit = func(targetStatus string) {
 		if targetStatus == model.TaskStatusTemplateFillChecking {
 			close(confirmAtTransition)
 			<-releaseConfirm
@@ -614,6 +668,55 @@ func TestRegenerateTemplateFillPlanRestoresOutputsWhenDBTransitionFails(t *testi
 	}
 }
 
+func TestRegenerateTemplateFillPlanRestoresOutputsWhenDatabaseRemainsUnavailable(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	paths := writeTemplateFillDownstreamOutputs(t, projectPath)
+	want := snapshotTemplateFillPreviewPaths(t, paths)
+	injected := errors.New("database unavailable after regenerate exchange")
+	installTemplateFillPersistentDatabaseFailure(t, repo.DB(), model.TaskStatusTemplateFillPlanning, injected)
+
+	if _, err := service.RegenerateTemplateFillPlan(context.Background(), task.ID); !errors.Is(err, injected) {
+		t.Fatalf("RegenerateTemplateFillPlan() error = %v, want database unavailable", err)
+	}
+	for path, wantBytes := range want {
+		if got := mustReadTemplateFillPreviewFile(t, path); !bytes.Equal(got, wantBytes) {
+			t.Fatalf("output %s was not restored without DB-backed rollback\ngot: %s\nwant: %s", path, got, wantBytes)
+		}
+	}
+}
+
+func TestSaveTemplateFillPlanRestoresPriorProjectWhenPreviewReadFails(t *testing.T) {
+	service, _, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	writeTemplateFillPreviewCheckReport(t, projectPath, 1, 2, 3)
+	contractPath := filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json")
+	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "contracts", "template_fill_check.json"), "stale contract\n")
+	planPath := filepath.Join(projectPath, "analysis", "fill_plan.json")
+	wantPlan := mustReadTemplateFillPreviewFile(t, planPath)
+	wantReport := mustReadTemplateFillPreviewFile(t, filepath.Join(projectPath, "analysis", "check_report.json"))
+	wantContract := mustReadTemplateFillPreviewFile(t, contractPath)
+	service.beforeTemplateFillAPICommit = func(point string) {
+		if point == "template_fill_preview" {
+			_ = os.Remove(planPath)
+		}
+	}
+	updated := templateFillContractPlan("confirmed", 1)
+	templateFillContractFirstSlide(updated)["purpose"] = "must roll back after preview failure"
+
+	if _, err := service.SaveTemplateFillPlan(context.Background(), task.ID, updated); err == nil {
+		t.Fatal("SaveTemplateFillPlan() error = nil, want post-promotion preview read failure")
+	}
+	for path, want := range map[string][]byte{
+		planPath: wantPlan,
+		filepath.Join(projectPath, "analysis", "check_report.json"): wantReport,
+		contractPath: wantContract,
+	} {
+		if got := mustReadTemplateFillPreviewFile(t, path); !bytes.Equal(got, want) {
+			t.Fatalf("prior file %s was not restored\ngot: %s\nwant: %s", path, got, want)
+		}
+	}
+}
+
 func TestRegenerateTemplateFillPlanPreservesOutputsWhenCleanupCannotBeStaged(t *testing.T) {
 	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
 	paths := writeTemplateFillDownstreamOutputs(t, projectPath)
@@ -639,6 +742,167 @@ func TestRegenerateTemplateFillPlanPreservesOutputsWhenCleanupCannotBeStaged(t *
 	}
 	if persisted.Status != model.TaskStatusAwaitingTemplateFillConfirm {
 		t.Fatalf("persisted status = %q", persisted.Status)
+	}
+}
+
+func TestTemplateFillAPISessionCleanupFailureIsObservableAndRetriable(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "api-session")
+	locked := filepath.Join(root, "locked")
+	if err := os.MkdirAll(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(locked, "keep.txt"), []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+	session := &templateFillAPISession{root: root}
+
+	if err := session.cleanup(); err == nil {
+		t.Fatal("cleanup() error = nil for retained unreadable session")
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("failed cleanup did not retain a retriable session: %v", err)
+	}
+	if err := os.Chmod(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.cleanup(); err != nil {
+		t.Fatalf("cleanup() retry error = %v", err)
+	}
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Fatalf("session still exists after successful retry: %v", err)
+	}
+}
+
+func TestCommittedTemplateFillCleanupFailureIsDurableAndRetried(t *testing.T) {
+	service, _, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	var retainedAttempt string
+	var locked string
+	service.beforeTemplateFillAPICommit = func(point string) {
+		if point != model.TaskStatusTemplateFillChecking {
+			return
+		}
+		matches, err := filepath.Glob(filepath.Join(workspacePath, ".slidesmith", "project-promotions", "template-fill-api-*", "*"))
+		if err != nil || len(matches) != 1 {
+			t.Fatalf("promotion attempts = %#v, error = %v", matches, err)
+		}
+		retainedAttempt = matches[0]
+		locked = filepath.Join(retainedAttempt, "project", "locked-cleanup")
+		if err := os.MkdirAll(locked, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(locked, "keep.txt"), []byte("keep\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(locked, 0o500); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o700) })
+
+	updated, err := service.ConfirmTemplateFillPlan(context.Background(), task.ID)
+	if err != nil {
+		t.Fatalf("ConfirmTemplateFillPlan() error = %v; committed result must stay successful", err)
+	}
+	if updated.Status != model.TaskStatusTemplateFillChecking {
+		t.Fatalf("status = %q, want template_fill_checking", updated.Status)
+	}
+	markers, err := filepath.Glob(filepath.Join(workspacePath, ".slidesmith", templateFillCommittedCleanupDir, "*.path"))
+	if err != nil || len(markers) != 1 {
+		t.Fatalf("committed cleanup markers = %#v, error = %v", markers, err)
+	}
+	if err := os.Chmod(locked, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.GetTemplateFillPlan(context.Background(), task.ID); err != nil {
+		t.Fatalf("GetTemplateFillPlan() cleanup retry error = %v", err)
+	}
+	if _, err := os.Stat(retainedAttempt); !os.IsNotExist(err) {
+		t.Fatalf("committed promotion cleanup debt still exists: %v", err)
+	}
+	if _, err := os.Stat(markers[0]); !os.IsNotExist(err) {
+		t.Fatalf("committed cleanup marker still exists: %v", err)
+	}
+}
+
+func TestRollbackExchangeFailureMarkerCannotDeleteRetainedCanonical(t *testing.T) {
+	service, _, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	unlockAPI, err := service.lockTemplateFillAPI(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlockAPI()
+	releaseClaim, err := service.claimTemplateFillAPI(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = releaseClaim() }()
+	session, err := service.newTemplateFillAPISession(context.Background(), task, projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exchange, err := service.beginTemplateFillProjectExchange(context.Background(), task, session, model.TaskStatusTemplateFillChecking, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryPath := exchange.staged.projectPath
+	injected := errors.New("injected direct rollback exchange failure")
+	exchange.staged.exchangeDirectories = func(string, string) error { return injected }
+	if err := exchange.rollback(); !errors.Is(err, injected) {
+		t.Fatalf("rollback() error = %v, want injected failure", err)
+	}
+	if _, err := os.Stat(recoveryPath); err != nil {
+		t.Fatalf("rollback recovery is absent before sweep: %v", err)
+	}
+	if err := service.sweepCommittedTemplateFillPromotions(context.Background(), task); err != nil {
+		t.Fatalf("sweepCommittedTemplateFillPromotions() error = %v", err)
+	}
+	if _, err := os.Stat(recoveryPath); err != nil {
+		t.Fatalf("sweeper deleted retained rollback recovery: %v", err)
+	}
+}
+
+func TestRollbackCleanupFailureActivatesRetriableMarker(t *testing.T) {
+	service, _, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	unlockAPI, err := service.lockTemplateFillAPI(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlockAPI()
+	releaseClaim, err := service.claimTemplateFillAPI(context.Background(), task)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = releaseClaim() }()
+	session, err := service.newTemplateFillAPISession(context.Background(), task, projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exchange, err := service.beginTemplateFillProjectExchange(context.Background(), task, session, model.TaskStatusTemplateFillChecking, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptPath := exchange.staged.attemptRoot
+	injected := errors.New("injected discarded candidate cleanup failure")
+	exchange.staged.removeAll = func(string) error { return injected }
+	if err := exchange.rollback(); !errors.Is(err, injected) {
+		t.Fatalf("rollback() error = %v, want cleanup failure", err)
+	}
+	markers, err := filepath.Glob(filepath.Join(workspacePath, ".slidesmith", templateFillCommittedCleanupDir, "*.path"))
+	if err != nil || len(markers) != 1 {
+		t.Fatalf("retriable rollback cleanup markers = %#v, error = %v", markers, err)
+	}
+	if err := service.sweepCommittedTemplateFillPromotions(context.Background(), task); err != nil {
+		t.Fatalf("sweepCommittedTemplateFillPromotions() error = %v", err)
+	}
+	if _, err := os.Stat(attemptPath); !os.IsNotExist(err) {
+		t.Fatalf("discarded candidate still exists after cleanup retry: %v", err)
 	}
 }
 
@@ -679,6 +943,25 @@ func installTemplateFillTransitionFailure(t *testing.T, db *gorm.DB, targetStatu
 	if err := db.Callback().Update().Before("gorm:update").Register(name, func(tx *gorm.DB) {
 		task, ok := tx.Statement.Dest.(*model.Task)
 		if ok && task.Status == targetStatus {
+			tx.AddError(injected)
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = db.Callback().Update().Remove(name)
+	})
+}
+
+func installTemplateFillPersistentDatabaseFailure(t *testing.T, db *gorm.DB, targetStatus string, injected error) {
+	t.Helper()
+	name := "test:persistent-template-fill-db-failure-" + strings.ReplaceAll(targetStatus, "_", "-")
+	armed := false
+	if err := db.Callback().Update().Before("gorm:update").Register(name, func(tx *gorm.DB) {
+		if task, ok := tx.Statement.Dest.(*model.Task); ok && task.Status == targetStatus {
+			armed = true
+		}
+		if armed {
 			tx.AddError(injected)
 		}
 	}); err != nil {

@@ -168,6 +168,50 @@ func TestTemplateFillPlanRouteReturnsNotFoundForMissingTask(t *testing.T) {
 	}
 }
 
+func TestTemplateFillPlanRoutesAllowFailedCheckSaveThenConfirm(t *testing.T) {
+	fixture := newTemplateFillRouterFixture(t)
+	fixture.task.Status = model.TaskStatusFailed
+	fixture.task.FailurePhase = "template_fill_check.contract"
+	if err := fixture.repo.SaveTask(context.Background(), fixture.task); err != nil {
+		t.Fatal(err)
+	}
+	body := mustTemplateFillRouterJSON(t, map[string]any{"plan": templateFillRouterPlan("confirmed")})
+	saveReq := httptest.NewRequest(http.MethodPut, "/api/tasks/"+fixture.task.ID+"/template-fill/plan", bytes.NewReader(body))
+	saveReq.Header.Set("Content-Type", "application/json")
+	saveRec := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(saveRec, saveReq)
+	if saveRec.Code != http.StatusOK {
+		t.Fatalf("save status = %d, body = %s", saveRec.Code, saveRec.Body.String())
+	}
+	var preview struct {
+		Data struct {
+			CanConfirm bool `json:"can_confirm"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(saveRec.Body.Bytes(), &preview); err != nil {
+		t.Fatal(err)
+	}
+	if !preview.Data.CanConfirm {
+		t.Fatalf("saved failed-check preview cannot confirm: %s", saveRec.Body.String())
+	}
+
+	confirmReq := httptest.NewRequest(http.MethodPost, "/api/tasks/"+fixture.task.ID+"/template-fill/confirm", nil)
+	confirmRec := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(confirmRec, confirmReq)
+	if confirmRec.Code != http.StatusOK {
+		t.Fatalf("confirm status = %d, body = %s", confirmRec.Code, confirmRec.Body.String())
+	}
+	var confirmed struct {
+		Data model.Task `json:"data"`
+	}
+	if err := json.Unmarshal(confirmRec.Body.Bytes(), &confirmed); err != nil {
+		t.Fatal(err)
+	}
+	if confirmed.Data.Status != model.TaskStatusTemplateFillChecking {
+		t.Fatalf("confirmed status = %q, want template_fill_checking", confirmed.Data.Status)
+	}
+}
+
 type templateFillRouterFixture struct {
 	engine      *gin.Engine
 	repo        *repository.Repository

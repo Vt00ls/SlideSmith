@@ -40,7 +40,28 @@ type templateFillAPISession struct {
 	root               string
 	candidateWorkspace string
 	candidateProject   string
-	backupWorkspace    string
+	removeAll          func(string) error
+}
+
+type templateFillProjectExchange struct {
+	service        *TaskService
+	task           *model.Task
+	staged         *stagedProjectPromotion
+	markerPath     string
+	expectedStatus string
+	targetStatus   string
+	unlock         func()
+	exchanged      bool
+	finished       bool
+}
+
+const templateFillCommittedCleanupDir = "template-fill-committed-cleanup"
+
+type templateFillCleanupDebt struct {
+	TaskID         string `json:"task_id"`
+	AttemptPath    string `json:"attempt_path"`
+	ExpectedStatus string `json:"expected_status"`
+	TargetStatus   string `json:"target_status"`
 }
 
 func (s *TaskService) GetTemplateFillPlan(ctx context.Context, taskID string) (*TemplateFillPlanPreview, error) {
@@ -58,6 +79,9 @@ func (s *TaskService) GetTemplateFillPlan(ctx context.Context, taskID string) (*
 	defer unlock()
 	task, err = s.reloadTemplateFillAPITask(ctx, task.ID)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.sweepCommittedTemplateFillPromotions(ctx, task); err != nil {
 		return nil, err
 	}
 	if !templateFillPlanReadableStatus(task.Status) {
@@ -91,6 +115,12 @@ func (s *TaskService) SaveTemplateFillPlan(ctx context.Context, taskID string, s
 	if !templateFillPlanEditableTask(task) {
 		return nil, fmt.Errorf("cannot edit template fill plan while task status is %q and failure phase is %q", task.Status, task.FailurePhase)
 	}
+	if err := s.sweepTemplateFillAPISessions(task); err != nil {
+		return nil, err
+	}
+	if err := s.sweepCommittedTemplateFillPromotions(ctx, task); err != nil {
+		return nil, err
+	}
 	releaseClaim, err := s.claimTemplateFillAPI(ctx, task)
 	if err != nil {
 		return nil, err
@@ -108,11 +138,13 @@ func (s *TaskService) SaveTemplateFillPlan(ctx context.Context, taskID string, s
 	if err != nil {
 		return nil, err
 	}
-	session, err := s.newTemplateFillAPISession(ctx, task, projectPath, true)
+	session, err := s.newTemplateFillAPISession(ctx, task, projectPath)
 	if err != nil {
 		return nil, err
 	}
-	defer session.cleanup()
+	defer func() {
+		resultErr = errors.Join(resultErr, session.cleanup())
+	}()
 
 	inputs, err := discoverTemplateFillInputs(session.candidateProject)
 	if err != nil {
@@ -138,12 +170,21 @@ func (s *TaskService) SaveTemplateFillPlan(ctx context.Context, taskID string, s
 		}
 		return requireTemplateFillFormalCheckEvidenceAbsent(candidate)
 	}
-	workspaceDir := filepath.Dir(filepath.Dir(projectPath))
-	if _, err := s.syncPreparedProjectValidated(ctx, task, session.candidateWorkspace, workspaceDir, validate); err != nil {
-		rollbackErr := s.restoreTemplateFillAPIProject(ctx, task, session, workspaceDir)
-		return nil, errors.Join(err, rollbackErr)
+	exchange, err := s.beginTemplateFillProjectExchange(ctx, task, session, task.Status, validate)
+	if err != nil {
+		return nil, err
 	}
-	return s.templateFillPlanPreview(task)
+	if s.beforeTemplateFillAPICommit != nil {
+		s.beforeTemplateFillAPICommit("template_fill_preview")
+	}
+	preview, err := s.templateFillPlanPreview(task)
+	if err != nil {
+		return nil, errors.Join(err, exchange.rollback())
+	}
+	if err := exchange.commit(ctx); err != nil {
+		return nil, errors.Join(err, exchange.rollback())
+	}
+	return preview, nil
 }
 
 func (s *TaskService) CheckTemplateFillPlan(ctx context.Context, taskID string) (_ *model.Task, resultErr error) {
@@ -165,6 +206,12 @@ func (s *TaskService) CheckTemplateFillPlan(ctx context.Context, taskID string) 
 	}
 	if task.Status != model.TaskStatusAwaitingTemplateFillConfirm {
 		return nil, fmt.Errorf("cannot check template fill plan while task status is %q", task.Status)
+	}
+	if err := s.sweepTemplateFillAPISessions(task); err != nil {
+		return nil, err
+	}
+	if err := s.sweepCommittedTemplateFillPromotions(ctx, task); err != nil {
+		return nil, err
 	}
 	releaseClaim, err := s.claimTemplateFillAPI(ctx, task)
 	if err != nil {
@@ -250,8 +297,14 @@ func (s *TaskService) ConfirmTemplateFillPlan(ctx context.Context, taskID string
 	if err != nil {
 		return nil, err
 	}
-	if task.Status != model.TaskStatusAwaitingTemplateFillConfirm {
+	if !templateFillPlanConfirmableTask(task) {
 		return nil, fmt.Errorf("cannot confirm template fill plan while task status is %q", task.Status)
+	}
+	if err := s.sweepTemplateFillAPISessions(task); err != nil {
+		return nil, err
+	}
+	if err := s.sweepCommittedTemplateFillPromotions(ctx, task); err != nil {
+		return nil, err
 	}
 	releaseClaim, err := s.claimTemplateFillAPI(ctx, task)
 	if err != nil {
@@ -279,11 +332,13 @@ func (s *TaskService) ConfirmTemplateFillPlan(ctx context.Context, taskID string
 		return nil, fmt.Errorf("cannot confirm template fill plan with %d check errors", checkErrors)
 	}
 
-	session, err := s.newTemplateFillAPISession(ctx, task, projectPath, true)
+	session, err := s.newTemplateFillAPISession(ctx, task, projectPath)
 	if err != nil {
 		return nil, err
 	}
-	defer session.cleanup()
+	defer func() {
+		resultErr = errors.Join(resultErr, session.cleanup())
+	}()
 	if err := setTemplateFillPlanStatus(session.candidateProject, "confirmed"); err != nil {
 		return nil, err
 	}
@@ -297,20 +352,19 @@ func (s *TaskService) ConfirmTemplateFillPlan(ctx context.Context, taskID string
 		}
 		return nil
 	}
-	workspaceDir := filepath.Dir(filepath.Dir(projectPath))
-	if _, err := s.syncPreparedProjectValidated(ctx, task, session.candidateWorkspace, workspaceDir, validateConfirmed); err != nil {
-		rollbackErr := s.restoreTemplateFillAPIProject(ctx, task, session, workspaceDir)
-		return nil, errors.Join(err, rollbackErr)
+	exchange, err := s.beginTemplateFillProjectExchange(ctx, task, session, model.TaskStatusTemplateFillChecking, validateConfirmed)
+	if err != nil {
+		return nil, err
 	}
-	if s.beforeTemplateFillAPITransition != nil {
-		s.beforeTemplateFillAPITransition(model.TaskStatusTemplateFillChecking)
+	if s.beforeTemplateFillAPICommit != nil {
+		s.beforeTemplateFillAPICommit(model.TaskStatusTemplateFillChecking)
 	}
 	if err := s.transitionTemplateFillAtGate(ctx, task, model.TaskStatusTemplateFillChecking, "Template fill checking", map[string]any{
 		"project_path": projectPath,
 	}); err != nil {
-		rollbackErr := s.restoreTemplateFillAPIProject(ctx, task, session, workspaceDir)
-		return nil, errors.Join(err, rollbackErr)
+		return nil, errors.Join(err, exchange.rollback())
 	}
+	exchange.commitAfterDB(ctx)
 	return task, nil
 }
 
@@ -334,6 +388,12 @@ func (s *TaskService) RegenerateTemplateFillPlan(ctx context.Context, taskID str
 	if task.Status != model.TaskStatusAwaitingTemplateFillConfirm && task.Status != model.TaskStatusFailed {
 		return nil, fmt.Errorf("cannot regenerate template fill plan while task status is %q", task.Status)
 	}
+	if err := s.sweepTemplateFillAPISessions(task); err != nil {
+		return nil, err
+	}
+	if err := s.sweepCommittedTemplateFillPromotions(ctx, task); err != nil {
+		return nil, err
+	}
 	releaseClaim, err := s.claimTemplateFillAPI(ctx, task)
 	if err != nil {
 		return nil, err
@@ -345,11 +405,13 @@ func (s *TaskService) RegenerateTemplateFillPlan(ctx context.Context, taskID str
 	if err != nil {
 		return nil, err
 	}
-	session, err := s.newTemplateFillAPISession(ctx, task, projectPath, true)
+	session, err := s.newTemplateFillAPISession(ctx, task, projectPath)
 	if err != nil {
 		return nil, err
 	}
-	defer session.cleanup()
+	defer func() {
+		resultErr = errors.Join(resultErr, session.cleanup())
+	}()
 	if err := cleanupTemplateFillRegenerateOutputs(session.candidateProject); err != nil {
 		return nil, err
 	}
@@ -359,21 +421,20 @@ func (s *TaskService) RegenerateTemplateFillPlan(ctx context.Context, taskID str
 		}
 		return requireTemplateFillRegenerateOutputsAbsent(candidate)
 	}
-	workspaceDir := filepath.Dir(filepath.Dir(projectPath))
-	if _, err := s.syncPreparedProjectValidated(ctx, task, session.candidateWorkspace, workspaceDir, validateClean); err != nil {
-		rollbackErr := s.restoreTemplateFillAPIProject(ctx, task, session, workspaceDir)
-		return nil, errors.Join(err, rollbackErr)
+	exchange, err := s.beginTemplateFillProjectExchange(ctx, task, session, model.TaskStatusTemplateFillPlanning, validateClean)
+	if err != nil {
+		return nil, err
 	}
-	if s.beforeTemplateFillAPITransition != nil {
-		s.beforeTemplateFillAPITransition(model.TaskStatusTemplateFillPlanning)
+	if s.beforeTemplateFillAPICommit != nil {
+		s.beforeTemplateFillAPICommit(model.TaskStatusTemplateFillPlanning)
 	}
 	if err := s.transitionTemplateFillAtGate(ctx, task, model.TaskStatusTemplateFillPlanning, "Template fill planning", map[string]any{
 		"project_path": projectPath,
 		"regenerated":  true,
 	}); err != nil {
-		rollbackErr := s.restoreTemplateFillAPIProject(ctx, task, session, workspaceDir)
-		return nil, errors.Join(err, rollbackErr)
+		return nil, errors.Join(err, exchange.rollback())
 	}
+	exchange.commitAfterDB(ctx)
 	return task, nil
 }
 
@@ -415,7 +476,7 @@ func (s *TaskService) templateFillPlanPreview(task *model.Task) (*TemplateFillPl
 		planStatus = validatedStatus
 	}
 	canEdit := templateFillPlanEditableTask(task)
-	canConfirm := planValid && planStatus == "draft" && task.Status == model.TaskStatusAwaitingTemplateFillConfirm && checkErrors == 0
+	canConfirm := planValid && planStatus == "draft" && templateFillPlanConfirmableTask(task) && checkErrors == 0
 	return &TemplateFillPlanPreview{
 		TaskID:      task.ID,
 		ProjectPath: inputs.ProjectPath,
@@ -443,7 +504,7 @@ func (s *TaskService) templateFillPlanPreview(task *model.Task) (*TemplateFillPl
 	}, nil
 }
 
-func (s *TaskService) newTemplateFillAPISession(ctx context.Context, task *model.Task, projectPath string, withBackup bool) (*templateFillAPISession, error) {
+func (s *TaskService) newTemplateFillAPISession(ctx context.Context, task *model.Task, projectPath string) (*templateFillAPISession, error) {
 	workspace := s.resolveTaskWorkspace(task)
 	canonicalProject := filepath.Join(workspace.HostDir, "projects", filepath.Base(projectPath))
 	if !sameFilesystemPath(projectPath, canonicalProject) {
@@ -452,62 +513,232 @@ func (s *TaskService) newTemplateFillAPISession(ctx context.Context, task *model
 	root := filepath.Join(workspace.HostDir, ".slidesmith", "template-fill-api-sessions", uuid.NewString())
 	candidateWorkspace := filepath.Join(root, "candidate")
 	candidateProject := filepath.Join(candidateWorkspace, "projects", filepath.Base(projectPath))
-	if err := os.MkdirAll(filepath.Dir(candidateProject), 0o755); err != nil {
-		return nil, err
-	}
-	if err := copyProjectDirectoryStrict(ctx, projectPath, candidateProject); err != nil {
-		_ = os.RemoveAll(root)
-		return nil, err
-	}
 	session := &templateFillAPISession{
 		root:               root,
 		candidateWorkspace: candidateWorkspace,
 		candidateProject:   candidateProject,
+		removeAll:          os.RemoveAll,
 	}
-	if !withBackup {
-		return session, nil
-	}
-	backupWorkspace := filepath.Join(root, "backup")
-	backupProject := filepath.Join(backupWorkspace, "projects", filepath.Base(projectPath))
-	if err := os.MkdirAll(filepath.Dir(backupProject), 0o755); err != nil {
-		session.cleanup()
+	if err := os.MkdirAll(filepath.Dir(candidateProject), 0o755); err != nil {
 		return nil, err
 	}
-	if err := copyProjectDirectoryStrict(ctx, projectPath, backupProject); err != nil {
-		session.cleanup()
-		return nil, err
+	if err := copyProjectDirectoryStrict(ctx, projectPath, candidateProject); err != nil {
+		return nil, errors.Join(err, session.cleanup())
 	}
-	session.backupWorkspace = backupWorkspace
 	return session, nil
 }
 
-func (session *templateFillAPISession) cleanup() {
-	if session != nil && session.root != "" {
-		_ = os.RemoveAll(session.root)
+func (session *templateFillAPISession) cleanup() error {
+	if session == nil || session.root == "" {
+		return nil
 	}
+	removeAll := session.removeAll
+	if removeAll == nil {
+		removeAll = os.RemoveAll
+	}
+	if err := removeAll(session.root); err != nil {
+		return fmt.Errorf("remove template fill API session %s: %w", session.root, err)
+	}
+	session.root = ""
+	return nil
 }
 
-func (s *TaskService) restoreTemplateFillAPIProject(ctx context.Context, task *model.Task, session *templateFillAPISession, workspaceDir string) error {
-	if session == nil || session.backupWorkspace == "" {
-		return fmt.Errorf("template fill API rollback backup is unavailable")
+func (s *TaskService) beginTemplateFillProjectExchange(
+	ctx context.Context,
+	task *model.Task,
+	session *templateFillAPISession,
+	targetStatus string,
+	validate func(string) error,
+) (*templateFillProjectExchange, error) {
+	if session == nil {
+		return nil, fmt.Errorf("template fill API session is required")
 	}
-	returnStatus := task.Status
-	task.Status = taskTemplateFillPreviousStatus(task)
-	_, err := s.syncPreparedProjectValidated(context.WithoutCancel(ctx), task, session.backupWorkspace, workspaceDir, nil)
+	workspace := s.resolveTaskWorkspace(task)
+	staged, err := s.stagePreparedProject(ctx, task, session.candidateWorkspace, workspace.HostDir)
 	if err != nil {
-		task.Status = returnStatus
+		return nil, errors.Join(err, session.cleanup())
 	}
-	return err
+	cleanupStaged := func(cause error) error {
+		return errors.Join(cause, staged.cleanup())
+	}
+	if staged.noOp {
+		return nil, cleanupStaged(fmt.Errorf("template fill API exchange requires a distinct staged project"))
+	}
+	if validate != nil {
+		if err := validate(staged.projectPath); err != nil {
+			return nil, cleanupStaged(err)
+		}
+	}
+	if err := session.cleanup(); err != nil {
+		return nil, cleanupStaged(err)
+	}
+
+	lockPath := filepath.Join(filepath.Dir(staged.promotionRoot), "project-promotions.lock")
+	unlock, err := acquireProjectPromotionLock(ctx, lockPath)
+	if err != nil {
+		return nil, cleanupStaged(err)
+	}
+	exchange := &templateFillProjectExchange{
+		service:        s,
+		task:           task,
+		staged:         staged,
+		expectedStatus: task.Status,
+		targetStatus:   targetStatus,
+		unlock:         unlock,
+	}
+	fail := func(cause error) (*templateFillProjectExchange, error) {
+		unlock()
+		exchange.finished = true
+		cleanupErr := staged.cleanup()
+		if cleanupErr == nil {
+			exchange.removeMarker()
+		} else if exchange.markerPath != "" {
+			cleanupErr = errors.Join(cleanupErr, exchange.activateCommitMarker())
+		}
+		return nil, errors.Join(cause, cleanupErr)
+	}
+	matched, err := s.repo.RenewTaskExecutionClaim(ctx, task.ID, task.Status, task.ExecutionClaimToken)
+	if err != nil {
+		return fail(err)
+	}
+	if !matched {
+		return fail(errTaskStateChanged)
+	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+	if err := requireRealProjectDirectory(staged.projectPath, "staged template fill API project"); err != nil {
+		return fail(err)
+	}
+	if err := requireRealProjectDirectory(staged.targetPath, "canonical template fill API project"); err != nil {
+		return fail(err)
+	}
+	markerPath, err := writeTemplateFillPendingCleanupMarker(staged, task.ID, task.Status, targetStatus)
+	if err != nil {
+		return fail(err)
+	}
+	exchange.markerPath = markerPath
+	exchangeDirectories := staged.exchangeDirectories
+	if exchangeDirectories == nil {
+		exchangeDirectories = atomicExchangeDirectories
+	}
+	if err := exchangeDirectories(staged.projectPath, staged.targetPath); err != nil {
+		return fail(fmt.Errorf("atomically exchange template fill API project: %w", err))
+	}
+	staged.recoveryPath = staged.projectPath
+	exchange.exchanged = true
+	if validate != nil {
+		if err := validate(staged.targetPath); err != nil {
+			rollbackErr := exchange.rollback()
+			return nil, errors.Join(fmt.Errorf("revalidate template fill API canonical project: %w", err), rollbackErr)
+		}
+	}
+	return exchange, nil
 }
 
-func taskTemplateFillPreviousStatus(task *model.Task) string {
-	if task.Status == model.TaskStatusTemplateFillChecking || task.Status == model.TaskStatusTemplateFillPlanning {
-		if task.FailurePhase != "" {
-			return model.TaskStatusFailed
-		}
-		return model.TaskStatusAwaitingTemplateFillConfirm
+func (exchange *templateFillProjectExchange) rollback() error {
+	if exchange == nil || exchange.finished {
+		return nil
 	}
-	return task.Status
+	defer exchange.finishUnlock()
+	if !exchange.exchanged {
+		cleanupErr := exchange.staged.cleanup()
+		if cleanupErr == nil {
+			exchange.removeMarker()
+		} else {
+			cleanupErr = errors.Join(cleanupErr, exchange.activateCommitMarker())
+		}
+		return cleanupErr
+	}
+	exchangeDirectories := exchange.staged.exchangeDirectories
+	if exchangeDirectories == nil {
+		exchangeDirectories = atomicExchangeDirectories
+	}
+	if err := exchangeDirectories(exchange.staged.projectPath, exchange.staged.targetPath); err != nil {
+		exchange.staged.retainRecovery = true
+		return fmt.Errorf(
+			"restore template fill API canonical project without DB (old canonical retained at %s): %w",
+			exchange.staged.projectPath,
+			err,
+		)
+	}
+	exchange.exchanged = false
+	exchange.staged.recoveryPath = ""
+	cleanupErr := exchange.staged.cleanup()
+	if cleanupErr == nil {
+		exchange.removeMarker()
+	} else {
+		cleanupErr = errors.Join(cleanupErr, exchange.activateCommitMarker())
+	}
+	return cleanupErr
+}
+
+func (exchange *templateFillProjectExchange) commit(ctx context.Context) error {
+	if exchange == nil || exchange.finished {
+		return nil
+	}
+	if err := exchange.activateCommitMarker(); err != nil {
+		return err
+	}
+	exchange.finishCommitted(ctx, nil)
+	return nil
+}
+
+func (exchange *templateFillProjectExchange) commitAfterDB(ctx context.Context) {
+	if exchange == nil || exchange.finished {
+		return
+	}
+	markerErr := exchange.activateCommitMarker()
+	exchange.finishCommitted(ctx, markerErr)
+}
+
+func (exchange *templateFillProjectExchange) activateCommitMarker() error {
+	if exchange == nil || exchange.markerPath == "" {
+		return fmt.Errorf("template fill cleanup marker is unavailable")
+	}
+	if filepath.Ext(exchange.markerPath) != ".pending" {
+		return nil
+	}
+	committedPath := strings.TrimSuffix(exchange.markerPath, ".pending") + ".path"
+	if err := os.Rename(exchange.markerPath, committedPath); err != nil {
+		return fmt.Errorf("activate committed template fill cleanup marker: %w", err)
+	}
+	exchange.markerPath = committedPath
+	return nil
+}
+
+func (exchange *templateFillProjectExchange) finishCommitted(ctx context.Context, markerErr error) {
+	cleanupErr := exchange.staged.cleanup()
+	if cleanupErr == nil {
+		exchange.removeMarker()
+	}
+	exchange.finishUnlock()
+	if cleanupErr != nil {
+		_ = exchange.service.event(context.WithoutCancel(ctx), exchange.task.ID, model.EventTypeRuntime, "template_fill_cleanup_pending", "Template fill cleanup pending", map[string]any{
+			"path":          exchange.staged.attemptRoot,
+			"marker_error":  errorString(markerErr),
+			"cleanup_error": errorString(cleanupErr),
+		})
+	}
+}
+
+func (exchange *templateFillProjectExchange) removeMarker() {
+	if exchange == nil || exchange.markerPath == "" {
+		return
+	}
+	_ = os.Remove(exchange.markerPath)
+	_ = os.Remove(filepath.Dir(exchange.markerPath))
+	exchange.markerPath = ""
+}
+
+func (exchange *templateFillProjectExchange) finishUnlock() {
+	if exchange == nil || exchange.finished {
+		return
+	}
+	exchange.finished = true
+	if exchange.unlock != nil {
+		exchange.unlock()
+	}
 }
 
 func (s *TaskService) transitionTemplateFillAtGate(ctx context.Context, task *model.Task, target, message string, payload map[string]any) error {
@@ -547,6 +778,123 @@ func requireTemplateFillRoute(task *model.Task) error {
 func (s *TaskService) lockTemplateFillAPI(ctx context.Context, task *model.Task) (func(), error) {
 	workspace := s.resolveTaskWorkspace(task)
 	return acquireProjectPromotionLock(ctx, filepath.Join(workspace.HostDir, ".slidesmith", "template-fill-api.lock"))
+}
+
+func (s *TaskService) sweepTemplateFillAPISessions(task *model.Task) error {
+	workspace := s.resolveTaskWorkspace(task)
+	root := filepath.Join(workspace.HostDir, ".slidesmith", "template-fill-api-sessions")
+	info, err := os.Lstat(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect stale template fill API sessions: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("template fill API sessions root must be a real directory: %s", root)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		return fmt.Errorf("remove stale template fill API sessions %s: %w", root, err)
+	}
+	return nil
+}
+
+func (s *TaskService) sweepCommittedTemplateFillPromotions(ctx context.Context, task *model.Task) error {
+	workspace := s.resolveTaskWorkspace(task)
+	promotionRoot := filepath.Join(workspace.HostDir, ".slidesmith", "project-promotions")
+	debtRoot := filepath.Join(workspace.HostDir, ".slidesmith", templateFillCommittedCleanupDir)
+	unlock, err := s.lockTemplateFillProjectSnapshot(ctx, task)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	info, err := os.Lstat(debtRoot)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect committed template fill cleanup debt: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("committed template fill cleanup debt must be a real directory: %s", debtRoot)
+	}
+	markers, err := os.ReadDir(debtRoot)
+	if err != nil {
+		return fmt.Errorf("read committed template fill cleanup debt: %w", err)
+	}
+	for _, marker := range markers {
+		if marker.IsDir() {
+			continue
+		}
+		markerPath := filepath.Join(debtRoot, marker.Name())
+		markerInfo, err := os.Lstat(markerPath)
+		if err != nil {
+			return fmt.Errorf("inspect committed template fill cleanup marker %s: %w", markerPath, err)
+		}
+		if markerInfo.Mode()&os.ModeSymlink != 0 || !markerInfo.Mode().IsRegular() {
+			return fmt.Errorf("committed template fill cleanup marker must be a regular non-symlinked file: %s", markerPath)
+		}
+		rawDebt, err := os.ReadFile(markerPath)
+		if err != nil {
+			return fmt.Errorf("read committed template fill cleanup marker %s: %w", markerPath, err)
+		}
+		var debt templateFillCleanupDebt
+		if err := json.Unmarshal(rawDebt, &debt); err != nil {
+			return fmt.Errorf("parse template fill cleanup marker %s: %w", markerPath, err)
+		}
+		if debt.TaskID != task.ID {
+			return fmt.Errorf("template fill cleanup marker task = %q, expected %q", debt.TaskID, task.ID)
+		}
+		if filepath.Ext(markerPath) == ".pending" && (debt.TargetStatus == debt.ExpectedStatus || task.Status != debt.TargetStatus) {
+			continue
+		}
+		attemptPath := debt.AttemptPath
+		claimPath := filepath.Dir(attemptPath)
+		if !pathWithinRoot(promotionRoot, attemptPath) || !strings.HasPrefix(filepath.Base(claimPath), "template-fill-api-") {
+			return fmt.Errorf("committed template fill cleanup path is invalid: %s", attemptPath)
+		}
+		if err := os.RemoveAll(attemptPath); err != nil {
+			return fmt.Errorf("retry committed template fill promotion cleanup %s: %w", attemptPath, err)
+		}
+		if err := os.Remove(markerPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove committed template fill cleanup marker %s: %w", markerPath, err)
+		}
+		_ = os.Remove(claimPath)
+	}
+	_ = os.Remove(debtRoot)
+	_ = os.Remove(promotionRoot)
+	return nil
+}
+
+func writeTemplateFillPendingCleanupMarker(staged *stagedProjectPromotion, taskID, expectedStatus, targetStatus string) (string, error) {
+	if staged == nil || staged.attemptRoot == "" || staged.promotionRoot == "" {
+		return "", fmt.Errorf("template fill committed cleanup staging paths are unavailable")
+	}
+	debtRoot := filepath.Join(filepath.Dir(staged.promotionRoot), templateFillCommittedCleanupDir)
+	if err := os.MkdirAll(debtRoot, 0o700); err != nil {
+		return "", fmt.Errorf("create committed template fill cleanup debt directory: %w", err)
+	}
+	markerPath := filepath.Join(debtRoot, filepath.Base(staged.attemptRoot)+".pending")
+	rawDebt, err := json.Marshal(templateFillCleanupDebt{
+		TaskID:         taskID,
+		AttemptPath:    staged.attemptRoot,
+		ExpectedStatus: expectedStatus,
+		TargetStatus:   targetStatus,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode pending template fill cleanup marker: %w", err)
+	}
+	if err := os.WriteFile(markerPath, append(rawDebt, '\n'), 0o600); err != nil {
+		return "", fmt.Errorf("write pending template fill cleanup marker: %w", err)
+	}
+	return markerPath, nil
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (s *TaskService) lockTemplateFillProjectSnapshot(ctx context.Context, task *model.Task) (func(), error) {
@@ -616,6 +964,10 @@ func templateFillPlanReadableStatus(status string) bool {
 func templateFillPlanEditableTask(task *model.Task) bool {
 	return task.Status == model.TaskStatusAwaitingTemplateFillConfirm ||
 		(task.Status == model.TaskStatusFailed && strings.HasPrefix(task.FailurePhase, string(PhaseTemplateFillCheck)))
+}
+
+func templateFillPlanConfirmableTask(task *model.Task) bool {
+	return templateFillPlanEditableTask(task)
 }
 
 func cloneTemplateFillPlan(submitted map[string]any) (map[string]any, error) {

@@ -28,7 +28,7 @@ type TaskService struct {
 	machine    *StateMachine
 
 	beforeCanonicalMutationPromotion func(string) error
-	beforeTemplateFillAPITransition  func(string)
+	beforeTemplateFillAPICommit      func(string)
 }
 
 const (
