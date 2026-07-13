@@ -7,9 +7,13 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 import re
@@ -46,7 +50,40 @@ STATE_DIR = WORKSPACE / ".slidesmith"
 EVENTS_PATH = STATE_DIR / "events.ndjson"
 STATUS_PATH = STATE_DIR / "status.json"
 ARTIFACTS_PATH = STATE_DIR / "artifacts.json"
-TEXT_SOURCE_SUFFIXES = {".md", ".markdown", ".txt", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml"}
+TEXT_SOURCE_SUFFIXES = {".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml"}
+PRESENTATION_SOURCE_SUFFIXES = {".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm"}
+TEMPLATE_FILL_CONTENT_SOURCE_SUFFIXES = {".md", ".markdown", ".txt", ".text", ".csv", ".tsv"}
+
+PRESENTATION_MAIN_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"
+MACRO_PRESENTATION_MAIN_CONTENT_TYPE = "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml"
+OOXML_CONTENT_TYPES_NAMESPACE = "http://schemas.openxmlformats.org/package/2006/content-types"
+PRESENTATIONML_NAMESPACE = "http://schemas.openxmlformats.org/presentationml/2006/main"
+PRESERVED_PRESENTATION_CONTENT_TYPES = {
+    ".pptx": (PRESENTATION_MAIN_CONTENT_TYPE, "presentation"),
+    ".pptm": (MACRO_PRESENTATION_MAIN_CONTENT_TYPE, "macro presentation"),
+}
+STAGED_PRESENTATION_CONTENT_TYPES = {
+    ".ppsx": (
+        "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",
+        PRESENTATION_MAIN_CONTENT_TYPE,
+        "slideshow",
+    ),
+    ".ppsm": (
+        "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",
+        MACRO_PRESENTATION_MAIN_CONTENT_TYPE,
+        "macro slideshow",
+    ),
+    ".potx": (
+        "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+        PRESENTATION_MAIN_CONTENT_TYPE,
+        "template",
+    ),
+    ".potm": (
+        "application/vnd.ms-powerpoint.template.macroEnabled.main+xml",
+        MACRO_PRESENTATION_MAIN_CONTENT_TYPE,
+        "macro template",
+    ),
+}
 
 
 def utc_now() -> str:
@@ -174,12 +211,464 @@ def project_path_from_args(args: argparse.Namespace) -> Path:
     return direct.resolve()
 
 
+def _contained_relative_path(root: Path, path: Path, label: str) -> Path:
+    try:
+        return path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"{label} is outside project: {path}") from exc
+
+
+def _reject_symlink_components(root: Path, path: Path, label: str) -> None:
+    relative = _contained_relative_path(root, path, label)
+    current = root
+    for component in relative.parts:
+        current = current / component
+        if current.is_symlink():
+            raise ValueError(f"{label} must be regular and non-symlinked: {relative.as_posix()}")
+
+
+def _require_template_fill_regular_file(
+    project_path: Path,
+    path: Path,
+    label: str,
+    *,
+    nonempty: bool = False,
+) -> None:
+    relative = _contained_relative_path(project_path, path, label)
+    _reject_symlink_components(project_path, path, label)
+    if not path.is_file():
+        raise ValueError(f"{label} must be a non-empty regular file: {relative.as_posix()}" if nonempty else f"{label} must be a regular file: {relative.as_posix()}")
+    if nonempty and path.stat().st_size == 0:
+        raise ValueError(f"{label} must be a non-empty regular file: {relative.as_posix()}")
+
+
+def _validate_template_fill_output_path(project_path: Path, path: Path) -> None:
+    relative = _contained_relative_path(project_path, path, "template fill output path")
+    _reject_symlink_components(project_path, path, "template fill output path")
+    current = project_path
+    for component in relative.parts[:-1]:
+        current = current / component
+        if not current.exists():
+            return
+        if not current.is_dir():
+            raise ValueError(f"template fill output parent must be a directory: {relative.as_posix()}")
+    if path.exists() and not path.is_file():
+        raise ValueError(f"template fill output path must be a regular file: {relative.as_posix()}")
+
+
+TEMPLATE_FILL_CASEFOLD_SCHEMA = "slidesmith.unicode_casefold.v1"
+TEMPLATE_FILL_CASEFOLD_UNICODE_VERSION = "15.0.0"
+TEMPLATE_FILL_CASEFOLD_SOURCE_SHA256 = "cdd49e55eae3bbf1f0a3f6580c974a0263cb86a6a08daa10fbf705b4808a56f7"
+TEMPLATE_FILL_CASEFOLD_ASSET_SHA256 = "11272a5b74c86e20065be587da38ef2291c08caec383908b3acbad8ed583feb1"
+TEMPLATE_FILL_CASEFOLD_MAPPING_COUNT = 1530
+TEMPLATE_FILL_CASEFOLD_ASSET_PATH = Path(__file__).with_name("unicode_casefold_15_0.json")
+
+
+def _load_template_fill_casefold_mappings(path: Path) -> dict[str, str]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"read template fill case-fold asset: {exc}") from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != TEMPLATE_FILL_CASEFOLD_ASSET_SHA256:
+        raise RuntimeError(
+            f"template fill case-fold asset SHA-256 = {digest}, "
+            f"want {TEMPLATE_FILL_CASEFOLD_ASSET_SHA256}"
+        )
+    try:
+        asset = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"parse template fill case-fold asset: {exc}") from exc
+    if not isinstance(asset, dict):
+        raise RuntimeError("template fill case-fold asset must be a JSON object")
+    mappings = asset.get("mappings")
+    if (
+        asset.get("schema") != TEMPLATE_FILL_CASEFOLD_SCHEMA
+        or asset.get("unicode_version") != TEMPLATE_FILL_CASEFOLD_UNICODE_VERSION
+        or asset.get("source_sha256") != TEMPLATE_FILL_CASEFOLD_SOURCE_SHA256
+        or asset.get("mapping_statuses") != ["C", "F"]
+        or asset.get("mapping_count") != TEMPLATE_FILL_CASEFOLD_MAPPING_COUNT
+        or not isinstance(mappings, dict)
+        or len(mappings) != TEMPLATE_FILL_CASEFOLD_MAPPING_COUNT
+    ):
+        raise RuntimeError("template fill case-fold asset metadata is invalid")
+
+    parsed: dict[str, str] = {}
+    for source_hex, target_hex in mappings.items():
+        if not isinstance(source_hex, str) or not isinstance(target_hex, str):
+            raise RuntimeError("template fill case-fold asset mappings must be strings")
+        try:
+            source = chr(int(source_hex, 16))
+            target = "".join(chr(int(item, 16)) for item in target_hex.split())
+        except (ValueError, OverflowError) as exc:
+            raise RuntimeError(f"template fill case-fold asset has invalid mapping {source_hex!r}") from exc
+        if not target or any(0xD800 <= ord(char) <= 0xDFFF for char in source + target):
+            raise RuntimeError(f"template fill case-fold asset has invalid scalar mapping {source_hex!r}")
+        parsed[source] = target
+    return parsed
+
+
+TEMPLATE_FILL_CASEFOLD_MAPPINGS = _load_template_fill_casefold_mappings(
+    TEMPLATE_FILL_CASEFOLD_ASSET_PATH
+)
+
+
+def _template_fill_casefold(value: str) -> str:
+    """Apply the vendored Unicode 15.0 Default full C+F mapping only."""
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        raise ValueError("template fill case-fold input must contain valid Unicode scalar values")
+    return "".join(TEMPLATE_FILL_CASEFOLD_MAPPINGS.get(char, char) for char in value)
+
+
+def _template_fill_manifest_source_name(entry: dict[str, Any], index: int) -> str | None:
+    names: list[str] = []
+    name = entry.get("name", "")
+    if not isinstance(name, str):
+        raise ValueError(f"template fill source inputs manifest files[{index}].name must be a string")
+    name = name.strip()
+    if name:
+        normalized = name.replace("\\", "/")
+        basename = Path(normalized).name
+        if normalized != basename or basename in {".", ".."}:
+            raise ValueError(f"template fill source inputs manifest files[{index}].name must be a filename")
+        names.append(basename)
+
+    upload_path = entry.get("upload_path", "")
+    if not isinstance(upload_path, str):
+        raise ValueError(f"template fill source inputs manifest files[{index}].upload_path must be a string")
+    upload_path = upload_path.strip()
+    if upload_path:
+        normalized = upload_path.replace("\\", "/")
+        cleaned = posixpath.normpath(normalized)
+        if normalized.startswith("/") or cleaned == ".." or cleaned.startswith("../"):
+            raise ValueError(f"template fill source inputs manifest files[{index}].upload_path is outside workspace")
+        basename = Path(cleaned).name
+        if basename not in {"", ".", ".."}:
+            names.append(basename)
+
+    if not names:
+        return None
+    if len(names) == 2 and names[0] != names[1]:
+        raise ValueError(
+            f"template fill source inputs manifest files[{index}] ambiguously authorizes "
+            f"{names[0]!r} and {names[1]!r}"
+        )
+    return names[0]
+
+
+def _template_fill_authorized_source_paths(project_path: Path) -> set[str]:
+    manifest_paths: list[tuple[Path, Path]] = [(project_path, project_path / ".slidesmith" / "source_inputs.json")]
+    projects_dir = project_path.parent
+    if projects_dir.name == "projects":
+        workspace = projects_dir.parent
+        manifest_paths.insert(0, (workspace, workspace / ".slidesmith" / "source_inputs.json"))
+
+    for permitted_root, manifest_path in manifest_paths:
+        _reject_symlink_components(permitted_root, manifest_path, "template fill source inputs manifest")
+        if not manifest_path.exists():
+            continue
+        if not manifest_path.is_file():
+            raise ValueError(f"template fill source inputs manifest must be a regular non-symlinked file: {manifest_path}")
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"parse template fill source inputs manifest: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("template fill source inputs manifest must be a JSON object")
+        if payload.get("schema") != "slidesmith.source_inputs.v1":
+            raise ValueError(f"unsupported template fill source inputs manifest schema: {payload.get('schema')!r}")
+        files = payload.get("files", [])
+        if not isinstance(files, list):
+            raise ValueError("template fill source inputs manifest files must be a list")
+        claimed_names: set[str] = set()
+        folded_claims: dict[str, str] = {}
+        for index, entry in enumerate(files):
+            if not isinstance(entry, dict):
+                raise ValueError(f"template fill source inputs manifest files[{index}] must be an object")
+            name = _template_fill_manifest_source_name(entry, index)
+            if name is None:
+                continue
+            if name in claimed_names:
+                raise ValueError(f"template fill source inputs manifest has duplicate claim for {name!r}")
+            folded = _template_fill_casefold(name)
+            existing = folded_claims.get(folded)
+            if existing is not None and existing != name:
+                raise ValueError(
+                    "template fill source inputs manifest has case-fold-colliding claims "
+                    f"{existing!r} and {name!r} under Unicode Default full case folding"
+                )
+            claimed_names.add(name)
+            folded_claims[folded] = name
+        return {f"sources/{name}" for name in claimed_names}
+    return set()
+
+
+def _template_fill_should_include_content_source(
+    relative_path: str,
+    extension: str,
+    stem: str,
+    presentation_stem: str,
+    authorized_source_paths: set[str],
+) -> bool:
+    if extension != ".md" or _template_fill_casefold(stem) != _template_fill_casefold(presentation_stem):
+        return True
+    return relative_path in authorized_source_paths
+
+
+def discover_template_fill_inputs(project_path: Path) -> dict[str, Any]:
+    requested_path = Path(project_path).expanduser()
+    absolute_path = Path(os.path.abspath(requested_path))
+    if absolute_path.is_symlink():
+        raise ValueError(f"template fill project path must be non-symlinked: {absolute_path}")
+    if not absolute_path.exists():
+        raise FileNotFoundError(f"template fill project path not found: {absolute_path}")
+    if not absolute_path.is_dir():
+        raise ValueError(f"template fill project path must be a directory: {absolute_path}")
+    project_path = absolute_path.resolve()
+
+    sources_path = project_path / "sources"
+    _reject_symlink_components(project_path, sources_path, "template fill sources directory")
+    if not sources_path.is_dir():
+        raise ValueError("template fill requires sources directory: sources")
+    try:
+        entries = sorted(sources_path.iterdir(), key=lambda item: item.name)
+    except OSError as exc:
+        raise ValueError(f"read template fill sources directory: {exc}") from exc
+
+    presentations: list[Path] = []
+    for entry in entries:
+        if entry.suffix.lower() not in PRESENTATION_SOURCE_SUFFIXES:
+            continue
+        _require_template_fill_regular_file(project_path, entry, "template fill presentation input")
+        presentations.append(entry)
+    if len(presentations) != 1 or presentations[0].suffix.lower() != ".pptx":
+        relative_paths = sorted(path.relative_to(project_path).as_posix() for path in presentations)
+        message = f"template fill requires exactly one source PPTX, found {len(presentations)} presentation files"
+        if relative_paths:
+            message += ": " + ", ".join(relative_paths)
+        raise ValueError(message)
+
+    source_pptx = presentations[0]
+    slide_library = project_path / "analysis" / f"{source_pptx.stem}.slide_library.json"
+    try:
+        _require_template_fill_regular_file(
+            project_path,
+            slide_library,
+            "template fill requires slide library",
+            nonempty=True,
+        )
+    except ValueError as exc:
+        relative = slide_library.relative_to(project_path).as_posix()
+        raise ValueError(f"template fill requires slide library: {relative}: {exc}") from exc
+
+    authorized_source_paths = _template_fill_authorized_source_paths(project_path)
+    content_sources: list[Path] = []
+    for entry in entries:
+        extension = entry.suffix.lower()
+        if extension not in TEMPLATE_FILL_CONTENT_SOURCE_SUFFIXES:
+            continue
+        relative_path = entry.relative_to(project_path).as_posix()
+        if not _template_fill_should_include_content_source(
+            relative_path,
+            extension,
+            entry.stem,
+            source_pptx.stem,
+            authorized_source_paths,
+        ):
+            continue
+        _require_template_fill_regular_file(project_path, entry, "template fill content source")
+        content_sources.append(entry)
+    content_sources.sort(key=lambda path: str(path))
+    if not content_sources:
+        raise ValueError("template fill requires content source beside template PPTX")
+
+    inputs: dict[str, Any] = {
+        "project_path": project_path,
+        "source_pptx": source_pptx,
+        "slide_library": slide_library,
+        "fill_plan": project_path / "analysis" / "fill_plan.json",
+        "check_report": project_path / "analysis" / "check_report.json",
+        "validate_report": project_path / "validation" / "validate_report.json",
+        "readback": project_path / "validation" / "readback.md",
+        "export_base": project_path / "exports" / f"{project_path.name}_template_fill.pptx",
+        "content_sources": content_sources,
+    }
+    for key in ("fill_plan", "check_report", "validate_report", "readback", "export_base"):
+        _validate_template_fill_output_path(project_path, inputs[key])
+    return inputs
+
+
+def load_source_manifest(path: Path) -> list[Path]:
+    manifest_path = path if path.is_absolute() else WORKSPACE / path
+    manifest_path = manifest_path.resolve()
+    if not manifest_path.exists():
+        return []
+
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("source manifest must be a JSON object")
+    if payload.get("schema") != "slidesmith.source_inputs.v1":
+        raise ValueError(f"unsupported source manifest schema: {payload.get('schema')!r}")
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise ValueError("source manifest files must be a list")
+
+    sources: list[Path] = []
+    for index, entry in enumerate(files):
+        if not isinstance(entry, dict):
+            raise ValueError(f"source manifest files[{index}] must be an object")
+        upload_path = entry.get("upload_path", "")
+        if not isinstance(upload_path, str):
+            raise ValueError(f"source manifest files[{index}].upload_path must be a string")
+        upload_path = upload_path.strip()
+        if not upload_path:
+            continue
+
+        source_path = (WORKSPACE / upload_path).resolve()
+        try:
+            source_path.relative_to(WORKSPACE)
+        except ValueError as exc:
+            raise ValueError(f"source path escapes workspace: {upload_path}") from exc
+        if source_path.is_file():
+            sources.append(source_path)
+    return sources
+
+
+def stage_prepare_inputs(args: argparse.Namespace, scratch_input_dir: Path) -> list[Path]:
+    manifest_arg = getattr(args, "sources_manifest", "")
+    selected = load_source_manifest(Path(manifest_arg)) if manifest_arg else []
+    if not selected:
+        input_arg = getattr(args, "input", "")
+        if input_arg:
+            input_path = Path(input_arg)
+            if not input_path.is_absolute():
+                input_path = WORKSPACE / input_path
+            input_path = input_path.resolve()
+            if not input_path.exists():
+                raise FileNotFoundError(f"input not found: {input_path}")
+            selected = [input_path]
+    if not selected:
+        raise FileNotFoundError("no source inputs found")
+
+    staged: list[Path] = []
+    for source_path in selected:
+        staged_path = scratch_input_dir / source_path.name
+        shutil.copy2(source_path, staged_path)
+        normalize_staged_presentation_package(staged_path)
+        staged.append(staged_path)
+    return staged
+
+
+def normalize_staged_presentation_package(staged_path: Path) -> None:
+    normalization = STAGED_PRESENTATION_CONTENT_TYPES.get(staged_path.suffix.lower())
+    preserved = PRESERVED_PRESENTATION_CONTENT_TYPES.get(staged_path.suffix.lower())
+    if normalization is None and preserved is None:
+        return
+    should_normalize = normalization is not None
+    if normalization is not None:
+        expected_content_type, target_content_type, content_type_label = normalization
+    else:
+        expected_content_type, content_type_label = preserved
+        target_content_type = expected_content_type
+    temp_path: Path | None = None
+    try:
+        with zipfile.ZipFile(staged_path, "r") as source:
+            try:
+                content_types_raw = source.read("[Content_Types].xml")
+            except KeyError as exc:
+                raise ValueError(
+                    f"non-OOXML presentation package {staged_path.name}: missing [Content_Types].xml"
+                ) from exc
+            try:
+                content_types = ET.fromstring(content_types_raw)
+            except ET.ParseError as exc:
+                raise ValueError(
+                    f"malformed OOXML presentation package {staged_path.name}: invalid [Content_Types].xml"
+                ) from exc
+            expected_types_tag = f"{{{OOXML_CONTENT_TYPES_NAMESPACE}}}Types"
+            if content_types.tag != expected_types_tag:
+                raise ValueError(
+                    f"non-OOXML presentation package {staged_path.name}: invalid content-types namespace"
+                )
+            override_tag = f"{{{OOXML_CONTENT_TYPES_NAMESPACE}}}Override"
+            presentation_overrides = [
+                element
+                for element in content_types
+                if element.tag == override_tag
+                and element.attrib.get("PartName") == "/ppt/presentation.xml"
+            ]
+            if len(presentation_overrides) != 1:
+                raise ValueError(
+                    f"{staged_path.name}: expected exactly one {content_type_label} main content type; "
+                    f"found {len(presentation_overrides)} overrides"
+                )
+            presentation_override = presentation_overrides[0]
+            actual_content_type = presentation_override.attrib.get("ContentType")
+            if actual_content_type != expected_content_type:
+                raise ValueError(
+                    f"{staged_path.name}: expected {content_type_label} main content type "
+                    f"{expected_content_type!r}; found {actual_content_type!r}"
+                )
+
+            try:
+                presentation_raw = source.read("ppt/presentation.xml")
+            except KeyError as exc:
+                raise ValueError(
+                    f"non-OOXML presentation package {staged_path.name}: missing ppt/presentation.xml"
+                ) from exc
+            try:
+                presentation = ET.fromstring(presentation_raw)
+            except ET.ParseError as exc:
+                raise ValueError(
+                    f"malformed OOXML presentation package {staged_path.name}: invalid ppt/presentation.xml"
+                ) from exc
+            expected_presentation_tag = f"{{{PRESENTATIONML_NAMESPACE}}}presentation"
+            if presentation.tag != expected_presentation_tag:
+                raise ValueError(
+                    f"non-OOXML presentation package {staged_path.name}: "
+                    "missing PresentationML presentation root"
+                )
+            if not should_normalize:
+                return
+
+            presentation_override.set("ContentType", target_content_type)
+            ET.register_namespace("", OOXML_CONTENT_TYPES_NAMESPACE)
+            normalized_content_types = ET.tostring(
+                content_types,
+                encoding="utf-8",
+                xml_declaration=True,
+            )
+
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{staged_path.name}.",
+                suffix=".tmp",
+                dir=staged_path.parent,
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+            with zipfile.ZipFile(temp_path, "w") as destination:
+                destination.comment = source.comment
+                for entry in source.infolist():
+                    data = (
+                        normalized_content_types
+                        if entry.filename == "[Content_Types].xml"
+                        else source.read(entry)
+                    )
+                    destination.writestr(entry, data)
+        shutil.copystat(staged_path, temp_path)
+        temp_path.replace(staged_path)
+        temp_path = None
+    except zipfile.BadZipFile as exc:
+        raise ValueError(
+            f"malformed OOXML presentation package {staged_path.name}: invalid ZIP package"
+        ) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
 def prepare(args: argparse.Namespace) -> None:
     set_status("source_converting", project=args.project)
-    input_path = Path(args.input).resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(f"input not found: {input_path}")
-
     projects_dir = WORKSPACE / "projects"
     projects_dir.mkdir(parents=True, exist_ok=True)
     project_path = project_path_from_args(args)
@@ -193,13 +682,14 @@ def prepare(args: argparse.Namespace) -> None:
     if scratch_input_dir.exists():
         shutil.rmtree(scratch_input_dir)
     scratch_input_dir.mkdir(parents=True, exist_ok=True)
-    staged_input = scratch_input_dir / input_path.name
-    shutil.copy2(input_path, staged_input)
+    staged_inputs = stage_prepare_inputs(args, scratch_input_dir)
+    if not staged_inputs:
+        raise FileNotFoundError("no staged source inputs")
 
-    if staged_input.suffix.lower() not in TEXT_SOURCE_SUFFIXES:
-        run_command(["python3", str(script_path("source_to_md.py")), str(staged_input)])
-
-    run_command(["python3", str(script_path("project_manager.py")), "import-sources", str(project_path), str(scratch_input_dir), "--move"])
+    run_command([
+        "python3", str(script_path("project_manager.py")), "import-sources",
+        str(project_path), str(scratch_input_dir), "--move",
+    ])
 
     confirmation_dir = project_path / "confirm_ui"
     confirmation_dir.mkdir(parents=True, exist_ok=True)
@@ -1096,6 +1586,218 @@ def escape_xml(value: str) -> str:
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _template_fill_project_path(args: argparse.Namespace) -> Path:
+    value = str(getattr(args, "project_path", "") or "").strip()
+    if not value:
+        raise ValueError("--project-path is required")
+    return Path(value).expanduser()
+
+
+def _read_template_fill_report(
+    project_path: Path,
+    path: Path,
+    expected_schema: str,
+    label: str,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    try:
+        _require_template_fill_regular_file(project_path, path, label, nonempty=True)
+    except ValueError as exc:
+        raise RuntimeError(f"{label} was not newly produced: {exc}") from exc
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"parse {label}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"{label} root must be a JSON object")
+    if payload.get("schema") != expected_schema:
+        raise ValueError(f"{label} schema = {payload.get('schema')!r}, expected {expected_schema!r}")
+    raw_summary = payload.get("summary")
+    if not isinstance(raw_summary, dict):
+        raise ValueError(f"{label} summary must be an object")
+    summary: dict[str, int] = {}
+    for field in ("ok", "warn", "error"):
+        value = raw_summary.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{label} summary.{field} must be a non-negative integer")
+        summary[field] = value
+    return payload, summary
+
+
+def _template_fill_failure(command: str, completed: subprocess.CompletedProcess[str]) -> RuntimeError:
+    details = (completed.stderr or completed.stdout or "").strip()
+    suffix = f": {details}" if details else ""
+    return RuntimeError(f"template fill {command} failed with exit {completed.returncode}{suffix}")
+
+
+def template_fill_check(args: argparse.Namespace) -> dict[str, int]:
+    inputs = discover_template_fill_inputs(_template_fill_project_path(args))
+    project_path = inputs["project_path"]
+    check_report = inputs["check_report"]
+    set_status("template_fill_checking", project_path=str(project_path))
+    check_report.unlink(missing_ok=True)
+
+    completed = run_command(
+        [
+            "python3",
+            str(script_path("template_fill_pptx.py")),
+            "check-plan",
+            str(inputs["slide_library"]),
+            str(inputs["fill_plan"]),
+            "-o",
+            str(check_report),
+        ],
+        check=False,
+    )
+    _, summary = _read_template_fill_report(
+        project_path,
+        check_report,
+        "template_fill_pptx_check.v1",
+        "template fill check report",
+    )
+    if completed.returncode not in (0, 1):
+        raise _template_fill_failure("check", completed)
+
+    summary_text = f"ok={summary['ok']} warn={summary['warn']} error={summary['error']}"
+    emit_event(
+        "template_fill_check",
+        "Template fill check completed",
+        summary_text,
+        "warning" if summary["error"] else "completed",
+        {"summary": summary, "exit_code": completed.returncode, "check_report": str(check_report)},
+    )
+    set_status(
+        "template_fill_checking",
+        "completed",
+        project_path=str(project_path),
+        check_report=str(check_report),
+        summary=summary,
+    )
+    return summary
+
+
+def _timestamped_template_fill_export_pattern(export_base: Path) -> re.Pattern[str]:
+    return re.compile(rf"^{re.escape(export_base.stem)}_\d{{8}}_\d{{6}}\.pptx$")
+
+
+def _matching_template_fill_export_names(export_base: Path) -> set[str]:
+    exports_dir = export_base.parent
+    if not exports_dir.exists():
+        return set()
+    pattern = _timestamped_template_fill_export_pattern(export_base)
+    return {path.name for path in exports_dir.iterdir() if pattern.fullmatch(path.name)}
+
+
+def template_fill_apply(args: argparse.Namespace) -> Path:
+    inputs = discover_template_fill_inputs(_template_fill_project_path(args))
+    project_path = inputs["project_path"]
+    export_base = inputs["export_base"]
+    set_status("template_fill_applying", project_path=str(project_path))
+    existing_exports = _matching_template_fill_export_names(export_base)
+    transition = str(getattr(args, "transition", "fade") or "fade")
+
+    completed = run_command(
+        [
+            "python3",
+            str(script_path("template_fill_pptx.py")),
+            "apply",
+            str(inputs["source_pptx"]),
+            str(inputs["fill_plan"]),
+            "-o",
+            str(export_base),
+            "--transition",
+            transition,
+        ],
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise _template_fill_failure("apply", completed)
+
+    pattern = _timestamped_template_fill_export_pattern(export_base)
+    new_exports = [
+        path
+        for path in export_base.parent.iterdir()
+        if path.name not in existing_exports
+        and pattern.fullmatch(path.name)
+        and not path.is_symlink()
+        and path.is_file()
+        and path.stat().st_size > 0
+    ] if export_base.parent.is_dir() else []
+    if not new_exports:
+        raise RuntimeError(f"template fill apply did not produce a new timestamped PPTX for {export_base.name}")
+    export_path = max(new_exports, key=lambda path: path.name)
+    emit_event(
+        "template_fill_apply",
+        "Template fill apply completed",
+        str(export_path),
+        "completed",
+        {"export": str(export_path), "transition": transition},
+    )
+    set_status(
+        "template_fill_applying",
+        "completed",
+        project_path=str(project_path),
+        export=str(export_path),
+    )
+    return export_path
+
+
+def template_fill_validate(args: argparse.Namespace) -> dict[str, int]:
+    inputs = discover_template_fill_inputs(_template_fill_project_path(args))
+    project_path = inputs["project_path"]
+    readback = inputs["readback"]
+    validate_report = inputs["validate_report"]
+    set_status("template_fill_validating", project_path=str(project_path))
+    readback.unlink(missing_ok=True)
+    validate_report.unlink(missing_ok=True)
+
+    completed = run_command(
+        [
+            "python3",
+            str(script_path("template_fill_pptx.py")),
+            "validate",
+            str(project_path),
+        ],
+        check=False,
+    )
+    _, summary = _read_template_fill_report(
+        project_path,
+        validate_report,
+        "template_fill_pptx_validate.v1",
+        "template fill validate report",
+    )
+    try:
+        _require_template_fill_regular_file(
+            project_path,
+            readback,
+            "template fill validation readback",
+            nonempty=True,
+        )
+    except ValueError as exc:
+        raise RuntimeError(f"template fill validation readback was not newly produced: {exc}") from exc
+    if completed.returncode != 0:
+        raise _template_fill_failure("validate", completed)
+    if summary["error"] != 0:
+        raise RuntimeError(f"template fill validate report summary.error = {summary['error']}")
+
+    summary_text = f"ok={summary['ok']} warn={summary['warn']} error={summary['error']}"
+    emit_event(
+        "template_fill_validate",
+        "Template fill validation completed",
+        summary_text,
+        "warning" if summary["warn"] else "completed",
+        {"summary": summary, "validate_report": str(validate_report), "readback": str(readback)},
+    )
+    set_status(
+        "template_fill_validating",
+        "completed",
+        project_path=str(project_path),
+        validate_report=str(validate_report),
+        readback=str(readback),
+        summary=summary,
+    )
+    return summary
+
+
 def publish(args: argparse.Namespace) -> None:
     project_path = project_path_from_args(args)
     publish_project(project_path)
@@ -1117,6 +1819,7 @@ def publish_project(project_path: Path) -> None:
         project_path / "svg_output",
         project_path / "svg_final",
         project_path / "exports",
+        project_path / "validation",
         project_path / "logs",
     ]
     artifacts: list[dict[str, Any]] = []
@@ -1146,7 +1849,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--profile", choices=["mock", "full"], default="full")
 
     prepare_parser = sub.add_parser("prepare")
-    prepare_parser.add_argument("--input", required=True)
+    prepare_parser.add_argument("--input", default="")
+    prepare_parser.add_argument("--sources-manifest", default=".slidesmith/source_inputs.json")
     prepare_parser.add_argument("--project", required=True)
     prepare_parser.add_argument("--format", default="ppt169")
     prepare_parser.add_argument("--profile", choices=["smoke", "real-lite"], default="smoke")
@@ -1160,6 +1864,16 @@ def build_parser() -> argparse.ArgumentParser:
     publish_parser = sub.add_parser("publish")
     publish_parser.add_argument("--project", default="")
     publish_parser.add_argument("--project-path", default="")
+
+    template_fill_check_parser = sub.add_parser("template-fill-check")
+    template_fill_check_parser.add_argument("--project-path", required=True)
+
+    template_fill_apply_parser = sub.add_parser("template-fill-apply")
+    template_fill_apply_parser.add_argument("--project-path", required=True)
+    template_fill_apply_parser.add_argument("--transition", default="fade")
+
+    template_fill_validate_parser = sub.add_parser("template-fill-validate")
+    template_fill_validate_parser.add_argument("--project-path", required=True)
 
     return parser
 
@@ -1177,6 +1891,12 @@ def main() -> None:
             generate(args)
         elif args.command == "publish":
             publish(args)
+        elif args.command == "template-fill-check":
+            template_fill_check(args)
+        elif args.command == "template-fill-apply":
+            template_fill_apply(args)
+        elif args.command == "template-fill-validate":
+            template_fill_validate(args)
         else:
             parser.error(f"unsupported command: {args.command}")
     except Exception as exc:

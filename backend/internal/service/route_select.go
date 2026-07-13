@@ -84,7 +84,14 @@ func (s *TaskService) persistRouteSelection(ctx context.Context, task *model.Tas
 	task.RouteStandaloneWorkflow = selection.StandaloneWorkflow
 	task.RouteSelectionJSON = string(raw)
 	task.RouteSelectedAt = &selectedAt
-	return s.repo.SaveTask(ctx, task)
+	saved, err := s.repo.SaveTaskIfStatus(ctx, task, model.TaskStatusSourceConverting, task.ExecutionClaimToken)
+	if err != nil {
+		return err
+	}
+	if !saved {
+		return errTaskStateChanged
+	}
+	return nil
 }
 
 func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*routeSelection, error) {
@@ -93,8 +100,8 @@ func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*route
 		return nil, err
 	}
 	var sources []routeSourceArtifact
-	hasPPTX := false
-	hasNonPPTX := false
+	hasPresentation := false
+	hasNonPresentation := false
 	var corpus strings.Builder
 	corpus.WriteString(task.Title)
 	for _, artifact := range artifacts {
@@ -110,10 +117,10 @@ func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*route
 		})
 		corpus.WriteString(" ")
 		corpus.WriteString(artifact.Name)
-		if extension == "pptx" || extension == "ppt" {
-			hasPPTX = true
+		if DetectSourceKind(artifact.Name).Kind == SourceKindPresentation {
+			hasPresentation = true
 		} else {
-			hasNonPPTX = true
+			hasNonPresentation = true
 		}
 	}
 
@@ -121,18 +128,18 @@ func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*route
 	route := routeMain
 	reason := "default main workflow for markdown/pdf/docx or general source material"
 	confidence := 0.60
-	if hasPPTX && isTemplateFillIntent(normalized, hasNonPPTX) {
+	if hasPresentation && isTemplateFillIntent(normalized, hasNonPresentation) {
 		route = routeTemplateFill
 		reason = "pptx template with new content or fill intent"
 		confidence = 0.90
-	} else if hasPPTX && containsAny(normalized, beautifyIntentKeywords) {
+	} else if hasPresentation && containsAny(normalized, beautifyIntentKeywords) {
 		route = routeBeautify
 		reason = "pptx source with preserve text/page-count beautify intent"
 		confidence = 0.90
-	} else if hasPPTX && containsAny(normalized, materialRebuildKeywords) {
+	} else if hasPresentation && containsAny(normalized, materialRebuildKeywords) {
 		reason = "pptx source requested as reconstruction material"
 		confidence = 0.80
-	} else if hasPPTX {
+	} else if hasPresentation {
 		reason = "pptx source without explicit preserve/template-fill intent"
 		confidence = 0.55
 	}
@@ -151,11 +158,11 @@ func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*route
 	}, nil
 }
 
-func isTemplateFillIntent(value string, hasNonPPTX bool) bool {
+func isTemplateFillIntent(value string, hasNonPresentation bool) bool {
 	if !containsAny(value, templateIntentKeywords) {
 		return false
 	}
-	return hasNonPPTX || containsAny(value, templateFillKeywords)
+	return hasNonPresentation || containsAny(value, templateFillKeywords)
 }
 
 func containsAny(value string, keywords []string) bool {

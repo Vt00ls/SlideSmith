@@ -1,12 +1,69 @@
 package service
 
 import (
+	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/slidesmith/slidesmith/backend/internal/config"
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 )
+
+type prepareCommandRecordingAgent struct {
+	request AgentRunRequest
+}
+
+func (a *prepareCommandRecordingAgent) Up(context.Context, AgentRunRequest) error {
+	return nil
+}
+
+func (a *prepareCommandRecordingAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+	a.request = req
+	sessionWorkspace, err := distinctTestAgentWorkspace(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	project := filepath.Join(sessionWorkspace, "projects", "task_template_ppt169_20260708")
+	mustWriteFileNoTest(project, filepath.Join("sources", "input.md"), "# Source\n")
+	exitCode := 0
+	return &AgentRunResult{
+		RunID:         "run-prepare",
+		SessionID:     "session-prepare",
+		Status:        "succeeded",
+		ExitCode:      &exitCode,
+		WorkspacePath: sessionWorkspace,
+	}, nil
+}
+
+func TestPrepareCommandIncludesSourceManifestAndFallbackInput(t *testing.T) {
+	service, repo, task, _ := templateResolvePrepareService(t)
+	agent := &prepareCommandRecordingAgent{}
+	service.agent = agent
+
+	if err := service.processPrepare(context.Background(), task); err != nil {
+		t.Fatalf("processPrepare() error = %v", err)
+	}
+
+	want := "node workflows/ppt_workflow.js prepare --profile 'real-lite' --sources-manifest '.slidesmith/source_inputs.json' --input 'uploads/task-template/input.md' --project 'task_template'"
+	if agent.request.Command != want {
+		t.Fatalf("prepare command = %q, want %q", agent.request.Command, want)
+	}
+
+	phaseRuns, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phaseRun := range phaseRuns {
+		if phaseRun.Phase == string(PhaseSourcePrepare) {
+			if !strings.Contains(phaseRun.InputJSON, `"sources_manifest":".slidesmith/source_inputs.json"`) {
+				t.Fatalf("source_prepare input missing sources_manifest: %s", phaseRun.InputJSON)
+			}
+			return
+		}
+	}
+	t.Fatal("source_prepare phase run not found")
+}
 
 func TestFullPPTMasterPromptPreservesSkillBoundaries(t *testing.T) {
 	service := &TaskService{

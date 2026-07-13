@@ -5,18 +5,21 @@ import "github.com/slidesmith/slidesmith/backend/internal/model"
 const (
 	routeFailureUnsupportedWorkflow = "route_select.unsupported_workflow"
 	routeFailureUnsupportedRoute    = "route_select.unsupported_route"
+	routeFailureWorkflowNotEnabled  = "source_prepare.workflow_not_enabled"
 )
 
 type routeExecutionPolicy struct {
-	Route           string        `json:"route"`
-	Executable      bool          `json:"executable"`
-	FailurePhase    string        `json:"failure_phase,omitempty"`
-	FailureMessage  string        `json:"failure_message,omitempty"`
-	NextSpec        string        `json:"next_spec,omitempty"`
-	SupportedRoutes []string      `json:"supported_routes"`
-	KnownRoutes     []string      `json:"known_routes"`
-	NextStatus      string        `json:"next_status,omitempty"`
-	NextPhase       PipelinePhase `json:"next_phase,omitempty"`
+	Route              string        `json:"route"`
+	Executable         bool          `json:"executable"`
+	WorkflowExecutable bool          `json:"workflow_executable"`
+	FailurePhase       string        `json:"failure_phase,omitempty"`
+	FailureMessage     string        `json:"failure_message,omitempty"`
+	UnsupportedAfter   PipelinePhase `json:"unsupported_after,omitempty"`
+	NextSpec           string        `json:"next_spec,omitempty"`
+	SupportedRoutes    []string      `json:"supported_routes"`
+	KnownRoutes        []string      `json:"known_routes"`
+	NextStatus         string        `json:"next_status,omitempty"`
+	NextPhase          PipelinePhase `json:"next_phase,omitempty"`
 }
 
 func routeExecutionPolicyFor(selection *routeSelection) routeExecutionPolicy {
@@ -25,7 +28,7 @@ func routeExecutionPolicyFor(selection *routeSelection) routeExecutionPolicy {
 		model.TaskRouteTemplateFill,
 		model.TaskRouteBeautify,
 	}
-	supportedRoutes := []string{model.TaskRouteMain}
+	supportedRoutes := []string{model.TaskRouteMain, model.TaskRouteTemplateFill}
 	if selection == nil {
 		return routeExecutionPolicy{
 			Route:           "",
@@ -39,32 +42,37 @@ func routeExecutionPolicyFor(selection *routeSelection) routeExecutionPolicy {
 	switch selection.Route {
 	case model.TaskRouteMain:
 		return routeExecutionPolicy{
-			Route:           model.TaskRouteMain,
-			Executable:      true,
-			SupportedRoutes: supportedRoutes,
-			KnownRoutes:     knownRoutes,
-			NextStatus:      model.TaskStatusSourceConverting,
-			NextPhase:       PhaseSourcePrepare,
+			Route:              model.TaskRouteMain,
+			Executable:         true,
+			WorkflowExecutable: true,
+			SupportedRoutes:    supportedRoutes,
+			KnownRoutes:        knownRoutes,
+			NextStatus:         model.TaskStatusSourceConverting,
+			NextPhase:          PhaseSourcePrepare,
 		}
 	case model.TaskRouteTemplateFill:
 		return routeExecutionPolicy{
-			Route:           model.TaskRouteTemplateFill,
-			Executable:      false,
-			FailurePhase:    routeFailureUnsupportedWorkflow,
-			FailureMessage:  "route template-fill is recognized but execution workflow is not enabled in SPEC-01",
-			NextSpec:        "SPEC-03-Template-Fill-PPTX.md",
-			SupportedRoutes: supportedRoutes,
-			KnownRoutes:     knownRoutes,
+			Route:              model.TaskRouteTemplateFill,
+			Executable:         true,
+			WorkflowExecutable: true,
+			SupportedRoutes:    supportedRoutes,
+			KnownRoutes:        knownRoutes,
+			NextStatus:         model.TaskStatusSourceConverting,
+			NextPhase:          PhaseSourcePrepare,
 		}
 	case model.TaskRouteBeautify:
 		return routeExecutionPolicy{
-			Route:           model.TaskRouteBeautify,
-			Executable:      false,
-			FailurePhase:    routeFailureUnsupportedWorkflow,
-			FailureMessage:  "route beautify is recognized but execution workflow is not enabled in SPEC-01",
-			NextSpec:        "SPEC-04-Beautify-PPTX.md",
-			SupportedRoutes: supportedRoutes,
-			KnownRoutes:     knownRoutes,
+			Route:              model.TaskRouteBeautify,
+			Executable:         true,
+			WorkflowExecutable: false,
+			FailurePhase:       routeFailureWorkflowNotEnabled,
+			FailureMessage:     "route beautify source intake is complete, but the full workflow is deferred to SPEC-04",
+			UnsupportedAfter:   PhaseSourcePrepare,
+			NextSpec:           "SPEC-04-Beautify-PPTX.md",
+			SupportedRoutes:    supportedRoutes,
+			KnownRoutes:        knownRoutes,
+			NextStatus:         model.TaskStatusSourceConverting,
+			NextPhase:          PhaseSourcePrepare,
 		}
 	default:
 		return routeExecutionPolicy{

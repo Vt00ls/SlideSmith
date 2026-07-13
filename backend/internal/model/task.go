@@ -24,6 +24,14 @@ const (
 )
 
 const (
+	TaskStatusTemplateFillPlanning        = "template_fill_planning"
+	TaskStatusAwaitingTemplateFillConfirm = "awaiting_template_fill_confirm"
+	TaskStatusTemplateFillChecking        = "template_fill_checking"
+	TaskStatusTemplateFillApplying        = "template_fill_applying"
+	TaskStatusTemplateFillValidating      = "template_fill_validating"
+)
+
+const (
 	TaskRouteMain         = "main"
 	TaskRouteBeautify     = "beautify"
 	TaskRouteTemplateFill = "template-fill"
@@ -39,15 +47,27 @@ const (
 )
 
 const (
-	ArtifactKindSource     = "source"
-	ArtifactKindDesignSpec = "design_spec"
-	ArtifactKindSpecLock   = "spec_lock"
-	ArtifactKindSVGOutput  = "svg_output"
-	ArtifactKindSVGFinal   = "svg_final"
-	ArtifactKindPPTX       = "pptx"
-	ArtifactKindLog        = "log"
-	ArtifactKindManifest   = "manifest"
-	ArtifactKindOther      = "other"
+	ArtifactKindSource                  = "source"
+	ArtifactKindSourceMarkdown          = "source_markdown"
+	ArtifactKindSourceConversionProfile = "source_conversion_profile"
+	ArtifactKindSourceProfile           = "source_profile"
+	ArtifactKindDesignSpec              = "design_spec"
+	ArtifactKindSpecLock                = "spec_lock"
+	ArtifactKindSVGOutput               = "svg_output"
+	ArtifactKindSVGFinal                = "svg_final"
+	ArtifactKindPPTX                    = "pptx"
+	ArtifactKindPPTXIdentity            = "pptx_identity"
+	ArtifactKindPPTXSlideLibrary        = "pptx_slide_library"
+	ArtifactKindLog                     = "log"
+	ArtifactKindManifest                = "manifest"
+	ArtifactKindOther                   = "other"
+)
+
+const (
+	ArtifactKindTemplateFillPlan           = "template_fill_plan"
+	ArtifactKindTemplateFillCheckReport    = "template_fill_check_report"
+	ArtifactKindTemplateFillValidateReport = "template_fill_validate_report"
+	ArtifactKindTemplateFillReadback       = "template_fill_readback"
 )
 
 type Task struct {
@@ -68,6 +88,8 @@ type Task struct {
 	ErrorMessage            string     `json:"error_message" gorm:"not null;type:text;default:''"`
 	FailurePhase            string     `json:"failure_phase" gorm:"not null;size:128;default:''"`
 	FailureMetadata         string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
+	ExecutionClaimToken     string     `json:"-" gorm:"not null;size:64;default:''"`
+	ExecutionClaimedAt      *time.Time `json:"-"`
 	CreatedAt               time.Time  `json:"created_at" gorm:"not null"`
 	UpdatedAt               time.Time  `json:"updated_at" gorm:"not null"`
 	StartedAt               *time.Time `json:"started_at,omitempty"`
@@ -106,6 +128,7 @@ type Artifact struct {
 	Size           int64     `json:"size" gorm:"not null;default:0"`
 	SHA256         string    `json:"sha256" gorm:"not null;size:64;default:''"`
 	PublishVersion string    `json:"publish_version" gorm:"not null;size:64;default:'';index"`
+	MetadataJSON   string    `json:"metadata_json" gorm:"not null;type:text;default:'{}'"`
 	CreatedAt      time.Time `json:"created_at" gorm:"not null"`
 	UpdatedAt      time.Time `json:"updated_at" gorm:"not null"`
 }
@@ -115,26 +138,28 @@ func (Artifact) TableName() string {
 }
 
 type TaskRuntimeRun struct {
-	ID                string     `json:"id" gorm:"primaryKey;size:64"`
-	TaskID            string     `json:"task_id" gorm:"not null;size:64;index"`
-	Runtime           string     `json:"runtime" gorm:"not null;size:64;default:'agent-compose'"`
-	Agent             string     `json:"agent" gorm:"not null;size:128;default:'ppt_master'"`
-	Phase             string     `json:"phase" gorm:"not null;size:64"`
-	Command           string     `json:"command" gorm:"not null;type:text"`
-	ExternalRunID     string     `json:"external_run_id" gorm:"not null;size:128;default:''"`
-	ExternalSessionID string     `json:"external_session_id" gorm:"not null;size:128;default:''"`
-	Status            string     `json:"status" gorm:"not null;size:64;index"`
-	ExitCode          *int       `json:"exit_code,omitempty"`
-	WorkspacePath     string     `json:"workspace_path" gorm:"not null;type:text;default:''"`
-	RawResponse       string     `json:"raw_response" gorm:"not null;type:text;default:''"`
-	ErrorMessage      string     `json:"error_message" gorm:"not null;type:text;default:''"`
-	StderrTail        string     `json:"stderr_tail" gorm:"not null;type:text;default:''"`
-	FailurePhase      string     `json:"failure_phase" gorm:"not null;size:128;default:''"`
-	FailureMetadata   string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
-	CreatedAt         time.Time  `json:"created_at" gorm:"not null"`
-	UpdatedAt         time.Time  `json:"updated_at" gorm:"not null"`
-	StartedAt         *time.Time `json:"started_at,omitempty"`
-	FinishedAt        *time.Time `json:"finished_at,omitempty"`
+	ID                  string     `json:"id" gorm:"primaryKey;size:64"`
+	TaskID              string     `json:"task_id" gorm:"not null;size:64;index"`
+	ExecutionClaimToken string     `json:"-" gorm:"not null;size:64;default:''"`
+	TaskStatus          string     `json:"-" gorm:"not null;size:64;default:''"`
+	Runtime             string     `json:"runtime" gorm:"not null;size:64;default:'agent-compose'"`
+	Agent               string     `json:"agent" gorm:"not null;size:128;default:'ppt_master'"`
+	Phase               string     `json:"phase" gorm:"not null;size:64"`
+	Command             string     `json:"command" gorm:"not null;type:text"`
+	ExternalRunID       string     `json:"external_run_id" gorm:"not null;size:128;default:''"`
+	ExternalSessionID   string     `json:"external_session_id" gorm:"not null;size:128;default:''"`
+	Status              string     `json:"status" gorm:"not null;size:64;index"`
+	ExitCode            *int       `json:"exit_code,omitempty"`
+	WorkspacePath       string     `json:"workspace_path" gorm:"not null;type:text;default:''"`
+	RawResponse         string     `json:"raw_response" gorm:"not null;type:text;default:''"`
+	ErrorMessage        string     `json:"error_message" gorm:"not null;type:text;default:''"`
+	StderrTail          string     `json:"stderr_tail" gorm:"not null;type:text;default:''"`
+	FailurePhase        string     `json:"failure_phase" gorm:"not null;size:128;default:''"`
+	FailureMetadata     string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
+	CreatedAt           time.Time  `json:"created_at" gorm:"not null"`
+	UpdatedAt           time.Time  `json:"updated_at" gorm:"not null"`
+	StartedAt           *time.Time `json:"started_at,omitempty"`
+	FinishedAt          *time.Time `json:"finished_at,omitempty"`
 }
 
 func (TaskRuntimeRun) TableName() string {
@@ -142,23 +167,25 @@ func (TaskRuntimeRun) TableName() string {
 }
 
 type TaskPhaseRun struct {
-	ID               string     `json:"id" gorm:"primaryKey;size:64"`
-	TaskID           string     `json:"task_id" gorm:"not null;size:64;index"`
-	Phase            string     `json:"phase" gorm:"not null;size:64;index"`
-	Attempt          int        `json:"attempt" gorm:"not null;default:1"`
-	Runner           string     `json:"runner" gorm:"not null;size:64;default:''"`
-	Status           string     `json:"status" gorm:"not null;size:64;index"`
-	StartedAt        *time.Time `json:"started_at,omitempty"`
-	FinishedAt       *time.Time `json:"finished_at,omitempty"`
-	RuntimeRunID     string     `json:"runtime_run_id" gorm:"not null;size:128;default:''"`
-	RuntimeSessionID string     `json:"runtime_session_id" gorm:"not null;size:128;default:''"`
-	WorkspacePath    string     `json:"workspace_path" gorm:"not null;type:text;default:''"`
-	InputJSON        string     `json:"input_json" gorm:"not null;type:text;default:'{}'"`
-	OutputJSON       string     `json:"output_json" gorm:"not null;type:text;default:'{}'"`
-	ErrorMessage     string     `json:"error_message" gorm:"not null;type:text;default:''"`
-	FailureMetadata  string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
-	CreatedAt        time.Time  `json:"created_at" gorm:"not null"`
-	UpdatedAt        time.Time  `json:"updated_at" gorm:"not null"`
+	ID                  string     `json:"id" gorm:"primaryKey;size:64"`
+	TaskID              string     `json:"task_id" gorm:"not null;size:64;index"`
+	ExecutionClaimToken string     `json:"-" gorm:"not null;size:64;default:''"`
+	TaskStatus          string     `json:"-" gorm:"not null;size:64;default:''"`
+	Phase               string     `json:"phase" gorm:"not null;size:64;index"`
+	Attempt             int        `json:"attempt" gorm:"not null;default:1"`
+	Runner              string     `json:"runner" gorm:"not null;size:64;default:''"`
+	Status              string     `json:"status" gorm:"not null;size:64;index"`
+	StartedAt           *time.Time `json:"started_at,omitempty"`
+	FinishedAt          *time.Time `json:"finished_at,omitempty"`
+	RuntimeRunID        string     `json:"runtime_run_id" gorm:"not null;size:128;default:''"`
+	RuntimeSessionID    string     `json:"runtime_session_id" gorm:"not null;size:128;default:''"`
+	WorkspacePath       string     `json:"workspace_path" gorm:"not null;type:text;default:''"`
+	InputJSON           string     `json:"input_json" gorm:"not null;type:text;default:'{}'"`
+	OutputJSON          string     `json:"output_json" gorm:"not null;type:text;default:'{}'"`
+	ErrorMessage        string     `json:"error_message" gorm:"not null;type:text;default:''"`
+	FailureMetadata     string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
+	CreatedAt           time.Time  `json:"created_at" gorm:"not null"`
+	UpdatedAt           time.Time  `json:"updated_at" gorm:"not null"`
 }
 
 func (TaskPhaseRun) TableName() string {

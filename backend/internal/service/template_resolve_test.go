@@ -13,6 +13,7 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 	"github.com/slidesmith/slidesmith/backend/internal/repository"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 type templateResolvePrepareAgent struct{}
@@ -21,8 +22,12 @@ func (a templateResolvePrepareAgent) Up(context.Context, AgentRunRequest) error 
 	return nil
 }
 
-func (a templateResolvePrepareAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
-	project := filepath.Join(req.WorkDir, "projects", "task_template_ppt169_20260708")
+func (a templateResolvePrepareAgent) Run(ctx context.Context, req AgentRunRequest) (*AgentRunResult, error) {
+	sessionWorkspace, err := distinctTestAgentWorkspace(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	project := filepath.Join(sessionWorkspace, "projects", "task_template_ppt169_20260708")
 	mustWriteFileNoTest(project, filepath.Join("sources", "input.md"), "# Source\n")
 	exitCode := 0
 	return &AgentRunResult{
@@ -30,8 +35,21 @@ func (a templateResolvePrepareAgent) Run(_ context.Context, req AgentRunRequest)
 		SessionID:     "session-prepare",
 		Status:        "succeeded",
 		ExitCode:      &exitCode,
-		WorkspacePath: req.WorkDir,
+		WorkspacePath: sessionWorkspace,
 	}, nil
+}
+
+func distinctTestAgentWorkspace(ctx context.Context, req AgentRunRequest) (string, error) {
+	sessionDir, err := os.MkdirTemp(filepath.Dir(req.WorkDir), "agent-session-")
+	if err != nil {
+		return "", err
+	}
+	sessionWorkspace := filepath.Join(sessionDir, "workspace")
+	if err := copyDir(ctx, req.WorkDir, sessionWorkspace); err != nil {
+		_ = os.RemoveAll(sessionDir)
+		return "", err
+	}
+	return sessionWorkspace, nil
 }
 
 func TestProcessPrepareRecordsTemplateResolvePhase(t *testing.T) {
@@ -127,7 +145,10 @@ func TestSpecGeneratePhaseInputReferencesTemplateResolution(t *testing.T) {
 
 func templateResolvePrepareService(t *testing.T) (*TaskService, *repository.Repository, *model.Task, string) {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	tmp := t.TempDir()
+	db, err := gorm.Open(sqlite.Open(filepath.Join(tmp, "template-resolve.sqlite")), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +163,6 @@ func templateResolvePrepareService(t *testing.T) (*TaskService, *repository.Repo
 		t.Fatal(err)
 	}
 	repo := repository.New(db)
-	tmp := t.TempDir()
 	seed := filepath.Join(tmp, "seed")
 	mustWriteFile(t, filepath.Join(seed, "scripts", "ppt_runner.py"), "print('runner')\n")
 	mustWriteFile(t, filepath.Join(seed, "workflows", "ppt_workflow.js"), "console.log('workflow')\n")

@@ -49,7 +49,7 @@ esac
 		CLI:             cliPath,
 		Agent:           "ppt_master",
 		SessionDataRoot: "/data",
-		Timeout:         time.Second,
+		Timeout:         5 * time.Second,
 	})
 	result, err := client.Run(context.Background(), AgentRunRequest{
 		Phase:        "generate",

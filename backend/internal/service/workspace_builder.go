@@ -27,6 +27,7 @@ type TaskWorkspace struct {
 	ProjectPath    string
 	InputPath      string
 	SkillDir       string
+	SourceCount    int
 }
 
 type RuntimeWorkspaceBuilder struct {
@@ -47,6 +48,24 @@ type runtimeManifest struct {
 	AssetRoots       []string `json:"asset_roots"`
 	ExtensionSkills  []string `json:"extension_skills"`
 	CreatedAt        string   `json:"created_at"`
+}
+
+type sourceInputsManifest struct {
+	Schema    string                     `json:"schema"`
+	TaskID    string                     `json:"task_id"`
+	CreatedAt string                     `json:"created_at"`
+	Files     []sourceInputsManifestFile `json:"files"`
+}
+
+type sourceInputsManifestFile struct {
+	Name       string `json:"name"`
+	UploadPath string `json:"upload_path"`
+	ObjectKey  string `json:"object_key"`
+	MimeType   string `json:"mime_type"`
+	Size       int64  `json:"size"`
+	SHA256     string `json:"sha256"`
+	SourceKind string `json:"source_kind"`
+	Extension  string `json:"extension"`
 }
 
 type skillLock struct {
@@ -106,11 +125,15 @@ func (b *RuntimeWorkspaceBuilder) Build(ctx context.Context, task *model.Task, s
 		return nil, err
 	}
 
-	inputPath, err := b.copySources(ctx, workspace.HostDir, task.ID, sources)
+	inputPath, sourceFiles, err := b.copySources(ctx, workspace.HostDir, task.ID, sources)
 	if err != nil {
 		return nil, err
 	}
 	workspace.InputPath = inputPath
+	workspace.SourceCount = len(sourceFiles)
+	if err := writeSourceInputsManifest(workspace, task, sourceFiles); err != nil {
+		return nil, err
+	}
 
 	if err := os.MkdirAll(filepath.Join(workspace.HostDir, "projects"), 0o755); err != nil {
 		return nil, err
@@ -165,11 +188,12 @@ func (b *RuntimeWorkspaceBuilder) copySeedDir(ctx context.Context, workspaceDir,
 	return copyDir(ctx, source, filepath.Join(workspaceDir, name))
 }
 
-func (b *RuntimeWorkspaceBuilder) copySources(ctx context.Context, workspaceDir, taskID string, sources []model.Artifact) (string, error) {
+func (b *RuntimeWorkspaceBuilder) copySources(ctx context.Context, workspaceDir, taskID string, sources []model.Artifact) (string, []sourceInputsManifestFile, error) {
 	var firstRel string
+	files := make([]sourceInputsManifestFile, 0, len(sources))
 	uploadDir := filepath.Join(workspaceDir, "uploads", taskID)
 	if err := os.MkdirAll(uploadDir, 0o755); err != nil {
-		return "", err
+		return "", nil, err
 	}
 	for _, artifact := range sources {
 		if artifact.Kind != model.ArtifactKindSource {
@@ -179,24 +203,45 @@ func (b *RuntimeWorkspaceBuilder) copySources(ctx context.Context, workspaceDir,
 		name := sanitizeFilename(artifact.Name)
 		targetPath := filepath.Join(uploadDir, name)
 		if err := copyFile(sourcePath, targetPath, 0o644); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if err := ctx.Err(); err != nil {
-			return "", err
+			return "", nil, err
 		}
 		rel, err := filepath.Rel(workspaceDir, targetPath)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		rel = filepath.ToSlash(rel)
 		if firstRel == "" {
 			firstRel = rel
 		}
+		sourceInfo := DetectSourceKind(artifact.Name)
+		files = append(files, sourceInputsManifestFile{
+			Name:       artifact.Name,
+			UploadPath: rel,
+			ObjectKey:  artifact.ObjectKey,
+			MimeType:   artifact.MimeType,
+			Size:       artifact.Size,
+			SHA256:     artifact.SHA256,
+			SourceKind: string(sourceInfo.Kind),
+			Extension:  sourceInfo.Extension,
+		})
 	}
 	if firstRel == "" {
-		return "", fmt.Errorf("task has no source artifact")
+		return "", nil, fmt.Errorf("task has no source artifact")
 	}
-	return firstRel, nil
+	return firstRel, files, nil
+}
+
+func writeSourceInputsManifest(workspace *TaskWorkspace, task *model.Task, files []sourceInputsManifestFile) error {
+	manifest := sourceInputsManifest{
+		Schema:    "slidesmith.source_inputs.v1",
+		TaskID:    task.ID,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		Files:     files,
+	}
+	return writeJSONPretty(filepath.Join(workspace.HostDir, ".slidesmith", "source_inputs.json"), manifest)
 }
 
 func (b *RuntimeWorkspaceBuilder) writeComposeFile(path string) error {

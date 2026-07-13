@@ -3,9 +3,11 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/slidesmith/slidesmith/backend/internal/model"
+	"github.com/slidesmith/slidesmith/backend/internal/repository"
 )
 
 const (
@@ -20,18 +22,31 @@ func (s *TaskService) beginPhaseRun(ctx context.Context, task *model.Task, phase
 		return nil, nil
 	}
 	now := time.Now().UTC()
+	claimToken, taskStatus := taskRunOwnership(task)
 	run := &model.TaskPhaseRun{
-		TaskID:    task.ID,
-		Phase:     string(phase),
-		Runner:    runner,
-		Status:    PhaseRunStatusRunning,
-		StartedAt: &now,
-		InputJSON: encodeAnyJSON(input),
+		TaskID:              task.ID,
+		ExecutionClaimToken: claimToken,
+		TaskStatus:          taskStatus,
+		Phase:               string(phase),
+		Runner:              runner,
+		Status:              PhaseRunStatusRunning,
+		StartedAt:           &now,
+		InputJSON:           encodeAnyJSON(input),
 	}
 	if err := s.repo.CreatePhaseRun(ctx, run); err != nil {
+		if errors.Is(err, repository.ErrTaskExecutionClaimLost) {
+			return nil, errTaskStateChanged
+		}
 		return nil, err
 	}
 	return run, nil
+}
+
+func taskRunOwnership(task *model.Task) (string, string) {
+	if task == nil || task.ExecutionClaimToken == "" {
+		return "", ""
+	}
+	return task.ExecutionClaimToken, task.Status
 }
 
 func (s *TaskService) finishPhaseRun(ctx context.Context, run *model.TaskPhaseRun, status string, output any, cause error) error {
@@ -51,7 +66,12 @@ func (s *TaskService) finishPhaseRun(ctx context.Context, run *model.TaskPhaseRu
 			"error_message": cause.Error(),
 		})
 	}
-	return s.repo.SavePhaseRun(ctx, run)
+	err := s.repo.SavePhaseRun(ctx, run)
+	if !errors.Is(err, repository.ErrTaskExecutionClaimLost) {
+		return err
+	}
+	_, abandonErr := s.repo.AbandonPhaseRun(context.WithoutCancel(ctx), run, "task execution ownership changed before phase completion")
+	return errors.Join(errTaskStateChanged, abandonErr)
 }
 
 func applyRuntimeRunToPhaseRun(phaseRun *model.TaskPhaseRun, runtimeRun *model.TaskRuntimeRun) {

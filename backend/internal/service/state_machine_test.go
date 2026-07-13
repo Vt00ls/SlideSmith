@@ -75,3 +75,48 @@ func TestStateMachineAllowsFailedPhaseRetries(t *testing.T) {
 		}
 	}
 }
+
+func TestStateMachineAllowsTemplateFillTransitions(t *testing.T) {
+	machine := NewStateMachine()
+	allowed := [][2]string{
+		{model.TaskStatusSourceConverting, model.TaskStatusTemplateFillPlanning},
+		{model.TaskStatusTemplateFillPlanning, model.TaskStatusAwaitingTemplateFillConfirm},
+		{model.TaskStatusAwaitingTemplateFillConfirm, model.TaskStatusTemplateFillPlanning},
+		{model.TaskStatusAwaitingTemplateFillConfirm, model.TaskStatusTemplateFillChecking},
+		{model.TaskStatusTemplateFillChecking, model.TaskStatusAwaitingTemplateFillConfirm},
+		{model.TaskStatusTemplateFillChecking, model.TaskStatusTemplateFillApplying},
+		{model.TaskStatusTemplateFillApplying, model.TaskStatusTemplateFillValidating},
+		{model.TaskStatusTemplateFillValidating, model.TaskStatusPublishing},
+		{model.TaskStatusFailed, model.TaskStatusTemplateFillPlanning},
+		{model.TaskStatusFailed, model.TaskStatusTemplateFillChecking},
+		{model.TaskStatusFailed, model.TaskStatusTemplateFillApplying},
+		{model.TaskStatusFailed, model.TaskStatusTemplateFillValidating},
+	}
+	for _, item := range allowed {
+		if err := machine.Validate(item[0], item[1]); err != nil {
+			t.Fatalf("Validate(%q, %q) error = %v", item[0], item[1], err)
+		}
+	}
+}
+
+func TestStateMachineRejectsMainSpecToTemplateFillApply(t *testing.T) {
+	machine := NewStateMachine()
+	if machine.CanTransition(model.TaskStatusSpecGenerating, model.TaskStatusTemplateFillApplying) {
+		t.Fatal("spec_generating -> template_fill_applying should be rejected")
+	}
+}
+
+func TestStateMachineAllowsTemplateFillCancellation(t *testing.T) {
+	machine := NewStateMachine()
+	for _, status := range []string{
+		model.TaskStatusTemplateFillPlanning,
+		model.TaskStatusAwaitingTemplateFillConfirm,
+		model.TaskStatusTemplateFillChecking,
+		model.TaskStatusTemplateFillApplying,
+		model.TaskStatusTemplateFillValidating,
+	} {
+		if err := machine.Validate(status, model.TaskStatusCancelled); err != nil {
+			t.Fatalf("%s -> cancelled should be allowed: %v", status, err)
+		}
+	}
+}

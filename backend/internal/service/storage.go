@@ -25,6 +25,7 @@ type StorageService interface {
 	Save(ctx context.Context, taskID, kind, filename string, reader io.Reader) (*StoredObject, error)
 	CopyFile(ctx context.Context, taskID, kind, objectName, sourcePath string) (*StoredObject, error)
 	CopyFileToObject(ctx context.Context, objectKey, sourcePath string) (*StoredObject, error)
+	DeleteObject(ctx context.Context, objectKey string) error
 	Open(objectKey string) (*os.File, error)
 	Path(objectKey string) string
 }
@@ -101,6 +102,20 @@ func (s *LocalStorage) CopyFileToObject(ctx context.Context, objectKey, sourcePa
 	}
 	defer source.Close()
 	return s.saveObject(ctx, objectKey, filepath.Base(objectKey), source)
+}
+
+func (s *LocalStorage) DeleteObject(ctx context.Context, objectKey string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	cleanKey, err := cleanObjectKey(objectKey)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(s.Path(cleanKey)); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func (s *LocalStorage) Open(objectKey string) (*os.File, error) {

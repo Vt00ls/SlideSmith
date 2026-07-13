@@ -37,6 +37,34 @@ func NewStateMachine() *StateMachine {
 		model.TaskStatusSourceConverting: allow(
 			model.TaskStatusAwaitingConfirm,
 			model.TaskStatusAwaitingAnchorConfirm,
+			model.TaskStatusTemplateFillPlanning,
+			model.TaskStatusCancelled,
+			model.TaskStatusFailed,
+		),
+		model.TaskStatusTemplateFillPlanning: allow(
+			model.TaskStatusAwaitingTemplateFillConfirm,
+			model.TaskStatusCancelled,
+			model.TaskStatusFailed,
+		),
+		model.TaskStatusAwaitingTemplateFillConfirm: allow(
+			model.TaskStatusTemplateFillPlanning,
+			model.TaskStatusTemplateFillChecking,
+			model.TaskStatusCancelled,
+			model.TaskStatusFailed,
+		),
+		model.TaskStatusTemplateFillChecking: allow(
+			model.TaskStatusAwaitingTemplateFillConfirm,
+			model.TaskStatusTemplateFillApplying,
+			model.TaskStatusCancelled,
+			model.TaskStatusFailed,
+		),
+		model.TaskStatusTemplateFillApplying: allow(
+			model.TaskStatusTemplateFillValidating,
+			model.TaskStatusCancelled,
+			model.TaskStatusFailed,
+		),
+		model.TaskStatusTemplateFillValidating: allow(
+			model.TaskStatusPublishing,
 			model.TaskStatusCancelled,
 			model.TaskStatusFailed,
 		),
@@ -101,6 +129,10 @@ func NewStateMachine() *StateMachine {
 		),
 		model.TaskStatusFailed: allow(
 			model.TaskStatusRuntimePreparing,
+			model.TaskStatusTemplateFillPlanning,
+			model.TaskStatusTemplateFillChecking,
+			model.TaskStatusTemplateFillApplying,
+			model.TaskStatusTemplateFillValidating,
 			model.TaskStatusSpecGenerating,
 			model.TaskStatusSVGGenerating,
 			model.TaskStatusQualityChecking,

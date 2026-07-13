@@ -9,6 +9,11 @@ export type TaskStatus =
   | "awaiting_realization_confirm"
   | "spec_generating"
   | "awaiting_spec_confirm"
+  | "template_fill_planning"
+  | "awaiting_template_fill_confirm"
+  | "template_fill_checking"
+  | "template_fill_applying"
+  | "template_fill_validating"
   | "image_acquiring"
   | "svg_generating"
   | "quality_checking"
@@ -66,6 +71,7 @@ export type Artifact = {
   size: number;
   sha256: string;
   publish_version: string;
+  metadata_json: string;
   created_at: string;
   updated_at: string;
 };
@@ -102,6 +108,10 @@ export type PipelinePhase =
   | "realization_confirm"
   | "spec_generate"
   | "spec_refine"
+  | "template_fill_plan"
+  | "template_fill_check"
+  | "template_fill_apply"
+  | "template_fill_validate"
   | "image_acquire"
   | "svg_execute"
   | "quality_check"
@@ -128,7 +138,17 @@ export type TaskPhaseRun = {
   updated_at: string;
 };
 
-export type RetryPhase = "prepare" | "spec_generate" | "svg_execute" | "quality_check" | "finalize_export" | "publish";
+export type RetryPhase =
+  | "prepare"
+  | "spec_generate"
+  | "template_fill_plan"
+  | "template_fill_check"
+  | "template_fill_apply"
+  | "template_fill_validate"
+  | "svg_execute"
+  | "quality_check"
+  | "finalize_export"
+  | "publish";
 
 export type ContinuePhase = "spec_generate" | "svg_execute";
 
@@ -148,6 +168,38 @@ export type SpecPreview = {
   summary: Record<string, unknown>;
   confirmation: Record<string, unknown>;
   contract: Record<string, unknown>;
+};
+
+export type TemplateFillInputs = {
+  project_path: string;
+  source_pptx: string;
+  slide_library: string;
+  fill_plan: string;
+  check_report: string;
+  validate_report: string;
+  readback: string;
+  export_base: string;
+  content_sources: string[];
+};
+
+export type TemplateFillPlanFile = {
+  name: string;
+  path: string;
+  content: string;
+  size: number;
+  updated_at: string;
+};
+
+export type TemplateFillPlanPreview = {
+  task_id: string;
+  project_path: string;
+  inputs: TemplateFillInputs;
+  plan: Record<string, unknown>;
+  check_report: Record<string, unknown>;
+  summary: Record<string, unknown>;
+  plan_file: TemplateFillPlanFile;
+  can_edit: boolean;
+  can_confirm: boolean;
 };
 
 export type Confirmation = {
@@ -270,6 +322,19 @@ export const api = {
   listRuntimeRuns: (id: string) => request<RuntimeRun[]>(`/tasks/${encodeURIComponent(id)}/runtime-runs`),
   listPhaseRuns: (id: string) => request<TaskPhaseRun[]>(`/tasks/${encodeURIComponent(id)}/phase-runs`),
   getSpecPreview: (id: string) => request<SpecPreview>(`/tasks/${encodeURIComponent(id)}/spec`),
+  getTemplateFillPlan: (id: string) =>
+    request<TemplateFillPlanPreview>(`/tasks/${encodeURIComponent(id)}/template-fill/plan`),
+  saveTemplateFillPlan: (id: string, plan: Record<string, unknown>) =>
+    request<TemplateFillPlanPreview>(`/tasks/${encodeURIComponent(id)}/template-fill/plan`, {
+      method: "PUT",
+      body: JSON.stringify({ plan }),
+    }),
+  checkTemplateFillPlan: (id: string) =>
+    request<Task>(`/tasks/${encodeURIComponent(id)}/template-fill/check`, { method: "POST" }),
+  confirmTemplateFillPlan: (id: string) =>
+    request<Task>(`/tasks/${encodeURIComponent(id)}/template-fill/confirm`, { method: "POST" }),
+  regenerateTemplateFillPlan: (id: string) =>
+    request<Task>(`/tasks/${encodeURIComponent(id)}/template-fill/regenerate`, { method: "POST" }),
   listConfirmations: (id: string) =>
     request<Confirmation[]>(`/tasks/${encodeURIComponent(id)}/confirmations`),
   submitConfirmations: (id: string, values: Record<string, unknown>) =>
