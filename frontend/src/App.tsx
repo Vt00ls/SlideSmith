@@ -39,7 +39,7 @@ import {
   TemplateFillPlanPreview,
 } from "./api";
 import { artifactKindLabel, formatBytes, formatTime, phaseLabel, routeLabel, statusLabel, statusTone } from "./format";
-import { go, parseRoute, Route } from "./router";
+import { go, parseRoute, replaceRoute, Route } from "./router";
 
 const activeStatuses: TaskStatus[] = [
   "runtime_preparing",
@@ -191,6 +191,91 @@ function templateFillActionState({
   };
 }
 
+function templateFillBasename(value: unknown) {
+  if (typeof value !== "string") {
+    return "-";
+  }
+  const parts = value.trim().replace(/\\/g, "/").split("/").filter(Boolean);
+  return parts[parts.length - 1]?.trim() || "-";
+}
+
+function templateFillPageKey(taskId: string) {
+  return `template-fill:${taskId}`;
+}
+
+function taskRouteMatches(route: Route, routeName: "templateFill" | "preview", taskId: string) {
+  return route.name === routeName && "id" in route && route.id === taskId;
+}
+
+function createTemplateFillRequestScope(taskId: string, isRouteCurrent: () => boolean = () => true) {
+  let nextGeneration = 0;
+  let activeGeneration = 0;
+  return {
+    taskId,
+    activate() {
+      nextGeneration += 1;
+      activeGeneration = nextGeneration;
+      return activeGeneration;
+    },
+    deactivate(generation: number) {
+      if (activeGeneration === generation) {
+        activeGeneration = 0;
+      }
+    },
+    currentGeneration() {
+      return activeGeneration;
+    },
+    isGenerationCurrent(generation: number, currentTaskId: string) {
+      return generation !== 0
+        && generation === activeGeneration
+        && currentTaskId === taskId
+        && isRouteCurrent();
+    },
+    isCurrent(currentTaskId: string) {
+      return activeGeneration !== 0 && currentTaskId === taskId && isRouteCurrent();
+    },
+  };
+}
+
+function templateFillScopedTaskID(scope: ReturnType<typeof createTemplateFillRequestScope>, currentTaskId: string) {
+  return scope.isCurrent(currentTaskId) ? scope.taskId : "";
+}
+
+function startTemplateFillRequestGeneration(
+  scope: ReturnType<typeof createTemplateFillRequestScope>,
+  run: (generation: number) => void,
+) {
+  const generation = scope.activate();
+  try {
+    run(generation);
+  } catch (err) {
+    scope.deactivate(generation);
+    throw err;
+  }
+  return () => scope.deactivate(generation);
+}
+
+async function scopedTemplateFillRequest<T>(
+  scope: ReturnType<typeof createTemplateFillRequestScope>,
+  currentTaskId: string,
+  request: (scopedTaskId: string) => Promise<T>,
+  generation = scope.currentGeneration(),
+) {
+  const scopedTaskId = scope.isGenerationCurrent(generation, currentTaskId) ? scope.taskId : "";
+  if (!scopedTaskId) {
+    return undefined;
+  }
+  try {
+    const result = await request(scopedTaskId);
+    return scope.isGenerationCurrent(generation, currentTaskId) ? result : undefined;
+  } catch (err) {
+    if (scope.isGenerationCurrent(generation, currentTaskId)) {
+      throw err;
+    }
+    return undefined;
+  }
+}
+
 function retryOptionsForFailure(failurePhase: string, taskRoute = "main"): Array<{ phase: RetryPhase; label: string }> {
   const value = failurePhase.toLowerCase();
   if (taskRoute === "template-fill") {
@@ -246,6 +331,28 @@ function completedTaskRoute(taskId: string, taskRoute: string): Route {
 
 function visibleTaskArtifacts<T>(artifacts: T[], taskRoute: string) {
   return taskRoute === "template-fill" ? artifacts : artifacts.slice(0, 8);
+}
+
+async function loadPreviewPageData<TTask extends Pick<Task, "id" | "route">, TArtifact>(
+  taskId: string,
+  getTask: (id: string) => Promise<TTask>,
+  listArtifacts: (id: string) => Promise<TArtifact[]>,
+  isActive: () => boolean,
+  canonicalize: (route: Route) => void,
+) {
+  const task = await getTask(taskId);
+  if (!isActive()) {
+    return null;
+  }
+  if (task.route === "template-fill") {
+    canonicalize({ name: "templateFill", id: task.id });
+    return null;
+  }
+  const artifacts = await listArtifacts(taskId);
+  if (!isActive()) {
+    return null;
+  }
+  return { task, artifacts };
 }
 
 function templateFillNextPhase(status: TaskStatus) {
@@ -341,7 +448,9 @@ export function App() {
         {route.name === "task" && <TaskDetailPage taskId={route.id} />}
         {route.name === "confirm" && <ConfirmPage taskId={route.id} />}
         {route.name === "spec" && <SpecPreviewPage taskId={route.id} />}
-        {route.name === "templateFill" && <TemplateFillPlanPage taskId={route.id} />}
+        {route.name === "templateFill" && (
+          <TemplateFillPlanPage key={templateFillPageKey(route.id)} taskId={route.id} />
+        )}
         {route.name === "preview" && <PreviewPage taskId={route.id} />}
       </main>
     </div>
@@ -1180,6 +1289,10 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
 }
 
 function TemplateFillPlanPage({ taskId }: { taskId: string }) {
+  const [requestScope] = useState(() => createTemplateFillRequestScope(
+    taskId,
+    () => taskRouteMatches(parseRoute(), "templateFill", taskId),
+  ));
   const [task, setTask] = useState<Task | null>(null);
   const [preview, setPreview] = useState<TemplateFillPlanPreview | null>(null);
   const [planText, setPlanText] = useState("");
@@ -1195,23 +1308,34 @@ function TemplateFillPlanPage({ taskId }: { taskId: string }) {
     setSavedPlanText(canonicalText);
   }
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (generation: number) => {
     setLoading(true);
     setError("");
     try {
-      const nextTask = await api.getTask(taskId);
+      const nextTask = await scopedTemplateFillRequest(requestScope, taskId, api.getTask, generation);
+      if (!nextTask) {
+        return;
+      }
       setTask(nextTask);
-      adoptPreview(await api.getTemplateFillPlan(taskId));
+      const nextPreview = await scopedTemplateFillRequest(requestScope, taskId, api.getTemplateFillPlan, generation);
+      if (!nextPreview) {
+        return;
+      }
+      adoptPreview(nextPreview);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setLoading(false);
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setLoading(false);
+      }
     }
-  }, [taskId]);
+  }, [requestScope, taskId]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    return startTemplateFillRequestGeneration(requestScope, (generation) => void load(generation));
+  }, [load, requestScope]);
 
   const dirty = planText !== savedPlanText;
   const checkErrorCount = preview ? numberFromSummary(preview.summary.check_error) : 0;
@@ -1232,27 +1356,41 @@ function TemplateFillPlanPage({ taskId }: { taskId: string }) {
   const sourcePptxName = preview
     ? templateFillText(preview.summary.source_pptx_name) !== "-"
       ? templateFillText(preview.summary.source_pptx_name)
-      : preview.inputs.source_pptx.replace(/\\/g, "/").split("/").filter(Boolean).pop() || "-"
+      : templateFillBasename(preview.inputs?.source_pptx)
     : "-";
 
   async function regeneratePlan() {
-    if (!canRegenerate || busy) {
+    const requestGeneration = requestScope.currentGeneration();
+    if (!canRegenerate || busy || !requestScope.isGenerationCurrent(requestGeneration, taskId)) {
       return;
     }
     setBusy("regenerate");
     setError("");
     try {
-      await api.regenerateTemplateFillPlan(taskId);
+      const regenerated = await scopedTemplateFillRequest(
+        requestScope,
+        taskId,
+        api.regenerateTemplateFillPlan,
+        requestGeneration,
+      );
+      if (!regenerated) {
+        return;
+      }
       go({ name: "task", id: taskId });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestScope.isGenerationCurrent(requestGeneration, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setBusy("");
+      if (requestScope.isGenerationCurrent(requestGeneration, taskId)) {
+        setBusy("");
+      }
     }
   }
 
   async function savePlan() {
-    if (actionState.saveDisabled) {
+    const requestGeneration = requestScope.currentGeneration();
+    if (actionState.saveDisabled || !requestScope.isGenerationCurrent(requestGeneration, taskId)) {
       return;
     }
     setBusy("save");
@@ -1262,24 +1400,55 @@ function TemplateFillPlanPage({ taskId }: { taskId: string }) {
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error("JSON 根节点必须是对象。");
       }
-      const saved = await api.saveTemplateFillPlan(taskId, parsed as Record<string, unknown>);
+      const saved = await scopedTemplateFillRequest(
+        requestScope,
+        taskId,
+        (scopedTaskId) => api.saveTemplateFillPlan(scopedTaskId, parsed as Record<string, unknown>),
+        requestGeneration,
+      );
+      if (!saved) {
+        return;
+      }
       adoptPreview(saved);
-      adoptPreview(await api.getTemplateFillPlan(taskId));
+      const canonical = await scopedTemplateFillRequest(
+        requestScope,
+        taskId,
+        api.getTemplateFillPlan,
+        requestGeneration,
+      );
+      if (!canonical) {
+        return;
+      }
+      adoptPreview(canonical);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestScope.isGenerationCurrent(requestGeneration, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setBusy("");
+      if (requestScope.isGenerationCurrent(requestGeneration, taskId)) {
+        setBusy("");
+      }
     }
   }
 
   async function checkPlan() {
-    if (actionState.checkDisabled) {
+    const requestGeneration = requestScope.currentGeneration();
+    if (actionState.checkDisabled || !requestScope.isGenerationCurrent(requestGeneration, taskId)) {
       return;
     }
     setBusy("check");
     setError("");
     try {
-      setTask(await api.checkTemplateFillPlan(taskId));
+      const checked = await scopedTemplateFillRequest(
+        requestScope,
+        taskId,
+        api.checkTemplateFillPlan,
+        requestGeneration,
+      );
+      if (!checked) {
+        return;
+      }
+      setTask(checked);
       setPreview((current) => current ? {
         ...current,
         check_report: {},
@@ -1291,27 +1460,53 @@ function TemplateFillPlanPage({ taskId }: { taskId: string }) {
         },
         can_confirm: false,
       } : current);
-      adoptPreview(await api.getTemplateFillPlan(taskId));
+      const refreshed = await scopedTemplateFillRequest(
+        requestScope,
+        taskId,
+        api.getTemplateFillPlan,
+        requestGeneration,
+      );
+      if (!refreshed) {
+        return;
+      }
+      adoptPreview(refreshed);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestScope.isGenerationCurrent(requestGeneration, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setBusy("");
+      if (requestScope.isGenerationCurrent(requestGeneration, taskId)) {
+        setBusy("");
+      }
     }
   }
 
   async function confirmPlan() {
-    if (actionState.confirmDisabled) {
+    const requestGeneration = requestScope.currentGeneration();
+    if (actionState.confirmDisabled || !requestScope.isGenerationCurrent(requestGeneration, taskId)) {
       return;
     }
     setBusy("confirm");
     setError("");
     try {
-      await api.confirmTemplateFillPlan(taskId);
+      const confirmed = await scopedTemplateFillRequest(
+        requestScope,
+        taskId,
+        api.confirmTemplateFillPlan,
+        requestGeneration,
+      );
+      if (!confirmed) {
+        return;
+      }
       go({ name: "task", id: taskId });
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestScope.isGenerationCurrent(requestGeneration, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setBusy("");
+      if (requestScope.isGenerationCurrent(requestGeneration, taskId)) {
+        setBusy("");
+      }
     }
   }
 
@@ -1698,23 +1893,35 @@ function PreviewPage({ taskId }: { taskId: string }) {
   const [error, setError] = useState("");
 
   useEffect(() => {
+    let active = true;
     async function load() {
       try {
-        const [nextTask, nextArtifacts] = await Promise.all([api.getTask(taskId), api.listArtifacts(taskId)]);
-        if (nextTask.route === "template-fill") {
-          go({ name: "templateFill", id: nextTask.id });
+        const result = await loadPreviewPageData(
+          taskId,
+          api.getTask,
+          api.listArtifacts,
+          () => active && taskRouteMatches(parseRoute(), "preview", taskId),
+          replaceRoute,
+        );
+        if (!result) {
           return;
         }
+        const { task: nextTask, artifacts: nextArtifacts } = result;
         const svg = nextArtifacts.filter((artifact) => artifact.kind === "svg_final");
         setTask(nextTask);
         setArtifacts(nextArtifacts);
         setSelectedId((current) => current || svg[0]?.id || "");
         setError("");
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        if (active && taskRouteMatches(parseRoute(), "preview", taskId)) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
       }
     }
     void load();
+    return () => {
+      active = false;
+    };
   }, [taskId]);
 
   const svgArtifacts = artifacts.filter((artifact) => artifact.kind === "svg_final");

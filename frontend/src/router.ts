@@ -38,6 +38,11 @@ export function go(route: Route) {
   window.location.hash = routeToHash(route);
 }
 
+export function replaceRoute(route: Route) {
+  window.history.replaceState(window.history.state, "", routeToHash(route));
+  window.dispatchEvent(new Event("hashchange"));
+}
+
 export function routeToHash(route: Route) {
   switch (route.name) {
     case "tasks":

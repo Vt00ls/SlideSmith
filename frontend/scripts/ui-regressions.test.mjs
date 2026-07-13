@@ -34,11 +34,19 @@ async function loadAppHelpersModule() {
     "templateFillSlideRows",
     "templateFillCheckRows",
     "templateFillActionState",
+    "templateFillBasename",
+    "templateFillPageKey",
+    "createTemplateFillRequestScope",
+    "templateFillScopedTaskID",
+    "scopedTemplateFillRequest",
+    "startTemplateFillRequestGeneration",
+    "taskRouteMatches",
     "retryOptionsForFailure",
     "retryGuidanceForFailure",
     "canOpenTemplateFillPlan",
     "completedTaskRoute",
     "visibleTaskArtifacts",
+    "loadPreviewPageData",
   ]);
   const declarations = [];
   const found = new Set();
@@ -152,6 +160,25 @@ test("Template Fill router parses and serializes the plan hash", async () => {
   assert.equal(routeToHash({ name: "templateFill", id: "task%20one" }), "#/tasks/task%20one/template-fill");
   window.location.hash = routeToHash({ name: "templateFill", id: "task-2" });
   assert.deepEqual(parseRoute(), { name: "templateFill", id: "task-2" });
+});
+
+test("replaceRoute canonicalizes with history replacement and dispatches routing", async () => {
+  const calls = [];
+  globalThis.window = {
+    location: { hash: "#/tasks/task-1/preview" },
+    history: {
+      state: { preserved: true },
+      replaceState: (state, title, url) => calls.push({ state, title, url }),
+    },
+    dispatchEvent: (event) => calls.push({ event: event.type }),
+  };
+  const { replaceRoute } = await loadSourceModule(routerSource, "router.ts");
+  replaceRoute({ name: "templateFill", id: "task-1" });
+  assert.deepEqual(calls, [
+    { state: { preserved: true }, title: "", url: "#/tasks/task-1/template-fill" },
+    { event: "hashchange" },
+  ]);
+  assert.equal(window.location.hash, "#/tasks/task-1/preview", "replaceRoute must not push by assigning location.hash");
 });
 
 test("Template Fill labels and status classifications are exact", async () => {
@@ -291,6 +318,98 @@ test("dirty and check-error action guards never act on stale JSON", async () => 
   assert.equal(templateFillActionState({ ...base, checkWarningCount: 9 }).confirmDisabled, false, "warnings do not block confirm");
 });
 
+test("Template Fill task switches fail closed and discard late task responses", async () => {
+  const {
+    createTemplateFillRequestScope,
+    scopedTemplateFillRequest,
+    startTemplateFillRequestGeneration,
+    templateFillActionState,
+    templateFillPageKey,
+    templateFillScopedTaskID,
+  } = await loadAppHelpersModule();
+
+  assert.notEqual(templateFillPageKey("task-a"), templateFillPageKey("task-b"), "task IDs must remount the page");
+  let currentHashTaskId = "task-a";
+  const scopeA = createTemplateFillRequestScope("task-a", () => currentHashTaskId === "task-a");
+  let resolveStrictProbe;
+  let strictProbeRequest;
+  const cleanupStrictProbe = startTemplateFillRequestGeneration(scopeA, () => {
+    strictProbeRequest = scopedTemplateFillRequest(scopeA, "task-a", () => new Promise((resolve) => {
+      resolveStrictProbe = resolve;
+    }));
+  });
+  cleanupStrictProbe();
+  let cleanupLiveGeneration = startTemplateFillRequestGeneration(scopeA, () => {});
+  assert.deepEqual(
+    await scopedTemplateFillRequest(scopeA, "task-a", async (id) => ({ task_id: id, generation: "live" })),
+    { task_id: "task-a", generation: "live" },
+    "StrictMode's second effect setup must receive a live generation",
+  );
+  resolveStrictProbe({ task_id: "task-a", generation: "stale-probe" });
+  assert.equal(await strictProbeRequest, undefined, "the first StrictMode setup cannot overwrite the live setup");
+
+  let rejectStaleProbe;
+  const staleProbeFailure = scopedTemplateFillRequest(scopeA, "task-a", () => new Promise((_, reject) => {
+    rejectStaleProbe = reject;
+  }));
+  cleanupLiveGeneration();
+  cleanupLiveGeneration = startTemplateFillRequestGeneration(scopeA, () => {});
+  rejectStaleProbe(new Error("stale StrictMode request"));
+  assert.equal(await staleProbeFailure, undefined, "a stale StrictMode rejection cannot poison the live setup");
+  assert.equal(templateFillScopedTaskID(scopeA, "task-a"), "task-a");
+
+  currentHashTaskId = "task-b";
+  assert.equal(templateFillScopedTaskID(scopeA, "task-b"), "", "task A JSON cannot target task B");
+
+  let mismatchedRequestCalled = false;
+  assert.equal(
+    await scopedTemplateFillRequest(scopeA, "task-b", async () => {
+      mismatchedRequestCalled = true;
+      return "wrong";
+    }),
+    undefined,
+  );
+  assert.equal(mismatchedRequestCalled, false);
+
+  currentHashTaskId = "task-a";
+  let resolveLate;
+  const pendingA = scopedTemplateFillRequest(scopeA, "task-a", () => new Promise((resolve) => {
+    resolveLate = resolve;
+  }));
+  currentHashTaskId = "task-b";
+  resolveLate({ task_id: "task-a", plan: { title: "A" } });
+  assert.equal(await pendingA, undefined, "a hash change invalidates A before React effect cleanup");
+  cleanupLiveGeneration();
+
+  const scopeB = createTemplateFillRequestScope("task-b", () => currentHashTaskId === "task-b");
+  scopeB.activate();
+  assert.deepEqual(
+    await scopedTemplateFillRequest(scopeB, "task-b", async (id) => ({ task_id: id, plan: { title: "B" } })),
+    { task_id: "task-b", plan: { title: "B" } },
+  );
+  assert.deepEqual(
+    templateFillActionState({
+      canEdit: false,
+      canConfirm: false,
+      taskStatus: undefined,
+      busy: false,
+      dirty: false,
+      checkErrorCount: 0,
+    }),
+    { saveDisabled: true, checkDisabled: true, confirmDisabled: true, hint: "" },
+    "the freshly keyed task B page starts with actions closed",
+  );
+});
+
+test("Template Fill basename fallback tolerates malformed runtime input", async () => {
+  const { templateFillBasename } = await loadAppHelpersModule();
+  assert.equal(templateFillBasename("/workspace/projects/demo/sources/company.pptx"), "company.pptx");
+  assert.equal(templateFillBasename("C:\\workspace\\sources\\brand.pptx"), "brand.pptx");
+  assert.equal(templateFillBasename("  "), "-");
+  assert.equal(templateFillBasename(null), "-");
+  assert.equal(templateFillBasename({ path: "unsafe.pptx" }), "-");
+});
+
 test("Template Fill retry recovery is failure-phase-aware and main retry behavior remains intact", async () => {
   const { retryOptionsForFailure, retryGuidanceForFailure } = await loadAppHelpersModule();
   assert.deepEqual(retryOptionsForFailure("template_fill_plan.inputs", "template-fill"), [
@@ -336,22 +455,92 @@ test("completed navigation, plan entry, and artifact visibility are route-aware"
   assert.equal(visibleTaskArtifacts(artifacts, "template-fill").length, 12);
 });
 
+test("direct preview canonicalization fetches task first, skips Template Fill artifacts, and ignores stale completion", async () => {
+  const { loadPreviewPageData, taskRouteMatches } = await loadAppHelpersModule();
+
+  const templateCalls = [];
+  const replacements = [];
+  const templateResult = await loadPreviewPageData(
+    "task-template",
+    async (id) => {
+      templateCalls.push(`task:${id}`);
+      return { id, route: "template-fill" };
+    },
+    async (id) => {
+      templateCalls.push(`artifacts:${id}`);
+      throw new Error("Template Fill artifacts must not be fetched before redirect");
+    },
+    () => true,
+    (route) => replacements.push(route),
+  );
+  assert.equal(templateResult, null);
+  assert.deepEqual(templateCalls, ["task:task-template"]);
+  assert.deepEqual(replacements, [{ name: "templateFill", id: "task-template" }]);
+
+  const mainCalls = [];
+  const mainResult = await loadPreviewPageData(
+    "task-main",
+    async (id) => {
+      mainCalls.push(`task:${id}`);
+      return { id, route: "main" };
+    },
+    async (id) => {
+      mainCalls.push(`artifacts:${id}`);
+      return [{ id: "svg-1", kind: "svg_final" }];
+    },
+    () => true,
+    () => assert.fail("main preview must not redirect"),
+  );
+  assert.deepEqual(mainCalls, ["task:task-main", "artifacts:task-main"]);
+  assert.deepEqual(mainResult, {
+    task: { id: "task-main", route: "main" },
+    artifacts: [{ id: "svg-1", kind: "svg_final" }],
+  });
+
+  let previewRoute = { name: "preview", id: "task-stale" };
+  let resolveTask;
+  const staleReplacements = [];
+  const staleLoad = loadPreviewPageData(
+    "task-stale",
+    () => new Promise((resolve) => {
+      resolveTask = resolve;
+    }),
+    async () => assert.fail("stale load must stop before artifacts"),
+    () => taskRouteMatches(previewRoute, "preview", "task-stale"),
+    (route) => staleReplacements.push(route),
+  );
+  previewRoute = { name: "tasks" };
+  resolveTask({ id: "task-stale", route: "template-fill" });
+  assert.equal(await staleLoad, null);
+  assert.deepEqual(staleReplacements, [], "an unmounted preview cannot hijack later navigation");
+});
+
 test("Template Fill component uses production helpers and required actions", () => {
   const app = appFunctionSource("App");
   const page = appFunctionSource("TemplateFillPlanPage");
   const detail = appFunctionSource("TaskDetailPage");
-  assert.match(app, /route\.name === "templateFill"\s*&&\s*<TemplateFillPlanPage taskId=\{route\.id\}/);
+  const previewPage = appFunctionSource("PreviewPage");
+  assert.match(app, /route\.name === "templateFill"[\s\S]*?<TemplateFillPlanPage key=\{templateFillPageKey\(route\.id\)\} taskId=\{route\.id\}/);
   for (const label of ["返回", "重新生成计划", "保存 JSON", "检查计划", "确认并导出", "打开填充计划"]) {
     assert.ok(appSource.includes(label), `missing Template Fill action ${label}`);
   }
   assert.match(page, /templateFillActionState\s*\(/);
   assert.match(page, /templateFillSlideRows\s*\(/);
   assert.match(page, /templateFillCheckRows\s*\(/);
+  assert.match(page, /useState\(\(\) => createTemplateFillRequestScope\([\s\S]*?taskRouteMatches\(parseRoute\(\), "templateFill", taskId\)/);
+  assert.match(page, /startTemplateFillRequestGeneration\(requestScope, \(generation\) => void load\(generation\)\)/);
+  assert.match(page, /requestScope\.isGenerationCurrent\(generation, taskId\)/);
+  assert.ok((page.match(/scopedTemplateFillRequest\s*\(/g) || []).length >= 7, "all plan requests must use the task scope");
+  assert.doesNotMatch(page, /api\.(?:save|check|confirm|regenerate)TemplateFillPlan\(taskId/);
   assert.match(page, /uploaded PPTX|上传的 PPTX/);
   assert.match(detail, /visibleTaskArtifacts\s*\(/);
   assert.match(detail, /canOpenTemplateFillPlan\s*\(/);
   assert.match(detail, /completedTaskRoute\s*\(/);
   assert.match(detail, /taskRoute !== "template-fill"[\s\S]*?<span>SVG<\/span>/);
+  assert.match(previewPage, /loadPreviewPageData\([\s\S]*?replaceRoute/);
+  assert.match(previewPage, /taskRouteMatches\(parseRoute\(\), "preview", taskId\)/);
+  assert.match(previewPage, /catch \(err\)[\s\S]*?active && taskRouteMatches\(parseRoute\(\), "preview", taskId\)/);
+  assert.match(previewPage, /return \(\) => \{\s*active = false;/);
 });
 
 test("save and check refetch canonical previews while only confirm advances", () => {
