@@ -1,13 +1,81 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
+
+func TestTemplateFillCaseFoldUsesPinnedUnicode15Corpus(t *testing.T) {
+	if len(templateFillCaseFoldMappings) != templateFillCaseFoldMappingCount {
+		t.Fatalf("case-fold mappings = %d, want %d", len(templateFillCaseFoldMappings), templateFillCaseFoldMappingCount)
+	}
+	if digest := sha256.Sum256(templateFillCaseFoldAsset); strings.ToLower(templateFillCaseFoldAssetSHA256) != strings.ToLower(fmt.Sprintf("%x", digest)) {
+		t.Fatalf("case-fold asset SHA-256 = %x, want %s", digest, templateFillCaseFoldAssetSHA256)
+	}
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve test file path")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(testFile), "..", "..", ".."))
+	pythonAsset, err := os.ReadFile(filepath.Join(repoRoot, "runtime", "ppt-master-agent", "scripts", "unicode_casefold_15_0.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(templateFillCaseFoldAsset, pythonAsset) {
+		t.Fatal("Go and Python pinned case-fold assets differ")
+	}
+
+	tests := map[string]string{
+		"I": "i",
+		"İ": "i\u0307",
+		"ẞ": "ss",
+		"ﬃ": "ffi",
+		"Σ": "σ",
+		"ς": "σ",
+		"Ɤ": "Ɤ",
+	}
+	for input, want := range tests {
+		if got := templateFillCaseFold(input); got != want {
+			t.Fatalf("templateFillCaseFold(%q) = %q, want %q", input, got, want)
+		}
+	}
+	if templateFillCaseFold("Ɤ") == templateFillCaseFold("ɤ") {
+		t.Fatal("Unicode 16 U+A7CB mapping leaked into pinned Unicode 15 folding")
+	}
+
+	hash := sha256.New()
+	var encoded [4]byte
+	for source := rune(0); source <= utf8.MaxRune; source++ {
+		if source >= 0xD800 && source <= 0xDFFF {
+			continue
+		}
+		binary.BigEndian.PutUint32(encoded[:], uint32(source))
+		_, _ = hash.Write(encoded[:])
+		folded := templateFillCaseFold(string(source))
+		runeCount := utf8.RuneCountInString(folded)
+		if runeCount > 255 {
+			t.Fatalf("folded rune count = %d for U+%04X", runeCount, source)
+		}
+		_, _ = hash.Write([]byte{byte(runeCount)})
+		for _, target := range folded {
+			binary.BigEndian.PutUint32(encoded[:], uint32(target))
+			_, _ = hash.Write(encoded[:])
+		}
+	}
+	if got := fmt.Sprintf("%x", hash.Sum(nil)); got != "e7b7267656504e1e9625b731d88c5fe9f669a0f4b07038e76caaf8296ce1769b" {
+		t.Fatalf("Unicode 15 full-scalar fold corpus SHA-256 = %s", got)
+	}
+}
 
 func TestDiscoverTemplateFillInputsFindsSingleDeckAndContent(t *testing.T) {
 	projectPath := t.TempDir()

@@ -256,9 +256,68 @@ def _validate_template_fill_output_path(project_path: Path, path: Path) -> None:
         raise ValueError(f"template fill output path must be a regular file: {relative.as_posix()}")
 
 
+TEMPLATE_FILL_CASEFOLD_SCHEMA = "slidesmith.unicode_casefold.v1"
+TEMPLATE_FILL_CASEFOLD_UNICODE_VERSION = "15.0.0"
+TEMPLATE_FILL_CASEFOLD_SOURCE_SHA256 = "cdd49e55eae3bbf1f0a3f6580c974a0263cb86a6a08daa10fbf705b4808a56f7"
+TEMPLATE_FILL_CASEFOLD_ASSET_SHA256 = "11272a5b74c86e20065be587da38ef2291c08caec383908b3acbad8ed583feb1"
+TEMPLATE_FILL_CASEFOLD_MAPPING_COUNT = 1530
+TEMPLATE_FILL_CASEFOLD_ASSET_PATH = Path(__file__).with_name("unicode_casefold_15_0.json")
+
+
+def _load_template_fill_casefold_mappings(path: Path) -> dict[str, str]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"read template fill case-fold asset: {exc}") from exc
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != TEMPLATE_FILL_CASEFOLD_ASSET_SHA256:
+        raise RuntimeError(
+            f"template fill case-fold asset SHA-256 = {digest}, "
+            f"want {TEMPLATE_FILL_CASEFOLD_ASSET_SHA256}"
+        )
+    try:
+        asset = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"parse template fill case-fold asset: {exc}") from exc
+    if not isinstance(asset, dict):
+        raise RuntimeError("template fill case-fold asset must be a JSON object")
+    mappings = asset.get("mappings")
+    if (
+        asset.get("schema") != TEMPLATE_FILL_CASEFOLD_SCHEMA
+        or asset.get("unicode_version") != TEMPLATE_FILL_CASEFOLD_UNICODE_VERSION
+        or asset.get("source_sha256") != TEMPLATE_FILL_CASEFOLD_SOURCE_SHA256
+        or asset.get("mapping_statuses") != ["C", "F"]
+        or asset.get("mapping_count") != TEMPLATE_FILL_CASEFOLD_MAPPING_COUNT
+        or not isinstance(mappings, dict)
+        or len(mappings) != TEMPLATE_FILL_CASEFOLD_MAPPING_COUNT
+    ):
+        raise RuntimeError("template fill case-fold asset metadata is invalid")
+
+    parsed: dict[str, str] = {}
+    for source_hex, target_hex in mappings.items():
+        if not isinstance(source_hex, str) or not isinstance(target_hex, str):
+            raise RuntimeError("template fill case-fold asset mappings must be strings")
+        try:
+            source = chr(int(source_hex, 16))
+            target = "".join(chr(int(item, 16)) for item in target_hex.split())
+        except (ValueError, OverflowError) as exc:
+            raise RuntimeError(f"template fill case-fold asset has invalid mapping {source_hex!r}") from exc
+        if not target or any(0xD800 <= ord(char) <= 0xDFFF for char in source + target):
+            raise RuntimeError(f"template fill case-fold asset has invalid scalar mapping {source_hex!r}")
+        parsed[source] = target
+    return parsed
+
+
+TEMPLATE_FILL_CASEFOLD_MAPPINGS = _load_template_fill_casefold_mappings(
+    TEMPLATE_FILL_CASEFOLD_ASSET_PATH
+)
+
+
 def _template_fill_casefold(value: str) -> str:
-    """Use Unicode Default full case folding for cross-runtime stem/collision checks."""
-    return value.casefold()
+    """Apply the vendored Unicode 15.0 Default full C+F mapping only."""
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        raise ValueError("template fill case-fold input must contain valid Unicode scalar values")
+    return "".join(TEMPLATE_FILL_CASEFOLD_MAPPINGS.get(char, char) for char in value)
 
 
 def _template_fill_manifest_source_name(entry: dict[str, Any], index: int) -> str | None:

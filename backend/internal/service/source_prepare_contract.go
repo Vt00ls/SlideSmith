@@ -79,7 +79,7 @@ func validateSourcePrepareContractWithSourceCount(projectPath, route string, man
 			conversionProfileCount++
 		}
 		if _, ok := pptxDeckExtensions[sourceFile.extension]; ok {
-			foldedStem := strings.ToLower(sourceFile.stem)
+			foldedStem := templateFillCaseFold(sourceFile.stem)
 			if previousFile, exists := pptxDeckFilesByFoldedStem[foldedStem]; exists {
 				return nil, fmt.Errorf(
 					"source prepare contract deck stem collision: %s and %s share case-folded stem %q",

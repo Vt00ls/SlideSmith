@@ -306,6 +306,21 @@ func TestValidateSourcePrepareContractRejectsCaseFoldedDuplicateDeckStems(t *tes
 	}
 }
 
+func TestValidateSourcePrepareContractRejectsPinnedUnicodeFoldDeckCollision(t *testing.T) {
+	projectPath := t.TempDir()
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "straße.pptx"), "pptx")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "STRASSE.pptm"), "pptm")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "content.md"), "# Content\n")
+
+	_, err := validateSourcePrepareContract(projectPath, model.TaskRouteMain)
+	if err == nil {
+		t.Fatal("validateSourcePrepareContract() error = nil, want Unicode full-fold deck stem collision")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "deck stem collision") {
+		t.Fatalf("error = %q, want clear deck stem collision", err)
+	}
+}
+
 func TestValidateSourcePrepareContractAcceptsReadableMainSources(t *testing.T) {
 	tests := []struct {
 		name string

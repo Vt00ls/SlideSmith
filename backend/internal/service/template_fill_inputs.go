@@ -2,15 +2,16 @@ package service
 
 import (
 	"crypto/sha256"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
-
-	"golang.org/x/text/cases"
+	"unicode/utf8"
 )
 
 type TemplateFillInputs struct {
@@ -331,8 +332,85 @@ func snapshotTemplateFillSourceProvenance(projectPath string) (templateFillSourc
 	return provenance, nil
 }
 
+const (
+	templateFillCaseFoldSchema         = "slidesmith.unicode_casefold.v1"
+	templateFillCaseFoldUnicodeVersion = "15.0.0"
+	templateFillCaseFoldSourceSHA256   = "cdd49e55eae3bbf1f0a3f6580c974a0263cb86a6a08daa10fbf705b4808a56f7"
+	templateFillCaseFoldAssetSHA256    = "11272a5b74c86e20065be587da38ef2291c08caec383908b3acbad8ed583feb1"
+	templateFillCaseFoldMappingCount   = 1530
+)
+
+type templateFillCaseFoldAssetDocument struct {
+	Schema          string            `json:"schema"`
+	UnicodeVersion  string            `json:"unicode_version"`
+	MappingStatuses []string          `json:"mapping_statuses"`
+	SourceSHA256    string            `json:"source_sha256"`
+	MappingCount    int               `json:"mapping_count"`
+	Mappings        map[string]string `json:"mappings"`
+}
+
+//go:embed unicode_casefold_15_0.json
+var templateFillCaseFoldAsset []byte
+
+var templateFillCaseFoldMappings = mustLoadTemplateFillCaseFoldMappings(templateFillCaseFoldAsset)
+
+func mustLoadTemplateFillCaseFoldMappings(raw []byte) map[rune]string {
+	if digest := fmt.Sprintf("%x", sha256.Sum256(raw)); digest != templateFillCaseFoldAssetSHA256 {
+		panic(fmt.Sprintf("template fill case-fold asset SHA-256 = %s, want %s", digest, templateFillCaseFoldAssetSHA256))
+	}
+	var asset templateFillCaseFoldAssetDocument
+	if err := json.Unmarshal(raw, &asset); err != nil {
+		panic(fmt.Sprintf("parse template fill case-fold asset: %v", err))
+	}
+	if asset.Schema != templateFillCaseFoldSchema ||
+		asset.UnicodeVersion != templateFillCaseFoldUnicodeVersion ||
+		asset.SourceSHA256 != templateFillCaseFoldSourceSHA256 ||
+		asset.MappingCount != templateFillCaseFoldMappingCount ||
+		len(asset.Mappings) != templateFillCaseFoldMappingCount ||
+		len(asset.MappingStatuses) != 2 ||
+		asset.MappingStatuses[0] != "C" || asset.MappingStatuses[1] != "F" {
+		panic("template fill case-fold asset metadata is invalid")
+	}
+
+	mappings := make(map[rune]string, len(asset.Mappings))
+	for sourceHex, targetHex := range asset.Mappings {
+		sourceValue, err := strconv.ParseUint(sourceHex, 16, 32)
+		if err != nil || !utf8.ValidRune(rune(sourceValue)) {
+			panic(fmt.Sprintf("template fill case-fold asset has invalid source %q", sourceHex))
+		}
+		var target strings.Builder
+		for _, item := range strings.Fields(targetHex) {
+			targetValue, err := strconv.ParseUint(item, 16, 32)
+			if err != nil || !utf8.ValidRune(rune(targetValue)) {
+				panic(fmt.Sprintf("template fill case-fold asset has invalid target %q", item))
+			}
+			target.WriteRune(rune(targetValue))
+		}
+		if target.Len() == 0 {
+			panic(fmt.Sprintf("template fill case-fold asset has empty target for %q", sourceHex))
+		}
+		mappings[rune(sourceValue)] = target.String()
+	}
+	return mappings
+}
+
 func templateFillCaseFold(value string) string {
-	return cases.Fold().String(value)
+	var folded strings.Builder
+	for len(value) > 0 {
+		r, size := utf8.DecodeRuneInString(value)
+		if r == utf8.RuneError && size == 1 {
+			folded.WriteByte(value[0])
+			value = value[1:]
+			continue
+		}
+		if mapped, ok := templateFillCaseFoldMappings[r]; ok {
+			folded.WriteString(mapped)
+		} else {
+			folded.WriteRune(r)
+		}
+		value = value[size:]
+	}
+	return folded.String()
 }
 
 func templateFillSourceManifestPaths(projectPath string) []templateFillManifestPath {

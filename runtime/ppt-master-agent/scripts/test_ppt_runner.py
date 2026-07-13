@@ -167,14 +167,53 @@ class PPTSourceStagingTests(IsolatedRunnerStateTestCase):
 
 
 class TemplateFillRunnerTests(IsolatedRunnerStateTestCase):
-    def test_template_fill_casefold_uses_unicode_default_full_folding(self) -> None:
-        self.assertEqual(
-            ppt_runner._template_fill_casefold("straße"),
-            ppt_runner._template_fill_casefold("STRASSE"),
+    def test_template_fill_casefold_uses_pinned_unicode_15_default_full_folding(self) -> None:
+        cases = {
+            "I": "i",
+            "İ": "i\u0307",
+            "ẞ": "ss",
+            "ﬃ": "ffi",
+            "Σ": "σ",
+            "ς": "σ",
+            "Ɤ": "Ɤ",
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(ppt_runner._template_fill_casefold(value), expected)
+        self.assertNotEqual(
+            ppt_runner._template_fill_casefold("Ɤ"),
+            ppt_runner._template_fill_casefold("ɤ"),
+            "Unicode 16 U+A7CB mapping leaked into pinned Unicode 15 folding",
         )
+
+    def test_template_fill_casefold_assets_and_full_scalar_corpus_are_pinned(self) -> None:
+        python_asset = ppt_runner.TEMPLATE_FILL_CASEFOLD_ASSET_PATH.read_bytes()
+        backend_asset = (
+            RUNNER_PATH.parents[3]
+            / "backend"
+            / "internal"
+            / "service"
+            / "unicode_casefold_15_0.json"
+        ).read_bytes()
+        self.assertEqual(python_asset, backend_asset)
         self.assertEqual(
-            ppt_runner._template_fill_casefold("Σ"),
-            ppt_runner._template_fill_casefold("ς"),
+            hashlib.sha256(python_asset).hexdigest(),
+            "11272a5b74c86e20065be587da38ef2291c08caec383908b3acbad8ed583feb1",
+        )
+        self.assertEqual(len(ppt_runner.TEMPLATE_FILL_CASEFOLD_MAPPINGS), 1530)
+
+        digest = hashlib.sha256()
+        for codepoint in range(0x110000):
+            if 0xD800 <= codepoint <= 0xDFFF:
+                continue
+            folded = ppt_runner._template_fill_casefold(chr(codepoint))
+            digest.update(codepoint.to_bytes(4, "big"))
+            digest.update(len(folded).to_bytes(1, "big"))
+            for target in folded:
+                digest.update(ord(target).to_bytes(4, "big"))
+        self.assertEqual(
+            digest.hexdigest(),
+            "e7b7267656504e1e9625b731d88c5fe9f669a0f4b07038e76caaf8296ce1769b",
         )
 
     def test_discover_template_fill_inputs_returns_every_runtime_path(self) -> None:
