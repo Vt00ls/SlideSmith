@@ -642,23 +642,39 @@ def capture_template_fill_safety_snapshot(
 
 
 def assert_template_fill_safety_unchanged(snapshot: dict[str, object]) -> None:
-    current = capture_template_fill_safety_snapshot(
-        snapshot["source_paths"],
-        external_root=snapshot["external_root"],
-        repository_state=snapshot["repository_state"],
-    )
     differences: list[str] = []
-    for label in (
-        "source fixtures",
-        "external ppt-master Git status",
-        "external ppt-master __pycache__",
-        "repository runtime .slidesmith",
-    ):
-        if current[label] != snapshot[label]:
+    component_captures = (
+        (
+            "source fixtures",
+            lambda: tuple(
+                (str(path), snapshot_filesystem_node(path))
+                for path in snapshot["source_paths"]
+            ),
+        ),
+        (
+            "external ppt-master Git status",
+            lambda: snapshot_git_status(snapshot["external_root"]),
+        ),
+        (
+            "external ppt-master __pycache__",
+            lambda: snapshot_external_pycache_manifest(snapshot["external_root"]),
+        ),
+        (
+            "repository runtime .slidesmith",
+            lambda: snapshot_tree_manifest(snapshot["repository_state"]),
+        ),
+    )
+    for label, capture_current in component_captures:
+        try:
+            current = capture_current()
+        except Exception as exc:
+            differences.append(f"{label} capture failed: {type(exc).__name__}: {exc}")
+            continue
+        if current != snapshot[label]:
             differences.append(
                 f"{label} changed\n"
                 f"  before: {snapshot[label]!r}\n"
-                f"  after:  {current[label]!r}"
+                f"  after:  {current!r}"
             )
     if differences:
         raise AssertionError("Template Fill smoke safety violation:\n" + "\n".join(differences))
@@ -849,6 +865,59 @@ class RealTemplateFillSafetyGuardTests(unittest.TestCase):
             self.assertIn("forced phase failure", diagnostics)
             self.assertIn("source fixtures", diagnostics)
             self.assertGreaterEqual(len(result.failures) + len(result.errors), 2)
+
+    def test_safety_finalizer_exhausts_checks_after_source_capture_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources, external_root, repository_state = self.make_safety_context(root)
+            fixture = sources[0]
+            repository_state.mkdir(parents=True)
+            state_file = repository_state / "status.json"
+            state_file.write_text('{"state":"before"}\n', encoding="utf-8")
+            pycache = external_root / "skills" / "scripts" / "__pycache__"
+            pycache.mkdir(parents=True)
+            cached_module = pycache / "module.pyc"
+            cached_module.write_bytes(b"before bytecode")
+            capture_fault = {"enabled": False}
+            real_snapshot_node = snapshot_filesystem_node
+
+            def snapshot_node_with_fault(path: Path) -> tuple[str, ...]:
+                if capture_fault["enabled"] and path == fixture:
+                    raise PermissionError("forced fixture capture denial")
+                return real_snapshot_node(path)
+
+            class ForcedPhaseFailure(unittest.TestCase):
+                def runTest(inner_self) -> None:
+                    patcher = mock.patch.object(
+                        sys.modules[__name__],
+                        "snapshot_filesystem_node",
+                        side_effect=snapshot_node_with_fault,
+                    )
+                    patcher.start()
+                    inner_self.addCleanup(patcher.stop)
+                    register_template_fill_safety_finalizer(
+                        inner_self,
+                        sources,
+                        external_root=external_root,
+                        repository_state=repository_state,
+                    )
+                    state_file.write_text('{"state":"after"}\n', encoding="utf-8")
+                    cached_module.write_bytes(b"after bytecode!")
+                    (external_root / "unexpected.txt").write_text("dirty\n", encoding="utf-8")
+                    capture_fault["enabled"] = True
+                    inner_self.fail("forced primary phase failure")
+
+            result = unittest.TestResult()
+            ForcedPhaseFailure().run(result)
+            diagnostics = "\n".join(
+                detail
+                for _, detail in [*result.failures, *result.errors]
+            )
+            self.assertIn("forced primary phase failure", diagnostics)
+            self.assertIn("external ppt-master Git status", diagnostics)
+            self.assertIn("external ppt-master __pycache__", diagnostics)
+            self.assertIn("repository runtime .slidesmith", diagnostics)
+            self.assertIn("source fixtures capture failed", diagnostics)
 
 
 @unittest.skipUnless(
