@@ -237,3 +237,44 @@ phase behavior, the approved plan-page lease and `replaceState`, Template Fill
 canonical-only publishing, and the blocked Beautify workflow remain intact.
 
 Remaining concerns: **0**.
+
+## Final whole-branch closure
+
+Three residual code waves followed the first whole-branch fix:
+
+- `c522da0acdc0ccaa84abdd984159e7334ce91e7b` — exact source provenance,
+  under-lock promotion fences, transactional artifact identity validation,
+  global exact-ID cleanup, and terminal cleanup-incomplete propagation.
+- `9713236a417fa542a1d94fcecc3abff3105c1894` — recursive typed companion-tree
+  provenance (including empty directories), nested mutation/symlink/special
+  node rejection, and exact Python manifest-path authorization.
+- `08a25a9bce60654ace60425daa85f0d2828463e2` — pinned Unicode 15.0 Default
+  full C+F folding for Go, Python, and source-prepare deck-stem collisions.
+  Both production assets are 37,895 bytes with SHA-256
+  `11272a5b74c86e20065be587da38ef2291c08caec383908b3acbad8ed583feb1`;
+  their official `CaseFolding.txt` source SHA-256 is
+  `cdd49e55eae3bbf1f0a3f6580c974a0263cb86a6a08daa10fbf705b4808a56f7`.
+
+The final immutable review package is:
+
+```text
+.superpowers/sdd/spec3-whole-branch-review-488356a..08a25a9.diff
+bytes: 992556
+SHA-256: c1831a54372e0ad160564f41e9826336472e637fafe068df54a51dc8fd1a1b6d
+```
+
+Formal final verdict: **Meets SPEC3; Ready; 0 Critical / 0 Important / 0
+Minor.** The independent residual review and the Unicode implementation review
+also reported `0/0/0` over their respective final deltas.
+
+Controller verification at `08a25a9` passed:
+
+- backend `go test ./... -count=1` and `go vet ./...`;
+- Python 40 tests with 4 expected gated/APFS skips;
+- fixed real Template Fill smoke with the approved plan/check SHA values,
+  32,119-byte PPTX, 569-byte readback, one slide, and zero validation errors;
+- frontend 23/23 executable regressions, typecheck, and production build;
+- clean repository status and unchanged read-only external checkout/fixture
+  hashes.
+
+Final remaining concerns: **0**.
