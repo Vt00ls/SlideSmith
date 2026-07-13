@@ -150,13 +150,22 @@ func validatePPTXExportContract(projectPath string) (map[string]any, error) {
 	return contract, nil
 }
 
-func buildPublishedArtifactsContract(projectPath string, storage StorageService, artifacts []model.Artifact, publishVersion string) (map[string]any, error) {
+func buildPublishedArtifactsContract(projectPath string, storage StorageService, artifacts []model.Artifact, publishVersion, route string) (map[string]any, error) {
 	if len(artifacts) == 0 {
 		return nil, fmt.Errorf("publish produced no platform artifacts")
 	}
-	expectedPageCount := confirmedPageCount(projectPath)
+	expectedPageCount, err := expectedPublishedSlideCount(projectPath, route)
+	if err != nil {
+		return nil, err
+	}
 	artifactReports := make([]map[string]any, 0, len(artifacts))
 	pptxCount := 0
+	requiredTemplateFillArtifacts := map[string]bool{}
+	if route == model.TaskRouteTemplateFill {
+		for _, kind := range templateFillRequiredPublishedArtifactKinds() {
+			requiredTemplateFillArtifacts[kind] = false
+		}
+	}
 	for _, artifact := range artifacts {
 		report, err := validateStoredArtifact(storage, artifact)
 		if err != nil {
@@ -176,10 +185,18 @@ func buildPublishedArtifactsContract(projectPath string, storage StorageService,
 			report["slide_count"] = slideCount
 			pptxCount++
 		}
+		if _, required := requiredTemplateFillArtifacts[artifact.Kind]; required {
+			requiredTemplateFillArtifacts[artifact.Kind] = true
+		}
 		artifactReports = append(artifactReports, report)
 	}
 	if pptxCount == 0 {
 		return nil, fmt.Errorf("published artifacts missing pptx")
+	}
+	for _, kind := range templateFillRequiredPublishedArtifactKinds() {
+		if route == model.TaskRouteTemplateFill && !requiredTemplateFillArtifacts[kind] {
+			return nil, fmt.Errorf("published artifacts missing required template fill artifact kind %s", kind)
+		}
 	}
 	manifest, hasManifest, err := readProjectRuntimeArtifactManifest(projectPath)
 	if err != nil {
@@ -189,17 +206,38 @@ func buildPublishedArtifactsContract(projectPath string, storage StorageService,
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
+	contract := map[string]any{
 		"phase":           string(PhasePublish),
 		"project_path":    projectPath,
 		"publish_version": publishVersion,
+		"route":           route,
 		"expected_pages":  expectedPageCount,
 		"artifact_count":  len(artifacts),
 		"pptx_count":      pptxCount,
 		"manifest":        manifestReport,
 		"artifacts":       artifactReports,
 		"checked_at":      time.Now().UTC().Format(time.RFC3339Nano),
-	}, nil
+	}
+	if route == model.TaskRouteTemplateFill {
+		contract["required_template_fill_artifacts"] = requiredTemplateFillArtifacts
+	}
+	return contract, nil
+}
+
+func expectedPublishedSlideCount(projectPath, route string) (int, error) {
+	if route == model.TaskRouteTemplateFill {
+		return templateFillExpectedSlideCount(projectPath)
+	}
+	return confirmedPageCount(projectPath), nil
+}
+
+func templateFillRequiredPublishedArtifactKinds() []string {
+	return []string{
+		model.ArtifactKindTemplateFillPlan,
+		model.ArtifactKindTemplateFillCheckReport,
+		model.ArtifactKindTemplateFillValidateReport,
+		model.ArtifactKindTemplateFillReadback,
+	}
 }
 
 func buildFinalTaskContract(projectPath string, publishContract map[string]any) map[string]any {

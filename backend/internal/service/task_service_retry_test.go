@@ -594,6 +594,73 @@ func TestProcessTaskContinuesFromPublishRetryAfterPlatformArtifactsDeleted(t *te
 	}
 }
 
+func TestProcessTaskCompletesTemplateFillPublishRetry(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+	task.FailurePhase = "publish.contract"
+	task.ErrorMessage = "template fill publish failed"
+	task.FailureMetadata = `{"phase":"publish.contract"}`
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "contracts", "publish.json"), "stale publish\n")
+	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "contracts", "final.json"), "stale final\n")
+
+	updated, err := service.RetryTask(context.Background(), task.ID, string(PhasePublish))
+	if err != nil {
+		t.Fatalf("RetryTask() error = %v", err)
+	}
+	if updated.Status != model.TaskStatusPublishing {
+		t.Fatalf("status = %q, want publishing", updated.Status)
+	}
+	assertPathMissing(t, filepath.Join(projectPath, ".slidesmith", "contracts", "publish.json"))
+	assertPathMissing(t, filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"))
+	assertPathExists(t, filepath.Join(projectPath, "analysis", "fill_plan.json"))
+	assertPathExists(t, filepath.Join(projectPath, "analysis", "check_report.json"))
+	assertPathExists(t, filepath.Join(projectPath, "validation", "validate_report.json"))
+	assertPathExists(t, filepath.Join(projectPath, "validation", "readback.md"))
+	assertPathExists(t, filepath.Join(projectPath, "exports", "result.pptx"))
+
+	if err := service.ProcessTask(context.Background(), task.ID); err != nil {
+		t.Fatalf("ProcessTask() error = %v", err)
+	}
+	latest, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.Status != model.TaskStatusCompleted || latest.CompletedAt == nil {
+		t.Fatalf("completed template fill publish retry = %#v", latest)
+	}
+	phaseRuns, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(phaseRuns) != 1 || phaseRuns[0].Phase != string(PhasePublish) || phaseRuns[0].Status != PhaseRunStatusSucceeded {
+		t.Fatalf("template fill publish retry should only run publish: %#v", phaseRuns)
+	}
+	artifacts, err := repo.ListArtifacts(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKinds := map[string]bool{
+		model.ArtifactKindTemplateFillPlan:           false,
+		model.ArtifactKindTemplateFillCheckReport:    false,
+		model.ArtifactKindTemplateFillValidateReport: false,
+		model.ArtifactKindTemplateFillReadback:       false,
+		model.ArtifactKindPPTX:                       false,
+	}
+	for _, artifact := range artifacts {
+		if _, ok := wantKinds[artifact.Kind]; ok {
+			wantKinds[artifact.Kind] = true
+		}
+	}
+	for kind, found := range wantKinds {
+		if !found {
+			t.Fatalf("template fill publish retry missing artifact kind %q: %#v", kind, artifacts)
+		}
+	}
+}
+
 func retryTestService(t *testing.T) (*TaskService, *repository.Repository, *model.Task, string) {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})

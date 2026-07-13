@@ -335,6 +335,7 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 	}{
 		{"sources", "source"},
 		{"analysis", "analysis"},
+		{"validation", "validation"},
 		{"design_spec.md", "design_spec.md"},
 		{"spec_lock.md", "spec_lock.md"},
 		{"svg_output", "svg_output"},
@@ -483,6 +484,14 @@ func artifactKindFromRuntimePath(path string) string {
 		return model.ArtifactKindSource
 	case lowerPath == "analysis/source_profile.json":
 		return model.ArtifactKindSourceProfile
+	case lowerPath == "analysis/fill_plan.json":
+		return model.ArtifactKindTemplateFillPlan
+	case lowerPath == "analysis/check_report.json":
+		return model.ArtifactKindTemplateFillCheckReport
+	case lowerPath == "validation/validate_report.json":
+		return model.ArtifactKindTemplateFillValidateReport
+	case lowerPath == "validation/readback.md":
+		return model.ArtifactKindTemplateFillReadback
 	case strings.HasPrefix(lowerPath, "analysis/") && strings.HasSuffix(lowerPath, ".identity.json"):
 		return model.ArtifactKindPPTXIdentity
 	case strings.HasPrefix(lowerPath, "analysis/") && strings.HasSuffix(lowerPath, ".slide_library.json"):

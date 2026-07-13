@@ -71,6 +71,10 @@ func TestFindGeneratedRuntimeWorkspaceCandidates(t *testing.T) {
 
 func TestProcessLegacyGenerateRecoveryFinishesSpecPhaseBeforeAdvancing(t *testing.T) {
 	service, repo, task, _, _ := newTemplateFillWorkflowService(t, model.TaskStatusSpecGenerating, &failedLegacyRecoveryAgent{})
+	task.Route = model.TaskRouteMain
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
 	recoveryRoot := t.TempDir()
 	service.agentCfg.SessionDataRoot = recoveryRoot
 	createPublishableRuntimeCandidate(t, recoveryRoot, "recovered-session", task.RuntimeProject+"_ppt169_20260713")
@@ -110,6 +114,10 @@ func TestProcessLegacyGenerateRecoveryFinishesSpecPhaseBeforeAdvancing(t *testin
 func TestLegacyGenerateRecoveryStopsWhenSpecPhaseCannotBeOwned(t *testing.T) {
 	agent := &failedLegacyRecoveryAgent{}
 	service, repo, task, _, _ := newTemplateFillWorkflowService(t, model.TaskStatusSpecGenerating, agent)
+	task.Route = model.TaskRouteMain
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
 	recoveryRoot := t.TempDir()
 	service.agentCfg.SessionDataRoot = recoveryRoot
 	createPublishableRuntimeCandidate(t, recoveryRoot, "recovered-session", task.RuntimeProject+"_ppt169_20260713")

@@ -134,6 +134,58 @@ func hasPublishedArtifactObjectRel(artifacts []model.Artifact, objectRel string)
 	return false
 }
 
+func TestArtifactKindFromRuntimePathTemplateFill(t *testing.T) {
+	tests := map[string]string{
+		"analysis/fill_plan.json":         model.ArtifactKindTemplateFillPlan,
+		"analysis/check_report.json":      model.ArtifactKindTemplateFillCheckReport,
+		"validation/validate_report.json": model.ArtifactKindTemplateFillValidateReport,
+		"validation/readback.md":          model.ArtifactKindTemplateFillReadback,
+	}
+	for path, want := range tests {
+		if got := artifactKindFromRuntimePath(path); got != want {
+			t.Fatalf("artifactKindFromRuntimePath(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestRuntimeWorkspacePublisherPublishesTemplateFillArtifacts(t *testing.T) {
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, "workspace")
+	project := filepath.Join(workspace, "projects", "task-template-fill")
+	mustWriteFile(t, filepath.Join(project, "analysis", "fill_plan.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "analysis", "check_report.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "validation", "validate_report.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "validation", "readback.md"), "## Slide 1\n")
+	mustWriteFile(t, filepath.Join(project, "exports", "result.pptx"), "pptx bytes\n")
+
+	publisher := NewRuntimeWorkspacePublisher(NewLocalStorage(filepath.Join(tmp, "storage")))
+	artifacts, err := publisher.Publish(context.Background(), "task-1", workspace, "v1")
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+	want := map[string]string{
+		"analysis/fill_plan.json":         model.ArtifactKindTemplateFillPlan,
+		"analysis/check_report.json":      model.ArtifactKindTemplateFillCheckReport,
+		"validation/validate_report.json": model.ArtifactKindTemplateFillValidateReport,
+		"validation/readback.md":          model.ArtifactKindTemplateFillReadback,
+	}
+	for rel, kind := range want {
+		var found *model.Artifact
+		for index := range artifacts {
+			if strings.HasSuffix(filepath.ToSlash(artifacts[index].ObjectKey), "/"+rel) {
+				found = &artifacts[index]
+				break
+			}
+		}
+		if found == nil {
+			t.Fatalf("published artifacts missing %s: %#v", rel, artifacts)
+		}
+		if found.Kind != kind {
+			t.Fatalf("artifact %s kind = %q, want %q", rel, found.Kind, kind)
+		}
+	}
+}
+
 func TestRuntimeWorkspacePublisherPublishesStage5Contract(t *testing.T) {
 	tmp := t.TempDir()
 	workspace := filepath.Join(tmp, "workspace")

@@ -644,16 +644,21 @@ func TestTemplateFillFormalCheckRejectsStaleReportAndPlanMutation(t *testing.T) 
 	}
 }
 
-func TestProcessQueuedTasksRunsConfirmedTemplateFillCheckApplyAndValidate(t *testing.T) {
+func TestProcessQueuedTasksRunsConfirmedTemplateFillCheckApplyValidateAndPublish(t *testing.T) {
 	agent := &templateFillWorkflowAgent{}
 	service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillChecking, agent)
 	agent.projectPath = projectPath
 	mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
+	mustWriteFileNoTest(projectPath, filepath.Join("analysis", "source_profile.json"), "{}\n")
+	mustWriteFileNoTest(projectPath, filepath.Join("analysis", "brand.identity.json"), "{}\n")
+	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "contracts", "source_prepare.json"), "{}\n")
+	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "contracts", "template_fill_plan.json"), "{}\n")
 
 	wantStatuses := []string{
 		model.TaskStatusTemplateFillApplying,
 		model.TaskStatusTemplateFillValidating,
 		model.TaskStatusPublishing,
+		model.TaskStatusCompleted,
 	}
 	for _, wantStatus := range wantStatuses {
 		processed, err := service.ProcessQueuedTasks(context.Background(), 1)
@@ -712,6 +717,138 @@ func TestProcessQueuedTasksRunsConfirmedTemplateFillCheckApplyAndValidate(t *tes
 	checkPhaseRun := requireSingleTemplateFillPhaseRun(t, repo, task.ID, PhaseTemplateFillCheck)
 	if !strings.Contains(checkPhaseRun.OutputJSON, `"plan_status":"confirmed"`) || !strings.Contains(checkPhaseRun.OutputJSON, `"plan_sha256":"`+planSHA+`"`) {
 		t.Fatalf("formal check phase evidence missing plan digest/status: %s", checkPhaseRun.OutputJSON)
+	}
+	publishPhaseRun := requireSingleTemplateFillPhaseRun(t, repo, task.ID, PhasePublish)
+	if publishPhaseRun.Status != PhaseRunStatusSucceeded || publishPhaseRun.Runner != PhaseRunnerPublisher {
+		t.Fatalf("publish phase run = %#v", publishPhaseRun)
+	}
+	updated, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != model.TaskStatusCompleted || updated.CompletedAt == nil {
+		t.Fatalf("completed template fill task = %#v", updated)
+	}
+	phaseRuns, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, phaseRun := range phaseRuns {
+		for _, forbidden := range []PipelinePhase{PhaseSpecGenerate, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport} {
+			if phaseRun.Phase == string(forbidden) {
+				t.Fatalf("template fill publish entered main-route phase %s: %#v", forbidden, phaseRuns)
+			}
+		}
+	}
+	for _, forbiddenPath := range []string{"design_spec.md", "spec_lock.md", "svg_output", "svg_final"} {
+		if _, err := os.Stat(filepath.Join(projectPath, forbiddenPath)); !os.IsNotExist(err) {
+			t.Fatalf("template fill publish created main-route path %s, err=%v", forbiddenPath, err)
+		}
+	}
+	artifacts, err := repo.ListArtifacts(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantKinds := map[string]bool{
+		model.ArtifactKindTemplateFillPlan:           false,
+		model.ArtifactKindTemplateFillCheckReport:    false,
+		model.ArtifactKindTemplateFillValidateReport: false,
+		model.ArtifactKindTemplateFillReadback:       false,
+		model.ArtifactKindPPTX:                       false,
+		model.ArtifactKindSource:                     false,
+		model.ArtifactKindSourceProfile:              false,
+		model.ArtifactKindPPTXIdentity:               false,
+		model.ArtifactKindPPTXSlideLibrary:           false,
+	}
+	wantObjectSuffixes := map[string]bool{
+		"/contracts/source_prepare.json":         false,
+		"/contracts/template_fill_plan.json":     false,
+		"/contracts/template_fill_check.json":    false,
+		"/contracts/template_fill_apply.json":    false,
+		"/contracts/template_fill_validate.json": false,
+		"/contracts/publish.json":                false,
+		"/contracts/final.json":                  false,
+	}
+	for _, artifact := range artifacts {
+		if _, ok := wantKinds[artifact.Kind]; ok {
+			wantKinds[artifact.Kind] = true
+		}
+		objectKey := filepath.ToSlash(artifact.ObjectKey)
+		for suffix := range wantObjectSuffixes {
+			if strings.HasSuffix(objectKey, suffix) {
+				wantObjectSuffixes[suffix] = true
+			}
+		}
+	}
+	for kind, found := range wantKinds {
+		if !found {
+			t.Fatalf("completed template fill artifacts missing kind %q: %#v", kind, artifacts)
+		}
+	}
+	for suffix, found := range wantObjectSuffixes {
+		if !found {
+			t.Fatalf("completed template fill artifacts missing %s: %#v", suffix, artifacts)
+		}
+	}
+}
+
+func TestTemplateFillPublishRejectsMissingKindBeforePersistence(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+	if err := os.Remove(filepath.Join(projectPath, "validation", "readback.md")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := service.ProcessTask(context.Background(), task.ID)
+	if err == nil {
+		t.Fatal("ProcessTask() error = nil, want missing readback rejection")
+	}
+	if !strings.Contains(err.Error(), model.ArtifactKindTemplateFillReadback) {
+		t.Fatalf("ProcessTask() error = %q, want missing readback kind", err)
+	}
+	updated, getErr := repo.GetTask(context.Background(), task.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "publish" {
+		t.Fatalf("failed template fill publish = %#v", updated)
+	}
+	var publishedCount int64
+	if err := repo.DB().Model(&model.Artifact{}).Where("task_id = ? AND publish_version <> ''", task.ID).Count(&publishedCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if publishedCount != 0 {
+		t.Fatalf("pre-persistence rejection stored %d artifacts, want 0", publishedCount)
+	}
+}
+
+func TestTemplateFillPublishRechecksRequiredKindsAfterPersistence(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+	prepareTemplateFillPublishedProjectForTest(t, projectPath, 3)
+	if err := repo.DB().Exec(`
+		CREATE TRIGGER corrupt_template_fill_readback_kind
+		AFTER INSERT ON artifacts
+		WHEN NEW.kind = 'template_fill_readback'
+		BEGIN
+			UPDATE artifacts SET kind = 'other' WHERE id = NEW.id;
+		END;
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	err := service.ProcessTask(context.Background(), task.ID)
+	if err == nil {
+		t.Fatal("ProcessTask() error = nil, want post-persistence readback rejection")
+	}
+	if !strings.Contains(err.Error(), "final persisted artifact check failed") || !strings.Contains(err.Error(), model.ArtifactKindTemplateFillReadback) {
+		t.Fatalf("ProcessTask() error = %q, want route-aware persisted readback rejection", err)
+	}
+	updated, getErr := repo.GetTask(context.Background(), task.ID)
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if updated.Status != model.TaskStatusFailed || updated.FailurePhase != "publish" {
+		t.Fatalf("failed template fill persisted recheck = %#v", updated)
 	}
 }
 

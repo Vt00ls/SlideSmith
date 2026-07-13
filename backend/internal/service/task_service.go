@@ -2432,8 +2432,11 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 			ProjectPath: projectPath,
 		})
 	}
+	if task.Route == model.TaskRouteTemplateFill && workspace != nil {
+		addRoot(workspace.HostDir, "task_workspace", "", "")
+	}
 	addRoot(task.RuntimeWorkspacePath, "task_runtime_workspace", task.LastRuntimeSessionID, "")
-	if workspace != nil {
+	if task.Route != model.TaskRouteTemplateFill && workspace != nil {
 		addRoot(workspace.HostDir, "task_workspace", "", "")
 	}
 	if candidates, err := s.findGeneratedRuntimeWorkspaceCandidates(ctx, task); err == nil {
@@ -2465,7 +2468,7 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 			lastErr = fmt.Errorf("published runtime project path not found for workspace %s", root.Path)
 			continue
 		}
-		publishContract, err := buildPublishedArtifactsContract(projectPath, s.storage, published, publishVersion)
+		publishContract, err := buildPublishedArtifactsContract(projectPath, s.storage, published, publishVersion, task.Route)
 		if err != nil {
 			lastErr = err
 			continue
@@ -2510,7 +2513,7 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 		if len(persisted) != len(published) {
 			return nil, fmt.Errorf("persisted artifact count = %d, expected %d", len(persisted), len(published))
 		}
-		if _, err := buildPublishedArtifactsContract(projectPath, s.storage, persisted, publishVersion); err != nil {
+		if _, err := buildPublishedArtifactsContract(projectPath, s.storage, persisted, publishVersion, task.Route); err != nil {
 			return nil, fmt.Errorf("final persisted artifact check failed: %w", err)
 		}
 		contract := map[string]any{
