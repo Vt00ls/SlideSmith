@@ -47,6 +47,9 @@ async function loadAppHelpersModule() {
     "completedTaskRoute",
     "visibleTaskArtifacts",
     "loadPreviewPageData",
+    "previewPageKey",
+    "createPreviewPageState",
+    "previewPageStateForTask",
   ]);
   const declarations = [];
   const found = new Set();
@@ -515,6 +518,54 @@ test("direct preview canonicalization fetches task first, skips Template Fill ar
   assert.deepEqual(staleReplacements, [], "an unmounted preview cannot hijack later navigation");
 });
 
+test("preview task switches reset main A state before Template Fill B resolves or fails", async () => {
+  const {
+    createPreviewPageState,
+    loadPreviewPageData,
+    previewPageKey,
+    previewPageStateForTask,
+    taskRouteMatches,
+  } = await loadAppHelpersModule();
+
+  const loadedA = {
+    ...createPreviewPageState("task-a"),
+    task: { id: "task-a", title: "Main A", route: "main" },
+    artifacts: [
+      { id: "svg-a", kind: "svg_final", name: "A.svg" },
+      { id: "pptx-a", kind: "pptx", name: "A.pptx" },
+    ],
+    selectedId: "svg-a",
+  };
+  assert.notEqual(previewPageKey("task-a"), previewPageKey("task-b"));
+  assert.deepEqual(
+    previewPageStateForTask(loadedA, "task-b"),
+    createPreviewPageState("task-b"),
+    "B URL must synchronously hide A metadata, artifacts, and selection",
+  );
+
+  let rejectTaskB;
+  const routeB = { name: "preview", id: "task-b" };
+  const pendingB = loadPreviewPageData(
+    "task-b",
+    () => new Promise((_, reject) => {
+      rejectTaskB = reject;
+    }),
+    async () => assert.fail("failed B task fetch must not request artifacts"),
+    () => taskRouteMatches(routeB, "preview", "task-b"),
+    () => assert.fail("failed B task fetch must not redirect"),
+  );
+  const pendingState = previewPageStateForTask(loadedA, "task-b");
+  assert.equal(pendingState.task, null);
+  assert.deepEqual(pendingState.artifacts, []);
+  assert.equal(pendingState.selectedId, "");
+  rejectTaskB(new Error("task B unavailable"));
+  await assert.rejects(pendingB, /task B unavailable/);
+  const failedB = { ...createPreviewPageState("task-b"), error: "task B unavailable" };
+  assert.equal(failedB.task, null);
+  assert.deepEqual(failedB.artifacts, []);
+  assert.equal(failedB.selectedId, "");
+});
+
 test("Template Fill component uses production helpers and required actions", () => {
   const app = appFunctionSource("App");
   const page = appFunctionSource("TemplateFillPlanPage");
@@ -538,6 +589,9 @@ test("Template Fill component uses production helpers and required actions", () 
   assert.match(detail, /completedTaskRoute\s*\(/);
   assert.match(detail, /taskRoute !== "template-fill"[\s\S]*?<span>SVG<\/span>/);
   assert.match(previewPage, /loadPreviewPageData\([\s\S]*?replaceRoute/);
+  assert.match(app, /route\.name === "preview"[\s\S]*?<PreviewPage key=\{previewPageKey\(route\.id\)\} taskId=\{route\.id\}/);
+  assert.match(previewPage, /previewPageStateForTask\(state, taskId\)/);
+  assert.match(previewPage, /catch \(err\)[\s\S]*?setState\(\{[\s\S]*?createPreviewPageState\(taskId\)/);
   assert.match(previewPage, /taskRouteMatches\(parseRoute\(\), "preview", taskId\)/);
   assert.match(previewPage, /catch \(err\)[\s\S]*?active && taskRouteMatches\(parseRoute\(\), "preview", taskId\)/);
   assert.match(previewPage, /return \(\) => \{\s*active = false;/);

@@ -355,6 +355,24 @@ async function loadPreviewPageData<TTask extends Pick<Task, "id" | "route">, TAr
   return { task, artifacts };
 }
 
+function previewPageKey(taskId: string) {
+  return `preview:${taskId}`;
+}
+
+function createPreviewPageState(taskId: string) {
+  return {
+    taskId,
+    task: null as Task | null,
+    artifacts: [] as Artifact[],
+    selectedId: "",
+    error: "",
+  };
+}
+
+function previewPageStateForTask(state: ReturnType<typeof createPreviewPageState>, taskId: string) {
+  return state.taskId === taskId ? state : createPreviewPageState(taskId);
+}
+
 function templateFillNextPhase(status: TaskStatus) {
   switch (status) {
     case "template_fill_planning":
@@ -451,7 +469,9 @@ export function App() {
         {route.name === "templateFill" && (
           <TemplateFillPlanPage key={templateFillPageKey(route.id)} taskId={route.id} />
         )}
-        {route.name === "preview" && <PreviewPage taskId={route.id} />}
+        {route.name === "preview" && (
+          <PreviewPage key={previewPageKey(route.id)} taskId={route.id} />
+        )}
       </main>
     </div>
   );
@@ -1887,10 +1907,8 @@ function SpecFilePanel({ file, title }: { file: SpecPreview["design_spec"]; titl
 }
 
 function PreviewPage({ taskId }: { taskId: string }) {
-  const [task, setTask] = useState<Task | null>(null);
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [selectedId, setSelectedId] = useState("");
-  const [error, setError] = useState("");
+  const [state, setState] = useState(() => createPreviewPageState(taskId));
+  const visibleState = previewPageStateForTask(state, taskId);
 
   useEffect(() => {
     let active = true;
@@ -1908,13 +1926,19 @@ function PreviewPage({ taskId }: { taskId: string }) {
         }
         const { task: nextTask, artifacts: nextArtifacts } = result;
         const svg = nextArtifacts.filter((artifact) => artifact.kind === "svg_final");
-        setTask(nextTask);
-        setArtifacts(nextArtifacts);
-        setSelectedId((current) => current || svg[0]?.id || "");
-        setError("");
+        setState({
+          taskId,
+          task: nextTask,
+          artifacts: nextArtifacts,
+          selectedId: svg[0]?.id || "",
+          error: "",
+        });
       } catch (err) {
         if (active && taskRouteMatches(parseRoute(), "preview", taskId)) {
-          setError(err instanceof Error ? err.message : String(err));
+          setState({
+            ...createPreviewPageState(taskId),
+            error: err instanceof Error ? err.message : String(err),
+          });
         }
       }
     }
@@ -1924,15 +1948,15 @@ function PreviewPage({ taskId }: { taskId: string }) {
     };
   }, [taskId]);
 
-  const svgArtifacts = artifacts.filter((artifact) => artifact.kind === "svg_final");
-  const selected = svgArtifacts.find((artifact) => artifact.id === selectedId) || svgArtifacts[0];
-  const pptx = artifacts.find((artifact) => artifact.kind === "pptx");
+  const svgArtifacts = visibleState.artifacts.filter((artifact) => artifact.kind === "svg_final");
+  const selected = svgArtifacts.find((artifact) => artifact.id === visibleState.selectedId) || svgArtifacts[0];
+  const pptx = visibleState.artifacts.find((artifact) => artifact.kind === "pptx");
 
   return (
     <section className="page preview-page">
       <PageHeader
         title="预览与下载"
-        subtitle={task?.title || taskId}
+        subtitle={visibleState.task?.title || taskId}
         actions={
           <>
             <button className="secondary-button" onClick={() => go({ name: "task", id: taskId })}>
@@ -1947,14 +1971,16 @@ function PreviewPage({ taskId }: { taskId: string }) {
         }
       />
 
-      {error && <InlineState icon={<XCircle size={18} />} text={error} bad />}
+      {visibleState.error && <InlineState icon={<XCircle size={18} />} text={visibleState.error} bad />}
       <div className="preview-layout">
         <div className="slide-rail">
           {svgArtifacts.map((artifact, index) => (
             <button
               className={artifact.id === selected?.id ? "slide-thumb active" : "slide-thumb"}
               key={artifact.id}
-              onClick={() => setSelectedId(artifact.id)}
+              onClick={() => setState((current) => current.taskId === taskId
+                ? { ...current, selectedId: artifact.id }
+                : current)}
             >
               <span>{String(index + 1).padStart(2, "0")}</span>
               <small>{artifact.name}</small>
