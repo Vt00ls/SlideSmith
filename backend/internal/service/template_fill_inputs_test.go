@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -82,6 +83,183 @@ func TestDiscoverTemplateFillInputsPreservesExplicitSameStemMarkdown(t *testing.
 	if !reflect.DeepEqual(inputs.ContentSources, want) {
 		t.Fatalf("ContentSources = %#v, want explicitly uploaded same-stem Markdown %#v", inputs.ContentSources, want)
 	}
+}
+
+func TestTemplateFillProvenanceKeepsExactCaseAuthorizationAndFingerprintsGeneratedReadback(t *testing.T) {
+	workspacePath := t.TempDir()
+	if !supportsCaseSensitiveTemplateFillTestPaths(t, workspacePath) {
+		t.Skip("filesystem does not support distinct case-sensitive filenames")
+	}
+	projectPath := filepath.Join(workspacePath, "projects", "brand_project")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "Brand.pptx"), "pptx")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand.md"), "# Explicit upload\n")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "Brand.md"), "# Generated readback\n")
+	mustWriteFileNoTest(projectPath, filepath.Join("analysis", "Brand.slide_library.json"), `{"slides":[]}`+"\n")
+	mustWriteFileNoTest(workspacePath, filepath.Join(".slidesmith", "source_inputs.json"), `{
+  "schema": "slidesmith.source_inputs.v1",
+  "files": [
+    {"name": "Brand.pptx", "upload_path": "uploads/task-1/Brand.pptx"},
+    {"name": "brand.md", "upload_path": "uploads/task-1/brand.md"}
+  ]
+}`+"\n")
+
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !provenance.hasBoundSource("sources/brand.md") {
+		t.Fatal("exact uploaded sources/brand.md was not authorized")
+	}
+	if provenance.hasBoundSource("sources/Brand.md") {
+		t.Fatal("generated sources/Brand.md was authorized by a case-folded claim")
+	}
+	for _, relativePath := range []string{"sources/Brand.pptx", "sources/brand.md", "sources/Brand.md"} {
+		if _, ok := provenance.sources[relativePath]; !ok {
+			t.Fatalf("provenance omitted exact fingerprint %s: %#v", relativePath, provenance.sources)
+		}
+	}
+
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantContent := filepath.Join(mustCanonicalTemplateFillTestPath(t, projectPath), "sources", "brand.md")
+	if !reflect.DeepEqual(inputs.ContentSources, []string{wantContent}) {
+		t.Fatalf("ContentSources = %#v, want only exact upload %s", inputs.ContentSources, wantContent)
+	}
+
+	candidateProject := filepath.Join(t.TempDir(), "candidate")
+	if err := copyProjectDirectoryStrict(context.Background(), projectPath, candidateProject); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFileNoTest(candidateProject, filepath.Join("sources", "Brand.md"), "# Mutated generated readback\n")
+	if err := provenance.validateCandidate(candidateProject); err == nil || !strings.Contains(err.Error(), "sources/Brand.md") {
+		t.Fatalf("validateCandidate() error = %v, want exact generated readback mutation fence", err)
+	}
+}
+
+func TestTemplateFillProvenanceValidateCandidateRejectsChangedSourceInventory(t *testing.T) {
+	projectPath := t.TempDir()
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "Brand.pptx"), "pptx")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "content.md"), "# Content\n")
+
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		mutate     func(t *testing.T, candidateProject string)
+		wantSource string
+	}{
+		{
+			name: "extra exact-case source",
+			mutate: func(t *testing.T, candidateProject string) {
+				mustWriteFileNoTest(candidateProject, filepath.Join("sources", "Extra.md"), "# Extra\n")
+			},
+			wantSource: "sources/Extra.md",
+		},
+		{
+			name: "missing exact-case source",
+			mutate: func(t *testing.T, candidateProject string) {
+				t.Helper()
+				if err := os.Remove(filepath.Join(candidateProject, "sources", "content.md")); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantSource: "sources/content.md",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidateProject := filepath.Join(t.TempDir(), "candidate")
+			if err := copyProjectDirectoryStrict(context.Background(), projectPath, candidateProject); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, candidateProject)
+
+			if err := provenance.validateCandidate(candidateProject); err == nil || !strings.Contains(err.Error(), test.wantSource) {
+				t.Fatalf("validateCandidate() error = %v, want changed inventory rejection naming %s", err, test.wantSource)
+			}
+		})
+	}
+}
+
+func TestTemplateFillProvenanceRejectsAmbiguousManifestClaims(t *testing.T) {
+	tests := []struct {
+		name      string
+		filesJSON string
+		want      string
+	}{
+		{
+			name: "duplicate exact source across entries",
+			filesJSON: `[
+        {"name":"brand.md","upload_path":"uploads/task-1/brand.md"},
+        {"name":"brand.md","upload_path":"uploads/task-1/brand.md"}
+      ]`,
+			want: "duplicate",
+		},
+		{
+			name: "case fold collision",
+			filesJSON: `[
+        {"name":"brand.md","upload_path":"uploads/task-1/brand.md"},
+        {"name":"Brand.md","upload_path":"uploads/task-1/Brand.md"}
+      ]`,
+			want: "case-fold",
+		},
+		{
+			name: "unicode case fold collision",
+			filesJSON: `[
+        {"name":"Σ.md","upload_path":"uploads/task-1/Σ.md"},
+        {"name":"ς.md","upload_path":"uploads/task-1/ς.md"}
+      ]`,
+			want: "case-fold",
+		},
+		{
+			name:      "one entry authorizes different basenames",
+			filesJSON: `[{"name":"brand.md","upload_path":"uploads/task-1/other.md"}]`,
+			want:      "ambiguous",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			workspacePath := t.TempDir()
+			projectPath := filepath.Join(workspacePath, "projects", "brand_project")
+			mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand.pptx"), "pptx")
+			mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand.md"), "# Content\n")
+			mustWriteFileNoTest(projectPath, filepath.Join("sources", "other.md"), "# Other\n")
+			mustWriteFileNoTest(projectPath, filepath.Join("analysis", "brand.slide_library.json"), `{"slides":[]}`+"\n")
+			mustWriteFileNoTest(workspacePath, filepath.Join(".slidesmith", "source_inputs.json"), `{
+  "schema":"slidesmith.source_inputs.v1",
+  "files":`+test.filesJSON+`
+}`+"\n")
+
+			_, err := snapshotTemplateFillSourceProvenance(projectPath)
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), test.want) {
+				t.Fatalf("snapshotTemplateFillSourceProvenance() error = %v, want %q rejection", err, test.want)
+			}
+		})
+	}
+}
+
+func supportsCaseSensitiveTemplateFillTestPaths(t *testing.T, root string) bool {
+	t.Helper()
+	probeDir := filepath.Join(root, "case-sensitive-probe")
+	if err := os.MkdirAll(probeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	upper := filepath.Join(probeDir, "Probe")
+	lower := filepath.Join(probeDir, "probe")
+	if err := os.WriteFile(upper, []byte("upper"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lower, []byte("lower"), 0o644); err != nil {
+		return false
+	}
+	upperRaw, upperErr := os.ReadFile(upper)
+	lowerRaw, lowerErr := os.ReadFile(lower)
+	return upperErr == nil && lowerErr == nil && string(upperRaw) == "upper" && string(lowerRaw) == "lower"
 }
 
 func TestDiscoverTemplateFillInputsCanonicalizesIntermediateProjectSymlink(t *testing.T) {

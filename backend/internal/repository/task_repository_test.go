@@ -95,6 +95,128 @@ func TestReplaceArtifactsByObjectKeyPrefixDoesNotMutateCallerOnRollback(t *testi
 	}
 }
 
+func TestReplaceArtifactsByObjectKeyPrefixRollsBackPersistedIdentityDrift(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Artifact{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	ctx := context.Background()
+	unrelatedB := &model.Artifact{ID: "unrelated-b", TaskID: "task-b", Kind: model.ArtifactKindPPTX, ObjectKey: "tasks/task-b/artifacts/v-old/exports/old.pptx", PublishVersion: "v-old"}
+	oldA := &model.Artifact{ID: "old-a", TaskID: "task-a", Kind: model.ArtifactKindPPTX, ObjectKey: "tasks/task-a/artifacts/v-old/exports/old.pptx", PublishVersion: "v-old"}
+	for _, artifact := range []*model.Artifact{unrelatedB, oldA} {
+		if err := repo.CreateArtifact(ctx, artifact); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Exec(`
+		CREATE TRIGGER mutate_new_publish_identity
+		AFTER INSERT ON artifacts
+		WHEN NEW.id = 'attempt-a'
+		BEGIN
+			UPDATE artifacts
+			SET task_id = 'task-b',
+				publish_version = 'v-mutated',
+				kind = 'other',
+				object_key = 'tasks/task-b/artifacts/v-mutated/hijacked.bin'
+			WHERE id = NEW.id;
+		END;
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+	replacements := []model.Artifact{{
+		ID:             "attempt-a",
+		TaskID:         "task-a",
+		Kind:           model.ArtifactKindPPTX,
+		ObjectKey:      "tasks/task-a/artifacts/v-new/exports/new.pptx",
+		PublishVersion: "v-new",
+	}}
+	prefix := "tasks/task-a/artifacts/v-new/"
+
+	err = repo.ReplaceArtifactsByObjectKeyPrefix(ctx, "task-a", prefix, replacements)
+	if err == nil || !strings.Contains(err.Error(), "persisted artifact") {
+		t.Fatalf("ReplaceArtifactsByObjectKeyPrefix() error = %v, want persisted identity drift rejection", err)
+	}
+	var attemptCount int64
+	if err := db.Model(&model.Artifact{}).Where("id = ?", "attempt-a").Count(&attemptCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attemptCount != 0 {
+		t.Fatalf("drifted attempt row count = %d, want transaction rollback", attemptCount)
+	}
+	for _, id := range []string{unrelatedB.ID, oldA.ID} {
+		var count int64
+		if err := db.Model(&model.Artifact{}).Where("id = ?", id).Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("unrelated/old row %s count = %d, want 1", id, count)
+		}
+	}
+}
+
+func TestDeleteArtifactsByIDsOrObjectKeyPrefixUsesGlobalExactIDsAndTaskScopedPrefix(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Artifact{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	ctx := context.Background()
+	artifacts := []*model.Artifact{
+		{ID: "moved-attempt", TaskID: "task-b", ObjectKey: "tasks/task-b/artifacts/v-mutated/hijacked.bin"},
+		{ID: "unrelated-b", TaskID: "task-b", ObjectKey: "tasks/task-b/artifacts/v-old/keep.bin"},
+		{ID: "prefix-a", TaskID: "task-a", ObjectKey: "tasks/task-a/artifacts/v-new/a.bin"},
+		{ID: "prefix-b", TaskID: "task-b", ObjectKey: "tasks/task-a/artifacts/v-new/b.bin"},
+		{ID: "moved-combined", TaskID: "task-b", ObjectKey: "tasks/task-b/artifacts/v-mutated/combined.bin"},
+		{ID: "prefix-combined-a", TaskID: "task-a", ObjectKey: "tasks/task-a/artifacts/v-combined/a.bin"},
+		{ID: "prefix-combined-b", TaskID: "task-b", ObjectKey: "tasks/task-a/artifacts/v-combined/b.bin"},
+	}
+	for _, artifact := range artifacts {
+		if err := repo.CreateArtifact(ctx, artifact); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := repo.DeleteArtifactsByIDsOrObjectKeyPrefix(ctx, "task-a", "", []string{"moved-attempt"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.DeleteArtifactsByIDsOrObjectKeyPrefix(ctx, "task-a", "tasks/task-a/artifacts/v-new/", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.DeleteArtifactsByIDsOrObjectKeyPrefix(
+		ctx,
+		"task-a",
+		"tasks/task-a/artifacts/v-combined/",
+		[]string{"moved-combined"},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	wantPresent := map[string]bool{
+		"moved-attempt":     false,
+		"unrelated-b":       true,
+		"prefix-a":          false,
+		"prefix-b":          true,
+		"moved-combined":    false,
+		"prefix-combined-a": false,
+		"prefix-combined-b": true,
+	}
+	for id, present := range wantPresent {
+		var count int64
+		if err := db.Model(&model.Artifact{}).Where("id = ?", id).Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if (count == 1) != present {
+			t.Fatalf("artifact %s count = %d, want present=%v", id, count, present)
+		}
+	}
+}
+
 func TestReplaceArtifactsByObjectKeyPrefixKeepsUploadedSources(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	if err != nil {

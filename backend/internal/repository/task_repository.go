@@ -319,6 +319,38 @@ func (r *Repository) ReplaceArtifactsByObjectKeyPrefix(ctx context.Context, task
 				return err
 			}
 		}
+		if len(persisted) == 0 {
+			return nil
+		}
+		ids := make([]string, len(persisted))
+		for i := range persisted {
+			ids[i] = persisted[i].ID
+		}
+		var reloaded []model.Artifact
+		if err := tx.Where("id IN ?", ids).Find(&reloaded).Error; err != nil {
+			return fmt.Errorf("reload persisted artifacts: %w", err)
+		}
+		if len(reloaded) != len(persisted) {
+			return fmt.Errorf("persisted artifact count = %d, want %d", len(reloaded), len(persisted))
+		}
+		byID := make(map[string]model.Artifact, len(reloaded))
+		for _, artifact := range reloaded {
+			byID[artifact.ID] = artifact
+		}
+		for i, expected := range persisted {
+			actual, ok := byID[expected.ID]
+			if !ok {
+				return fmt.Errorf("persisted artifact %q is missing", expected.ID)
+			}
+			if actual.ID != expected.ID ||
+				actual.TaskID != expected.TaskID ||
+				actual.ObjectKey != expected.ObjectKey ||
+				actual.PublishVersion != expected.PublishVersion ||
+				actual.Kind != expected.Kind {
+				return fmt.Errorf("persisted artifact %q identity does not match inserted artifact", expected.ID)
+			}
+			persisted[i] = actual
+		}
 		return nil
 	})
 	if err != nil {
@@ -382,17 +414,23 @@ func (r *Repository) DeleteArtifactsByIDsOrObjectKeyPrefix(ctx context.Context, 
 		return fmt.Errorf("artifact cleanup identity is empty")
 	}
 
-	query := r.db.WithContext(ctx).Where("task_id = ?", taskID)
+	query := r.db.WithContext(ctx)
 	switch {
 	case objectKeyPrefix != "" && len(ids) > 0:
 		query = query.Where(
-			"id IN ? OR substr(object_key, 1, ?) = ?",
+			"id IN ? OR (task_id = ? AND substr(object_key, 1, ?) = ?)",
 			ids,
+			taskID,
 			len(objectKeyPrefix),
 			objectKeyPrefix,
 		)
 	case objectKeyPrefix != "":
-		query = query.Where("substr(object_key, 1, ?) = ?", len(objectKeyPrefix), objectKeyPrefix)
+		query = query.Where(
+			"task_id = ? AND substr(object_key, 1, ?) = ?",
+			taskID,
+			len(objectKeyPrefix),
+			objectKeyPrefix,
+		)
 	default:
 		query = query.Where("id IN ?", ids)
 	}

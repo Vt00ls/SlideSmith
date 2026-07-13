@@ -633,6 +633,184 @@ func TestMainRoutePublishStillPrefersRuntimeWorkspaceCandidate(t *testing.T) {
 	t.Fatalf("published artifacts missing design spec: %#v", artifacts)
 }
 
+func TestMainRoutePublishCleanupFailureStopsFallback(t *testing.T) {
+	service, repo, task, canonicalProject := retryTestService(t)
+	mustWriteRetryProjectFiles(canonicalProject)
+	mustWriteFileNoTest(canonicalProject, filepath.Join("logs", "second-root-only.log"), "second\n")
+
+	runtimeWorkspace := filepath.Join(t.TempDir(), "runtime-workspace")
+	runtimeProject := filepath.Join(runtimeWorkspace, "projects", task.RuntimeProject+"_ppt169_20260713")
+	mustWriteRetryProjectFiles(runtimeProject)
+	mustWritePPTXNoTest(runtimeProject, filepath.Join("exports", "stale.pptx"), 2)
+	mustWriteFileNoTest(runtimeProject, filepath.Join("logs", "first-root-only.log"), "first\n")
+	task.Status = model.TaskStatusPublishing
+	task.Route = model.TaskRouteMain
+	task.RuntimeWorkspacePath = runtimeWorkspace
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	local, ok := service.storage.(*LocalStorage)
+	if !ok {
+		t.Fatalf("storage = %T, want *LocalStorage", service.storage)
+	}
+	tracking := &publishCleanupTrackingStorage{
+		StorageService:     local,
+		failDeleteContains: "/logs/first-root-only.log",
+	}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
+
+	err := service.ProcessTask(context.Background(), task.ID)
+	for _, want := range []string{
+		"has 2 slides, expected 3",
+		"injected publish object cleanup failure",
+	} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("ProcessTask() error = %v, want %q", err, want)
+		}
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusFailed || persisted.FailurePhase != "publish" {
+		t.Fatalf("task after cleanup-incomplete publish = %#v", persisted)
+	}
+	artifacts, err := repo.ListArtifacts(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(artifacts) != 0 {
+		t.Fatalf("cleanup-incomplete publish persisted artifacts: %#v", artifacts)
+	}
+	firstMarker := ""
+	for _, objectKey := range tracking.copiedObjectKeys {
+		switch {
+		case strings.Contains(objectKey, "/logs/first-root-only.log"):
+			firstMarker = objectKey
+		case strings.Contains(objectKey, "/logs/second-root-only.log"):
+			t.Fatalf("cleanup-incomplete first root fell back to second root: %#v", tracking.copiedObjectKeys)
+		}
+	}
+	if firstMarker == "" {
+		t.Fatalf("first-root marker was not copied: %#v", tracking.copiedObjectKeys)
+	}
+	if _, statErr := os.Stat(local.Path(firstMarker)); statErr != nil {
+		t.Fatalf("failed-delete first-root orphan %s not observable: %v", firstMarker, statErr)
+	}
+}
+
+func TestMainRoutePublishStillFallsBackAfterCompleteFailedRootCleanup(t *testing.T) {
+	service, _, task, canonicalProject := retryTestService(t)
+	mustWriteRetryProjectFiles(canonicalProject)
+	mustWriteFileNoTest(canonicalProject, filepath.Join("logs", "second-root-only.log"), "second\n")
+
+	runtimeWorkspace := filepath.Join(t.TempDir(), "runtime-workspace")
+	runtimeProject := filepath.Join(runtimeWorkspace, "projects", task.RuntimeProject+"_ppt169_20260713")
+	mustWriteRetryProjectFiles(runtimeProject)
+	mustWritePPTXNoTest(runtimeProject, filepath.Join("exports", "stale.pptx"), 2)
+	mustWriteFileNoTest(runtimeProject, filepath.Join("logs", "first-root-only.log"), "first\n")
+	task.Route = model.TaskRouteMain
+	task.RuntimeWorkspacePath = runtimeWorkspace
+
+	local, ok := service.storage.(*LocalStorage)
+	if !ok {
+		t.Fatalf("storage = %T, want *LocalStorage", service.storage)
+	}
+	tracking := &publishCleanupTrackingStorage{StorageService: local}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
+	contract, err := service.publishRuntimeArtifacts(context.Background(), task, service.resolveTaskWorkspace(task))
+	if err != nil {
+		t.Fatalf("publishRuntimeArtifacts() error = %v, want fallback after complete cleanup", err)
+	}
+	if contract == nil {
+		t.Fatal("publishRuntimeArtifacts() contract = nil")
+	}
+	firstMarker := ""
+	secondMarker := ""
+	for _, objectKey := range tracking.copiedObjectKeys {
+		switch {
+		case strings.Contains(objectKey, "/logs/first-root-only.log"):
+			firstMarker = objectKey
+		case strings.Contains(objectKey, "/logs/second-root-only.log"):
+			secondMarker = objectKey
+		}
+	}
+	if firstMarker == "" || secondMarker == "" {
+		t.Fatalf("fallback markers first=%q second=%q; copied=%#v", firstMarker, secondMarker, tracking.copiedObjectKeys)
+	}
+	if _, statErr := os.Stat(local.Path(firstMarker)); !os.IsNotExist(statErr) {
+		t.Fatalf("completely cleaned first-root object remains: %v", statErr)
+	}
+	if _, statErr := os.Stat(local.Path(secondMarker)); statErr != nil {
+		t.Fatalf("fallback second-root object missing: %v", statErr)
+	}
+}
+
+func TestMainRoutePublisherCleanupIncompleteStopsFallback(t *testing.T) {
+	service, repo, task, canonicalProject := retryTestService(t)
+	mustWriteRetryProjectFiles(canonicalProject)
+	mustWriteFileNoTest(canonicalProject, filepath.Join("logs", "second-root-only.log"), "second\n")
+
+	runtimeWorkspace := filepath.Join(t.TempDir(), "runtime-workspace")
+	runtimeProject := filepath.Join(runtimeWorkspace, "projects", task.RuntimeProject+"_ppt169_20260713")
+	mustWriteRetryProjectFiles(runtimeProject)
+	mustWriteFileNoTest(runtimeProject, filepath.Join("logs", "first-root-only.log"), "first\n")
+	task.Status = model.TaskStatusPublishing
+	task.Route = model.TaskRouteMain
+	task.RuntimeWorkspacePath = runtimeWorkspace
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	local, ok := service.storage.(*LocalStorage)
+	if !ok {
+		t.Fatalf("storage = %T, want *LocalStorage", service.storage)
+	}
+	tracking := &publishCleanupTrackingStorage{
+		StorageService:     local,
+		failCopyContains:   "/logs/first-root-only.log",
+		failCopyAfterWrite: true,
+		failDeleteContains: "/logs/first-root-only.log",
+	}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
+
+	err := service.ProcessTask(context.Background(), task.ID)
+	for _, want := range []string{
+		"injected publish copy write-then-error",
+		"runtime publish cleanup incomplete",
+		"injected publish object cleanup failure",
+	} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("ProcessTask() error = %v, want %q", err, want)
+		}
+	}
+	if !errors.Is(err, ErrRuntimePublishCleanupIncomplete) {
+		t.Fatalf("ProcessTask() error = %v, want publisher cleanup-incomplete classification", err)
+	}
+	for _, objectKey := range tracking.attemptedObjectKeys {
+		if strings.Contains(objectKey, "/logs/second-root-only.log") {
+			t.Fatalf("publisher cleanup-incomplete first root fell back to second root: %#v", tracking.attemptedObjectKeys)
+		}
+	}
+	firstMarker := ""
+	for _, objectKey := range tracking.attemptedObjectKeys {
+		if strings.Contains(objectKey, "/logs/first-root-only.log") {
+			firstMarker = objectKey
+			break
+		}
+	}
+	if firstMarker == "" {
+		t.Fatalf("first-root write-then-error marker was not attempted: %#v", tracking.attemptedObjectKeys)
+	}
+	if _, statErr := os.Stat(local.Path(firstMarker)); statErr != nil {
+		t.Fatalf("publisher failed-delete orphan %s not observable: %v", firstMarker, statErr)
+	}
+}
+
 func TestProcessTaskCompletesTemplateFillPublishRetry(t *testing.T) {
 	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
 	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)

@@ -948,6 +948,219 @@ func TestGetTemplateFillPlanWaitsForCanonicalProjectPromotion(t *testing.T) {
 	}
 }
 
+func TestTemplateFillAPIExchangeRevalidatesProvenanceUnderPromotionLock(t *testing.T) {
+	tests := []struct {
+		name    string
+		prepare func(*testing.T, string)
+		mutate  func(*testing.T, string, string) (string, []byte)
+		invoke  func(context.Context, *TaskService, string) error
+	}{
+		{
+			name: "save source mutation",
+			prepare: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+			},
+			mutate: mutateTemplateFillCanonicalSourceForPromotionRace,
+			invoke: func(ctx context.Context, service *TaskService, taskID string) error {
+				_, err := service.SaveTemplateFillPlan(ctx, taskID, templateFillContractPlan("draft", 1))
+				return err
+			},
+		},
+		{
+			name: "save project local manifest creation",
+			prepare: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+			},
+			mutate: mutateTemplateFillProjectLocalManifestForPromotionRace,
+			invoke: func(ctx context.Context, service *TaskService, taskID string) error {
+				_, err := service.SaveTemplateFillPlan(ctx, taskID, templateFillContractPlan("draft", 1))
+				return err
+			},
+		},
+		{
+			name: "confirm manifest mutation",
+			prepare: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+			},
+			mutate: mutateTemplateFillCanonicalManifestForPromotionRace,
+			invoke: func(ctx context.Context, service *TaskService, taskID string) error {
+				_, err := service.ConfirmTemplateFillPlan(ctx, taskID)
+				return err
+			},
+		},
+		{
+			name: "regenerate source mutation",
+			prepare: func(t *testing.T, projectPath string) {
+				writeTemplateFillDownstreamOutputs(t, projectPath)
+			},
+			mutate: mutateTemplateFillCanonicalSourceForPromotionRace,
+			invoke: func(ctx context.Context, service *TaskService, taskID string) error {
+				_, err := service.RegenerateTemplateFillPlan(ctx, taskID)
+				return err
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+			manifestPath, _ := configureExplicitSameStemTemplateFillInputs(t, projectPath, workspacePath)
+			test.prepare(t, projectPath)
+			staged := make(chan struct{})
+			releasePromotionAttempt := make(chan struct{})
+			service.beforeTemplateFillPromotionLock = func() {
+				close(staged)
+				<-releasePromotionAttempt
+			}
+			lockPath := filepath.Join(workspacePath, ".slidesmith", "project-promotions.lock")
+			done := make(chan error, 1)
+			go func() { done <- test.invoke(context.Background(), service, task.ID) }()
+			select {
+			case <-staged:
+			case err := <-done:
+				t.Fatalf("API operation completed before staging: %v", err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for staged Template Fill promotion")
+			}
+			unlockPromotion, err := acquireProjectPromotionLock(context.Background(), lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			close(releasePromotionAttempt)
+			mutatedPath, mutatedBytes := test.mutate(t, projectPath, manifestPath)
+			unlockPromotion()
+
+			if err := <-done; err == nil || !strings.Contains(strings.ToLower(err.Error()), "provenance") {
+				t.Fatalf("API operation error = %v, want under-lock provenance rejection", err)
+			}
+			if got := mustReadTemplateFillPreviewFile(t, mutatedPath); !bytes.Equal(got, mutatedBytes) {
+				t.Fatalf("stale candidate overwrote canonical mutation %s\n got: %s\nwant: %s", mutatedPath, got, mutatedBytes)
+			}
+			persisted, err := repo.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Status != model.TaskStatusAwaitingTemplateFillConfirm {
+				t.Fatalf("status = %q, want unchanged user gate", persisted.Status)
+			}
+			assertTemplateFillPromotionRaceCleaned(t, workspacePath)
+		})
+	}
+}
+
+func TestCheckTemplateFillPlanRevalidatesProvenanceUnderPromotionLock(t *testing.T) {
+	service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	staged := make(chan struct{})
+	releasePromotionAttempt := make(chan struct{})
+	service.beforeTemplateFillPromotionLock = func() {
+		close(staged)
+		<-releasePromotionAttempt
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.CheckTemplateFillPlan(context.Background(), task.ID)
+		done <- err
+	}()
+	select {
+	case <-staged:
+	case err := <-done:
+		t.Fatalf("CheckTemplateFillPlan() completed before staged promotion: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for staged Template Fill check promotion")
+	}
+
+	lockPath := filepath.Join(workspacePath, ".slidesmith", "project-promotions.lock")
+	unlockPromotion, err := acquireProjectPromotionLock(context.Background(), lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(releasePromotionAttempt)
+	mutatedPath := filepath.Join(projectPath, "sources", "content.md")
+	mutatedBytes := []byte("# Canonical content mutated while API check promotion waited\n")
+	if err := os.WriteFile(mutatedPath, mutatedBytes, 0o644); err != nil {
+		unlockPromotion()
+		t.Fatal(err)
+	}
+	unlockPromotion()
+
+	if err := <-done; err == nil || !strings.Contains(strings.ToLower(err.Error()), "provenance") {
+		t.Fatalf("CheckTemplateFillPlan() error = %v, want under-lock provenance rejection", err)
+	}
+	if got := mustReadTemplateFillPreviewFile(t, mutatedPath); !bytes.Equal(got, mutatedBytes) {
+		t.Fatalf("stale API check candidate overwrote canonical mutation: got=%q want=%q", got, mutatedBytes)
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusAwaitingTemplateFillConfirm {
+		t.Fatalf("status = %q, want unchanged user gate", persisted.Status)
+	}
+	assertTemplateFillPromotionRaceCleaned(t, workspacePath)
+}
+
+func mutateTemplateFillCanonicalSourceForPromotionRace(t *testing.T, projectPath, _ string) (string, []byte) {
+	t.Helper()
+	path := filepath.Join(projectPath, "sources", "brand.md")
+	raw := []byte("# Canonical source mutated while promotion waited\n")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path, raw
+}
+
+func mutateTemplateFillCanonicalManifestForPromotionRace(t *testing.T, _, manifestPath string) (string, []byte) {
+	t.Helper()
+	raw := []byte(`{
+  "schema": "slidesmith.source_inputs.v1",
+  "task_id": "mutated-under-promotion-lock",
+  "files": [
+    {"name": "brand.pptx", "upload_path": "uploads/task-template-fill/brand.pptx", "extension": "pptx"},
+    {"name": "brand.md", "upload_path": "uploads/task-template-fill/brand.md", "extension": "md"}
+  ]
+}` + "\n")
+	if err := os.WriteFile(manifestPath, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return manifestPath, raw
+}
+
+func mutateTemplateFillProjectLocalManifestForPromotionRace(t *testing.T, projectPath, _ string) (string, []byte) {
+	t.Helper()
+	path := filepath.Join(projectPath, ".slidesmith", "source_inputs.json")
+	raw := []byte(`{
+  "schema": "slidesmith.source_inputs.v1",
+  "task_id": "project-local-created-under-promotion-lock",
+  "files": [
+    {"name": "brand.pptx", "upload_path": "uploads/task-template-fill/brand.pptx", "extension": "pptx"},
+    {"name": "brand.md", "upload_path": "uploads/task-template-fill/brand.md", "extension": "md"}
+  ]
+}` + "\n")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path, raw
+}
+
+func assertTemplateFillPromotionRaceCleaned(t *testing.T, workspacePath string) {
+	t.Helper()
+	for _, pattern := range []string{
+		filepath.Join(workspacePath, ".slidesmith", "project-promotions", "*", "*", "project"),
+		filepath.Join(workspacePath, ".slidesmith", "template-fill-api-sessions", "*"),
+	} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(matches) != 0 {
+			t.Fatalf("stale Template Fill promotion/session paths remain: %#v", matches)
+		}
+	}
+}
+
 func TestConfirmTemplateFillPlanSerializesCancellationThroughTransition(t *testing.T) {
 	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
 	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)

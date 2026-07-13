@@ -308,7 +308,14 @@ func (s *TaskService) CheckTemplateFillPlan(ctx context.Context, taskID string) 
 		_, err = validateTemplateFillCheckContractForPlanWithProvenance(candidate, provenance, false, "draft", planSHA256)
 		return err
 	}
-	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, validate)
+	projectPath, err = s.syncRuntimeProjectValidatedWithFence(
+		ctx,
+		task,
+		workspace,
+		runtimeRun.WorkspacePath,
+		validate,
+		provenance.revalidateAuthoritative,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -631,6 +638,9 @@ func (s *TaskService) beginTemplateFillProjectExchange(
 	if err := session.cleanup(); err != nil {
 		return nil, cleanupStaged(err)
 	}
+	if s.beforeTemplateFillPromotionLock != nil {
+		s.beforeTemplateFillPromotionLock()
+	}
 
 	lockPath := filepath.Join(filepath.Dir(staged.promotionRoot), "project-promotions.lock")
 	unlock, err := acquireProjectPromotionLock(ctx, lockPath)
@@ -662,6 +672,9 @@ func (s *TaskService) beginTemplateFillProjectExchange(
 	}
 	if !matched {
 		return fail(errTaskStateChanged)
+	}
+	if err := session.provenance.revalidateAuthoritative(); err != nil {
+		return fail(fmt.Errorf("revalidate template fill provenance under promotion lock: %w", err))
 	}
 	if err := ctx.Err(); err != nil {
 		return fail(err)

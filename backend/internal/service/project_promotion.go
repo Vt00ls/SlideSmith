@@ -137,6 +137,7 @@ func (s *TaskService) mutateCanonicalProjectClaimed(
 	projectPath string,
 	mutate func(string) error,
 	validate func(string) error,
+	validateAuthoritative func() error,
 ) (targetProject string, err error) {
 	if task == nil || task.ExecutionClaimToken == "" {
 		return "", fmt.Errorf("mutate canonical runtime project: claimed task is required")
@@ -173,7 +174,7 @@ func (s *TaskService) mutateCanonicalProjectClaimed(
 			return "", err
 		}
 	}
-	return s.promoteStagedProjectValidated(ctx, task, staged, validate)
+	return s.promoteStagedProjectValidatedWithFence(ctx, task, staged, validate, validateAuthoritative)
 }
 
 func requireRealProjectDirectory(path, label string) error {
@@ -229,11 +230,24 @@ func (s *TaskService) promoteStagedProjectValidated(
 	staged *stagedProjectPromotion,
 	validateCanonical func(string) error,
 ) (string, error) {
+	return s.promoteStagedProjectValidatedWithFence(ctx, task, staged, validateCanonical, nil)
+}
+
+func (s *TaskService) promoteStagedProjectValidatedWithFence(
+	ctx context.Context,
+	task *model.Task,
+	staged *stagedProjectPromotion,
+	validateCanonical func(string) error,
+	validateAuthoritative func() error,
+) (string, error) {
 	if task == nil || staged == nil {
 		return "", fmt.Errorf("promote runtime project: task and staging are required")
 	}
 	if err := requireRealProjectDirectory(staged.projectPath, "staged runtime project"); err != nil {
 		return "", err
+	}
+	if validateAuthoritative != nil && s.beforeTemplateFillPromotionLock != nil {
+		s.beforeTemplateFillPromotionLock()
 	}
 	lockPath := filepath.Join(filepath.Dir(staged.promotionRoot), "project-promotions.lock")
 	unlock, err := acquireProjectPromotionLock(ctx, lockPath)
@@ -257,6 +271,11 @@ func (s *TaskService) promoteStagedProjectValidated(
 	}
 	if err := requireRealProjectDirectory(staged.projectPath, "staged runtime project"); err != nil {
 		return "", err
+	}
+	if validateAuthoritative != nil {
+		if err := validateAuthoritative(); err != nil {
+			return "", fmt.Errorf("revalidate authoritative project under promotion lock: %w", err)
+		}
 	}
 	info, statErr := os.Lstat(staged.targetPath)
 	switch {

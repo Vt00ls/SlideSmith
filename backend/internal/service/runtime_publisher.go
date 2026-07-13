@@ -13,6 +13,8 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 )
 
+var ErrRuntimePublishCleanupIncomplete = errors.New("runtime publish cleanup incomplete")
+
 type RuntimeWorkspacePublisher struct {
 	storage StorageService
 }
@@ -145,14 +147,18 @@ func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspa
 		}
 		cleanupCtx := context.WithoutCancel(ctx)
 		seen := make(map[string]bool, len(attemptedObjectKeys))
+		var cleanupErr error
 		for _, objectKey := range attemptedObjectKeys {
 			if seen[objectKey] {
 				continue
 			}
 			seen[objectKey] = true
 			if err := p.storage.DeleteObject(cleanupCtx, objectKey); err != nil {
-				resultErr = errors.Join(resultErr, fmt.Errorf("rollback partial runtime publish object %s: %w", objectKey, err))
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("rollback partial runtime publish object %s: %w", objectKey, err))
 			}
+		}
+		if cleanupErr != nil {
+			resultErr = errors.Join(resultErr, fmt.Errorf("%w: %w", ErrRuntimePublishCleanupIncomplete, cleanupErr))
 		}
 	}()
 

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1110,7 +1111,7 @@ func TestTemplateFillPublishRejectsInvalidBindingsAfterPersistenceAndCleansFaile
 					UPDATE artifacts SET kind = 'other' WHERE id = NEW.id;
 				END;
 			`,
-			wantError:        "validation/readback.md",
+			wantError:        "identity does not match inserted artifact",
 			preservePrevious: true,
 		},
 		{
@@ -1126,7 +1127,7 @@ func TestTemplateFillPublishRejectsInvalidBindingsAfterPersistenceAndCleansFaile
 					UPDATE artifacts SET kind = 'template_fill_validate_report' WHERE id = NEW.id;
 				END;
 			`,
-			wantError: "validation/readback.md",
+			wantError: "identity does not match inserted artifact",
 		},
 		{
 			name: "duplicate canonical path",
@@ -1149,7 +1150,7 @@ func TestTemplateFillPublishRejectsInvalidBindingsAfterPersistenceAndCleansFaile
 					  AND object_key LIKE '%/analysis/check_report.json';
 				END;
 			`,
-			wantError: "duplicate",
+			wantError: "persisted artifact count",
 		},
 		{
 			name: "case variant canonical path",
@@ -1163,7 +1164,7 @@ func TestTemplateFillPublishRejectsInvalidBindingsAfterPersistenceAndCleansFaile
 					WHERE id = NEW.id;
 				END;
 			`,
-			wantError: "analysis/fill_plan.json",
+			wantError: "identity does not match inserted artifact",
 		},
 		{
 			name: "near match canonical path",
@@ -1175,7 +1176,7 @@ func TestTemplateFillPublishRejectsInvalidBindingsAfterPersistenceAndCleansFaile
 					UPDATE artifacts SET object_key = object_key || '.bak' WHERE id = NEW.id;
 				END;
 			`,
-			wantError: "validation/readback.md",
+			wantError: "identity does not match inserted artifact",
 		},
 		{
 			name: "case variant pptx path",
@@ -1189,7 +1190,7 @@ func TestTemplateFillPublishRejectsInvalidBindingsAfterPersistenceAndCleansFaile
 					WHERE id = NEW.id;
 				END;
 			`,
-			wantError: "exports/*.pptx",
+			wantError: "identity does not match inserted artifact",
 		},
 	}
 
@@ -1226,8 +1227,8 @@ func TestTemplateFillPublishRejectsInvalidBindingsAfterPersistenceAndCleansFaile
 			if err == nil {
 				t.Fatal("ProcessTask() error = nil, want post-persistence binding rejection")
 			}
-			if !strings.Contains(err.Error(), "final persisted artifact check failed") || !strings.Contains(err.Error(), test.wantError) {
-				t.Fatalf("ProcessTask() error = %q, want post-persistence %q rejection", err, test.wantError)
+			if !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("ProcessTask() error = %q, want transactional identity rejection %q", err, test.wantError)
 			}
 			updated, getErr := repo.GetTask(context.Background(), task.ID)
 			if getErr != nil {
@@ -1374,7 +1375,7 @@ func TestTemplateFillPublishCleanupDeletesInsertedRowsWhoseVersionWasMutated(t *
 	}
 
 	err = service.ProcessTask(context.Background(), task.ID)
-	if err == nil || !strings.Contains(err.Error(), "persisted artifact count") {
+	if err == nil || !strings.Contains(err.Error(), "identity does not match inserted artifact") {
 		t.Fatalf("ProcessTask() error = %v, want post-insert version mutation rejection", err)
 	}
 	failedVersion := singlePublishVersionForTest(t, tracking.copiedObjectKeys)
@@ -1437,17 +1438,9 @@ func TestTemplateFillPublishCleanupJoinsExactRowAndObjectErrors(t *testing.T) {
 	service.storage = tracking
 	service.publisher = NewRuntimeWorkspacePublisher(tracking)
 	if err := repo.DB().Exec(`
-		CREATE TRIGGER move_new_readback_before_cleanup_error
-		AFTER INSERT ON artifacts
-		WHEN NEW.kind = 'template_fill_readback'
-		BEGIN
-			UPDATE artifacts
-			SET publish_version = 'v20260712T120000Z'
-			WHERE id = NEW.id;
-		END;
 		CREATE TRIGGER fail_exact_inserted_row_cleanup
 		BEFORE DELETE ON artifacts
-		WHEN OLD.publish_version = 'v20260712T120000Z'
+		WHEN OLD.publish_version <> 'v20260712T120000Z'
 		  AND OLD.object_key LIKE '%/validation/readback.md'
 		BEGIN
 			SELECT RAISE(ABORT, 'injected exact inserted row cleanup failure');
@@ -1455,16 +1448,36 @@ func TestTemplateFillPublishCleanupJoinsExactRowAndObjectErrors(t *testing.T) {
 	`).Error; err != nil {
 		t.Fatal(err)
 	}
+	injectedListFailure := false
+	callbackName := "inject_joined_publish_cleanup_list_failure"
+	if err := repo.DB().Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if injectedListFailure || tx.Statement.Schema == nil || tx.Statement.Schema.Table != "artifacts" {
+			return
+		}
+		if _, inTransaction := tx.Statement.ConnPool.(gorm.TxCommitter); inTransaction {
+			return
+		}
+		injectedListFailure = true
+		tx.AddError(errors.New("injected persisted publish list failure"))
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	err := service.ProcessTask(context.Background(), task.ID)
+	if removeErr := repo.DB().Callback().Query().Remove(callbackName); removeErr != nil {
+		t.Fatal(removeErr)
+	}
 	for _, want := range []string{
-		"persisted artifact count",
+		"injected persisted publish list failure",
 		"injected exact inserted row cleanup failure",
 		"injected publish object cleanup failure",
 	} {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("ProcessTask() error = %v, want joined error %q", err, want)
 		}
+	}
+	if !injectedListFailure {
+		t.Fatal("persisted publish list failure was not injected")
 	}
 	if len(tracking.deletedObjectKeys) != len(tracking.copiedObjectKeys) {
 		t.Fatalf("object cleanup attempts = %d, want %d after row cleanup failure", len(tracking.deletedObjectKeys), len(tracking.copiedObjectKeys))
@@ -1809,6 +1822,224 @@ func TestTemplateFillValidateRejectsFormalEvidenceMutationBeforeCanonicalPromoti
 					t.Fatalf("rejected validate session promoted %s: %v", relativePath, err)
 				}
 			}
+		})
+	}
+}
+
+func TestTemplateFillWorkerPromotionRevalidatesProvenanceUnderLock(t *testing.T) {
+	tests := []struct {
+		name   string
+		status string
+	}{
+		{name: "plan", status: model.TaskStatusTemplateFillPlanning},
+		{name: "check", status: model.TaskStatusTemplateFillChecking},
+		{name: "apply", status: model.TaskStatusTemplateFillApplying},
+		{name: "validate", status: model.TaskStatusTemplateFillValidating},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := &templateFillWorkflowAgent{}
+			service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, test.status, agent)
+			agent.projectPath = projectPath
+			prepareTemplateFillWorkflowPhase(t, projectPath, test.status)
+
+			staged := make(chan struct{})
+			releasePromotionAttempt := make(chan struct{})
+			var blockFirstPromotion sync.Once
+			service.beforeTemplateFillPromotionLock = func() {
+				blockFirstPromotion.Do(func() {
+					close(staged)
+					<-releasePromotionAttempt
+				})
+			}
+			done := make(chan error, 1)
+			go func() { done <- service.ProcessTask(context.Background(), task.ID) }()
+			select {
+			case <-staged:
+			case err := <-done:
+				t.Fatalf("worker completed before staged promotion: %v", err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for staged Template Fill worker promotion")
+			}
+
+			lockPath := filepath.Join(workspacePath, ".slidesmith", "project-promotions.lock")
+			unlockPromotion, err := acquireProjectPromotionLock(context.Background(), lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			close(releasePromotionAttempt)
+			mutatedPath := filepath.Join(projectPath, "sources", "content.md")
+			mutatedBytes := []byte("# Canonical content mutated while worker promotion waited\n")
+			if err := os.WriteFile(mutatedPath, mutatedBytes, 0o644); err != nil {
+				unlockPromotion()
+				t.Fatal(err)
+			}
+			unlockPromotion()
+
+			if err := <-done; err == nil || !strings.Contains(strings.ToLower(err.Error()), "provenance") {
+				t.Fatalf("ProcessTask() error = %v, want under-lock provenance rejection", err)
+			}
+			if got, err := os.ReadFile(mutatedPath); err != nil || !reflect.DeepEqual(got, mutatedBytes) {
+				t.Fatalf("stale worker candidate overwrote canonical mutation: got=%q error=%v", got, err)
+			}
+			persisted, err := repo.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Status != model.TaskStatusFailed {
+				t.Fatalf("status = %q, want failed", persisted.Status)
+			}
+			assertTemplateFillPromotionRaceCleaned(t, workspacePath)
+		})
+	}
+}
+
+func TestTemplateFillPlanDraftCheckPromotionRevalidatesProvenanceUnderLock(t *testing.T) {
+	agent := &templateFillWorkflowAgent{}
+	service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillPlanning, agent)
+	agent.projectPath = projectPath
+
+	stagedSecondPromotion := make(chan struct{})
+	releaseSecondPromotion := make(chan struct{})
+	promotionAttempt := 0
+	service.beforeTemplateFillPromotionLock = func() {
+		promotionAttempt++
+		if promotionAttempt == 2 {
+			close(stagedSecondPromotion)
+			<-releaseSecondPromotion
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- service.ProcessTask(context.Background(), task.ID) }()
+	select {
+	case <-stagedSecondPromotion:
+	case err := <-done:
+		t.Fatalf("planning worker completed before second staged promotion: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for staged draft-check promotion")
+	}
+
+	lockPath := filepath.Join(workspacePath, ".slidesmith", "project-promotions.lock")
+	unlockPromotion, err := acquireProjectPromotionLock(context.Background(), lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(releaseSecondPromotion)
+	mutatedPath := filepath.Join(projectPath, "sources", "content.md")
+	mutatedBytes := []byte("# Canonical content mutated during draft-check promotion\n")
+	if err := os.WriteFile(mutatedPath, mutatedBytes, 0o644); err != nil {
+		unlockPromotion()
+		t.Fatal(err)
+	}
+	unlockPromotion()
+
+	if err := <-done; err == nil || !strings.Contains(strings.ToLower(err.Error()), "provenance") {
+		t.Fatalf("ProcessTask() error = %v, want second-promotion provenance rejection", err)
+	}
+	if got, err := os.ReadFile(mutatedPath); err != nil || !reflect.DeepEqual(got, mutatedBytes) {
+		t.Fatalf("stale draft-check candidate overwrote canonical mutation: got=%q error=%v", got, err)
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusFailed || persisted.FailurePhase != "template_fill_plan.draft_check.contract" {
+		t.Fatalf("task after draft-check promotion race = %#v", persisted)
+	}
+	if promotionAttempt != 2 || len(agent.requests) != 2 {
+		t.Fatalf("promotion attempts = %d, agent requests = %d; want direct second promotion coverage", promotionAttempt, len(agent.requests))
+	}
+	assertTemplateFillPromotionRaceCleaned(t, workspacePath)
+}
+
+func TestTemplateFillCanonicalMutationPromotionsRevalidateProvenanceUnderLock(t *testing.T) {
+	tests := []struct {
+		name              string
+		configure         func(*testing.T, *templateFillWorkflowAgent, string)
+		targetPromotion   int
+		wantFailurePhase  string
+		wantAgentRequests int
+	}{
+		{
+			name: "draft reconciliation cleanup",
+			configure: func(t *testing.T, _ *templateFillWorkflowAgent, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+				prepareTemplateFillCheckContractReport(t, projectPath)
+				mustWriteFile(t, filepath.Join(projectPath, ".slidesmith", "contracts", "template_fill_check.json"), "{}\n")
+			},
+			targetPromotion:   1,
+			wantFailurePhase:  "template_fill_check.cleanup",
+			wantAgentRequests: 0,
+		},
+		{
+			name: "blocked check plan reset",
+			configure: func(t *testing.T, agent *templateFillWorkflowAgent, projectPath string) {
+				agent.draftCheckErrors = 2
+				mustWriteTemplateFillPlan(t, projectPath, "confirmed", 1)
+			},
+			targetPromotion:   2,
+			wantFailurePhase:  "template_fill_check.reset_plan_contract",
+			wantAgentRequests: 1,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			agent := &templateFillWorkflowAgent{}
+			service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusTemplateFillChecking, agent)
+			agent.projectPath = projectPath
+			test.configure(t, agent, projectPath)
+
+			stagedTargetPromotion := make(chan struct{})
+			releaseTargetPromotion := make(chan struct{})
+			promotionAttempt := 0
+			service.beforeTemplateFillPromotionLock = func() {
+				promotionAttempt++
+				if promotionAttempt == test.targetPromotion {
+					close(stagedTargetPromotion)
+					<-releaseTargetPromotion
+				}
+			}
+			done := make(chan error, 1)
+			go func() { done <- service.ProcessTask(context.Background(), task.ID) }()
+			select {
+			case <-stagedTargetPromotion:
+			case err := <-done:
+				t.Fatalf("worker completed before canonical mutation promotion %d: %v", test.targetPromotion, err)
+			case <-time.After(2 * time.Second):
+				t.Fatalf("timed out waiting for canonical mutation promotion %d", test.targetPromotion)
+			}
+
+			lockPath := filepath.Join(workspacePath, ".slidesmith", "project-promotions.lock")
+			unlockPromotion, err := acquireProjectPromotionLock(context.Background(), lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			close(releaseTargetPromotion)
+			mutatedPath := filepath.Join(projectPath, "sources", "content.md")
+			mutatedBytes := []byte("# Canonical content mutated during canonical mutation promotion\n")
+			if err := os.WriteFile(mutatedPath, mutatedBytes, 0o644); err != nil {
+				unlockPromotion()
+				t.Fatal(err)
+			}
+			unlockPromotion()
+
+			if err := <-done; err == nil || !strings.Contains(strings.ToLower(err.Error()), "provenance") {
+				t.Fatalf("ProcessTask() error = %v, want canonical mutation provenance rejection", err)
+			}
+			if got, err := os.ReadFile(mutatedPath); err != nil || !reflect.DeepEqual(got, mutatedBytes) {
+				t.Fatalf("stale canonical mutation overwrote authoritative source: got=%q error=%v", got, err)
+			}
+			persisted, err := repo.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Status != model.TaskStatusFailed || persisted.FailurePhase != test.wantFailurePhase {
+				t.Fatalf("task after canonical mutation race = %#v", persisted)
+			}
+			if promotionAttempt != test.targetPromotion || len(agent.requests) != test.wantAgentRequests {
+				t.Fatalf("promotion attempts = %d, agent requests = %d; want %d/%d", promotionAttempt, len(agent.requests), test.targetPromotion, test.wantAgentRequests)
+			}
+			assertTemplateFillPromotionRaceCleaned(t, workspacePath)
 		})
 	}
 }

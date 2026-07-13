@@ -282,6 +282,7 @@ func TestPublishSourceIntakeArtifactsDoesNotReadArtifactsAfterCommit(t *testing.
 	mustWriteFile(t, filepath.Join(projectPath, "sources", "alpha.md"), "alpha\n")
 
 	artifactQueries := 0
+	transactionalIdentityReads := 0
 	if err := repo.DB().Callback().Query().Before("gorm:query").Register(
 		"test:reject_source_intake_post_commit_read",
 		func(db *gorm.DB) {
@@ -289,6 +290,10 @@ func TestPublishSourceIntakeArtifactsDoesNotReadArtifactsAfterCommit(t *testing.
 				return
 			}
 			artifactQueries++
+			if _, inTransaction := db.Statement.ConnPool.(gorm.TxCommitter); inTransaction {
+				transactionalIdentityReads++
+				return
+			}
 			if artifactQueries > 1 {
 				db.AddError(errors.New("forbidden post-commit artifact read"))
 			}
@@ -301,8 +306,8 @@ func TestPublishSourceIntakeArtifactsDoesNotReadArtifactsAfterCommit(t *testing.
 	if err != nil {
 		t.Fatalf("publishSourceIntakeArtifacts() error = %v", err)
 	}
-	if artifactQueries != 1 {
-		t.Fatalf("artifact queries = %d, want one pre-mutation prefix read", artifactQueries)
+	if artifactQueries != 2 || transactionalIdentityReads != 1 {
+		t.Fatalf("artifact queries = %d (transactional identity reads = %d), want one pre-mutation read plus one in-transaction identity reload", artifactQueries, transactionalIdentityReads)
 	}
 	if len(artifacts) != 1 || artifacts[0].ID == "" || artifacts[0].CreatedAt.IsZero() {
 		t.Fatalf("returned artifacts lack transactional identity: %#v", artifacts)

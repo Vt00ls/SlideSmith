@@ -30,6 +30,7 @@ type TaskService struct {
 
 	beforeCanonicalMutationPromotion func(string) error
 	beforeTemplateFillAPICommit      func(string)
+	beforeTemplateFillPromotionLock  func()
 }
 
 const (
@@ -664,7 +665,7 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 	}
 	planPreflightFailure := false
 	validatedPlanSHA256 := ""
-	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, planRun.WorkspacePath, func(stagedProjectPath string) error {
+	projectPath, err = s.syncRuntimeProjectValidatedWithFence(ctx, task, workspace, planRun.WorkspacePath, func(stagedProjectPath string) error {
 		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
 			planPreflightFailure = true
 			return stagedErr
@@ -680,6 +681,12 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 		}
 		validatedPlanSHA256 = stagedPlanSHA256
 		return nil
+	}, func() error {
+		fenceErr := provenance.revalidateAuthoritative()
+		if fenceErr != nil {
+			planPreflightFailure = true
+		}
+		return fenceErr
 	})
 	if err != nil {
 		failurePhase := string(PhaseTemplateFillPlan) + ".sync"
@@ -723,7 +730,7 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 		})
 	}
 	draftCheckFailurePhase := ""
-	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, draftCheckRun.WorkspacePath, func(stagedProjectPath string) error {
+	projectPath, err = s.syncRuntimeProjectValidatedWithFence(ctx, task, workspace, draftCheckRun.WorkspacePath, func(stagedProjectPath string) error {
 		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
 			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.contract"
 			return stagedErr
@@ -747,6 +754,12 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 			return stagedErr
 		}
 		return nil
+	}, func() error {
+		fenceErr := provenance.revalidateAuthoritative()
+		if fenceErr != nil {
+			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.contract"
+		}
+		return fenceErr
 	})
 	if err != nil {
 		failurePhase := string(PhaseTemplateFillPlan) + ".draft_check.sync"
@@ -859,6 +872,7 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 				}
 				return requireTemplateFillFormalCheckEvidenceAbsentWithProvenance(stagedProjectPath, provenance)
 			},
+			provenance.revalidateAuthoritative,
 		)
 		if errors.Is(err, errTaskStateChanged) {
 			return nil
@@ -920,7 +934,7 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 		})
 	}
 	preflightFailurePhase := ""
-	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
+	projectPath, err = s.syncRuntimeProjectValidatedWithFence(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
 		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".inputs"
 			return stagedErr
@@ -948,6 +962,12 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			return stagedErr
 		}
 		return nil
+	}, func() error {
+		fenceErr := provenance.revalidateAuthoritative()
+		if fenceErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".inputs"
+		}
+		return fenceErr
 	})
 	if err != nil {
 		failurePhase := string(PhaseTemplateFillCheck) + ".sync"
@@ -1053,6 +1073,7 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 				planContract = stagedPlanContract
 				return nil
 			},
+			provenance.revalidateAuthoritative,
 		)
 		if errors.Is(err, errTaskStateChanged) {
 			return nil
@@ -1161,7 +1182,7 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 		})
 	}
 	preflightFailurePhase := ""
-	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
+	projectPath, err = s.syncRuntimeProjectValidatedWithFence(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
 		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillApply) + ".inputs"
 			return stagedErr
@@ -1203,6 +1224,12 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 			return stagedErr
 		}
 		return nil
+	}, func() error {
+		fenceErr := provenance.revalidateAuthoritative()
+		if fenceErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".inputs"
+		}
+		return fenceErr
 	})
 	if err != nil {
 		failurePhase := string(PhaseTemplateFillApply) + ".sync"
@@ -1352,7 +1379,7 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 		})
 	}
 	preflightFailurePhase := ""
-	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
+	projectPath, err = s.syncRuntimeProjectValidatedWithFence(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
 		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".inputs"
 			return stagedErr
@@ -1398,6 +1425,12 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 			return stagedErr
 		}
 		return nil
+	}, func() error {
+		fenceErr := provenance.revalidateAuthoritative()
+		if fenceErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".inputs"
+		}
+		return fenceErr
 	})
 	if err != nil {
 		failurePhase := string(PhaseTemplateFillValidate) + ".sync"
@@ -2528,7 +2561,11 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 		}
 		defer func() {
 			if attempt.armed {
-				resultErr = errors.Join(resultErr, s.cleanupFailedPublishAttempt(ctx, attempt))
+				cleanupErr := s.cleanupFailedPublishAttempt(ctx, attempt)
+				if cleanupErr != nil {
+					terminal = true
+					resultErr = errors.Join(resultErr, cleanupErr)
+				}
 			}
 		}()
 
@@ -2539,7 +2576,7 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 			published, err = s.publisher.Publish(ctx, task.ID, root.Path, publishVersion)
 		}
 		if err != nil {
-			return nil, false, err
+			return nil, errors.Is(err, ErrRuntimePublishCleanupIncomplete), err
 		}
 		if err := attempt.addArtifacts(published); err != nil {
 			return nil, false, err
@@ -3496,6 +3533,17 @@ func (s *TaskService) syncPreparedProjectValidated(
 	targetWorkspaceDir string,
 	validate func(string) error,
 ) (targetProject string, err error) {
+	return s.syncPreparedProjectValidatedWithFence(ctx, task, workspacePath, targetWorkspaceDir, validate, nil)
+}
+
+func (s *TaskService) syncPreparedProjectValidatedWithFence(
+	ctx context.Context,
+	task *model.Task,
+	workspacePath string,
+	targetWorkspaceDir string,
+	validate func(string) error,
+	validateAuthoritative func() error,
+) (targetProject string, err error) {
 	if task == nil || task.RuntimeProject == "" || workspacePath == "" {
 		return "", nil
 	}
@@ -3516,7 +3564,7 @@ func (s *TaskService) syncPreparedProjectValidated(
 	}
 	targetProject = staged.targetPath
 	if !staged.noOp {
-		targetProject, err = s.promoteStagedProjectValidated(ctx, task, staged, validate)
+		targetProject, err = s.promoteStagedProjectValidatedWithFence(ctx, task, staged, validate, validateAuthoritative)
 		if err != nil {
 			return targetProject, err
 		}
@@ -3535,6 +3583,17 @@ func (s *TaskService) syncRuntimeProjectValidated(
 	runtimeWorkspacePath string,
 	validate func(string) error,
 ) (string, error) {
+	return s.syncRuntimeProjectValidatedWithFence(ctx, task, workspace, runtimeWorkspacePath, validate, nil)
+}
+
+func (s *TaskService) syncRuntimeProjectValidatedWithFence(
+	ctx context.Context,
+	task *model.Task,
+	workspace *TaskWorkspace,
+	runtimeWorkspacePath string,
+	validate func(string) error,
+	validateAuthoritative func() error,
+) (string, error) {
 	if strings.TrimSpace(runtimeWorkspacePath) == "" || workspace == nil {
 		projectPath, err := s.findPersistentProjectPath(task)
 		if err != nil {
@@ -3545,7 +3604,7 @@ func (s *TaskService) syncRuntimeProjectValidated(
 		}
 		return projectPath, nil
 	}
-	return s.syncPreparedProjectValidated(ctx, task, runtimeWorkspacePath, workspace.HostDir, validate)
+	return s.syncPreparedProjectValidatedWithFence(ctx, task, runtimeWorkspacePath, workspace.HostDir, validate, validateAuthoritative)
 }
 
 func (s *TaskService) findPersistentProjectPath(task *model.Task) (string, error) {

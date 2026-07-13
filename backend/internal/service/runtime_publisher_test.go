@@ -14,8 +14,10 @@ import (
 
 type runtimePublisherWriteThenErrorStorage struct {
 	StorageService
-	failAt           int
-	attemptedObjects []string
+	failAt             int
+	failDeleteContains string
+	attemptedObjects   []string
+	deletedObjects     []string
 }
 
 func (s *runtimePublisherWriteThenErrorStorage) CopyFileToObject(ctx context.Context, objectKey, sourcePath string) (*StoredObject, error) {
@@ -28,6 +30,14 @@ func (s *runtimePublisherWriteThenErrorStorage) CopyFileToObject(ctx context.Con
 		return nil, errors.New("injected runtime publish write-then-error")
 	}
 	return stored, nil
+}
+
+func (s *runtimePublisherWriteThenErrorStorage) DeleteObject(ctx context.Context, objectKey string) error {
+	s.deletedObjects = append(s.deletedObjects, objectKey)
+	if s.failDeleteContains != "" && strings.Contains(objectKey, s.failDeleteContains) {
+		return errors.New("injected runtime publish rollback delete failure")
+	}
+	return s.StorageService.DeleteObject(ctx, objectKey)
 }
 
 func TestRuntimeWorkspacePublisherRollsBackExactObjectsOnWriteThenError(t *testing.T) {
@@ -49,6 +59,49 @@ func TestRuntimeWorkspacePublisherRollsBackExactObjectsOnWriteThenError(t *testi
 	for _, objectKey := range fault.attemptedObjects {
 		if _, statErr := os.Stat(local.Path(objectKey)); !os.IsNotExist(statErr) {
 			t.Fatalf("partial publish object %s remains, err=%v", objectKey, statErr)
+		}
+	}
+}
+
+func TestRuntimeWorkspacePublisherMarksPartialCopyRollbackIncompleteWhenDeleteFails(t *testing.T) {
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, "workspace")
+	project := filepath.Join(workspace, "projects", "task-1")
+	mustWriteFile(t, filepath.Join(project, "analysis", "fill_plan.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "exports", "result.pptx"), "pptx bytes\n")
+	local := NewLocalStorage(filepath.Join(tmp, "storage"))
+	fault := &runtimePublisherWriteThenErrorStorage{
+		StorageService:     local,
+		failAt:             2,
+		failDeleteContains: "/analysis/fill_plan.json",
+	}
+
+	_, err := NewRuntimeWorkspacePublisher(fault).PublishProject(context.Background(), "task-1", workspace, project, "v-delete-error")
+	for _, want := range []string{
+		"write-then-error",
+		"runtime publish cleanup incomplete",
+		"injected runtime publish rollback delete failure",
+	} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("PublishProject() error = %v, want %q", err, want)
+		}
+	}
+	if !errors.Is(err, ErrRuntimePublishCleanupIncomplete) {
+		t.Fatalf("PublishProject() error = %v, want cleanup-incomplete classification", err)
+	}
+	if len(fault.deletedObjects) != 2 {
+		t.Fatalf("rollback deletes = %#v, want both attempted object keys", fault.deletedObjects)
+	}
+	for _, objectKey := range fault.attemptedObjects {
+		_, statErr := os.Stat(local.Path(objectKey))
+		if strings.Contains(objectKey, fault.failDeleteContains) {
+			if statErr != nil {
+				t.Fatalf("failed-delete object %s unexpectedly missing: %v", objectKey, statErr)
+			}
+			continue
+		}
+		if !os.IsNotExist(statErr) {
+			t.Fatalf("rollback skipped object %s after delete failure: %v", objectKey, statErr)
 		}
 	}
 }
