@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1141,6 +1142,162 @@ func TestTemplateFillPublishSurfacesObjectCleanupFailureAndContinuesCompensation
 		}
 		if !os.IsNotExist(statErr) {
 			t.Fatalf("cleanup skipped object %s after another delete failed, err=%v", objectKey, statErr)
+		}
+	}
+}
+
+func TestTemplateFillPublishCleanupDeletesInsertedRowsWhoseVersionWasMutated(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+	storage := service.storage.(*LocalStorage)
+
+	const previousVersion = "v20260712T120000Z"
+	previous := copyTemplateFillPublishedArtifactsForTaskTest(t, storage, projectPath, task.ID, previousVersion)
+	if _, err := buildPublishedArtifactsContract(projectPath, storage, previous, previousVersion, model.TaskRouteTemplateFill); err != nil {
+		t.Fatalf("previous version is not valid: %v", err)
+	}
+	previousPrefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "artifacts", previousVersion)) + "/"
+	if err := repo.ReplaceArtifactsByObjectKeyPrefix(context.Background(), task.ID, previousPrefix, previous); err != nil {
+		t.Fatal(err)
+	}
+	previousRows, err := repo.ListArtifactsByPublishVersion(context.Background(), task.ID, previousVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousVisible, err := repo.ListArtifacts(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	previousBytes := make(map[string][]byte, len(previousRows))
+	for _, artifact := range previousRows {
+		raw, readErr := os.ReadFile(storage.Path(artifact.ObjectKey))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		previousBytes[artifact.ObjectKey] = raw
+	}
+
+	tracking := &publishCleanupTrackingStorage{StorageService: storage}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
+	if err := repo.DB().Exec(`
+		CREATE TRIGGER move_new_readback_to_previous_publish_version
+		AFTER INSERT ON artifacts
+		WHEN NEW.kind = 'template_fill_readback'
+		BEGIN
+			UPDATE artifacts
+			SET publish_version = 'v20260712T120000Z'
+			WHERE id = NEW.id;
+		END;
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	err = service.ProcessTask(context.Background(), task.ID)
+	if err == nil || !strings.Contains(err.Error(), "persisted artifact count") {
+		t.Fatalf("ProcessTask() error = %v, want post-insert version mutation rejection", err)
+	}
+	failedVersion := singlePublishVersionForTest(t, tracking.copiedObjectKeys)
+	failedPrefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "artifacts", failedVersion)) + "/"
+	var failedPrefixRows int64
+	if err := repo.DB().Model(&model.Artifact{}).
+		Where("task_id = ? AND object_key LIKE ?", task.ID, failedPrefix+"%").
+		Count(&failedPrefixRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if failedPrefixRows != 0 {
+		t.Fatalf("failed publish prefix retained %d rows, want 0", failedPrefixRows)
+	}
+	for _, objectKey := range tracking.copiedObjectKeys {
+		if _, statErr := os.Stat(storage.Path(objectKey)); !os.IsNotExist(statErr) {
+			t.Fatalf("failed publish object %s remains, err=%v", objectKey, statErr)
+		}
+	}
+
+	previousRowsAfter, err := repo.ListArtifactsByPublishVersion(context.Background(), task.ID, previousVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(previousRowsAfter, previousRows) {
+		t.Fatalf("previous version rows changed:\n before=%#v\n  after=%#v", previousRows, previousRowsAfter)
+	}
+	previousVisibleAfter, err := repo.ListArtifacts(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(previousVisibleAfter, previousVisible) {
+		t.Fatalf("previous version visibility changed:\n before=%#v\n  after=%#v", previousVisible, previousVisibleAfter)
+	}
+	for objectKey, wantBytes := range previousBytes {
+		gotBytes, readErr := os.ReadFile(storage.Path(objectKey))
+		if readErr != nil {
+			t.Fatalf("read previous object %s: %v", objectKey, readErr)
+		}
+		if !reflect.DeepEqual(gotBytes, wantBytes) {
+			t.Fatalf("previous object %s bytes changed", objectKey)
+		}
+	}
+}
+
+func TestTemplateFillPublishCleanupJoinsExactRowAndObjectErrors(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+	storage := service.storage.(*LocalStorage)
+
+	const previousVersion = "v20260712T120000Z"
+	previous := copyTemplateFillPublishedArtifactsForTaskTest(t, storage, projectPath, task.ID, previousVersion)
+	previousPrefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "artifacts", previousVersion)) + "/"
+	if err := repo.ReplaceArtifactsByObjectKeyPrefix(context.Background(), task.ID, previousPrefix, previous); err != nil {
+		t.Fatal(err)
+	}
+	tracking := &publishCleanupTrackingStorage{
+		StorageService:     storage,
+		failDeleteContains: "/analysis/fill_plan.json",
+	}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
+	if err := repo.DB().Exec(`
+		CREATE TRIGGER move_new_readback_before_cleanup_error
+		AFTER INSERT ON artifacts
+		WHEN NEW.kind = 'template_fill_readback'
+		BEGIN
+			UPDATE artifacts
+			SET publish_version = 'v20260712T120000Z'
+			WHERE id = NEW.id;
+		END;
+		CREATE TRIGGER fail_exact_inserted_row_cleanup
+		BEFORE DELETE ON artifacts
+		WHEN OLD.publish_version = 'v20260712T120000Z'
+		  AND OLD.object_key LIKE '%/validation/readback.md'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected exact inserted row cleanup failure');
+		END;
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	err := service.ProcessTask(context.Background(), task.ID)
+	for _, want := range []string{
+		"persisted artifact count",
+		"injected exact inserted row cleanup failure",
+		"injected publish object cleanup failure",
+	} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("ProcessTask() error = %v, want joined error %q", err, want)
+		}
+	}
+	if len(tracking.deletedObjectKeys) != len(tracking.copiedObjectKeys) {
+		t.Fatalf("object cleanup attempts = %d, want %d after row cleanup failure", len(tracking.deletedObjectKeys), len(tracking.copiedObjectKeys))
+	}
+	for _, artifact := range previous {
+		var count int64
+		if err := repo.DB().Model(&model.Artifact{}).
+			Where("task_id = ? AND id = ?", task.ID, artifact.ID).
+			Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("legitimate previous row %s count = %d, want 1", artifact.ID, count)
 		}
 	}
 }

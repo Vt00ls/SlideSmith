@@ -365,13 +365,38 @@ func (r *Repository) ListArtifactsByPublishVersion(ctx context.Context, taskID, 
 	return artifacts, err
 }
 
-func (r *Repository) DeleteArtifactsByPublishVersion(ctx context.Context, taskID, publishVersion string) error {
-	if publishVersion == "" {
-		return fmt.Errorf("publish version is empty")
+func (r *Repository) DeleteArtifactsByIDsOrObjectKeyPrefix(ctx context.Context, taskID, objectKeyPrefix string, artifactIDs []string) error {
+	ids := make([]string, 0, len(artifactIDs))
+	seen := make(map[string]bool, len(artifactIDs))
+	for _, id := range artifactIDs {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
 	}
-	return r.db.WithContext(ctx).
-		Where("task_id = ? AND publish_version = ?", taskID, publishVersion).
-		Delete(&model.Artifact{}).Error
+	if taskID == "" {
+		return fmt.Errorf("task id is empty")
+	}
+	if objectKeyPrefix == "" && len(ids) == 0 {
+		return fmt.Errorf("artifact cleanup identity is empty")
+	}
+
+	query := r.db.WithContext(ctx).Where("task_id = ?", taskID)
+	switch {
+	case objectKeyPrefix != "" && len(ids) > 0:
+		query = query.Where(
+			"id IN ? OR substr(object_key, 1, ?) = ?",
+			ids,
+			len(objectKeyPrefix),
+			objectKeyPrefix,
+		)
+	case objectKeyPrefix != "":
+		query = query.Where("substr(object_key, 1, ?) = ?", len(objectKeyPrefix), objectKeyPrefix)
+	default:
+		query = query.Where("id IN ?", ids)
+	}
+	return query.Delete(&model.Artifact{}).Error
 }
 
 func (r *Repository) latestPublishVersion(ctx context.Context, taskID string) (string, error) {

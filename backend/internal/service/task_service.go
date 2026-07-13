@@ -2559,11 +2559,17 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 func (s *TaskService) cleanupFailedPublishVersion(ctx context.Context, taskID, publishVersion string, artifacts []model.Artifact) error {
 	cleanupCtx := context.WithoutCancel(ctx)
 	var cleanupErr error
-	if err := s.repo.DeleteArtifactsByPublishVersion(cleanupCtx, taskID, publishVersion); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish version %s rows: %w", publishVersion, err))
+	prefix := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts", publishVersion)) + "/"
+	artifactIDs := make([]string, 0, len(artifacts))
+	for _, artifact := range artifacts {
+		if artifact.ID != "" {
+			artifactIDs = append(artifactIDs, artifact.ID)
+		}
+	}
+	if err := s.repo.DeleteArtifactsByIDsOrObjectKeyPrefix(cleanupCtx, taskID, prefix, artifactIDs); err != nil {
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish attempt %s rows: %w", publishVersion, err))
 	}
 
-	prefix := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts", publishVersion)) + "/"
 	seenObjectKeys := make(map[string]bool, len(artifacts))
 	for _, artifact := range artifacts {
 		objectKey := filepath.ToSlash(strings.TrimSpace(artifact.ObjectKey))
