@@ -198,9 +198,12 @@ func TestTemplateFillPlanPromptUsesWorkspaceRelativePathsAndHardRules(t *testing
 
 	prompt := service.templateFillPlanPrompt(task, inputs)
 	projectRel := service.projectRel(task, projectPath)
+	canonicalSource := filepath.ToSlash(filepath.Join("sources", filepath.Base(inputs.SourcePPTX)))
 	required := []string{
 		"You are building analysis/fill_plan.json for the Template Fill PPTX workflow.",
 		filepath.ToSlash(filepath.Join(projectRel, "sources", "brand.pptx")),
+		fmt.Sprintf("Required fill_plan.source_pptx value: %q", canonicalSource),
+		fmt.Sprintf("Set top-level source_pptx exactly to %q; it is relative to the Project directory and must not include the Project directory prefix.", canonicalSource),
 		filepath.ToSlash(filepath.Join(projectRel, "analysis", "brand.slide_library.json")),
 		filepath.ToSlash(filepath.Join(projectRel, "sources", "content.md")),
 		filepath.ToSlash(filepath.Join(projectRel, "analysis", "fill_plan.json")),

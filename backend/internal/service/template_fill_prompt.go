@@ -10,6 +10,11 @@ import (
 
 func (s *TaskService) templateFillPlanPrompt(task *model.Task, inputs TemplateFillInputs) string {
 	projectRel := s.projectRel(task, inputs.ProjectPath)
+	planSourcePath, err := filepath.Rel(inputs.ProjectPath, inputs.SourcePPTX)
+	if err != nil || filepath.IsAbs(planSourcePath) || planSourcePath == "." || strings.HasPrefix(planSourcePath, "..") {
+		planSourcePath = filepath.Join("sources", filepath.Base(inputs.SourcePPTX))
+	}
+	planSourcePath = filepath.ToSlash(planSourcePath)
 	workspacePath := func(hostPath string) string {
 		relativePath, err := filepath.Rel(inputs.ProjectPath, hostPath)
 		if err != nil || relativePath == "." || filepath.IsAbs(relativePath) || strings.HasPrefix(relativePath, "..") {
@@ -27,7 +32,8 @@ func (s *TaskService) templateFillPlanPrompt(task *model.Task, inputs TemplateFi
 Task:
 - SlideSmith task ID: %s
 - Project directory: %s
-- Source PPTX: %s
+- Source PPTX file to read: %s
+- Required fill_plan.source_pptx value: %q
 - Slide library: %s
 - Content sources:
 %s
@@ -40,10 +46,11 @@ Hard rules:
 - Reuse, reorder, or omit source slides when layout fit requires it.
 - Every planned slide must include layout_rationale.layout_pattern, why_fit, and risk.
 - All factual content must come from the provided content source files.
+- Set top-level source_pptx exactly to %q; it is relative to the Project directory and must not include the Project directory prefix.
 - Write only analysis/fill_plan.json.
 - Keep top-level status as "draft".
 - Do not create PPTX exports.
 
 Write the plan to %s and stop after verifying that it is valid JSON. Do not write a check report; the service runs the checker separately.
-`, task.ID, projectRel, workspacePath(inputs.SourcePPTX), workspacePath(inputs.SlideLibrary), strings.Join(contentSources, "\n"), workspacePath(inputs.FillPlan), workspacePath(inputs.FillPlan))
+`, task.ID, projectRel, workspacePath(inputs.SourcePPTX), planSourcePath, workspacePath(inputs.SlideLibrary), strings.Join(contentSources, "\n"), workspacePath(inputs.FillPlan), planSourcePath, workspacePath(inputs.FillPlan))
 }
