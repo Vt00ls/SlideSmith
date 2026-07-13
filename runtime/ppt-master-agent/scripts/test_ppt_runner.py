@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -546,6 +547,310 @@ def read_events() -> list[dict[str, object]]:
     ]
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def snapshot_filesystem_node(path: Path) -> tuple[str, ...]:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return ("missing",)
+    if stat.S_ISLNK(metadata.st_mode):
+        return ("symlink", os.readlink(path))
+    if stat.S_ISREG(metadata.st_mode):
+        return ("file", str(metadata.st_size), sha256_file(path))
+    if stat.S_ISDIR(metadata.st_mode):
+        return ("directory",)
+    return ("other", oct(stat.S_IFMT(metadata.st_mode)), str(metadata.st_size))
+
+
+def snapshot_tree_manifest(root: Path) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    root_snapshot = snapshot_filesystem_node(root)
+    entries: list[tuple[str, tuple[str, ...]]] = [(".", root_snapshot)]
+    if root_snapshot[0] != "directory":
+        return tuple(entries)
+
+    for current, directory_names, file_names in os.walk(root, topdown=True, followlinks=False):
+        directory_names.sort()
+        file_names.sort()
+        current_path = Path(current)
+        for name in [*directory_names, *file_names]:
+            path = current_path / name
+            entries.append((path.relative_to(root).as_posix(), snapshot_filesystem_node(path)))
+    return tuple(entries)
+
+
+def snapshot_external_pycache_manifest(
+    external_root: Path,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    entries: list[tuple[str, tuple[str, ...]]] = []
+    if snapshot_filesystem_node(external_root)[0] != "directory":
+        return tuple(entries)
+
+    for current, directory_names, _ in os.walk(external_root, topdown=True, followlinks=False):
+        directory_names.sort()
+        current_path = Path(current)
+        cache_names = [name for name in directory_names if name == "__pycache__"]
+        for name in cache_names:
+            cache = current_path / name
+            cache_relative = cache.relative_to(external_root)
+            for relative, node in snapshot_tree_manifest(cache):
+                path = cache_relative if relative == "." else cache_relative / relative
+                entries.append((path.as_posix(), node))
+        directory_names[:] = [name for name in directory_names if name != "__pycache__"]
+    return tuple(sorted(entries, key=lambda item: item[0]))
+
+
+def snapshot_git_status(root: Path) -> tuple[int, str, str]:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+            env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as exc:
+        return (-1, "", f"{type(exc).__name__}: {exc}")
+    return (completed.returncode, completed.stdout, completed.stderr)
+
+
+def capture_template_fill_safety_snapshot(
+    source_paths: list[Path] | tuple[Path, ...],
+    *,
+    external_root: Path,
+    repository_state: Path,
+) -> dict[str, object]:
+    sources = tuple(Path(path) for path in source_paths)
+    return {
+        "source_paths": sources,
+        "external_root": Path(external_root),
+        "repository_state": Path(repository_state),
+        "source fixtures": tuple(
+            (str(path), snapshot_filesystem_node(path))
+            for path in sources
+        ),
+        "external ppt-master Git status": snapshot_git_status(external_root),
+        "external ppt-master __pycache__": snapshot_external_pycache_manifest(external_root),
+        "repository runtime .slidesmith": snapshot_tree_manifest(repository_state),
+    }
+
+
+def assert_template_fill_safety_unchanged(snapshot: dict[str, object]) -> None:
+    current = capture_template_fill_safety_snapshot(
+        snapshot["source_paths"],
+        external_root=snapshot["external_root"],
+        repository_state=snapshot["repository_state"],
+    )
+    differences: list[str] = []
+    for label in (
+        "source fixtures",
+        "external ppt-master Git status",
+        "external ppt-master __pycache__",
+        "repository runtime .slidesmith",
+    ):
+        if current[label] != snapshot[label]:
+            differences.append(
+                f"{label} changed\n"
+                f"  before: {snapshot[label]!r}\n"
+                f"  after:  {current[label]!r}"
+            )
+    if differences:
+        raise AssertionError("Template Fill smoke safety violation:\n" + "\n".join(differences))
+
+
+def register_template_fill_safety_finalizer(
+    test_case: unittest.TestCase,
+    source_paths: list[Path] | tuple[Path, ...],
+    *,
+    external_root: Path,
+    repository_state: Path,
+) -> dict[str, object]:
+    snapshot = capture_template_fill_safety_snapshot(
+        source_paths,
+        external_root=external_root,
+        repository_state=repository_state,
+    )
+    test_case.addCleanup(assert_template_fill_safety_unchanged, snapshot)
+    return snapshot
+
+
+def run_template_fill_smoke_subprocess(
+    command: list[str],
+    *,
+    workspace: Path,
+    temporary_root: Path,
+    timeout: int = 180,
+) -> subprocess.CompletedProcess[str]:
+    resolved_root = temporary_root.resolve()
+    resolved_workspace = workspace.resolve()
+    try:
+        resolved_workspace.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(f"smoke workspace must be below temporary root: {workspace}") from exc
+
+    controlled_cwd = temporary_root / "subprocess-cwd"
+    controlled_cwd.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment["WORKSPACE"] = str(workspace)
+    return subprocess.run(
+        command,
+        cwd=controlled_cwd,
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+
+
+def assert_template_fill_runner_state_isolated(
+    temporary_root: Path,
+    workspace: Path,
+) -> None:
+    resolved_workspace = workspace.resolve()
+    state_directories = sorted(temporary_root.rglob(".slidesmith"), key=lambda path: str(path))
+    escaped_paths: list[Path] = []
+    for state_path in state_directories:
+        try:
+            state_path.resolve().relative_to(resolved_workspace)
+        except ValueError:
+            escaped_paths.append(state_path)
+    expected_state = workspace / ".slidesmith"
+    if escaped_paths:
+        raise AssertionError(f"runner state outside workspace: {escaped_paths}")
+    if state_directories != [expected_state]:
+        raise AssertionError(
+            f"runner state directories = {state_directories!r}, expected {[expected_state]!r}"
+        )
+    for state_file in expected_state.rglob("*"):
+        try:
+            state_file.resolve().relative_to(resolved_workspace)
+        except ValueError as exc:
+            raise AssertionError(f"runner state outside workspace: {state_file}") from exc
+
+
+class RealTemplateFillSafetyGuardTests(unittest.TestCase):
+    def make_safety_context(self, root: Path) -> tuple[list[Path], Path, Path]:
+        external_root = root / "ppt-master"
+        external_root.mkdir()
+        initialized = subprocess.run(
+            ["git", "init", "-q", str(external_root)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
+        (external_root / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+        fixture = external_root / "fixture.pptx"
+        content = external_root / "content.md"
+        fixture.write_bytes(b"fixture")
+        content.write_text("# Content\n", encoding="utf-8")
+        repository_state = root / "runtime" / ".slidesmith"
+        return [fixture, content], external_root, repository_state
+
+    def test_smoke_subprocess_uses_controlled_temp_cwd_and_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temporary_root = Path(tmp)
+            workspace = temporary_root / "workspace"
+            workspace.mkdir()
+            probe = (
+                "import json, os; from pathlib import Path; "
+                "state = Path('.slidesmith'); state.mkdir(); "
+                "(state / 'cwd-probe').write_text('probe', encoding='utf-8'); "
+                "print(json.dumps({'cwd': str(Path.cwd()), "
+                "'workspace': os.environ.get('WORKSPACE'), "
+                "'dont_write_bytecode': os.environ.get('PYTHONDONTWRITEBYTECODE')}))"
+            )
+            result = run_template_fill_smoke_subprocess(
+                [sys.executable, "-c", probe],
+                workspace=workspace,
+                temporary_root=temporary_root,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            payload = json.loads(result.stdout)
+            controlled_cwd = temporary_root / "subprocess-cwd"
+            self.assertTrue(controlled_cwd.is_dir())
+            self.assertEqual(Path(payload["cwd"]), controlled_cwd.resolve())
+            self.assertEqual(payload["workspace"], str(workspace))
+            self.assertEqual(payload["dont_write_bytecode"], "1")
+            cwd_state = controlled_cwd / ".slidesmith" / "cwd-probe"
+            self.assertTrue(cwd_state.is_file())
+            self.assertFalse(cwd_state.resolve().is_relative_to(workspace.resolve()))
+            workspace_state = workspace / ".slidesmith"
+            workspace_state.mkdir()
+            (workspace_state / "status.json").write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(AssertionError, "runner state outside workspace"):
+                assert_template_fill_runner_state_isolated(temporary_root, workspace)
+
+    def test_safety_guard_detects_repo_state_git_status_and_pycache_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources, external_root, repository_state = self.make_safety_context(root)
+            repository_state.mkdir(parents=True)
+            leaked_state = repository_state / "status.json"
+            leaked_state.write_bytes(b'{"a":1}\n')
+            state_stat = leaked_state.stat()
+            pycache = external_root / "skills" / "scripts" / "__pycache__"
+            pycache.mkdir(parents=True)
+            cached_module = pycache / "module.pyc"
+            cached_module.write_bytes(b"old bytecode")
+            cache_stat = cached_module.stat()
+            snapshot = capture_template_fill_safety_snapshot(
+                sources,
+                external_root=external_root,
+                repository_state=repository_state,
+            )
+
+            leaked_state.write_bytes(b'{"b":1}\n')
+            os.utime(leaked_state, ns=(state_stat.st_atime_ns, state_stat.st_mtime_ns))
+            cached_module.write_bytes(b"new bytecode")
+            os.utime(cached_module, ns=(cache_stat.st_atime_ns, cache_stat.st_mtime_ns))
+            (external_root / "unexpected.txt").write_text("dirty\n", encoding="utf-8")
+
+            with self.assertRaises(AssertionError) as caught:
+                assert_template_fill_safety_unchanged(snapshot)
+
+            message = str(caught.exception)
+            self.assertIn("repository runtime .slidesmith", message)
+            self.assertIn("external ppt-master Git status", message)
+            self.assertIn("external ppt-master __pycache__", message)
+
+    def test_safety_finalizer_preserves_primary_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources, external_root, repository_state = self.make_safety_context(root)
+            fixture = sources[0]
+
+            class ForcedPhaseFailure(unittest.TestCase):
+                def runTest(inner_self) -> None:
+                    register_template_fill_safety_finalizer(
+                        inner_self,
+                        sources,
+                        external_root=external_root,
+                        repository_state=repository_state,
+                    )
+                    fixture.write_bytes(b"changed fixture")
+                    inner_self.fail("forced phase failure")
+
+            result = unittest.TestResult()
+            ForcedPhaseFailure().run(result)
+            diagnostics = "\n".join(
+                detail
+                for _, detail in [*result.failures, *result.errors]
+            )
+            self.assertIn("forced phase failure", diagnostics)
+            self.assertIn("source fixtures", diagnostics)
+            self.assertGreaterEqual(len(result.failures) + len(result.errors), 2)
+
+
 @unittest.skipUnless(
     os.environ.get("SLIDESMITH_RUN_REAL_TEMPLATE_FILL_SMOKE") == "1",
     "set SLIDESMITH_RUN_REAL_TEMPLATE_FILL_SMOKE=1 for the real Template Fill smoke",
@@ -563,23 +868,28 @@ class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
             fixture: (105_402, "ddcaef381c298e0c5f4d1c636731044ed513e30166c07e79dae70ff5896227a3"),
             content_source: (12_239, "c823b8ff8e5733d7e0a778256cd0d03cf7b71da3cd8bb2cf15a70d5431d72906"),
         }
-
-        def sha256(path: Path) -> str:
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            return digest.hexdigest()
+        external_root = ppt_runner.PPT_MASTER_ROOT
+        repository_state = RUNNER_PATH.parent.parent / ".slidesmith"
+        safety_snapshot = register_template_fill_safety_finalizer(
+            self,
+            list(expected_sources),
+            external_root=external_root,
+            repository_state=repository_state,
+        )
+        git_status = safety_snapshot["external ppt-master Git status"]
+        self.assertEqual(git_status[0], 0, git_status)
+        self.assertEqual(git_status[1], "", git_status)
 
         source_digests_before: dict[Path, str] = {}
         for path, (expected_size, expected_digest) in expected_sources.items():
             self.assertFalse(path.is_symlink(), f"smoke source must not be a symlink: {path}")
             self.assertTrue(path.is_file(), f"smoke source must be a regular file: {path}")
             self.assertEqual(path.stat().st_size, expected_size, path)
-            source_digests_before[path] = sha256(path)
+            source_digests_before[path] = sha256_file(path)
             self.assertEqual(source_digests_before[path], expected_digest, path)
 
         temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         workspace = root / "workspace"
         project = workspace / "projects" / "spec3_template_fill_smoke"
@@ -592,15 +902,12 @@ class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
             copied_content = sources_dir / content_source.name
             shutil.copy2(fixture, copied_fixture)
             shutil.copy2(content_source, copied_content)
-            self.assertEqual(sha256(copied_fixture), source_digests_before[fixture])
-            self.assertEqual(sha256(copied_content), source_digests_before[content_source])
+            self.assertEqual(sha256_file(copied_fixture), source_digests_before[fixture])
+            self.assertEqual(sha256_file(copied_content), source_digests_before[content_source])
 
-            environment = os.environ.copy()
-            environment["PYTHONDONTWRITEBYTECODE"] = "1"
-            environment["WORKSPACE"] = str(workspace)
             analyzer = ppt_runner.SCRIPTS_DIR / "template_fill_pptx.py"
             slide_library = analysis_dir / f"{copied_fixture.stem}.slide_library.json"
-            analyze = subprocess.run(
+            analyze = run_template_fill_smoke_subprocess(
                 [
                     sys.executable,
                     str(analyzer),
@@ -609,12 +916,8 @@ class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
                     "-o",
                     str(slide_library),
                 ],
-                cwd=RUNNER_PATH.parent.parent,
-                env=environment,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=180,
+                workspace=workspace,
+                temporary_root=root,
             )
             self.assertEqual(analyze.returncode, 0, analyze.stdout + analyze.stderr)
             self.assertTrue(slide_library.is_file())
@@ -650,17 +953,13 @@ class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
             plan = json.loads(fill_plan.read_text(encoding="utf-8"))
             self.assertEqual(plan["status"], "confirmed")
             self.assertEqual(len(plan["slides"]), 1)
-            plan_digest = sha256(fill_plan)
+            plan_digest = sha256_file(fill_plan)
 
             def run_phase(*arguments: str) -> subprocess.CompletedProcess[str]:
-                completed = subprocess.run(
+                completed = run_template_fill_smoke_subprocess(
                     [sys.executable, str(RUNNER_PATH), *arguments],
-                    cwd=RUNNER_PATH.parent.parent,
-                    env=environment,
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    timeout=180,
+                    workspace=workspace,
+                    temporary_root=root,
                 )
                 self.assertEqual(
                     completed.returncode,
@@ -672,12 +971,12 @@ class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
             check_report = analysis_dir / "check_report.json"
             self.assertFalse(check_report.exists())
             run_phase("template-fill-check", "--project-path", str(project))
-            self.assertEqual(sha256(fill_plan), plan_digest)
+            self.assertEqual(sha256_file(fill_plan), plan_digest)
             self.assertTrue(check_report.is_file())
             check = json.loads(check_report.read_text(encoding="utf-8"))
             self.assertEqual(check.get("schema"), "template_fill_pptx_check.v1")
             self.assertEqual(check.get("summary", {}).get("error"), 0)
-            check_digest = sha256(check_report)
+            check_digest = sha256_file(check_report)
 
             exports_dir = project / "exports"
             export_pattern = re.compile(
@@ -695,8 +994,8 @@ class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
                 "--transition",
                 "fade",
             )
-            self.assertEqual(sha256(fill_plan), plan_digest)
-            self.assertEqual(sha256(check_report), check_digest)
+            self.assertEqual(sha256_file(fill_plan), plan_digest)
+            self.assertEqual(sha256_file(check_report), check_digest)
             exports_after = {
                 path.name
                 for path in exports_dir.iterdir()
@@ -717,8 +1016,8 @@ class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
             self.assertFalse(validate_report.exists())
             self.assertFalse(readback.exists())
             run_phase("template-fill-validate", "--project-path", str(project))
-            self.assertEqual(sha256(fill_plan), plan_digest)
-            self.assertEqual(sha256(check_report), check_digest)
+            self.assertEqual(sha256_file(fill_plan), plan_digest)
+            self.assertEqual(sha256_file(check_report), check_digest)
             self.assertTrue(validate_report.is_file())
             validate = json.loads(validate_report.read_text(encoding="utf-8"))
             self.assertEqual(validate.get("schema"), "template_fill_pptx_validate.v1")
@@ -750,17 +1049,14 @@ class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
             state_dir = workspace / ".slidesmith"
             self.assertTrue((state_dir / "events.ndjson").is_file())
             self.assertTrue((state_dir / "status.json").is_file())
-            state_dirs = [path.resolve() for path in root.rglob(".slidesmith")]
-            self.assertEqual(state_dirs, [state_dir.resolve()])
-            for state_file in state_dir.rglob("*"):
-                self.assertTrue(state_file.resolve().is_relative_to(workspace.resolve()))
+            assert_template_fill_runner_state_isolated(root, workspace)
 
-            self.assertEqual(sha256(copied_fixture), source_digests_before[fixture])
-            self.assertEqual(sha256(copied_content), source_digests_before[content_source])
+            self.assertEqual(sha256_file(copied_fixture), source_digests_before[fixture])
+            self.assertEqual(sha256_file(copied_content), source_digests_before[content_source])
             for path, digest in source_digests_before.items():
                 self.assertFalse(path.is_symlink(), path)
                 self.assertTrue(path.is_file(), path)
-                self.assertEqual(sha256(path), digest, path)
+                self.assertEqual(sha256_file(path), digest, path)
             print(
                 "real Template Fill smoke: "
                 f"plan_sha256={plan_digest} "
@@ -772,12 +1068,17 @@ class RealTemplateFillRunnerSmokeTests(unittest.TestCase):
                 f"slides={len(slide_entries)}"
             )
         except BaseException:
-            retained = Path(tempfile.mkdtemp(prefix="slidesmith-template-fill-smoke-failed-"))
-            shutil.copytree(root, retained, dirs_exist_ok=True)
-            print(f"retained failed Template Fill smoke at {retained}", file=sys.stderr)
+            try:
+                retained = Path(tempfile.mkdtemp(prefix="slidesmith-template-fill-smoke-failed-"))
+                shutil.copytree(root, retained, dirs_exist_ok=True)
+            except Exception as retention_error:
+                print(
+                    f"could not retain failed Template Fill smoke: {retention_error}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"retained failed Template Fill smoke at {retained}", file=sys.stderr)
             raise
-        finally:
-            temporary.cleanup()
 
 
 @unittest.skipUnless(
