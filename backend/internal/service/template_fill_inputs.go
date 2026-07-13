@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"golang.org/x/text/cases"
 )
 
 type TemplateFillInputs struct {
@@ -46,9 +48,15 @@ func discoverTemplateFillInputs(projectPath string) (TemplateFillInputs, error) 
 
 type templateFillProvenanceSource struct {
 	relativePath string
+	nodeType     string
 	size         int64
 	sha256       string
 }
+
+const (
+	templateFillSourceNodeDirectory = "directory"
+	templateFillSourceNodeFile      = "file"
+)
 
 type templateFillSourceProvenance struct {
 	canonicalProject     string
@@ -140,7 +148,7 @@ func discoverTemplateFillInputsWithProvenance(projectPath string, provenance tem
 		}
 		entryStem := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
 		relativePath := filepath.ToSlash(filepath.Join("sources", entry.Name()))
-		if extension == ".md" && strings.EqualFold(entryStem, stem) && !provenance.hasBoundSource(relativePath) {
+		if extension == ".md" && templateFillCaseFold(entryStem) == templateFillCaseFold(stem) && !provenance.hasBoundSource(relativePath) {
 			continue
 		}
 		absolutePath := filepath.Join(sourcesPath, entry.Name())
@@ -299,8 +307,12 @@ func snapshotTemplateFillSourceProvenance(projectPath string) (templateFillSourc
 				return templateFillSourceProvenance{}, fmt.Errorf("template fill source inputs manifest has duplicate claim for %q", name)
 			}
 			for existing := range claimedNames {
-				if strings.EqualFold(existing, name) {
-					return templateFillSourceProvenance{}, fmt.Errorf("template fill source inputs manifest has case-fold-colliding claims %q and %q", existing, name)
+				if templateFillCaseFold(existing) == templateFillCaseFold(name) {
+					return templateFillSourceProvenance{}, fmt.Errorf(
+						"template fill source inputs manifest has case-fold-colliding claims %q and %q under Unicode Default full case folding",
+						existing,
+						name,
+					)
 				}
 			}
 			claimedNames[name] = struct{}{}
@@ -317,6 +329,10 @@ func snapshotTemplateFillSourceProvenance(projectPath string) (templateFillSourc
 		return templateFillSourceProvenance{}, err
 	}
 	return provenance, nil
+}
+
+func templateFillCaseFold(value string) string {
+	return cases.Fold().String(value)
 }
 
 func templateFillSourceManifestPaths(projectPath string) []templateFillManifestPath {
@@ -385,32 +401,98 @@ func (provenance *templateFillSourceProvenance) bindCanonicalSources(projectPath
 	}
 	for _, entry := range entries {
 		relativePath := filepath.ToSlash(filepath.Join("sources", entry.Name()))
-		fingerprint, err := templateFillFingerprintSource(projectPath, relativePath)
-		if err != nil {
+		if err := provenance.bindCanonicalSourceNode(projectPath, relativePath); err != nil {
 			return err
 		}
-		provenance.sources[relativePath] = fingerprint
-		if _, authorized := claimedNames[entry.Name()]; authorized {
-			provenance.authorizedSources[relativePath] = struct{}{}
+		if fingerprint := provenance.sources[relativePath]; fingerprint.nodeType == templateFillSourceNodeFile {
+			if _, authorized := claimedNames[entry.Name()]; authorized {
+				provenance.authorizedSources[relativePath] = struct{}{}
+			}
 		}
 	}
 	return nil
 }
 
-func templateFillFingerprintSource(projectPath, relativePath string) (templateFillProvenanceSource, error) {
+func (provenance *templateFillSourceProvenance) bindCanonicalSourceNode(projectPath, relativePath string) error {
 	absolutePath := filepath.Join(projectPath, filepath.FromSlash(relativePath))
 	info, resolvedPath, err := inspectContainedPath(projectPath, absolutePath)
 	if err != nil {
-		return templateFillProvenanceSource{}, fmt.Errorf("inspect template fill provenance source %s: %w", relativePath, err)
+		return fmt.Errorf("inspect template fill provenance source %s: %w", relativePath, err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return templateFillProvenanceSource{}, fmt.Errorf("template fill provenance source must be a regular non-symlinked file: %s", relativePath)
+	switch {
+	case info.IsDir():
+		provenance.sources[relativePath] = templateFillProvenanceSource{
+			relativePath: relativePath,
+			nodeType:     templateFillSourceNodeDirectory,
+		}
+		entries, err := os.ReadDir(resolvedPath)
+		if err != nil {
+			return fmt.Errorf("read template fill provenance source directory %s: %w", relativePath, err)
+		}
+		for _, entry := range entries {
+			childRelativePath := filepath.ToSlash(filepath.Join(relativePath, entry.Name()))
+			if err := provenance.bindCanonicalSourceNode(projectPath, childRelativePath); err != nil {
+				return err
+			}
+		}
+		return nil
+	case info.Mode().IsRegular():
+		digest, err := sha256File(resolvedPath)
+		if err != nil {
+			return fmt.Errorf("hash template fill provenance source %s: %w", relativePath, err)
+		}
+		provenance.sources[relativePath] = templateFillProvenanceSource{
+			relativePath: relativePath,
+			nodeType:     templateFillSourceNodeFile,
+			size:         info.Size(),
+			sha256:       digest,
+		}
+		return nil
+	default:
+		return fmt.Errorf("template fill provenance source must be a regular file or directory: %s", relativePath)
 	}
-	digest, err := sha256File(resolvedPath)
-	if err != nil {
-		return templateFillProvenanceSource{}, fmt.Errorf("hash template fill provenance source %s: %w", relativePath, err)
+}
+
+func sortedTemplateFillSourcePaths(sources map[string]templateFillProvenanceSource) []string {
+	paths := make([]string, 0, len(sources))
+	for relativePath := range sources {
+		paths = append(paths, relativePath)
 	}
-	return templateFillProvenanceSource{relativePath: relativePath, size: info.Size(), sha256: digest}, nil
+	sort.Strings(paths)
+	return paths
+}
+
+func templateFillSourceFingerprintMatches(actual, expected templateFillProvenanceSource) bool {
+	return actual.nodeType == expected.nodeType &&
+		actual.size == expected.size &&
+		actual.sha256 == expected.sha256
+}
+
+func (provenance templateFillSourceProvenance) validateSourceInventory(candidate templateFillSourceProvenance) error {
+	for _, relativePath := range sortedTemplateFillSourcePaths(provenance.sources) {
+		expected := provenance.sources[relativePath]
+		if actual, ok := candidate.sources[relativePath]; ok && actual.nodeType != expected.nodeType {
+			return fmt.Errorf("template fill candidate source type changed from authoritative provenance: %s", relativePath)
+		}
+	}
+	for _, relativePath := range sortedTemplateFillSourcePaths(provenance.sources) {
+		if _, ok := candidate.sources[relativePath]; !ok {
+			return fmt.Errorf("template fill candidate source inventory is missing authoritative source: %s", relativePath)
+		}
+	}
+	for _, relativePath := range sortedTemplateFillSourcePaths(candidate.sources) {
+		if _, ok := provenance.sources[relativePath]; !ok {
+			return fmt.Errorf("template fill candidate source inventory has unexpected source: %s", relativePath)
+		}
+	}
+	for _, relativePath := range sortedTemplateFillSourcePaths(provenance.sources) {
+		expected := provenance.sources[relativePath]
+		actual := candidate.sources[relativePath]
+		if !templateFillSourceFingerprintMatches(actual, expected) {
+			return fmt.Errorf("template fill candidate source changed from authoritative provenance: %s", relativePath)
+		}
+	}
+	return nil
 }
 
 func (provenance templateFillSourceProvenance) hasBoundSource(relativePath string) bool {
@@ -448,23 +530,7 @@ func (provenance templateFillSourceProvenance) validateCandidate(projectPath str
 	if err := candidate.bindCanonicalSources(projectPath, nil); err != nil {
 		return fmt.Errorf("inspect template fill candidate source inventory: %w", err)
 	}
-	for relativePath := range provenance.sources {
-		if _, ok := candidate.sources[relativePath]; !ok {
-			return fmt.Errorf("template fill candidate source inventory is missing authoritative source: %s", relativePath)
-		}
-	}
-	for relativePath := range candidate.sources {
-		if _, ok := provenance.sources[relativePath]; !ok {
-			return fmt.Errorf("template fill candidate source inventory has unexpected source: %s", relativePath)
-		}
-	}
-	for relativePath, expected := range provenance.sources {
-		actual := candidate.sources[relativePath]
-		if actual.size != expected.size || actual.sha256 != expected.sha256 {
-			return fmt.Errorf("template fill candidate source changed from authoritative provenance: %s", relativePath)
-		}
-	}
-	return nil
+	return provenance.validateSourceInventory(candidate)
 }
 
 func (provenance templateFillSourceProvenance) revalidateAuthoritative() error {
@@ -480,9 +546,10 @@ func (provenance templateFillSourceProvenance) revalidateAuthoritative() error {
 		len(current.authorizedSources) != len(provenance.authorizedSources) {
 		return fmt.Errorf("template fill source provenance changed during operation")
 	}
-	for key, expected := range provenance.sources {
+	for _, key := range sortedTemplateFillSourcePaths(provenance.sources) {
+		expected := provenance.sources[key]
 		actual, ok := current.sources[key]
-		if !ok || actual.relativePath != expected.relativePath || actual.size != expected.size || actual.sha256 != expected.sha256 {
+		if !ok || actual.relativePath != expected.relativePath || !templateFillSourceFingerprintMatches(actual, expected) {
 			return fmt.Errorf("template fill source provenance changed during operation: %s", expected.relativePath)
 		}
 	}

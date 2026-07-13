@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -255,7 +256,48 @@ def _validate_template_fill_output_path(project_path: Path, path: Path) -> None:
         raise ValueError(f"template fill output path must be a regular file: {relative.as_posix()}")
 
 
-def _template_fill_has_explicit_same_stem_markdown(project_path: Path, stem: str) -> bool:
+def _template_fill_casefold(value: str) -> str:
+    """Use Unicode Default full case folding for cross-runtime stem/collision checks."""
+    return value.casefold()
+
+
+def _template_fill_manifest_source_name(entry: dict[str, Any], index: int) -> str | None:
+    names: list[str] = []
+    name = entry.get("name", "")
+    if not isinstance(name, str):
+        raise ValueError(f"template fill source inputs manifest files[{index}].name must be a string")
+    name = name.strip()
+    if name:
+        normalized = name.replace("\\", "/")
+        basename = Path(normalized).name
+        if normalized != basename or basename in {".", ".."}:
+            raise ValueError(f"template fill source inputs manifest files[{index}].name must be a filename")
+        names.append(basename)
+
+    upload_path = entry.get("upload_path", "")
+    if not isinstance(upload_path, str):
+        raise ValueError(f"template fill source inputs manifest files[{index}].upload_path must be a string")
+    upload_path = upload_path.strip()
+    if upload_path:
+        normalized = upload_path.replace("\\", "/")
+        cleaned = posixpath.normpath(normalized)
+        if normalized.startswith("/") or cleaned == ".." or cleaned.startswith("../"):
+            raise ValueError(f"template fill source inputs manifest files[{index}].upload_path is outside workspace")
+        basename = Path(cleaned).name
+        if basename not in {"", ".", ".."}:
+            names.append(basename)
+
+    if not names:
+        return None
+    if len(names) == 2 and names[0] != names[1]:
+        raise ValueError(
+            f"template fill source inputs manifest files[{index}] ambiguously authorizes "
+            f"{names[0]!r} and {names[1]!r}"
+        )
+    return names[0]
+
+
+def _template_fill_authorized_source_paths(project_path: Path) -> set[str]:
     manifest_paths: list[tuple[Path, Path]] = [(project_path, project_path / ".slidesmith" / "source_inputs.json")]
     projects_dir = project_path.parent
     if projects_dir.name == "projects":
@@ -279,20 +321,39 @@ def _template_fill_has_explicit_same_stem_markdown(project_path: Path, stem: str
         files = payload.get("files", [])
         if not isinstance(files, list):
             raise ValueError("template fill source inputs manifest files must be a list")
-        manifest_names: list[str] = []
+        claimed_names: set[str] = set()
+        folded_claims: dict[str, str] = {}
         for index, entry in enumerate(files):
             if not isinstance(entry, dict):
                 raise ValueError(f"template fill source inputs manifest files[{index}] must be an object")
-            for field in ("name", "upload_path"):
-                value = entry.get(field, "")
-                if not isinstance(value, str):
-                    raise ValueError(f"template fill source inputs manifest files[{index}].{field} must be a string")
-                manifest_names.append(Path(value.replace("\\", "/")).name.strip())
-        return any(
-            name.lower().endswith(".md") and Path(name).stem.casefold() == stem.casefold()
-            for name in manifest_names
-        )
-    return False
+            name = _template_fill_manifest_source_name(entry, index)
+            if name is None:
+                continue
+            if name in claimed_names:
+                raise ValueError(f"template fill source inputs manifest has duplicate claim for {name!r}")
+            folded = _template_fill_casefold(name)
+            existing = folded_claims.get(folded)
+            if existing is not None and existing != name:
+                raise ValueError(
+                    "template fill source inputs manifest has case-fold-colliding claims "
+                    f"{existing!r} and {name!r} under Unicode Default full case folding"
+                )
+            claimed_names.add(name)
+            folded_claims[folded] = name
+        return {f"sources/{name}" for name in claimed_names}
+    return set()
+
+
+def _template_fill_should_include_content_source(
+    relative_path: str,
+    extension: str,
+    stem: str,
+    presentation_stem: str,
+    authorized_source_paths: set[str],
+) -> bool:
+    if extension != ".md" or _template_fill_casefold(stem) != _template_fill_casefold(presentation_stem):
+        return True
+    return relative_path in authorized_source_paths
 
 
 def discover_template_fill_inputs(project_path: Path) -> dict[str, Any]:
@@ -341,13 +402,20 @@ def discover_template_fill_inputs(project_path: Path) -> dict[str, Any]:
         relative = slide_library.relative_to(project_path).as_posix()
         raise ValueError(f"template fill requires slide library: {relative}: {exc}") from exc
 
-    explicit_same_stem_markdown = _template_fill_has_explicit_same_stem_markdown(project_path, source_pptx.stem)
+    authorized_source_paths = _template_fill_authorized_source_paths(project_path)
     content_sources: list[Path] = []
     for entry in entries:
         extension = entry.suffix.lower()
         if extension not in TEMPLATE_FILL_CONTENT_SOURCE_SUFFIXES:
             continue
-        if extension == ".md" and entry.stem.casefold() == source_pptx.stem.casefold() and not explicit_same_stem_markdown:
+        relative_path = entry.relative_to(project_path).as_posix()
+        if not _template_fill_should_include_content_source(
+            relative_path,
+            extension,
+            entry.stem,
+            source_pptx.stem,
+            authorized_source_paths,
+        ):
             continue
         _require_template_fill_regular_file(project_path, entry, "template fill content source")
         content_sources.append(entry)

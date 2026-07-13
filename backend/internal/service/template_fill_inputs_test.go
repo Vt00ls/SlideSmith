@@ -37,6 +37,22 @@ func TestDiscoverTemplateFillInputsFindsSingleDeckAndContent(t *testing.T) {
 	}
 }
 
+func TestDiscoverTemplateFillInputsUsesUnicodeFullCaseFoldForGeneratedReadback(t *testing.T) {
+	projectPath := t.TempDir()
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "straße.pptx"), "pptx")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "STRASSE.md"), "# Generated template readback\n")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "content.md"), "# New content\n")
+	mustWriteFileNoTest(projectPath, filepath.Join("analysis", "straße.slide_library.json"), `{"slides":[]}`+"\n")
+
+	inputs, err := discoverTemplateFillInputs(projectPath)
+	if err != nil {
+		t.Fatalf("discoverTemplateFillInputs() error = %v", err)
+	}
+	if len(inputs.ContentSources) != 1 || filepath.Base(inputs.ContentSources[0]) != "content.md" {
+		t.Fatalf("content sources = %#v, want only exact business content", inputs.ContentSources)
+	}
+}
+
 func TestDiscoverTemplateFillInputsSortsReadableContentCaseInsensitively(t *testing.T) {
 	projectPath := t.TempDir()
 	mustWriteFileNoTest(projectPath, filepath.Join("sources", "template.PPTX"), "pptx")
@@ -186,6 +202,211 @@ func TestTemplateFillProvenanceValidateCandidateRejectsChangedSourceInventory(t 
 	}
 }
 
+func TestTemplateFillProvenanceAcceptsImageCompanionDirectory(t *testing.T) {
+	projectPath := newTemplateFillCompanionDirectoryProject(t)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		t.Fatalf("snapshotTemplateFillSourceProvenance() error = %v", err)
+	}
+	if empty, ok := provenance.sources["sources/brand_files/empty"]; !ok || empty.nodeType != templateFillSourceNodeDirectory {
+		t.Fatalf("provenance omitted empty companion directory: %#v", provenance.sources)
+	}
+	candidateProject := filepath.Join(t.TempDir(), "candidate")
+	if err := copyDir(context.Background(), projectPath, candidateProject); err != nil {
+		t.Fatal(err)
+	}
+	if err := provenance.validateCandidate(candidateProject); err != nil {
+		t.Fatalf("validateCandidate() error = %v", err)
+	}
+	inputs, err := discoverTemplateFillInputsWithProvenance(candidateProject, provenance)
+	if err != nil {
+		t.Fatalf("discoverTemplateFillInputsWithProvenance() error = %v", err)
+	}
+	if filepath.Base(inputs.SourcePPTX) != "brand.pptx" || len(inputs.ContentSources) != 1 || filepath.Base(inputs.ContentSources[0]) != "content.md" {
+		t.Fatalf("discovered companion-directory inputs = %#v", inputs)
+	}
+}
+
+func TestTemplateFillProvenanceRejectsNestedCompanionDirectoryMutation(t *testing.T) {
+	tests := []struct {
+		name       string
+		wantSource string
+		mutate     func(*testing.T, string)
+	}{
+		{
+			name:       "nested add",
+			wantSource: "sources/brand_files/nested/added.png",
+			mutate: func(t *testing.T, candidateProject string) {
+				mustWriteFileNoTest(candidateProject, filepath.Join("sources", "brand_files", "nested", "added.png"), "added")
+			},
+		},
+		{
+			name:       "nested remove",
+			wantSource: "sources/brand_files/nested/preview.png",
+			mutate: func(t *testing.T, candidateProject string) {
+				if err := os.Remove(filepath.Join(candidateProject, "sources", "brand_files", "nested", "preview.png")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:       "nested content",
+			wantSource: "sources/brand_files/nested/preview.png",
+			mutate: func(t *testing.T, candidateProject string) {
+				mustWriteFileNoTest(candidateProject, filepath.Join("sources", "brand_files", "nested", "preview.png"), "changed-preview")
+			},
+		},
+		{
+			name:       "empty directory remove",
+			wantSource: "sources/brand_files/empty",
+			mutate: func(t *testing.T, candidateProject string) {
+				if err := os.Remove(filepath.Join(candidateProject, "sources", "brand_files", "empty")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:       "empty directory add",
+			wantSource: "sources/brand_files/added-empty",
+			mutate: func(t *testing.T, candidateProject string) {
+				if err := os.Mkdir(filepath.Join(candidateProject, "sources", "brand_files", "added-empty"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:       "file becomes directory",
+			wantSource: "sources/brand_files/hero.png",
+			mutate: func(t *testing.T, candidateProject string) {
+				path := filepath.Join(candidateProject, "sources", "brand_files", "hero.png")
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:       "directory becomes file",
+			wantSource: "sources/brand_files/nested",
+			mutate: func(t *testing.T, candidateProject string) {
+				path := filepath.Join(candidateProject, "sources", "brand_files", "nested")
+				if err := os.RemoveAll(path); err != nil {
+					t.Fatal(err)
+				}
+				mustWriteFileNoTest(candidateProject, filepath.Join("sources", "brand_files", "nested"), "not-a-directory")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projectPath := newTemplateFillCompanionDirectoryProject(t)
+			provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+			if err != nil {
+				t.Fatalf("snapshotTemplateFillSourceProvenance() error = %v", err)
+			}
+			candidateProject := filepath.Join(t.TempDir(), "candidate")
+			if err := copyDir(context.Background(), projectPath, candidateProject); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, candidateProject)
+			if err := provenance.validateCandidate(candidateProject); err == nil || !strings.Contains(err.Error(), test.wantSource) {
+				t.Fatalf("validateCandidate() error = %v, want nested inventory rejection naming %s", err, test.wantSource)
+			}
+		})
+	}
+}
+
+func TestTemplateFillProvenanceRevalidationRejectsNestedCompanionMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, string)
+	}{
+		{
+			name: "add",
+			mutate: func(t *testing.T, projectPath string) {
+				mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand_files", "nested", "added.png"), "added")
+			},
+		},
+		{
+			name: "remove",
+			mutate: func(t *testing.T, projectPath string) {
+				if err := os.Remove(filepath.Join(projectPath, "sources", "brand_files", "nested", "preview.png")); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "content",
+			mutate: func(t *testing.T, projectPath string) {
+				mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand_files", "nested", "preview.png"), "changed-preview")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			projectPath := newTemplateFillCompanionDirectoryProject(t)
+			provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(t, projectPath)
+			if err := provenance.revalidateAuthoritative(); err == nil {
+				t.Fatal("revalidateAuthoritative() error = nil, want nested companion mutation rejection")
+			}
+		})
+	}
+}
+
+func TestTemplateFillProvenanceRejectsNestedCompanionSymlink(t *testing.T) {
+	projectPath := newTemplateFillCompanionDirectoryProject(t)
+	symlinkPath := filepath.Join(projectPath, "sources", "brand_files", "nested", "linked.png")
+	if err := os.Symlink(filepath.Join(projectPath, "sources", "brand_files", "hero.png"), symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+	_, err := snapshotTemplateFillSourceProvenance(projectPath)
+	wantSource := "sources/brand_files/nested/linked.png"
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "symlink") || !strings.Contains(filepath.ToSlash(err.Error()), wantSource) {
+		t.Fatalf("snapshotTemplateFillSourceProvenance() error = %v, want nested symlink rejection naming %s", err, wantSource)
+	}
+}
+
+func TestTemplateFillProvenanceRejectsNestedCandidateCompanionSymlink(t *testing.T) {
+	projectPath := newTemplateFillCompanionDirectoryProject(t)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidateProject := filepath.Join(t.TempDir(), "candidate")
+	if err := copyDir(context.Background(), projectPath, candidateProject); err != nil {
+		t.Fatal(err)
+	}
+	symlinkPath := filepath.Join(candidateProject, "sources", "brand_files", "nested", "linked.png")
+	if err := os.Symlink(filepath.Join(candidateProject, "sources", "brand_files", "hero.png"), symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+	err = provenance.validateCandidate(candidateProject)
+	wantSource := "sources/brand_files/nested/linked.png"
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "symlink") || !strings.Contains(filepath.ToSlash(err.Error()), wantSource) {
+		t.Fatalf("validateCandidate() error = %v, want nested candidate symlink rejection naming %s", err, wantSource)
+	}
+}
+
+func newTemplateFillCompanionDirectoryProject(t *testing.T) string {
+	t.Helper()
+	projectPath := t.TempDir()
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand.pptx"), "pptx")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "content.md"), "# Content\n")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand_files", "hero.png"), "hero-image")
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand_files", "nested", "preview.png"), "preview-image")
+	if err := os.MkdirAll(filepath.Join(projectPath, "sources", "brand_files", "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFileNoTest(projectPath, filepath.Join("analysis", "brand.slide_library.json"), `{"slides":[]}`+"\n")
+	return projectPath
+}
+
 func TestTemplateFillProvenanceRejectsAmbiguousManifestClaims(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -213,6 +434,14 @@ func TestTemplateFillProvenanceRejectsAmbiguousManifestClaims(t *testing.T) {
 			filesJSON: `[
         {"name":"Σ.md","upload_path":"uploads/task-1/Σ.md"},
         {"name":"ς.md","upload_path":"uploads/task-1/ς.md"}
+      ]`,
+			want: "case-fold",
+		},
+		{
+			name: "unicode full case fold expansion collision",
+			filesJSON: `[
+        {"name":"straße.md","upload_path":"uploads/task-1/straße.md"},
+        {"name":"STRASSE.md","upload_path":"uploads/task-1/STRASSE.md"}
       ]`,
 			want: "case-fold",
 		},

@@ -167,6 +167,16 @@ class PPTSourceStagingTests(IsolatedRunnerStateTestCase):
 
 
 class TemplateFillRunnerTests(IsolatedRunnerStateTestCase):
+    def test_template_fill_casefold_uses_unicode_default_full_folding(self) -> None:
+        self.assertEqual(
+            ppt_runner._template_fill_casefold("straße"),
+            ppt_runner._template_fill_casefold("STRASSE"),
+        )
+        self.assertEqual(
+            ppt_runner._template_fill_casefold("Σ"),
+            ppt_runner._template_fill_casefold("ς"),
+        )
+
     def test_discover_template_fill_inputs_returns_every_runtime_path(self) -> None:
         project = make_template_fill_project(Path(self.runner_state_tmp.name) / "brand_project")
         (project / "sources" / "brand.md").write_text(
@@ -224,6 +234,104 @@ class TemplateFillRunnerTests(IsolatedRunnerStateTestCase):
         inputs = ppt_runner.discover_template_fill_inputs(project)
 
         self.assertEqual(inputs["content_sources"], [project / "sources" / "brand.md"])
+
+    def test_discover_template_fill_inputs_authorizes_exact_same_stem_markdown_only(self) -> None:
+        if not supports_case_sensitive_paths(Path(self.runner_state_tmp.name)):
+            self.skipTest("exact-case source identity requires a case-sensitive filesystem")
+        project = make_template_fill_project(self.workspace / "projects" / "brand_project")
+        (project / "sources" / "brand.pptx").rename(project / "sources" / "Brand.pptx")
+        (project / "analysis" / "brand.slide_library.json").rename(
+            project / "analysis" / "Brand.slide_library.json"
+        )
+        (project / "sources" / "content.md").unlink()
+        (project / "sources" / "brand.md").write_text("# Explicit business content\n", encoding="utf-8")
+        (project / "sources" / "Brand.md").write_text("# Generated readback\n", encoding="utf-8")
+        write_json_file(
+            self.workspace / ".slidesmith" / "source_inputs.json",
+            {
+                "schema": "slidesmith.source_inputs.v1",
+                "files": [
+                    {"name": "Brand.pptx", "upload_path": "uploads/task/Brand.pptx"},
+                    {"name": "brand.md", "upload_path": "uploads/task/brand.md"},
+                ],
+            },
+        )
+
+        inputs = ppt_runner.discover_template_fill_inputs(project)
+
+        self.assertEqual(inputs["content_sources"], [project / "sources" / "brand.md"])
+
+    def test_template_fill_manifest_authorization_and_same_stem_decision_are_exact(self) -> None:
+        project = make_template_fill_project(self.workspace / "projects" / "brand_project")
+        write_json_file(
+            self.workspace / ".slidesmith" / "source_inputs.json",
+            {
+                "schema": "slidesmith.source_inputs.v1",
+                "files": [
+                    {"name": "Brand.pptx", "upload_path": "uploads/task/Brand.pptx"},
+                    {"name": "brand.md", "upload_path": "uploads/task/brand.md"},
+                ],
+            },
+        )
+
+        authorized = ppt_runner._template_fill_authorized_source_paths(project)
+
+        self.assertIn("sources/brand.md", authorized)
+        self.assertNotIn("sources/Brand.md", authorized)
+        self.assertTrue(
+            ppt_runner._template_fill_should_include_content_source(
+                "sources/brand.md", ".md", "brand", "Brand", authorized
+            )
+        )
+        self.assertFalse(
+            ppt_runner._template_fill_should_include_content_source(
+                "sources/Brand.md", ".md", "Brand", "Brand", authorized
+            )
+        )
+
+    def test_discover_template_fill_inputs_accepts_image_companion_directory(self) -> None:
+        project = make_template_fill_project(Path(self.runner_state_tmp.name) / "brand_project")
+        companion = project / "sources" / "brand_files"
+        (companion / "nested").mkdir(parents=True)
+        (companion / "hero.png").write_bytes(b"hero")
+        (companion / "nested" / "preview.png").write_bytes(b"preview")
+
+        inputs = ppt_runner.discover_template_fill_inputs(project)
+
+        self.assertEqual(inputs["content_sources"], [project / "sources" / "content.md"])
+
+    def test_discover_template_fill_inputs_rejects_ambiguous_or_colliding_manifest_claims(self) -> None:
+        cases = {
+            "ambiguous entry": (
+                [{"name": "brand.md", "upload_path": "uploads/task/other.md"}],
+                "ambiguously authorizes",
+            ),
+            "duplicate exact": (
+                [
+                    {"name": "brand.md", "upload_path": "uploads/task/brand.md"},
+                    {"name": "brand.md", "upload_path": "uploads/task/brand.md"},
+                ],
+                "duplicate claim",
+            ),
+            "unicode full-fold collision": (
+                [
+                    {"name": "straße.md", "upload_path": "uploads/task/straße.md"},
+                    {"name": "STRASSE.md", "upload_path": "uploads/task/STRASSE.md"},
+                ],
+                "case-fold-colliding claims",
+            ),
+        }
+        for name, (files, message) in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp) / "workspace"
+                project = make_template_fill_project(workspace / "projects" / "brand_project")
+                write_json_file(
+                    workspace / ".slidesmith" / "source_inputs.json",
+                    {"schema": "slidesmith.source_inputs.v1", "files": files},
+                )
+
+                with mock.patch.object(ppt_runner, "WORKSPACE", workspace), self.assertRaisesRegex(ValueError, message):
+                    ppt_runner.discover_template_fill_inputs(project)
 
     def test_discover_template_fill_inputs_rejects_malformed_matching_manifest_entry(self) -> None:
         project = make_template_fill_project(self.workspace / "projects" / "brand_project")
@@ -511,6 +619,18 @@ class TemplateFillRunnerTests(IsolatedRunnerStateTestCase):
         self.assertIn("validation/readback.md", paths)
         self.assertTrue(ppt_runner.ARTIFACTS_PATH.is_relative_to(self.workspace))
         self.assertTrue(ppt_runner.ARTIFACTS_PATH.is_file())
+
+
+def supports_case_sensitive_paths(root: Path) -> bool:
+    probe = root / "case-sensitive-probe"
+    probe.mkdir(parents=True, exist_ok=True)
+    upper = probe / "Probe"
+    lower = probe / "probe"
+    upper.write_text("probe", encoding="utf-8")
+    try:
+        return not lower.exists()
+    finally:
+        upper.unlink(missing_ok=True)
 
 
 def make_template_fill_project(project: Path) -> Path:
