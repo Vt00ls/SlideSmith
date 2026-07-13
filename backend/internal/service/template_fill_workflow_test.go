@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -33,8 +34,11 @@ type templateFillWorkflowAgent struct {
 	mutatePlanDuringApply       bool
 	mutatePlanDuringValidate    bool
 	mutateReportDuringValidate  bool
+	injectCandidateManifest     bool
+	mutateContentDuringCheck    bool
 	failPhase                   string
 	onPhase                     func(string) error
+	afterPhase                  func(string)
 	checkSawPlan                bool
 	checkReportPresentAfterPlan bool
 }
@@ -102,6 +106,18 @@ func (a *templateFillWorkflowAgent) Run(ctx context.Context, req AgentRunRequest
 		if _, err := os.Stat(filepath.Join(sessionProjectPath, "analysis", "fill_plan.json")); err == nil {
 			a.checkSawPlan = true
 		}
+		if a.injectCandidateManifest {
+			mustWriteFileNoTest(sessionProjectPath, filepath.Join(".slidesmith", "source_inputs.json"), `{
+  "schema": "slidesmith.source_inputs.v1",
+  "files": [
+    {"name": "brand.pptx", "upload_path": "uploads/task-template-fill/brand.pptx"},
+    {"name": "brand.md", "upload_path": "uploads/task-template-fill/brand.md"}
+  ]
+}`+"\n")
+		}
+		if a.mutateContentDuringCheck {
+			mustWriteFileNoTest(sessionProjectPath, filepath.Join("sources", "brand.md"), "# Candidate-mutated content\n")
+		}
 		if !a.noOpCheck {
 			writeTemplateFillWorkflowJSON(sessionProjectPath, filepath.Join("analysis", "check_report.json"), map[string]any{
 				"schema": "template_fill_pptx_check.v1",
@@ -158,6 +174,9 @@ func (a *templateFillWorkflowAgent) Run(ctx context.Context, req AgentRunRequest
 		}
 	default:
 		return nil, fmt.Errorf("unexpected template fill phase %q", req.Phase)
+	}
+	if a.afterPhase != nil {
+		a.afterPhase(req.Phase)
 	}
 	exitCode := 0
 	return &AgentRunResult{
@@ -799,6 +818,10 @@ func TestTemplateFillPublishRejectsMissingKindBeforePersistence(t *testing.T) {
 	if err := os.Remove(filepath.Join(projectPath, "validation", "readback.md")); err != nil {
 		t.Fatal(err)
 	}
+	storage := service.storage.(*LocalStorage)
+	tracking := &publishCleanupTrackingStorage{StorageService: storage}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
 
 	err := service.ProcessTask(context.Background(), task.ID)
 	if err == nil {
@@ -820,6 +843,163 @@ func TestTemplateFillPublishRejectsMissingKindBeforePersistence(t *testing.T) {
 	}
 	if publishedCount != 0 {
 		t.Fatalf("pre-persistence rejection stored %d artifacts, want 0", publishedCount)
+	}
+	if len(tracking.copiedObjectKeys) == 0 {
+		t.Fatal("missing-artifact contract failure did not reach object copy")
+	}
+	for _, objectKey := range tracking.copiedObjectKeys {
+		if _, statErr := os.Stat(storage.Path(objectKey)); !os.IsNotExist(statErr) {
+			t.Fatalf("pre-persistence contract failure leaked object %s, err=%v", objectKey, statErr)
+		}
+	}
+}
+
+func TestTemplateFillPublishRollsBackPreDBContractFailures(t *testing.T) {
+	tests := []struct {
+		name             string
+		configureProject func(*testing.T, string)
+		failCopyContains string
+		wantError        string
+	}{
+		{
+			name: "publish contract write",
+			configureProject: func(t *testing.T, projectPath string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Join(projectPath, ".slidesmith", "contracts", "publish.json"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "publish.json",
+		},
+		{
+			name: "final contract write",
+			configureProject: func(t *testing.T, projectPath string) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "final.json",
+		},
+		{
+			name:             "publish contract copy write then error",
+			failCopyContains: "/contracts/publish.json",
+			wantError:        "injected publish copy write-then-error",
+		},
+		{
+			name:             "final contract copy write then error",
+			failCopyContains: "/contracts/final.json",
+			wantError:        "injected publish copy write-then-error",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+			prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+			if test.configureProject != nil {
+				test.configureProject(t, projectPath)
+			}
+			storage := service.storage.(*LocalStorage)
+			previous := seedPreviousTemplateFillPublishForRollbackTest(t, repo, storage, projectPath, task.ID)
+			tracking := &publishCleanupTrackingStorage{
+				StorageService:     storage,
+				failCopyContains:   test.failCopyContains,
+				failCopyAfterWrite: test.failCopyContains != "",
+			}
+			service.storage = tracking
+			service.publisher = NewRuntimeWorkspacePublisher(tracking)
+
+			err := service.ProcessTask(context.Background(), task.ID)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("ProcessTask() error = %v, want %q", err, test.wantError)
+			}
+			assertFailedPublishAttemptCleaned(t, repo, storage, task.ID, tracking, previous)
+		})
+	}
+}
+
+func TestTemplateFillPublishRollsBackExactAttemptOnDBReplaceFailure(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+	storage := service.storage.(*LocalStorage)
+	previous := seedPreviousTemplateFillPublishForRollbackTest(t, repo, storage, projectPath, task.ID)
+	tracking := &publishCleanupTrackingStorage{StorageService: storage}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
+	if err := repo.DB().Exec(`
+		CREATE TRIGGER fail_new_publish_artifact_insert
+		BEFORE INSERT ON artifacts
+		WHEN NEW.publish_version <> 'v20260712T120000Z'
+		BEGIN
+			SELECT RAISE(ABORT, 'injected publish DB replace failure');
+		END;
+	`).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	err := service.ProcessTask(context.Background(), task.ID)
+	if err == nil || !strings.Contains(err.Error(), "injected publish DB replace failure") {
+		t.Fatalf("ProcessTask() error = %v, want DB replace failure", err)
+	}
+	assertFailedPublishAttemptCleaned(t, repo, storage, task.ID, tracking, previous)
+}
+
+func TestTemplateFillPublishRollsBackExactAttemptOnDBListFailure(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+	storage := service.storage.(*LocalStorage)
+	previous := seedPreviousTemplateFillPublishForRollbackTest(t, repo, storage, projectPath, task.ID)
+	tracking := &publishCleanupTrackingStorage{StorageService: storage}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
+	injected := false
+	callbackName := "inject_publish_artifact_list_failure"
+	if err := repo.DB().Callback().Query().Before("gorm:query").Register(callbackName, func(tx *gorm.DB) {
+		if !injected && tx.Statement.Schema != nil && tx.Statement.Schema.Table == "artifacts" {
+			injected = true
+			tx.AddError(errors.New("injected persisted publish list failure"))
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := service.ProcessTask(context.Background(), task.ID)
+	if removeErr := repo.DB().Callback().Query().Remove(callbackName); removeErr != nil {
+		t.Fatal(removeErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "injected persisted publish list failure") {
+		t.Fatalf("ProcessTask() error = %v, want DB list failure", err)
+	}
+	if !injected {
+		t.Fatal("artifact list fault was not injected")
+	}
+	assertFailedPublishAttemptCleaned(t, repo, storage, task.ID, tracking, previous)
+}
+
+func TestTemplateFillPublishCleanupIgnoresCancelledRequestContext(t *testing.T) {
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusPublishing, nil)
+	prepareTemplateFillPublishedProjectForTest(t, projectPath, 2)
+	storage := service.storage.(*LocalStorage)
+	previous := seedPreviousTemplateFillPublishForRollbackTest(t, repo, storage, projectPath, task.ID)
+	ctx, cancel := context.WithCancel(context.Background())
+	tracking := &publishCleanupTrackingStorage{
+		StorageService:          storage,
+		cancel:                  cancel,
+		cancelAfterCopyContains: "/validation/validate_report.json",
+	}
+	service.storage = tracking
+	service.publisher = NewRuntimeWorkspacePublisher(tracking)
+
+	err := service.ProcessTask(ctx, task.ID)
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ProcessTask() error = %v, want context cancellation", err)
+	}
+	assertFailedPublishAttemptCleaned(t, repo, storage, task.ID, tracking, previous)
+	for _, cancelled := range tracking.deleteContextCancelled {
+		if cancelled {
+			t.Fatal("publish cleanup reused cancelled request context")
+		}
 	}
 }
 
@@ -1850,25 +2030,125 @@ func newTemplateFillWorkflowService(t *testing.T, status string, agent AgentComp
 
 type publishCleanupTrackingStorage struct {
 	StorageService
-	copiedObjectKeys   []string
-	deletedObjectKeys  []string
-	failDeleteContains string
+	attemptedObjectKeys     []string
+	copiedObjectKeys        []string
+	deletedObjectKeys       []string
+	deleteContextCancelled  []bool
+	failCopyContains        string
+	failCopyAfterWrite      bool
+	failDeleteContains      string
+	cancel                  context.CancelFunc
+	cancelAfterCopyContains string
 }
 
 func (s *publishCleanupTrackingStorage) CopyFileToObject(ctx context.Context, objectKey, sourcePath string) (*StoredObject, error) {
+	s.attemptedObjectKeys = append(s.attemptedObjectKeys, objectKey)
+	if s.failCopyContains != "" && strings.Contains(objectKey, s.failCopyContains) && !s.failCopyAfterWrite {
+		return nil, fmt.Errorf("injected publish copy failure for %s", objectKey)
+	}
 	stored, err := s.StorageService.CopyFileToObject(ctx, objectKey, sourcePath)
 	if err == nil {
 		s.copiedObjectKeys = append(s.copiedObjectKeys, stored.ObjectKey)
+	}
+	if err == nil && s.cancel != nil && strings.Contains(objectKey, s.cancelAfterCopyContains) {
+		s.cancel()
+	}
+	if err == nil && s.failCopyContains != "" && strings.Contains(objectKey, s.failCopyContains) && s.failCopyAfterWrite {
+		return nil, fmt.Errorf("injected publish copy write-then-error for %s", objectKey)
 	}
 	return stored, err
 }
 
 func (s *publishCleanupTrackingStorage) DeleteObject(ctx context.Context, objectKey string) error {
 	s.deletedObjectKeys = append(s.deletedObjectKeys, objectKey)
+	s.deleteContextCancelled = append(s.deleteContextCancelled, ctx.Err() != nil)
 	if s.failDeleteContains != "" && strings.Contains(objectKey, s.failDeleteContains) {
 		return fmt.Errorf("injected publish object cleanup failure for %s", objectKey)
 	}
 	return s.StorageService.DeleteObject(ctx, objectKey)
+}
+
+type previousTemplateFillPublishSnapshot struct {
+	rows    []model.Artifact
+	objects map[string][]byte
+}
+
+func seedPreviousTemplateFillPublishForRollbackTest(
+	t *testing.T,
+	repo *repository.Repository,
+	storage *LocalStorage,
+	projectPath, taskID string,
+) previousTemplateFillPublishSnapshot {
+	t.Helper()
+	const previousVersion = "v20260712T120000Z"
+	previous := copyTemplateFillPublishedArtifactsForTaskTest(t, storage, projectPath, taskID, previousVersion)
+	prefix := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts", previousVersion)) + "/"
+	if err := repo.ReplaceArtifactsByObjectKeyPrefix(context.Background(), taskID, prefix, previous); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := repo.ListArtifactsByPublishVersion(context.Background(), taskID, previousVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := make(map[string][]byte, len(rows))
+	for _, artifact := range rows {
+		raw, err := os.ReadFile(storage.Path(artifact.ObjectKey))
+		if err != nil {
+			t.Fatal(err)
+		}
+		objects[artifact.ObjectKey] = raw
+	}
+	return previousTemplateFillPublishSnapshot{rows: rows, objects: objects}
+}
+
+func assertFailedPublishAttemptCleaned(
+	t *testing.T,
+	repo *repository.Repository,
+	storage *LocalStorage,
+	taskID string,
+	tracking *publishCleanupTrackingStorage,
+	previous previousTemplateFillPublishSnapshot,
+) {
+	t.Helper()
+	if len(tracking.attemptedObjectKeys) == 0 {
+		t.Fatal("publish failure did not attempt any object keys")
+	}
+	for _, objectKey := range tracking.attemptedObjectKeys {
+		if _, err := os.Stat(storage.Path(objectKey)); !os.IsNotExist(err) {
+			t.Fatalf("failed publish object %s remains, err=%v", objectKey, err)
+		}
+	}
+	previousIDs := make([]string, 0, len(previous.rows))
+	for _, artifact := range previous.rows {
+		previousIDs = append(previousIDs, artifact.ID)
+	}
+	var newRows int64
+	query := repo.DB().Model(&model.Artifact{}).Where("task_id = ?", taskID)
+	if len(previousIDs) > 0 {
+		query = query.Where("id NOT IN ?", previousIDs)
+	}
+	if err := query.Count(&newRows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if newRows != 0 {
+		t.Fatalf("failed publish retained %d new rows", newRows)
+	}
+	rowsAfter, err := repo.ListArtifactsByPublishVersion(context.Background(), taskID, "v20260712T120000Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rowsAfter, previous.rows) {
+		t.Fatalf("previous publish rows changed:\n before=%#v\n  after=%#v", previous.rows, rowsAfter)
+	}
+	for objectKey, want := range previous.objects {
+		got, err := os.ReadFile(storage.Path(objectKey))
+		if err != nil {
+			t.Fatalf("read previous publish object %s: %v", objectKey, err)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("previous publish object %s changed", objectKey)
+		}
+	}
 }
 
 func singlePublishVersionForTest(t *testing.T, objectKeys []string) string {

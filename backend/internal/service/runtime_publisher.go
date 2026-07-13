@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -49,7 +50,7 @@ func (p *RuntimeWorkspacePublisher) PublishProject(ctx context.Context, taskID, 
 	return p.publish(ctx, taskID, workspacePath, projectPath, publishVersion)
 }
 
-func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspacePath, exactProjectPath, publishVersion string) ([]model.Artifact, error) {
+func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspacePath, exactProjectPath, publishVersion string) (_ []model.Artifact, resultErr error) {
 	if workspacePath == "" {
 		return nil, fmt.Errorf("workspace path is empty")
 	}
@@ -136,11 +137,41 @@ func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspa
 		return nil, fmt.Errorf("runtime artifacts missing exports/*.pptx in %s", projectPath)
 	}
 
+	attemptedObjectKeys := make([]string, 0, len(items))
+	completed := false
+	defer func() {
+		if completed {
+			return
+		}
+		cleanupCtx := context.WithoutCancel(ctx)
+		seen := make(map[string]bool, len(attemptedObjectKeys))
+		for _, objectKey := range attemptedObjectKeys {
+			if seen[objectKey] {
+				continue
+			}
+			seen[objectKey] = true
+			if err := p.storage.DeleteObject(cleanupCtx, objectKey); err != nil {
+				resultErr = errors.Join(resultErr, fmt.Errorf("rollback partial runtime publish object %s: %w", objectKey, err))
+			}
+		}
+	}()
+
 	var artifacts []model.Artifact
 	for _, item := range items {
 		objectKey := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts", publishVersion, item.ObjectRel))
+		attemptedObjectKeys = append(attemptedObjectKeys, objectKey)
 		stored, err := p.storage.CopyFileToObject(ctx, objectKey, item.SourcePath)
 		if err != nil {
+			return nil, err
+		}
+		if stored == nil {
+			return nil, fmt.Errorf("runtime artifact copy returned no stored object for %s", objectKey)
+		}
+		storedObjectKey, err := cleanObjectKey(stored.ObjectKey)
+		if err != nil || storedObjectKey != objectKey {
+			return nil, fmt.Errorf("runtime artifact copy returned object key %q, expected %q", stored.ObjectKey, objectKey)
+		}
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		artifact := model.Artifact{
@@ -156,6 +187,7 @@ func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspa
 		}
 		artifacts = append(artifacts, artifact)
 	}
+	completed = true
 	return artifacts, nil
 }
 

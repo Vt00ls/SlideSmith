@@ -40,6 +40,7 @@ type templateFillAPISession struct {
 	root               string
 	candidateWorkspace string
 	candidateProject   string
+	provenance         templateFillSourceProvenance
 	removeAll          func(string) error
 }
 
@@ -159,33 +160,33 @@ func (s *TaskService) SaveTemplateFillPlan(ctx context.Context, taskID string, s
 		resultErr = errors.Join(resultErr, session.cleanup())
 	}()
 
-	inputs, err := discoverTemplateFillInputs(session.candidateProject)
+	inputs, err := discoverTemplateFillInputsWithProvenance(session.candidateProject, session.provenance)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("discover template fill save candidate: %w", err)
 	}
 	if err := writeTemplateFillPlanObject(inputs.FillPlan, plan); err != nil {
 		return nil, err
 	}
-	if _, _, err := validateTemplateFillPlanContractSnapshot(session.candidateProject); err != nil {
-		return nil, err
+	if _, _, err := validateTemplateFillPlanContractSnapshotWithProvenance(session.candidateProject, session.provenance); err != nil {
+		return nil, fmt.Errorf("validate template fill save candidate: %w", err)
 	}
 	if err := removeTemplateFillFormalCheckEvidence(inputs); err != nil {
 		return nil, err
 	}
 
 	validate := func(candidate string) error {
-		contract, _, err := validateTemplateFillPlanContractSnapshot(candidate)
+		contract, _, err := validateTemplateFillPlanContractSnapshotWithProvenance(candidate, session.provenance)
 		if err != nil {
 			return err
 		}
 		if status, _ := contract["plan_status"].(string); status != "draft" {
 			return fmt.Errorf("saved template fill plan status = %q, expected %q", status, "draft")
 		}
-		return requireTemplateFillFormalCheckEvidenceAbsent(candidate)
+		return requireTemplateFillFormalCheckEvidenceAbsentWithProvenance(candidate, session.provenance)
 	}
 	exchange, err := s.beginTemplateFillProjectExchange(ctx, task, session, task.Status, validate)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("promote template fill save candidate: %w", err)
 	}
 	if s.beforeTemplateFillAPICommit != nil {
 		s.beforeTemplateFillAPICommit("template_fill_preview")
@@ -208,11 +209,15 @@ func (s *TaskService) CheckTemplateFillPlan(ctx context.Context, taskID string) 
 	if err := requireTemplateFillRoute(task); err != nil {
 		return nil, err
 	}
-	unlock, err := s.lockTemplateFillAPI(ctx, task)
+	unlockAPI, err := s.lockTemplateFillAPI(ctx, task)
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
+	defer func() {
+		if unlockAPI != nil {
+			unlockAPI()
+		}
+	}()
 	task, err = s.reloadTemplateFillAPITask(ctx, task.ID)
 	if err != nil {
 		return nil, err
@@ -240,7 +245,11 @@ func (s *TaskService) CheckTemplateFillPlan(ctx context.Context, taskID string) 
 	if err != nil {
 		return nil, err
 	}
-	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err != nil {
 		return nil, err
 	}
@@ -250,6 +259,8 @@ func (s *TaskService) CheckTemplateFillPlan(ctx context.Context, taskID string) 
 	workspace := s.resolveTaskWorkspace(task)
 	projectRel := s.projectRel(task, projectPath)
 	command := templateFillFormalCheckCommand(projectRel)
+	unlockAPI()
+	unlockAPI = nil
 	runtimeRun, err := s.runAgent(ctx, task, string(PhaseTemplateFillCheck), AgentRunRequest{
 		Command:     command,
 		WorkDir:     workspace.HostDir,
@@ -261,8 +272,29 @@ func (s *TaskService) CheckTemplateFillPlan(ctx context.Context, taskID string) 
 	if runtimeRun == nil || strings.TrimSpace(runtimeRun.WorkspacePath) == "" {
 		return nil, fmt.Errorf("template fill draft check did not return a distinct session workspace")
 	}
+	unlockAPI, err = s.lockTemplateFillAPI(ctx, task)
+	if err != nil {
+		return nil, err
+	}
+	persistedTask, err := s.reloadTemplateFillAPITask(ctx, task.ID)
+	if err != nil {
+		return nil, err
+	}
+	if persistedTask.Status != task.Status || persistedTask.ExecutionClaimToken != task.ExecutionClaimToken {
+		return nil, errTaskStateChanged
+	}
+	if err := provenance.revalidateAuthoritative(); err != nil {
+		return nil, err
+	}
+	_, _, canonicalStatus, currentPlanSHA256, err := readValidatedTemplateFillPlanWithSHA256AndProvenance(projectPath, provenance)
+	if err != nil {
+		return nil, err
+	}
+	if canonicalStatus != "draft" || currentPlanSHA256 != planSHA256 {
+		return nil, fmt.Errorf("template fill canonical plan changed during draft check")
+	}
 	validate := func(candidate string) error {
-		inputs, err := discoverTemplateFillInputs(candidate)
+		inputs, err := discoverTemplateFillInputsWithProvenance(candidate, provenance)
 		if err != nil {
 			return err
 		}
@@ -273,21 +305,21 @@ func (s *TaskService) CheckTemplateFillPlan(ctx context.Context, taskID string) 
 		if checkedSHA256 != planSHA256 {
 			return fmt.Errorf("template fill plan changed during draft check: got %s, expected %s", checkedSHA256, planSHA256)
 		}
-		_, err = validateTemplateFillCheckContractForPlan(candidate, false, "draft", planSHA256)
+		_, err = validateTemplateFillCheckContractForPlanWithProvenance(candidate, provenance, false, "draft", planSHA256)
 		return err
 	}
 	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, validate)
 	if err != nil {
 		return nil, err
 	}
-	contract, canonicalSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	contract, canonicalSHA256, err := validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err != nil {
 		return nil, err
 	}
 	if status, _ := contract["plan_status"].(string); status != "draft" || canonicalSHA256 != planSHA256 {
 		return nil, fmt.Errorf("template fill canonical plan changed after draft check")
 	}
-	if _, err := validateTemplateFillCheckContractForPlan(projectPath, false, "draft", planSHA256); err != nil {
+	if _, err := validateTemplateFillCheckContractForPlanWithProvenance(projectPath, provenance, false, "draft", planSHA256); err != nil {
 		return nil, err
 	}
 	return task, nil
@@ -352,11 +384,11 @@ func (s *TaskService) ConfirmTemplateFillPlan(ctx context.Context, taskID string
 	defer func() {
 		resultErr = errors.Join(resultErr, session.cleanup())
 	}()
-	if err := setTemplateFillPlanStatus(session.candidateProject, "confirmed"); err != nil {
+	if err := setTemplateFillPlanStatusWithProvenance(session.candidateProject, "confirmed", session.provenance); err != nil {
 		return nil, err
 	}
 	validateConfirmed := func(candidate string) error {
-		contract, _, err := validateTemplateFillPlanContractSnapshot(candidate)
+		contract, _, err := validateTemplateFillPlanContractSnapshotWithProvenance(candidate, session.provenance)
 		if err != nil {
 			return err
 		}
@@ -429,7 +461,7 @@ func (s *TaskService) RegenerateTemplateFillPlan(ctx context.Context, taskID str
 		return nil, err
 	}
 	validateClean := func(candidate string) error {
-		if _, err := discoverTemplateFillInputs(candidate); err != nil {
+		if _, err := discoverTemplateFillInputsWithProvenance(candidate, session.provenance); err != nil {
 			return err
 		}
 		return requireTemplateFillRegenerateOutputsAbsent(candidate)
@@ -523,6 +555,10 @@ func (s *TaskService) newTemplateFillAPISession(ctx context.Context, task *model
 	if !sameFilesystemPath(projectPath, canonicalProject) {
 		return nil, fmt.Errorf("template fill API project is not canonical: %s", projectPath)
 	}
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return nil, err
+	}
 	root := filepath.Join(workspace.HostDir, ".slidesmith", "template-fill-api-sessions", uuid.NewString())
 	candidateWorkspace := filepath.Join(root, "candidate")
 	candidateProject := filepath.Join(candidateWorkspace, "projects", filepath.Base(projectPath))
@@ -530,12 +566,16 @@ func (s *TaskService) newTemplateFillAPISession(ctx context.Context, task *model
 		root:               root,
 		candidateWorkspace: candidateWorkspace,
 		candidateProject:   candidateProject,
+		provenance:         provenance,
 		removeAll:          os.RemoveAll,
 	}
 	if err := os.MkdirAll(filepath.Dir(candidateProject), 0o755); err != nil {
 		return nil, err
 	}
 	if err := copyProjectDirectoryStrict(ctx, projectPath, candidateProject); err != nil {
+		return nil, errors.Join(err, session.cleanup())
+	}
+	if err := provenance.validateCandidate(candidateProject); err != nil {
 		return nil, errors.Join(err, session.cleanup())
 	}
 	return session, nil
@@ -565,6 +605,12 @@ func (s *TaskService) beginTemplateFillProjectExchange(
 ) (*templateFillProjectExchange, error) {
 	if session == nil {
 		return nil, fmt.Errorf("template fill API session is required")
+	}
+	if err := session.provenance.revalidateAuthoritative(); err != nil {
+		return nil, err
+	}
+	if err := session.provenance.validateCandidate(session.candidateProject); err != nil {
+		return nil, err
 	}
 	workspace := s.resolveTaskWorkspace(task)
 	staged, err := s.stagePreparedProject(ctx, task, session.candidateWorkspace, workspace.HostDir)

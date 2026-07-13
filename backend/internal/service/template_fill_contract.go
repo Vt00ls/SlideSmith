@@ -19,7 +19,15 @@ func validateTemplateFillPlanContract(projectPath string) (map[string]any, error
 }
 
 func validateTemplateFillPlanContractSnapshot(projectPath string) (map[string]any, string, error) {
-	inputs, slides, status, planSHA256, err := readValidatedTemplateFillPlanWithSHA256(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return nil, "", err
+	}
+	return validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
+}
+
+func validateTemplateFillPlanContractSnapshotWithProvenance(projectPath string, provenance templateFillSourceProvenance) (map[string]any, string, error) {
+	inputs, slides, status, planSHA256, err := readValidatedTemplateFillPlanWithSHA256AndProvenance(projectPath, provenance)
 	if err != nil {
 		return nil, "", err
 	}
@@ -50,11 +58,19 @@ func validateTemplateFillCheckContract(projectPath string, requireNoErrors bool)
 }
 
 func validateTemplateFillCheckContractForPlan(projectPath string, requireNoErrors bool, expectedStatus, expectedSHA256 string) (map[string]any, error) {
-	inputs, err := discoverTemplateFillInputs(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
 	if err != nil {
 		return nil, err
 	}
-	_, _, planStatus, planSHA256, err := readValidatedTemplateFillPlanWithSHA256(inputs.ProjectPath)
+	return validateTemplateFillCheckContractForPlanWithProvenance(projectPath, provenance, requireNoErrors, expectedStatus, expectedSHA256)
+}
+
+func validateTemplateFillCheckContractForPlanWithProvenance(projectPath string, provenance templateFillSourceProvenance, requireNoErrors bool, expectedStatus, expectedSHA256 string) (map[string]any, error) {
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
+	if err != nil {
+		return nil, err
+	}
+	_, _, planStatus, planSHA256, err := readValidatedTemplateFillPlanWithSHA256AndProvenance(inputs.ProjectPath, provenance)
 	if err != nil {
 		return nil, err
 	}
@@ -99,7 +115,15 @@ func validateTemplateFillCheckContractForPlan(projectPath string, requireNoError
 }
 
 func validateTemplateFillApplyContract(projectPath string) (map[string]any, error) {
-	inputs, slides, status, err := readValidatedTemplateFillPlan(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	return validateTemplateFillApplyContractWithProvenance(projectPath, provenance)
+}
+
+func validateTemplateFillApplyContractWithProvenance(projectPath string, provenance templateFillSourceProvenance) (map[string]any, error) {
+	inputs, slides, status, _, err := readValidatedTemplateFillPlanWithSHA256AndProvenance(projectPath, provenance)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +162,15 @@ func validateTemplateFillApplyContract(projectPath string) (map[string]any, erro
 }
 
 func validateTemplateFillValidateContract(projectPath string) (map[string]any, error) {
-	inputs, err := discoverTemplateFillInputs(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	return validateTemplateFillValidateContractWithProvenance(projectPath, provenance)
+}
+
+func validateTemplateFillValidateContractWithProvenance(projectPath string, provenance templateFillSourceProvenance) (map[string]any, error) {
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +223,15 @@ func readValidatedTemplateFillPlan(projectPath string) (TemplateFillInputs, []an
 }
 
 func readValidatedTemplateFillPlanWithSHA256(projectPath string) (TemplateFillInputs, []any, string, string, error) {
-	inputs, err := discoverTemplateFillInputs(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return TemplateFillInputs{}, nil, "", "", err
+	}
+	return readValidatedTemplateFillPlanWithSHA256AndProvenance(projectPath, provenance)
+}
+
+func readValidatedTemplateFillPlanWithSHA256AndProvenance(projectPath string, provenance templateFillSourceProvenance) (TemplateFillInputs, []any, string, string, error) {
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return TemplateFillInputs{}, nil, "", "", err
 	}

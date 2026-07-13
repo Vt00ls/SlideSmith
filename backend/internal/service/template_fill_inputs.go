@@ -1,9 +1,11 @@
 package service
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -31,11 +33,37 @@ type templateFillPresentationInput struct {
 type templateFillManifestPath struct {
 	permittedRoot string
 	path          string
+	projectLocal  bool
 }
 
 func discoverTemplateFillInputs(projectPath string) (TemplateFillInputs, error) {
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return TemplateFillInputs{}, err
+	}
+	return discoverTemplateFillInputsWithProvenance(projectPath, provenance)
+}
+
+type templateFillProvenanceSource struct {
+	relativePath string
+	size         int64
+	sha256       string
+}
+
+type templateFillSourceProvenance struct {
+	canonicalProject     string
+	manifestPath         string
+	manifestSHA256       string
+	manifestProjectLocal bool
+	sources              map[string]templateFillProvenanceSource
+}
+
+func discoverTemplateFillInputsWithProvenance(projectPath string, provenance templateFillSourceProvenance) (TemplateFillInputs, error) {
 	projectPath, err := resolveTemplateFillProjectPath(projectPath)
 	if err != nil {
+		return TemplateFillInputs{}, err
+	}
+	if err := provenance.validateCandidate(projectPath); err != nil {
 		return TemplateFillInputs{}, err
 	}
 
@@ -102,10 +130,6 @@ func discoverTemplateFillInputs(projectPath string) (TemplateFillInputs, error) 
 		return TemplateFillInputs{}, fmt.Errorf("template fill requires slide library: %s must be a non-empty regular file", slideLibraryRelative)
 	}
 
-	explicitSameStemMarkdown, err := templateFillHasExplicitSameStemMarkdown(projectPath, stem)
-	if err != nil {
-		return TemplateFillInputs{}, err
-	}
 	contentSources := make([]string, 0)
 	for _, entry := range entries {
 		extension := strings.ToLower(filepath.Ext(entry.Name()))
@@ -113,10 +137,10 @@ func discoverTemplateFillInputs(projectPath string) (TemplateFillInputs, error) 
 			continue
 		}
 		entryStem := strings.TrimSuffix(entry.Name(), filepath.Ext(entry.Name()))
-		if extension == ".md" && strings.EqualFold(entryStem, stem) && !explicitSameStemMarkdown {
+		relativePath := filepath.ToSlash(filepath.Join("sources", entry.Name()))
+		if extension == ".md" && strings.EqualFold(entryStem, stem) && !provenance.hasBoundSource(relativePath) {
 			continue
 		}
-		relativePath := filepath.ToSlash(filepath.Join("sources", entry.Name()))
 		absolutePath := filepath.Join(sourcesPath, entry.Name())
 		info, _, err := inspectContainedPath(projectPath, absolutePath)
 		if err != nil {
@@ -210,10 +234,63 @@ func resolveTemplateFillProjectPath(projectPath string) (string, error) {
 	return filepath.Clean(resolvedPath), nil
 }
 
-func templateFillHasExplicitSameStemMarkdown(projectPath, stem string) (bool, error) {
+func snapshotTemplateFillSourceProvenance(projectPath string) (templateFillSourceProvenance, error) {
+	projectPath, err := resolveTemplateFillProjectPath(projectPath)
+	if err != nil {
+		return templateFillSourceProvenance{}, err
+	}
+	provenance := templateFillSourceProvenance{
+		canonicalProject: projectPath,
+		sources:          map[string]templateFillProvenanceSource{},
+	}
+	for _, manifestPath := range templateFillSourceManifestPaths(projectPath) {
+		info, resolvedPath, err := inspectContainedPath(manifestPath.permittedRoot, manifestPath.path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return templateFillSourceProvenance{}, fmt.Errorf("inspect template fill source inputs manifest: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return templateFillSourceProvenance{}, fmt.Errorf("template fill source inputs manifest must be a regular non-symlinked file: %s", manifestPath.path)
+		}
+		raw, err := os.ReadFile(resolvedPath)
+		if err != nil {
+			return templateFillSourceProvenance{}, fmt.Errorf("read template fill source inputs manifest: %w", err)
+		}
+		var manifest sourceInputsManifest
+		if err := json.Unmarshal(raw, &manifest); err != nil {
+			return templateFillSourceProvenance{}, fmt.Errorf("parse template fill source inputs manifest: %w", err)
+		}
+		if manifest.Schema != "slidesmith.source_inputs.v1" {
+			return templateFillSourceProvenance{}, fmt.Errorf("unsupported template fill source inputs manifest schema: %q", manifest.Schema)
+		}
+		claimedNames := make(map[string]struct{}, len(manifest.Files)*2)
+		for index, file := range manifest.Files {
+			names, err := templateFillManifestSourceNames(file, index)
+			if err != nil {
+				return templateFillSourceProvenance{}, err
+			}
+			for _, name := range names {
+				claimedNames[strings.ToLower(name)] = struct{}{}
+			}
+		}
+		provenance.manifestPath = resolvedPath
+		provenance.manifestSHA256 = fmt.Sprintf("%x", sha256.Sum256(raw))
+		provenance.manifestProjectLocal = manifestPath.projectLocal
+		if err := provenance.bindCanonicalSources(projectPath, claimedNames); err != nil {
+			return templateFillSourceProvenance{}, err
+		}
+		return provenance, nil
+	}
+	return provenance, nil
+}
+
+func templateFillSourceManifestPaths(projectPath string) []templateFillManifestPath {
 	manifestPaths := []templateFillManifestPath{{
 		permittedRoot: projectPath,
 		path:          filepath.Join(projectPath, ".slidesmith", "source_inputs.json"),
+		projectLocal:  true,
 	}}
 	projectsPath := filepath.Dir(projectPath)
 	if filepath.Base(projectsPath) == "projects" {
@@ -223,45 +300,134 @@ func templateFillHasExplicitSameStemMarkdown(projectPath, stem string) (bool, er
 			path:          filepath.Join(workspacePath, ".slidesmith", "source_inputs.json"),
 		}}, manifestPaths...)
 	}
-
-	for _, manifestPath := range manifestPaths {
-		info, resolvedPath, err := inspectContainedPath(manifestPath.permittedRoot, manifestPath.path)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			return false, fmt.Errorf("inspect template fill source inputs manifest: %w", err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return false, fmt.Errorf("template fill source inputs manifest must be a regular non-symlinked file: %s", manifestPath.path)
-		}
-		raw, err := os.ReadFile(resolvedPath)
-		if err != nil {
-			return false, fmt.Errorf("read template fill source inputs manifest: %w", err)
-		}
-		var manifest sourceInputsManifest
-		if err := json.Unmarshal(raw, &manifest); err != nil {
-			return false, fmt.Errorf("parse template fill source inputs manifest: %w", err)
-		}
-		if manifest.Schema != "slidesmith.source_inputs.v1" {
-			return false, fmt.Errorf("unsupported template fill source inputs manifest schema: %q", manifest.Schema)
-		}
-		for _, file := range manifest.Files {
-			if templateFillManifestNameMatchesMarkdownStem(file.Name, stem) ||
-				templateFillManifestNameMatchesMarkdownStem(filepath.Base(filepath.FromSlash(file.UploadPath)), stem) {
-				return true, nil
-			}
-		}
-		return false, nil
-	}
-	return false, nil
+	return manifestPaths
 }
 
-func templateFillManifestNameMatchesMarkdownStem(name, stem string) bool {
-	name = strings.TrimSpace(name)
-	extension := strings.ToLower(filepath.Ext(name))
-	if extension != ".md" {
-		return false
+func templateFillManifestSourceNames(file sourceInputsManifestFile, index int) ([]string, error) {
+	names := make([]string, 0, 2)
+	if name := strings.TrimSpace(file.Name); name != "" {
+		normalized := strings.ReplaceAll(name, "\\", "/")
+		if normalized != path.Base(normalized) || normalized == "." || normalized == ".." {
+			return nil, fmt.Errorf("template fill source inputs manifest files[%d].name must be a filename", index)
+		}
+		names = append(names, normalized)
 	}
-	return strings.EqualFold(strings.TrimSuffix(filepath.Base(name), filepath.Ext(name)), stem)
+	if uploadPath := strings.TrimSpace(file.UploadPath); uploadPath != "" {
+		normalized := strings.ReplaceAll(uploadPath, "\\", "/")
+		cleaned := path.Clean(normalized)
+		if path.IsAbs(normalized) || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+			return nil, fmt.Errorf("template fill source inputs manifest files[%d].upload_path is outside workspace", index)
+		}
+		name := path.Base(cleaned)
+		if name != "." && name != ".." && name != "" {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
+func (provenance *templateFillSourceProvenance) bindCanonicalSources(projectPath string, claimedNames map[string]struct{}) error {
+	sourcesPath := filepath.Join(projectPath, "sources")
+	info, resolvedSourcesPath, err := inspectContainedPath(projectPath, sourcesPath)
+	if err != nil {
+		return fmt.Errorf("inspect template fill provenance sources directory: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("template fill provenance sources path must be a directory: %s", sourcesPath)
+	}
+	entries, err := os.ReadDir(resolvedSourcesPath)
+	if err != nil {
+		return fmt.Errorf("read template fill provenance sources directory: %w", err)
+	}
+	for _, entry := range entries {
+		if _, ok := claimedNames[strings.ToLower(entry.Name())]; !ok {
+			continue
+		}
+		relativePath := filepath.ToSlash(filepath.Join("sources", entry.Name()))
+		fingerprint, err := templateFillFingerprintSource(projectPath, relativePath)
+		if err != nil {
+			return err
+		}
+		provenance.sources[strings.ToLower(relativePath)] = fingerprint
+	}
+	return nil
+}
+
+func templateFillFingerprintSource(projectPath, relativePath string) (templateFillProvenanceSource, error) {
+	absolutePath := filepath.Join(projectPath, filepath.FromSlash(relativePath))
+	info, resolvedPath, err := inspectContainedPath(projectPath, absolutePath)
+	if err != nil {
+		return templateFillProvenanceSource{}, fmt.Errorf("inspect template fill provenance source %s: %w", relativePath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return templateFillProvenanceSource{}, fmt.Errorf("template fill provenance source must be a regular non-symlinked file: %s", relativePath)
+	}
+	digest, err := sha256File(resolvedPath)
+	if err != nil {
+		return templateFillProvenanceSource{}, fmt.Errorf("hash template fill provenance source %s: %w", relativePath, err)
+	}
+	return templateFillProvenanceSource{relativePath: relativePath, size: info.Size(), sha256: digest}, nil
+}
+
+func (provenance templateFillSourceProvenance) hasBoundSource(relativePath string) bool {
+	_, ok := provenance.sources[strings.ToLower(filepath.ToSlash(relativePath))]
+	return ok
+}
+
+func (provenance templateFillSourceProvenance) validateCandidate(projectPath string) error {
+	if provenance.canonicalProject == "" {
+		return fmt.Errorf("template fill source provenance snapshot is required")
+	}
+	projectManifestPath := filepath.Join(projectPath, ".slidesmith", "source_inputs.json")
+	info, resolvedManifestPath, err := inspectContainedPath(projectPath, projectManifestPath)
+	switch {
+	case provenance.manifestProjectLocal:
+		if err != nil {
+			return fmt.Errorf("inspect candidate template fill source inputs manifest: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("candidate template fill source inputs manifest must be a regular non-symlinked file: %s", projectManifestPath)
+		}
+		raw, err := os.ReadFile(resolvedManifestPath)
+		if err != nil {
+			return fmt.Errorf("read candidate template fill source inputs manifest: %w", err)
+		}
+		if digest := fmt.Sprintf("%x", sha256.Sum256(raw)); digest != provenance.manifestSHA256 {
+			return fmt.Errorf("candidate template fill source inputs manifest changed from authoritative provenance")
+		}
+	case err == nil:
+		return fmt.Errorf("candidate template fill source inputs manifest is not authoritative: %s", projectManifestPath)
+	case !os.IsNotExist(err):
+		return fmt.Errorf("inspect candidate template fill source inputs manifest: %w", err)
+	}
+	for _, expected := range provenance.sources {
+		actual, err := templateFillFingerprintSource(projectPath, expected.relativePath)
+		if err != nil {
+			return err
+		}
+		if actual.size != expected.size || actual.sha256 != expected.sha256 {
+			return fmt.Errorf("template fill candidate source changed from authoritative provenance: %s", expected.relativePath)
+		}
+	}
+	return nil
+}
+
+func (provenance templateFillSourceProvenance) revalidateAuthoritative() error {
+	current, err := snapshotTemplateFillSourceProvenance(provenance.canonicalProject)
+	if err != nil {
+		return err
+	}
+	if current.manifestPath != provenance.manifestPath ||
+		current.manifestSHA256 != provenance.manifestSHA256 ||
+		current.manifestProjectLocal != provenance.manifestProjectLocal ||
+		len(current.sources) != len(provenance.sources) {
+		return fmt.Errorf("template fill source provenance changed during operation")
+	}
+	for key, expected := range provenance.sources {
+		actual, ok := current.sources[key]
+		if !ok || actual.relativePath != expected.relativePath || actual.size != expected.size || actual.sha256 != expected.sha256 {
+			return fmt.Errorf("template fill source provenance changed during operation: %s", expected.relativePath)
+		}
+	}
+	return nil
 }

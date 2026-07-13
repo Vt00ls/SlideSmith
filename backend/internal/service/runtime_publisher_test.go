@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,47 @@ import (
 
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 )
+
+type runtimePublisherWriteThenErrorStorage struct {
+	StorageService
+	failAt           int
+	attemptedObjects []string
+}
+
+func (s *runtimePublisherWriteThenErrorStorage) CopyFileToObject(ctx context.Context, objectKey, sourcePath string) (*StoredObject, error) {
+	s.attemptedObjects = append(s.attemptedObjects, objectKey)
+	stored, err := s.StorageService.CopyFileToObject(ctx, objectKey, sourcePath)
+	if err != nil {
+		return stored, err
+	}
+	if len(s.attemptedObjects) == s.failAt {
+		return nil, errors.New("injected runtime publish write-then-error")
+	}
+	return stored, nil
+}
+
+func TestRuntimeWorkspacePublisherRollsBackExactObjectsOnWriteThenError(t *testing.T) {
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, "workspace")
+	project := filepath.Join(workspace, "projects", "task-1")
+	mustWriteFile(t, filepath.Join(project, "analysis", "fill_plan.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "exports", "result.pptx"), "pptx bytes\n")
+	local := NewLocalStorage(filepath.Join(tmp, "storage"))
+	fault := &runtimePublisherWriteThenErrorStorage{StorageService: local, failAt: 2}
+
+	_, err := NewRuntimeWorkspacePublisher(fault).PublishProject(context.Background(), "task-1", workspace, project, "v-write-error")
+	if err == nil || !strings.Contains(err.Error(), "write-then-error") {
+		t.Fatalf("PublishProject() error = %v, want injected write-then-error", err)
+	}
+	if len(fault.attemptedObjects) != 2 {
+		t.Fatalf("attempted objects = %#v, want two exact keys", fault.attemptedObjects)
+	}
+	for _, objectKey := range fault.attemptedObjects {
+		if _, statErr := os.Stat(local.Path(objectKey)); !os.IsNotExist(statErr) {
+			t.Fatalf("partial publish object %s remains, err=%v", objectKey, statErr)
+		}
+	}
+}
 
 func TestRuntimeWorkspacePublisherAllowsAbsoluteProjectInsideWorkspace(t *testing.T) {
 	tmp := t.TempDir()

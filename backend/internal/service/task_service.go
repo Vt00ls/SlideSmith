@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -627,7 +628,11 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 	if err != nil {
 		return s.failTemplateFillPreflight(ctx, task, PhaseTemplateFillPlan, PhaseRunnerAgent, workspace, "", string(PhaseTemplateFillPlan)+".project", err)
 	}
-	inputs, err := discoverTemplateFillInputs(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return s.failTemplateFillInputs(ctx, task, PhaseTemplateFillPlan, PhaseRunnerAgent, workspace, projectPath, err)
+	}
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillInputs(ctx, task, PhaseTemplateFillPlan, PhaseRunnerAgent, workspace, projectPath, err)
 	}
@@ -660,7 +665,11 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 	planPreflightFailure := false
 	validatedPlanSHA256 := ""
 	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, planRun.WorkspacePath, func(stagedProjectPath string) error {
-		stagedPlanContract, stagedPlanSHA256, stagedErr := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
+			planPreflightFailure = true
+			return stagedErr
+		}
+		stagedPlanContract, stagedPlanSHA256, stagedErr := validateTemplateFillPlanContractSnapshotWithProvenance(stagedProjectPath, provenance)
 		if stagedErr != nil {
 			planPreflightFailure = true
 			return stagedErr
@@ -682,7 +691,7 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 			"project_path":   projectPath,
 		})
 	}
-	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err == nil {
 		if planStatus, _ := planContract["plan_status"].(string); planStatus != "draft" || canonicalPlanSHA256 != validatedPlanSHA256 {
 			err = fmt.Errorf("template fill canonical plan no longer matches validated draft snapshot")
@@ -715,7 +724,11 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 	}
 	draftCheckFailurePhase := ""
 	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, draftCheckRun.WorkspacePath, func(stagedProjectPath string) error {
-		stagedInputs, stagedErr := discoverTemplateFillInputs(stagedProjectPath)
+		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
+			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.contract"
+			return stagedErr
+		}
+		stagedInputs, stagedErr := discoverTemplateFillInputsWithProvenance(stagedProjectPath, provenance)
 		if stagedErr != nil {
 			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.contract"
 			return stagedErr
@@ -729,7 +742,7 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.plan_changed"
 			return fmt.Errorf("template fill plan changed during draft check: got %s, expected %s", stagedPlanSHA256, validatedPlanSHA256)
 		}
-		if _, stagedErr := validateTemplateFillCheckContractForPlan(stagedProjectPath, false, "draft", validatedPlanSHA256); stagedErr != nil {
+		if _, stagedErr := validateTemplateFillCheckContractForPlanWithProvenance(stagedProjectPath, provenance, false, "draft", validatedPlanSHA256); stagedErr != nil {
 			draftCheckFailurePhase = string(PhaseTemplateFillPlan) + ".draft_check.contract"
 			return stagedErr
 		}
@@ -746,7 +759,7 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 			"plan_sha256":    validatedPlanSHA256,
 		})
 	}
-	planContract, canonicalPlanSHA256, err = validateTemplateFillPlanContractSnapshot(projectPath)
+	planContract, canonicalPlanSHA256, err = validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err == nil {
 		if planStatus, _ := planContract["plan_status"].(string); planStatus != "draft" || canonicalPlanSHA256 != validatedPlanSHA256 {
 			err = fmt.Errorf("template fill canonical plan changed after draft check promotion")
@@ -758,7 +771,7 @@ func (s *TaskService) processTemplateFillPlan(ctx context.Context, task *model.T
 			"plan_sha256":  validatedPlanSHA256,
 		})
 	}
-	draftCheckContract, err := validateTemplateFillCheckContractForPlan(projectPath, false, "draft", validatedPlanSHA256)
+	draftCheckContract, err := validateTemplateFillCheckContractForPlanWithProvenance(projectPath, provenance, false, "draft", validatedPlanSHA256)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillPlan)+".draft_check.contract", err, draftCheckRun, map[string]any{
 			"project_path": projectPath,
@@ -805,11 +818,15 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 	if err != nil {
 		return s.failTemplateFillPreflight(ctx, task, PhaseTemplateFillCheck, PhaseRunnerWorker, workspace, "", string(PhaseTemplateFillCheck)+".project", err)
 	}
-	inputs, err := discoverTemplateFillInputs(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
 	if err != nil {
 		return s.failTemplateFillInputs(ctx, task, PhaseTemplateFillCheck, PhaseRunnerWorker, workspace, projectPath, err)
 	}
-	_, _, planStatus, err := readValidatedTemplateFillPlan(projectPath)
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
+	if err != nil {
+		return s.failTemplateFillInputs(ctx, task, PhaseTemplateFillCheck, PhaseRunnerWorker, workspace, projectPath, err)
+	}
+	_, _, planStatus, _, err := readValidatedTemplateFillPlanWithSHA256AndProvenance(projectPath, provenance)
 	if err != nil {
 		phaseRun, phaseRunErr := s.beginPhaseRun(ctx, task, PhaseTemplateFillCheck, PhaseRunnerWorker, inputs)
 		if phaseRunErr != nil {
@@ -823,21 +840,24 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			task,
 			projectPath,
 			func(stagedProjectPath string) error {
-				stagedInputs, err := discoverTemplateFillInputs(stagedProjectPath)
+				stagedInputs, err := discoverTemplateFillInputsWithProvenance(stagedProjectPath, provenance)
 				if err != nil {
 					return err
 				}
 				return removeTemplateFillFormalCheckEvidence(stagedInputs)
 			},
 			func(stagedProjectPath string) error {
-				planContract, _, err := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+				if err := provenance.revalidateAuthoritative(); err != nil {
+					return err
+				}
+				planContract, _, err := validateTemplateFillPlanContractSnapshotWithProvenance(stagedProjectPath, provenance)
 				if err != nil {
 					return err
 				}
 				if status, _ := planContract["plan_status"].(string); status != "draft" {
 					return fmt.Errorf("template fill reconciled plan status = %q, expected %q", status, "draft")
 				}
-				return requireTemplateFillFormalCheckEvidenceAbsent(stagedProjectPath)
+				return requireTemplateFillFormalCheckEvidenceAbsentWithProvenance(stagedProjectPath, provenance)
 			},
 		)
 		if errors.Is(err, errTaskStateChanged) {
@@ -873,7 +893,7 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			"project_path": projectPath,
 		})
 	}
-	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".plan_contract", err, nil, map[string]any{
 			"project_path": projectPath,
@@ -901,7 +921,11 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 	}
 	preflightFailurePhase := ""
 	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
-		stagedInputs, stagedErr := discoverTemplateFillInputs(stagedProjectPath)
+		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".inputs"
+			return stagedErr
+		}
+		stagedInputs, stagedErr := discoverTemplateFillInputsWithProvenance(stagedProjectPath, provenance)
 		if stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".inputs"
 			return stagedErr
@@ -919,7 +943,7 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".plan_changed"
 			return fmt.Errorf("template fill plan changed during formal check: got %s, expected %s", checkedPlanSHA256, planSHA256)
 		}
-		if _, stagedErr := validateTemplateFillCheckContractForPlan(stagedProjectPath, false, "confirmed", planSHA256); stagedErr != nil {
+		if _, stagedErr := validateTemplateFillCheckContractForPlanWithProvenance(stagedProjectPath, provenance, false, "confirmed", planSHA256); stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillCheck) + ".contract"
 			return stagedErr
 		}
@@ -936,7 +960,7 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			"plan_sha256":    planSHA256,
 		})
 	}
-	inputs, err = discoverTemplateFillInputs(projectPath)
+	inputs, err = discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".inputs", err, runtimeRun, map[string]any{
 			"project_path": projectPath,
@@ -948,7 +972,7 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			"plan_sha256":  planSHA256,
 		})
 	}
-	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".plan_changed", err, runtimeRun, map[string]any{
 			"project_path": projectPath,
@@ -963,7 +987,7 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			"checked_plan_sha256": canonicalPlanSHA256,
 		})
 	}
-	checkContract, err := validateTemplateFillCheckContractForPlan(projectPath, false, "confirmed", planSHA256)
+	checkContract, err := validateTemplateFillCheckContractForPlanWithProvenance(projectPath, provenance, false, "confirmed", planSHA256)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillCheck)+".contract", err, runtimeRun, map[string]any{
 			"project_path": projectPath,
@@ -1002,17 +1026,20 @@ func (s *TaskService) processTemplateFillCheck(ctx context.Context, task *model.
 			task,
 			projectPath,
 			func(stagedProjectPath string) error {
-				return setTemplateFillPlanStatus(stagedProjectPath, "draft")
+				return setTemplateFillPlanStatusWithProvenance(stagedProjectPath, "draft", provenance)
 			},
 			func(stagedProjectPath string) error {
-				stagedPlanContract, _, err := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+				if err := provenance.revalidateAuthoritative(); err != nil {
+					return err
+				}
+				stagedPlanContract, _, err := validateTemplateFillPlanContractSnapshotWithProvenance(stagedProjectPath, provenance)
 				if err != nil {
 					return err
 				}
 				if status, _ := stagedPlanContract["plan_status"].(string); status != "draft" {
 					return fmt.Errorf("template fill reset plan status = %q, expected %q", status, "draft")
 				}
-				stagedInputs, err := discoverTemplateFillInputs(stagedProjectPath)
+				stagedInputs, err := discoverTemplateFillInputsWithProvenance(stagedProjectPath, provenance)
 				if err != nil {
 					return err
 				}
@@ -1080,7 +1107,11 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 	if err != nil {
 		return s.failTemplateFillPreflight(ctx, task, PhaseTemplateFillApply, PhaseRunnerWorker, workspace, "", string(PhaseTemplateFillApply)+".project", err)
 	}
-	inputs, err := discoverTemplateFillInputs(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return s.failTemplateFillInputs(ctx, task, PhaseTemplateFillApply, PhaseRunnerWorker, workspace, projectPath, err)
+	}
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillInputs(ctx, task, PhaseTemplateFillApply, PhaseRunnerWorker, workspace, projectPath, err)
 	}
@@ -1090,7 +1121,7 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 			"project_path": projectPath,
 		})
 	}
-	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err == nil {
 		if planStatus, _ := planContract["plan_status"].(string); planStatus != "confirmed" {
 			err = fmt.Errorf("template fill apply plan status = %q, expected %q", planStatus, "confirmed")
@@ -1131,7 +1162,11 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 	}
 	preflightFailurePhase := ""
 	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
-		stagedInputs, stagedErr := discoverTemplateFillInputs(stagedProjectPath)
+		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillApply) + ".inputs"
+			return stagedErr
+		}
+		stagedInputs, stagedErr := discoverTemplateFillInputsWithProvenance(stagedProjectPath, provenance)
 		if stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillApply) + ".inputs"
 			return stagedErr
@@ -1145,7 +1180,7 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 			preflightFailurePhase = string(PhaseTemplateFillApply) + ".plan_changed"
 			return fmt.Errorf("template fill plan changed during apply: got %s, expected %s", stagedPlanSHA256, planSHA256)
 		}
-		stagedPlanContract, validatedPlanSHA256, stagedErr := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+		stagedPlanContract, validatedPlanSHA256, stagedErr := validateTemplateFillPlanContractSnapshotWithProvenance(stagedProjectPath, provenance)
 		if stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillApply) + ".plan_contract"
 			return stagedErr
@@ -1163,7 +1198,7 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 			preflightFailurePhase = string(PhaseTemplateFillApply) + ".check_contract"
 			return fmt.Errorf("template fill apply check report sha256 = %q, expected %q", stagedReportSHA256, expectedCheckReportSHA256)
 		}
-		if _, stagedErr := validateTemplateFillApplyContract(stagedProjectPath); stagedErr != nil {
+		if _, stagedErr := validateTemplateFillApplyContractWithProvenance(stagedProjectPath, provenance); stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillApply) + ".contract"
 			return stagedErr
 		}
@@ -1180,13 +1215,13 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 			"plan_sha256":    planSHA256,
 		})
 	}
-	inputs, err = discoverTemplateFillInputs(projectPath)
+	inputs, err = discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillApply)+".inputs", err, runtimeRun, map[string]any{
 			"project_path": projectPath,
 		})
 	}
-	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err == nil {
 		if planStatus, _ := planContract["plan_status"].(string); planStatus != "confirmed" || canonicalPlanSHA256 != planSHA256 {
 			err = fmt.Errorf("template fill apply canonical plan no longer matches confirmed snapshot")
@@ -1210,7 +1245,7 @@ func (s *TaskService) processTemplateFillApply(ctx context.Context, task *model.
 			"plan_sha256":  planSHA256,
 		})
 	}
-	applyContract, err := validateTemplateFillApplyContract(projectPath)
+	applyContract, err := validateTemplateFillApplyContractWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillApply)+".contract", err, runtimeRun, map[string]any{
 			"project_path": projectPath,
@@ -1257,7 +1292,11 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 	if err != nil {
 		return s.failTemplateFillPreflight(ctx, task, PhaseTemplateFillValidate, PhaseRunnerWorker, workspace, "", string(PhaseTemplateFillValidate)+".project", err)
 	}
-	inputs, err := discoverTemplateFillInputs(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return s.failTemplateFillInputs(ctx, task, PhaseTemplateFillValidate, PhaseRunnerWorker, workspace, projectPath, err)
+	}
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillInputs(ctx, task, PhaseTemplateFillValidate, PhaseRunnerWorker, workspace, projectPath, err)
 	}
@@ -1267,7 +1306,7 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 			"project_path": projectPath,
 		})
 	}
-	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	planContract, planSHA256, err := validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err == nil {
 		if planStatus, _ := planContract["plan_status"].(string); planStatus != "confirmed" {
 			err = fmt.Errorf("template fill validate plan status = %q, expected %q", planStatus, "confirmed")
@@ -1286,7 +1325,7 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 		})
 	}
 	expectedCheckReportSHA256, _ := checkContract["check_report_sha256"].(string)
-	applyContract, err := validateTemplateFillApplyContract(projectPath)
+	applyContract, err := validateTemplateFillApplyContractWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".apply_contract", err, nil, map[string]any{
 			"project_path": projectPath,
@@ -1314,7 +1353,11 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 	}
 	preflightFailurePhase := ""
 	projectPath, err = s.syncRuntimeProjectValidated(ctx, task, workspace, runtimeRun.WorkspacePath, func(stagedProjectPath string) error {
-		stagedInputs, stagedErr := discoverTemplateFillInputs(stagedProjectPath)
+		if stagedErr := provenance.revalidateAuthoritative(); stagedErr != nil {
+			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".inputs"
+			return stagedErr
+		}
+		stagedInputs, stagedErr := discoverTemplateFillInputsWithProvenance(stagedProjectPath, provenance)
 		if stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".inputs"
 			return stagedErr
@@ -1328,7 +1371,7 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".plan_changed"
 			return fmt.Errorf("template fill plan changed during validate: got %s, expected %s", stagedPlanSHA256, planSHA256)
 		}
-		stagedPlanContract, validatedPlanSHA256, stagedErr := validateTemplateFillPlanContractSnapshot(stagedProjectPath)
+		stagedPlanContract, validatedPlanSHA256, stagedErr := validateTemplateFillPlanContractSnapshotWithProvenance(stagedProjectPath, provenance)
 		if stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".plan_contract"
 			return stagedErr
@@ -1346,11 +1389,11 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".check_contract"
 			return fmt.Errorf("template fill validate check report sha256 = %q, expected %q", stagedReportSHA256, expectedCheckReportSHA256)
 		}
-		if _, stagedErr := validateTemplateFillApplyContract(stagedProjectPath); stagedErr != nil {
+		if _, stagedErr := validateTemplateFillApplyContractWithProvenance(stagedProjectPath, provenance); stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".apply_contract"
 			return stagedErr
 		}
-		if _, stagedErr := validateTemplateFillValidateContract(stagedProjectPath); stagedErr != nil {
+		if _, stagedErr := validateTemplateFillValidateContractWithProvenance(stagedProjectPath, provenance); stagedErr != nil {
 			preflightFailurePhase = string(PhaseTemplateFillValidate) + ".contract"
 			return stagedErr
 		}
@@ -1367,13 +1410,13 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 			"plan_sha256":    planSHA256,
 		})
 	}
-	inputs, err = discoverTemplateFillInputs(projectPath)
+	inputs, err = discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".inputs", err, runtimeRun, map[string]any{
 			"project_path": projectPath,
 		})
 	}
-	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshot(projectPath)
+	planContract, canonicalPlanSHA256, err := validateTemplateFillPlanContractSnapshotWithProvenance(projectPath, provenance)
 	if err == nil {
 		if planStatus, _ := planContract["plan_status"].(string); planStatus != "confirmed" || canonicalPlanSHA256 != planSHA256 {
 			err = fmt.Errorf("template fill validate canonical plan no longer matches confirmed snapshot")
@@ -1397,13 +1440,13 @@ func (s *TaskService) processTemplateFillValidate(ctx context.Context, task *mod
 			"plan_sha256":  planSHA256,
 		})
 	}
-	applyContract, err = validateTemplateFillApplyContract(projectPath)
+	applyContract, err = validateTemplateFillApplyContractWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".apply_contract", err, runtimeRun, map[string]any{
 			"project_path": projectPath,
 		})
 	}
-	validateContract, err := validateTemplateFillValidateContract(projectPath)
+	validateContract, err := validateTemplateFillValidateContractWithProvenance(projectPath, provenance)
 	if err != nil {
 		return s.failTemplateFillPhase(ctx, task, phaseRun, string(PhaseTemplateFillValidate)+".contract", err, runtimeRun, map[string]any{
 			"project_path": projectPath,
@@ -1475,7 +1518,15 @@ func removeTemplateFillFormalCheckEvidence(inputs TemplateFillInputs) error {
 }
 
 func requireTemplateFillFormalCheckEvidenceAbsent(projectPath string) error {
-	inputs, err := discoverTemplateFillInputs(projectPath)
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return err
+	}
+	return requireTemplateFillFormalCheckEvidenceAbsentWithProvenance(projectPath, provenance)
+}
+
+func requireTemplateFillFormalCheckEvidenceAbsentWithProvenance(projectPath string, provenance templateFillSourceProvenance) error {
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return err
 	}
@@ -1611,10 +1662,18 @@ func (s *TaskService) failTemplateFillPreflight(
 }
 
 func setTemplateFillPlanStatus(projectPath, status string) error {
+	provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+	if err != nil {
+		return err
+	}
+	return setTemplateFillPlanStatusWithProvenance(projectPath, status, provenance)
+}
+
+func setTemplateFillPlanStatusWithProvenance(projectPath, status string, provenance templateFillSourceProvenance) error {
 	if status != "draft" && status != "confirmed" {
 		return fmt.Errorf("unsupported template fill plan status %q", status)
 	}
-	inputs, err := discoverTemplateFillInputs(projectPath)
+	inputs, err := discoverTemplateFillInputsWithProvenance(projectPath, provenance)
 	if err != nil {
 		return err
 	}
@@ -2462,50 +2521,69 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 
 	var lastErr error
 	publishVersion := publishVersionName()
-	for _, root := range roots {
+	publishOne := func(root publishRoot) (_ map[string]any, terminal bool, resultErr error) {
+		attempt, err := newPublishRollbackAttempt(task.ID, publishVersion)
+		if err != nil {
+			return nil, true, err
+		}
+		defer func() {
+			if attempt.armed {
+				resultErr = errors.Join(resultErr, s.cleanupFailedPublishAttempt(ctx, attempt))
+			}
+		}()
+
 		var published []model.Artifact
-		var err error
 		if task.Route == model.TaskRouteTemplateFill {
 			published, err = s.publisher.PublishProject(ctx, task.ID, root.Path, root.ProjectPath, publishVersion)
 		} else {
 			published, err = s.publisher.Publish(ctx, task.ID, root.Path, publishVersion)
 		}
 		if err != nil {
-			lastErr = err
-			continue
+			return nil, false, err
+		}
+		if err := attempt.addArtifacts(published); err != nil {
+			return nil, false, err
 		}
 		projectPath := root.ProjectPath
 		if projectPath == "" {
 			projectPath, _ = discoverRuntimeProjectPath(root.Path)
 		}
 		if projectPath == "" {
-			lastErr = fmt.Errorf("published runtime project path not found for workspace %s", root.Path)
-			continue
+			return nil, false, fmt.Errorf("published runtime project path not found for workspace %s", root.Path)
 		}
 		publishContract, err := buildPublishedArtifactsContract(projectPath, s.storage, published, publishVersion, task.Route)
 		if err != nil {
-			lastErr = err
-			continue
+			return nil, false, err
 		}
 		if _, err := writeContractReport(projectPath, string(PhasePublish), publishContract); err != nil {
-			lastErr = err
-			continue
+			return nil, false, err
+		}
+		publishContractObjectKey := filepath.ToSlash(filepath.Join("tasks", task.ID, "artifacts", publishVersion, "contracts", string(PhasePublish)+".json"))
+		if err := attempt.addObjectKey(publishContractObjectKey); err != nil {
+			return nil, false, err
 		}
 		publishContractArtifact, err := s.copyContractReportArtifact(ctx, task.ID, projectPath, publishVersion, string(PhasePublish))
 		if err != nil {
-			lastErr = err
-			continue
+			return nil, false, err
+		}
+		if err := attempt.addArtifact(publishContractArtifact); err != nil {
+			return nil, false, err
 		}
 		published = append(published, publishContractArtifact)
 		finalContract := buildFinalTaskContract(projectPath, publishContract)
 		if _, err := writeContractReport(projectPath, "final", finalContract); err != nil {
-			lastErr = err
-			continue
+			return nil, false, err
+		}
+		finalContractObjectKey := filepath.ToSlash(filepath.Join("tasks", task.ID, "artifacts", publishVersion, "contracts", "final.json"))
+		if err := attempt.addObjectKey(finalContractObjectKey); err != nil {
+			return nil, false, err
 		}
 		finalContractArtifact, err := s.copyContractReportArtifact(ctx, task.ID, projectPath, publishVersion, "final")
 		if err != nil {
-			lastErr = err
-			continue
+			return nil, false, err
+		}
+		if err := attempt.addArtifact(finalContractArtifact); err != nil {
+			return nil, false, err
 		}
 		published = append(published, finalContractArtifact)
 		if root.Source == "agent_compose_session" {
@@ -2513,25 +2591,29 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 			task.RuntimeWorkspacePath = root.Path
 			task.LastRuntimeSessionID = root.SessionID
 			if err := s.saveTaskIfCurrent(ctx, task, expectedStatus); err != nil {
-				return nil, err
+				return nil, true, err
 			}
 		}
 		prefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "artifacts", publishVersion)) + "/"
+		for index := range published {
+			if published[index].ID == "" {
+				published[index].ID = uuid.NewString()
+			}
+			attempt.addArtifactID(published[index].ID)
+		}
 		if err := s.repo.ReplaceArtifactsByObjectKeyPrefix(ctx, task.ID, prefix, published); err != nil {
-			return nil, err
+			return nil, true, err
 		}
 		persisted, err := s.repo.ListArtifactsByPublishVersion(ctx, task.ID, publishVersion)
 		if err != nil {
-			cause := fmt.Errorf("list persisted publish artifacts: %w", err)
-			return nil, errors.Join(cause, s.cleanupFailedPublishVersion(ctx, task.ID, publishVersion, published))
+			return nil, true, fmt.Errorf("list persisted publish artifacts: %w", err)
 		}
+		attempt.addBoundPersistedArtifactIDs(persisted)
 		if len(persisted) != len(published) {
-			cause := fmt.Errorf("persisted artifact count = %d, expected %d", len(persisted), len(published))
-			return nil, errors.Join(cause, s.cleanupFailedPublishVersion(ctx, task.ID, publishVersion, append(published, persisted...)))
+			return nil, true, fmt.Errorf("persisted artifact count = %d, expected %d", len(persisted), len(published))
 		}
 		if _, err := buildPublishedArtifactsContract(projectPath, s.storage, persisted, publishVersion, task.Route); err != nil {
-			cause := fmt.Errorf("final persisted artifact check failed: %w", err)
-			return nil, errors.Join(cause, s.cleanupFailedPublishVersion(ctx, task.ID, publishVersion, append(published, persisted...)))
+			return nil, true, fmt.Errorf("final persisted artifact check failed: %w", err)
 		}
 		contract := map[string]any{
 			"publish":                  publishContract,
@@ -2549,34 +2631,141 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 			"publish_version":  publishVersion,
 			"contract":         contract,
 		}); err != nil {
-			return nil, err
+			return nil, true, err
+		}
+		attempt.disarm()
+		return contract, true, nil
+	}
+
+	for _, root := range roots {
+		contract, terminal, err := publishOne(root)
+		if err != nil {
+			if terminal {
+				return nil, err
+			}
+			lastErr = err
+			continue
 		}
 		return contract, nil
 	}
 	return nil, fmt.Errorf("publish runtime artifacts: %w", lastErr)
 }
 
-func (s *TaskService) cleanupFailedPublishVersion(ctx context.Context, taskID, publishVersion string, artifacts []model.Artifact) error {
-	cleanupCtx := context.WithoutCancel(ctx)
-	var cleanupErr error
-	prefix := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts", publishVersion)) + "/"
-	artifactIDs := make([]string, 0, len(artifacts))
+type publishRollbackAttempt struct {
+	taskID         string
+	publishVersion string
+	objectKeys     map[string]struct{}
+	artifactIDs    map[string]struct{}
+	armed          bool
+}
+
+func newPublishRollbackAttempt(taskID, publishVersion string) (*publishRollbackAttempt, error) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return nil, fmt.Errorf("publish rollback task id is empty")
+	}
+	cleanVersion, err := cleanPublishVersion(publishVersion)
+	if err != nil {
+		return nil, err
+	}
+	return &publishRollbackAttempt{
+		taskID:         taskID,
+		publishVersion: cleanVersion,
+		objectKeys:     map[string]struct{}{},
+		artifactIDs:    map[string]struct{}{},
+		armed:          true,
+	}, nil
+}
+
+func (attempt *publishRollbackAttempt) addObjectKey(objectKey string) error {
+	if attempt == nil || !attempt.armed {
+		return fmt.Errorf("publish rollback attempt is not armed")
+	}
+	normalized := filepath.ToSlash(strings.TrimSpace(objectKey))
+	clean, err := cleanObjectKey(normalized)
+	if err != nil || clean != normalized {
+		return fmt.Errorf("publish rollback object key is not canonical: %q", objectKey)
+	}
+	prefix := filepath.ToSlash(filepath.Join("tasks", attempt.taskID, "artifacts", attempt.publishVersion)) + "/"
+	if !strings.HasPrefix(clean, prefix) {
+		return fmt.Errorf("publish rollback object key %s is outside exact attempt", clean)
+	}
+	relativePath := strings.TrimPrefix(clean, prefix)
+	if _, err := cleanArtifactRel(relativePath); err != nil {
+		return fmt.Errorf("publish rollback object key %s is invalid: %w", clean, err)
+	}
+	attempt.objectKeys[clean] = struct{}{}
+	return nil
+}
+
+func (attempt *publishRollbackAttempt) addArtifact(artifact model.Artifact) error {
+	return attempt.addObjectKey(artifact.ObjectKey)
+}
+
+func (attempt *publishRollbackAttempt) addArtifacts(artifacts []model.Artifact) error {
 	for _, artifact := range artifacts {
-		if artifact.ID != "" {
-			artifactIDs = append(artifactIDs, artifact.ID)
+		if err := attempt.addArtifact(artifact); err != nil {
+			return err
 		}
 	}
-	if err := s.repo.DeleteArtifactsByIDsOrObjectKeyPrefix(cleanupCtx, taskID, prefix, artifactIDs); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish attempt %s rows: %w", publishVersion, err))
-	}
+	return nil
+}
 
-	seenObjectKeys := make(map[string]bool, len(artifacts))
+func (attempt *publishRollbackAttempt) addArtifactID(artifactID string) {
+	if attempt == nil || !attempt.armed {
+		return
+	}
+	if artifactID = strings.TrimSpace(artifactID); artifactID != "" {
+		attempt.artifactIDs[artifactID] = struct{}{}
+	}
+}
+
+func (attempt *publishRollbackAttempt) addBoundPersistedArtifactIDs(artifacts []model.Artifact) {
+	if attempt == nil || !attempt.armed {
+		return
+	}
 	for _, artifact := range artifacts {
 		objectKey := filepath.ToSlash(strings.TrimSpace(artifact.ObjectKey))
-		if objectKey == "" || seenObjectKeys[objectKey] || !strings.HasPrefix(objectKey, prefix) {
+		if artifact.TaskID != attempt.taskID {
 			continue
 		}
-		seenObjectKeys[objectKey] = true
+		if _, ok := attempt.objectKeys[objectKey]; !ok {
+			continue
+		}
+		attempt.addArtifactID(artifact.ID)
+	}
+}
+
+func (attempt *publishRollbackAttempt) disarm() {
+	if attempt != nil {
+		attempt.armed = false
+	}
+}
+
+func (s *TaskService) cleanupFailedPublishAttempt(ctx context.Context, attempt *publishRollbackAttempt) error {
+	if attempt == nil || !attempt.armed {
+		return nil
+	}
+	attempt.armed = false
+	cleanupCtx := context.WithoutCancel(ctx)
+	var cleanupErr error
+	artifactIDs := make([]string, 0, len(attempt.artifactIDs))
+	for artifactID := range attempt.artifactIDs {
+		artifactIDs = append(artifactIDs, artifactID)
+	}
+	sort.Strings(artifactIDs)
+	if len(artifactIDs) > 0 {
+		if err := s.repo.DeleteArtifactsByIDsOrObjectKeyPrefix(cleanupCtx, attempt.taskID, "", artifactIDs); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish attempt %s exact rows: %w", attempt.publishVersion, err))
+		}
+	}
+
+	objectKeys := make([]string, 0, len(attempt.objectKeys))
+	for objectKey := range attempt.objectKeys {
+		objectKeys = append(objectKeys, objectKey)
+	}
+	sort.Strings(objectKeys)
+	for _, objectKey := range objectKeys {
 		if err := s.storage.DeleteObject(cleanupCtx, objectKey); err != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete failed publish object %s: %w", objectKey, err))
 		}
@@ -2995,6 +3184,9 @@ func (s *TaskService) retryTemplateFillPhase(ctx context.Context, task *model.Ta
 		return nil, fmt.Errorf("cleanup before retry %s: %w", phase, err)
 	}
 	validateClean := func(candidate string) error {
+		if _, err := discoverTemplateFillInputsWithProvenance(candidate, session.provenance); err != nil {
+			return err
+		}
 		return requireTemplateFillRetryOutputsAbsent(candidate, phase)
 	}
 	exchange, err := s.beginTemplateFillProjectExchange(ctx, task, session, status, validateClean)

@@ -326,6 +326,391 @@ func TestCheckTemplateFillPlanRefreshesDraftAtUserGateWithoutFormalPhase(t *test
 	}
 }
 
+func TestTemplateFillAPICandidatesPreserveExplicitSameStemMarkdownProvenance(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     string
+		withAgent  bool
+		prepare    func(*testing.T, string)
+		invoke     func(context.Context, *TaskService, string) error
+		wantStatus string
+	}{
+		{
+			name:   "save",
+			status: model.TaskStatusAwaitingTemplateFillConfirm,
+			prepare: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+			},
+			invoke: func(ctx context.Context, service *TaskService, taskID string) error {
+				_, err := service.SaveTemplateFillPlan(ctx, taskID, templateFillContractPlan("confirmed", 1))
+				return err
+			},
+			wantStatus: model.TaskStatusAwaitingTemplateFillConfirm,
+		},
+		{
+			name:      "check",
+			status:    model.TaskStatusAwaitingTemplateFillConfirm,
+			withAgent: true,
+			prepare: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+			},
+			invoke: func(ctx context.Context, service *TaskService, taskID string) error {
+				_, err := service.CheckTemplateFillPlan(ctx, taskID)
+				return err
+			},
+			wantStatus: model.TaskStatusAwaitingTemplateFillConfirm,
+		},
+		{
+			name:   "confirm",
+			status: model.TaskStatusAwaitingTemplateFillConfirm,
+			prepare: func(t *testing.T, projectPath string) {
+				mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+			},
+			invoke: func(ctx context.Context, service *TaskService, taskID string) error {
+				_, err := service.ConfirmTemplateFillPlan(ctx, taskID)
+				return err
+			},
+			wantStatus: model.TaskStatusTemplateFillChecking,
+		},
+		{
+			name:   "regenerate",
+			status: model.TaskStatusAwaitingTemplateFillConfirm,
+			prepare: func(t *testing.T, projectPath string) {
+				writeTemplateFillDownstreamOutputs(t, projectPath)
+			},
+			invoke: func(ctx context.Context, service *TaskService, taskID string) error {
+				_, err := service.RegenerateTemplateFillPlan(ctx, taskID)
+				return err
+			},
+			wantStatus: model.TaskStatusTemplateFillPlanning,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var agent *templateFillWorkflowAgent
+			var agentClient AgentComposeClient
+			if test.withAgent {
+				agent = &templateFillWorkflowAgent{}
+				agentClient = agent
+			}
+			service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, test.status, agentClient)
+			if agent != nil {
+				agent.projectPath = projectPath
+			}
+			manifestPath, manifestBefore := configureExplicitSameStemTemplateFillInputs(t, projectPath, workspacePath)
+			test.prepare(t, projectPath)
+			provenance, err := snapshotTemplateFillSourceProvenance(projectPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !provenance.hasBoundSource("sources/brand.md") {
+				t.Fatalf("same-stem Markdown was not bound into provenance: %#v", provenance)
+			}
+			if err := test.invoke(context.Background(), service, task.ID); err != nil {
+				t.Fatalf("%s error = %v", test.name, err)
+			}
+			persisted, err := repo.GetTask(context.Background(), task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Status != test.wantStatus {
+				t.Fatalf("status = %q, want %q", persisted.Status, test.wantStatus)
+			}
+			if got := mustReadTemplateFillPreviewFile(t, manifestPath); !bytes.Equal(got, manifestBefore) {
+				t.Fatalf("authoritative provenance changed\ngot: %s\nwant: %s", got, manifestBefore)
+			}
+			if _, err := os.Lstat(filepath.Join(projectPath, ".slidesmith", "source_inputs.json")); !os.IsNotExist(err) {
+				t.Fatalf("candidate provenance leaked into canonical project: %v", err)
+			}
+			inputs, err := discoverTemplateFillInputs(projectPath)
+			if err != nil {
+				t.Fatalf("canonical input discovery error = %v", err)
+			}
+			wantContent := filepath.Join(mustCanonicalTemplateFillTestPath(t, projectPath), "sources", "brand.md")
+			if len(inputs.ContentSources) != 1 || inputs.ContentSources[0] != wantContent {
+				t.Fatalf("content sources = %#v, want [%s]", inputs.ContentSources, wantContent)
+			}
+		})
+	}
+}
+
+func TestTemplateFillRetryPreservesProvenanceForSubsequentAPICandidate(t *testing.T) {
+	service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusFailed, nil)
+	manifestPath, manifestBefore := configureExplicitSameStemTemplateFillInputs(t, projectPath, workspacePath)
+	writeTemplateFillDownstreamOutputs(t, projectPath)
+
+	updated, err := service.RetryTask(context.Background(), task.ID, "template_fill_plan")
+	if err != nil {
+		t.Fatalf("RetryTask() error = %v", err)
+	}
+	if updated.Status != model.TaskStatusTemplateFillPlanning {
+		t.Fatalf("retry status = %q, want template_fill_planning", updated.Status)
+	}
+	if got := mustReadTemplateFillPreviewFile(t, manifestPath); !bytes.Equal(got, manifestBefore) {
+		t.Fatalf("retry changed authoritative provenance\ngot: %s\nwant: %s", got, manifestBefore)
+	}
+	inputs, err := discoverTemplateFillInputs(projectPath)
+	if err != nil || len(inputs.ContentSources) != 1 || filepath.Base(inputs.ContentSources[0]) != "brand.md" {
+		t.Fatalf("post-retry inputs = %#v, error = %v", inputs, err)
+	}
+
+	// Model the worker's successful regenerated draft returning to the user
+	// gate, then exercise the next real API candidate transaction.
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	if err := repo.DB().Model(&model.Task{}).Where("id = ?", task.ID).Updates(map[string]any{
+		"status":           model.TaskStatusAwaitingTemplateFillConfirm,
+		"error_message":    "",
+		"failure_phase":    "",
+		"failure_metadata": "{}",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.SaveTemplateFillPlan(context.Background(), task.ID, templateFillContractPlan("confirmed", 1)); err != nil {
+		t.Fatalf("SaveTemplateFillPlan() after retry error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(projectPath, ".slidesmith", "source_inputs.json")); !os.IsNotExist(err) {
+		t.Fatalf("retry/API candidate leaked provenance into project: %v", err)
+	}
+}
+
+func TestTemplateFillCandidateDiscoveryUsesAuthoritativeProvenance(t *testing.T) {
+	service, _, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	configureExplicitSameStemTemplateFillInputs(t, projectPath, workspacePath)
+	session, err := service.newTemplateFillAPISession(context.Background(), task, projectPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = session.cleanup() }()
+
+	inputs, err := discoverTemplateFillInputsWithProvenance(session.candidateProject, session.provenance)
+	if err != nil {
+		t.Fatalf("candidate discovery error = %v", err)
+	}
+	if len(inputs.ContentSources) != 1 || filepath.Base(inputs.ContentSources[0]) != "brand.md" {
+		t.Fatalf("candidate content sources = %#v", inputs.ContentSources)
+	}
+}
+
+func TestCheckTemplateFillPlanRejectsCandidateAuthoredProvenance(t *testing.T) {
+	agent := &templateFillWorkflowAgent{injectCandidateManifest: true}
+	service, _, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, agent)
+	agent.projectPath = projectPath
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand.md"), "# Unproven same-stem content\n")
+
+	if _, err := service.CheckTemplateFillPlan(context.Background(), task.ID); err == nil || !strings.Contains(err.Error(), "source inputs manifest") {
+		t.Fatalf("CheckTemplateFillPlan() error = %v, want candidate provenance rejection", err)
+	}
+	if _, err := os.Lstat(filepath.Join(projectPath, ".slidesmith", "source_inputs.json")); !os.IsNotExist(err) {
+		t.Fatalf("candidate-authored provenance reached canonical project: %v", err)
+	}
+}
+
+func TestCheckTemplateFillPlanRejectsCandidateSourceMutationAgainstProvenance(t *testing.T) {
+	agent := &templateFillWorkflowAgent{mutateContentDuringCheck: true}
+	service, _, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, agent)
+	agent.projectPath = projectPath
+	configureExplicitSameStemTemplateFillInputs(t, projectPath, workspacePath)
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	wantContent := mustReadTemplateFillPreviewFile(t, filepath.Join(projectPath, "sources", "brand.md"))
+
+	if _, err := service.CheckTemplateFillPlan(context.Background(), task.ID); err == nil || !strings.Contains(err.Error(), "provenance") {
+		t.Fatalf("CheckTemplateFillPlan() error = %v, want candidate source provenance mismatch", err)
+	}
+	if got := mustReadTemplateFillPreviewFile(t, filepath.Join(projectPath, "sources", "brand.md")); !bytes.Equal(got, wantContent) {
+		t.Fatalf("candidate source mutation reached canonical project\ngot: %s\nwant: %s", got, wantContent)
+	}
+}
+
+func TestCheckTemplateFillPlanReleasesAPILockForPromptCancellationAndFencesLateResult(t *testing.T) {
+	agent := &templateFillWorkflowAgent{}
+	service, repo, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, agent)
+	agent.projectPath = projectPath
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	writeTemplateFillPreviewCheckReport(t, projectPath, 7, 0, 0)
+	wantPlan := mustReadTemplateFillPreviewFile(t, filepath.Join(projectPath, "analysis", "fill_plan.json"))
+	wantReport := mustReadTemplateFillPreviewFile(t, filepath.Join(projectPath, "analysis", "check_report.json"))
+	started := make(chan struct{})
+	releaseAgent := make(chan struct{})
+	agent.onPhase = func(phase string) error {
+		if phase == string(PhaseTemplateFillCheck) {
+			close(started)
+			<-releaseAgent
+		}
+		return nil
+	}
+	checkDone := make(chan error, 1)
+	go func() {
+		_, err := service.CheckTemplateFillPlan(context.Background(), task.ID)
+		checkDone <- err
+	}()
+	<-started
+
+	cancelDone := make(chan error, 1)
+	go func() {
+		_, err := service.CancelTask(context.Background(), task.ID)
+		cancelDone <- err
+	}()
+	select {
+	case err := <-cancelDone:
+		if err != nil {
+			close(releaseAgent)
+			<-checkDone
+			t.Fatalf("CancelTask() error = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(releaseAgent)
+		<-checkDone
+		<-cancelDone
+		t.Fatal("CancelTask blocked behind the long template fill check")
+	}
+	close(releaseAgent)
+	if err := <-checkDone; err == nil {
+		t.Fatal("late CheckTemplateFillPlan() error = nil after cancellation")
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusCancelled {
+		t.Fatalf("status = %q, want cancelled", persisted.Status)
+	}
+	for path, want := range map[string][]byte{
+		filepath.Join(projectPath, "analysis", "fill_plan.json"):    wantPlan,
+		filepath.Join(projectPath, "analysis", "check_report.json"): wantReport,
+	} {
+		if got := mustReadTemplateFillPreviewFile(t, path); !bytes.Equal(got, want) {
+			t.Fatalf("late check overwrote canonical %s\ngot: %s\nwant: %s", path, got, want)
+		}
+	}
+}
+
+func TestCheckTemplateFillPlanReleasesAPILockButClaimRejectsConcurrentSaveAndConfirm(t *testing.T) {
+	agent := &templateFillWorkflowAgent{}
+	service, _, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, agent)
+	agent.projectPath = projectPath
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	started := make(chan struct{})
+	releaseAgent := make(chan struct{})
+	agent.onPhase = func(phase string) error {
+		if phase == string(PhaseTemplateFillCheck) {
+			close(started)
+			<-releaseAgent
+		}
+		return nil
+	}
+	checkDone := make(chan error, 1)
+	go func() {
+		_, err := service.CheckTemplateFillPlan(context.Background(), task.ID)
+		checkDone <- err
+	}()
+	<-started
+
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "save", run: func() error {
+			_, err := service.SaveTemplateFillPlan(context.Background(), task.ID, templateFillContractPlan("draft", 1))
+			return err
+		}},
+		{name: "confirm", run: func() error {
+			_, err := service.ConfirmTemplateFillPlan(context.Background(), task.ID)
+			return err
+		}},
+	}
+	for _, operation := range operations {
+		done := make(chan error, 1)
+		go func(run func() error) { done <- run() }(operation.run)
+		select {
+		case err := <-done:
+			if err == nil {
+				close(releaseAgent)
+				<-checkDone
+				t.Fatalf("concurrent %s unexpectedly succeeded", operation.name)
+			}
+		case <-time.After(500 * time.Millisecond):
+			close(releaseAgent)
+			<-checkDone
+			<-done
+			t.Fatalf("concurrent %s blocked behind the long template fill check", operation.name)
+		}
+	}
+	close(releaseAgent)
+	if err := <-checkDone; err != nil {
+		t.Fatalf("CheckTemplateFillPlan() error = %v", err)
+	}
+}
+
+func TestCheckTemplateFillPlanReacquiresLockAndRevalidatesBeforePromotion(t *testing.T) {
+	agent := &templateFillWorkflowAgent{}
+	service, _, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, agent)
+	agent.projectPath = projectPath
+	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
+	started := make(chan struct{})
+	releaseAgent := make(chan struct{})
+	agentFinished := make(chan struct{})
+	agent.onPhase = func(phase string) error {
+		if phase == string(PhaseTemplateFillCheck) {
+			close(started)
+			<-releaseAgent
+		}
+		return nil
+	}
+	agent.afterPhase = func(phase string) {
+		if phase == string(PhaseTemplateFillCheck) {
+			close(agentFinished)
+		}
+	}
+	checkDone := make(chan error, 1)
+	go func() {
+		_, err := service.CheckTemplateFillPlan(context.Background(), task.ID)
+		checkDone <- err
+	}()
+	<-started
+
+	type lockResult struct {
+		unlock func()
+		err    error
+	}
+	lockDone := make(chan lockResult, 1)
+	go func() {
+		unlock, err := service.lockTemplateFillAPI(context.Background(), task)
+		lockDone <- lockResult{unlock: unlock, err: err}
+	}()
+	var locked lockResult
+	select {
+	case locked = <-lockDone:
+		if locked.err != nil {
+			close(releaseAgent)
+			<-checkDone
+			t.Fatal(locked.err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(releaseAgent)
+		<-checkDone
+		locked = <-lockDone
+		if locked.unlock != nil {
+			locked.unlock()
+		}
+		t.Fatal("template fill check retained the API lock during the agent call")
+	}
+	close(releaseAgent)
+	<-agentFinished
+	newPlan := templateFillContractPlan("draft", 1)
+	templateFillContractFirstSlide(newPlan)["purpose"] = "newer canonical plan"
+	writeTemplateFillWorkflowJSON(projectPath, filepath.Join("analysis", "fill_plan.json"), newPlan)
+	wantPlan := mustReadTemplateFillPreviewFile(t, filepath.Join(projectPath, "analysis", "fill_plan.json"))
+	locked.unlock()
+
+	if err := <-checkDone; err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Fatalf("CheckTemplateFillPlan() error = %v, want stale snapshot rejection", err)
+	}
+	if got := mustReadTemplateFillPreviewFile(t, filepath.Join(projectPath, "analysis", "fill_plan.json")); !bytes.Equal(got, wantPlan) {
+		t.Fatalf("late check overwrote newer canonical plan\ngot: %s\nwant: %s", got, wantPlan)
+	}
+}
+
 func TestConfirmTemplateFillPlanSetsConfirmedAndQueuesCheck(t *testing.T) {
 	service, _, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
 	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
@@ -1144,4 +1529,22 @@ func snapshotTemplateFillPreviewPaths(t *testing.T, paths []string) map[string][
 		snapshot[path] = mustReadTemplateFillPreviewFile(t, path)
 	}
 	return snapshot
+}
+
+func configureExplicitSameStemTemplateFillInputs(t *testing.T, projectPath, workspacePath string) (string, []byte) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(projectPath, "sources", "content.md")); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFileNoTest(projectPath, filepath.Join("sources", "brand.md"), "# Explicit same-stem business content\n")
+	manifestPath := filepath.Join(workspacePath, ".slidesmith", "source_inputs.json")
+	mustWriteFileNoTest(workspacePath, filepath.Join(".slidesmith", "source_inputs.json"), `{
+  "schema": "slidesmith.source_inputs.v1",
+  "task_id": "task-template-fill",
+  "files": [
+    {"name": "brand.pptx", "upload_path": "uploads/task-template-fill/brand.pptx", "extension": "pptx"},
+    {"name": "brand.md", "upload_path": "uploads/task-template-fill/brand.md", "extension": "md"}
+  ]
+}`+"\n")
+	return manifestPath, mustReadTemplateFillPreviewFile(t, manifestPath)
 }
