@@ -830,7 +830,7 @@ func TestCommittedTemplateFillCleanupFailureIsDurableAndRetried(t *testing.T) {
 }
 
 func TestRollbackExchangeFailureMarkerCannotDeleteRetainedCanonical(t *testing.T) {
-	service, _, task, projectPath, _ := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	service, repo, task, projectPath, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
 	mustWriteTemplateFillPlan(t, projectPath, "draft", 1)
 	unlockAPI, err := service.lockTemplateFillAPI(context.Background(), task)
 	if err != nil {
@@ -852,18 +852,162 @@ func TestRollbackExchangeFailureMarkerCannotDeleteRetainedCanonical(t *testing.T
 	}
 	recoveryPath := exchange.staged.projectPath
 	injected := errors.New("injected direct rollback exchange failure")
-	exchange.staged.exchangeDirectories = func(string, string) error { return injected }
+	protectedBeforeRollbackAttempt := false
+	exchange.staged.exchangeDirectories = func(string, string) error {
+		markers, globErr := filepath.Glob(filepath.Join(workspacePath, ".slidesmith", templateFillCommittedCleanupDir, "*.protected"))
+		protectedBeforeRollbackAttempt = globErr == nil && len(markers) == 1
+		return injected
+	}
 	if err := exchange.rollback(); !errors.Is(err, injected) {
 		t.Fatalf("rollback() error = %v, want injected failure", err)
+	}
+	if !protectedBeforeRollbackAttempt {
+		t.Fatal("rollback exchange was attempted before durable protected marker activation")
 	}
 	if _, err := os.Stat(recoveryPath); err != nil {
 		t.Fatalf("rollback recovery is absent before sweep: %v", err)
 	}
-	if err := service.sweepCommittedTemplateFillPromotions(context.Background(), task); err != nil {
+	protectedMarkers, err := filepath.Glob(filepath.Join(workspacePath, ".slidesmith", templateFillCommittedCleanupDir, "*.protected"))
+	if err != nil || len(protectedMarkers) != 1 {
+		t.Fatalf("protected rollback recovery markers = %#v, error = %v", protectedMarkers, err)
+	}
+	task.Status = model.TaskStatusTemplateFillChecking
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.sweepCommittedTemplateFillPromotions(context.Background(), reloaded); err != nil {
 		t.Fatalf("sweepCommittedTemplateFillPromotions() error = %v", err)
 	}
 	if _, err := os.Stat(recoveryPath); err != nil {
 		t.Fatalf("sweeper deleted retained rollback recovery: %v", err)
+	}
+	if _, err := os.Stat(protectedMarkers[0]); err != nil {
+		t.Fatalf("sweeper deleted protected rollback recovery marker: %v", err)
+	}
+}
+
+func TestPendingTemplateFillCleanupMarkerIsNotSweptFromTaskStatus(t *testing.T) {
+	service, _, task, _, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusAwaitingTemplateFillConfirm, nil)
+	promotionRoot := filepath.Join(workspacePath, ".slidesmith", "project-promotions")
+	attemptRoot := filepath.Join(promotionRoot, "template-fill-api-restart", "attempt")
+	staged := &stagedProjectPromotion{
+		promotionRoot: promotionRoot,
+		attemptRoot:   attemptRoot,
+	}
+	if err := os.MkdirAll(filepath.Join(attemptRoot, "project"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	markerPath, err := writeTemplateFillPendingCleanupMarker(
+		staged,
+		task.ID,
+		model.TaskStatusAwaitingTemplateFillConfirm,
+		model.TaskStatusTemplateFillChecking,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task.Status = model.TaskStatusTemplateFillChecking
+
+	if err := service.sweepCommittedTemplateFillPromotions(context.Background(), task); err != nil {
+		t.Fatalf("sweepCommittedTemplateFillPromotions() error = %v", err)
+	}
+	if _, err := os.Stat(attemptRoot); err != nil {
+		t.Fatalf("sweeper inferred pending recovery was disposable from task status: %v", err)
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("sweeper deleted pending recovery marker: %v", err)
+	}
+}
+
+func TestWriteTemplateFillCleanupMarkerAtomicallyDoesNotPublishPartialMarker(t *testing.T) {
+	markerDirectory := t.TempDir()
+	markerPath := filepath.Join(markerDirectory, "attempt.pending")
+	injected := errors.New("injected marker write failure")
+	ops := defaultTemplateFillCleanupMarkerOps()
+	ops.write = func(file *os.File, raw []byte) (int, error) {
+		written, err := file.Write(raw[:len(raw)/2])
+		if err != nil {
+			return written, err
+		}
+		return written, injected
+	}
+
+	err := writeTemplateFillCleanupMarkerAtomically(markerPath, []byte(`{"task_id":"task-template-fill"}`+"\n"), ops)
+	if !errors.Is(err, injected) {
+		t.Fatalf("writeTemplateFillCleanupMarkerAtomically() error = %v, want injected failure", err)
+	}
+	if _, err := os.Lstat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("partial final cleanup marker was published: %v", err)
+	}
+	entries, err := os.ReadDir(markerDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("temporary cleanup marker was not removed: %#v", entries)
+	}
+}
+
+func TestWriteTemplateFillCleanupMarkerAtomicallyPreservesExistingMarkerOnRenameFailure(t *testing.T) {
+	markerDirectory := t.TempDir()
+	markerPath := filepath.Join(markerDirectory, "attempt.pending")
+	existing := []byte(`{"task_id":"existing"}` + "\n")
+	if err := os.WriteFile(markerPath, existing, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected marker rename failure")
+	ops := defaultTemplateFillCleanupMarkerOps()
+	ops.rename = func(string, string) error { return injected }
+
+	err := writeTemplateFillCleanupMarkerAtomically(markerPath, []byte(`{"task_id":"replacement"}`+"\n"), ops)
+	if !errors.Is(err, injected) {
+		t.Fatalf("writeTemplateFillCleanupMarkerAtomically() error = %v, want injected failure", err)
+	}
+	retained, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(retained, existing) {
+		t.Fatalf("existing cleanup marker = %q, want %q", retained, existing)
+	}
+	entries, err := os.ReadDir(markerDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(markerPath) {
+		t.Fatalf("temporary cleanup marker was not removed: %#v", entries)
+	}
+}
+
+func TestWriteTemplateFillCleanupMarkerAtomicallyReportsTemporaryRemovalFailure(t *testing.T) {
+	markerDirectory := t.TempDir()
+	markerPath := filepath.Join(markerDirectory, "attempt.pending")
+	writeFailure := errors.New("injected marker write failure")
+	removeFailure := errors.New("injected marker temporary removal failure")
+	ops := defaultTemplateFillCleanupMarkerOps()
+	ops.write = func(*os.File, []byte) (int, error) { return 0, writeFailure }
+	var temporaryPath string
+	ops.remove = func(path string) error {
+		temporaryPath = path
+		return removeFailure
+	}
+
+	err := writeTemplateFillCleanupMarkerAtomically(markerPath, []byte(`{"task_id":"task-template-fill"}`+"\n"), ops)
+	if !errors.Is(err, writeFailure) || !errors.Is(err, removeFailure) {
+		t.Fatalf("writeTemplateFillCleanupMarkerAtomically() error = %v, want write and removal failures", err)
+	}
+	if _, err := os.Lstat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("partial final cleanup marker was published: %v", err)
+	}
+	if temporaryPath == "" {
+		t.Fatal("temporary cleanup marker removal was not attempted")
+	}
+	if err := os.Remove(temporaryPath); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -55,13 +55,26 @@ type templateFillProjectExchange struct {
 	finished       bool
 }
 
-const templateFillCommittedCleanupDir = "template-fill-committed-cleanup"
+const (
+	templateFillCommittedCleanupDir       = "template-fill-committed-cleanup"
+	templateFillPendingCleanupMarkerExt   = ".pending"
+	templateFillCommittedCleanupMarkerExt = ".path"
+	templateFillProtectedCleanupMarkerExt = ".protected"
+)
 
 type templateFillCleanupDebt struct {
 	TaskID         string `json:"task_id"`
 	AttemptPath    string `json:"attempt_path"`
 	ExpectedStatus string `json:"expected_status"`
 	TargetStatus   string `json:"target_status"`
+}
+
+type templateFillCleanupMarkerOps struct {
+	createTemp    func(string, string) (*os.File, error)
+	write         func(*os.File, []byte) (int, error)
+	rename        func(string, string) error
+	remove        func(string) error
+	syncDirectory func(string) error
 }
 
 func (s *TaskService) GetTemplateFillPlan(ctx context.Context, taskID string) (*TemplateFillPlanPreview, error) {
@@ -650,12 +663,15 @@ func (exchange *templateFillProjectExchange) rollback() error {
 		}
 		return cleanupErr
 	}
+	exchange.staged.retainRecovery = true
+	if err := exchange.activateProtectedMarker(); err != nil {
+		return err
+	}
 	exchangeDirectories := exchange.staged.exchangeDirectories
 	if exchangeDirectories == nil {
 		exchangeDirectories = atomicExchangeDirectories
 	}
 	if err := exchangeDirectories(exchange.staged.projectPath, exchange.staged.targetPath); err != nil {
-		exchange.staged.retainRecovery = true
 		return fmt.Errorf(
 			"restore template fill API canonical project without DB (old canonical retained at %s): %w",
 			exchange.staged.projectPath,
@@ -664,6 +680,10 @@ func (exchange *templateFillProjectExchange) rollback() error {
 	}
 	exchange.exchanged = false
 	exchange.staged.recoveryPath = ""
+	exchange.staged.retainRecovery = false
+	if err := exchange.activateCommitMarker(); err != nil {
+		return err
+	}
 	cleanupErr := exchange.staged.cleanup()
 	if cleanupErr == nil {
 		exchange.removeMarker()
@@ -696,14 +716,43 @@ func (exchange *templateFillProjectExchange) activateCommitMarker() error {
 	if exchange == nil || exchange.markerPath == "" {
 		return fmt.Errorf("template fill cleanup marker is unavailable")
 	}
-	if filepath.Ext(exchange.markerPath) != ".pending" {
+	extension := filepath.Ext(exchange.markerPath)
+	if extension == templateFillCommittedCleanupMarkerExt {
 		return nil
 	}
-	committedPath := strings.TrimSuffix(exchange.markerPath, ".pending") + ".path"
+	if extension != templateFillPendingCleanupMarkerExt && extension != templateFillProtectedCleanupMarkerExt {
+		return fmt.Errorf("commit template fill cleanup marker in state %q", extension)
+	}
+	committedPath := strings.TrimSuffix(exchange.markerPath, extension) + templateFillCommittedCleanupMarkerExt
 	if err := os.Rename(exchange.markerPath, committedPath); err != nil {
 		return fmt.Errorf("activate committed template fill cleanup marker: %w", err)
 	}
 	exchange.markerPath = committedPath
+	if err := syncTemplateFillCleanupMarkerDirectory(filepath.Dir(committedPath)); err != nil {
+		return fmt.Errorf("sync committed template fill cleanup marker: %w", err)
+	}
+	return nil
+}
+
+func (exchange *templateFillProjectExchange) activateProtectedMarker() error {
+	if exchange == nil || exchange.markerPath == "" {
+		return fmt.Errorf("template fill cleanup marker is unavailable")
+	}
+	extension := filepath.Ext(exchange.markerPath)
+	if extension == templateFillProtectedCleanupMarkerExt {
+		return nil
+	}
+	if extension != templateFillPendingCleanupMarkerExt && extension != templateFillCommittedCleanupMarkerExt {
+		return fmt.Errorf("protect template fill cleanup marker in state %q", extension)
+	}
+	protectedPath := strings.TrimSuffix(exchange.markerPath, extension) + templateFillProtectedCleanupMarkerExt
+	if err := os.Rename(exchange.markerPath, protectedPath); err != nil {
+		return fmt.Errorf("activate protected template fill cleanup marker: %w", err)
+	}
+	exchange.markerPath = protectedPath
+	if err := syncTemplateFillCleanupMarkerDirectory(filepath.Dir(protectedPath)); err != nil {
+		return fmt.Errorf("sync protected template fill cleanup marker: %w", err)
+	}
 	return nil
 }
 
@@ -834,6 +883,9 @@ func (s *TaskService) sweepCommittedTemplateFillPromotions(ctx context.Context, 
 		if markerInfo.Mode()&os.ModeSymlink != 0 || !markerInfo.Mode().IsRegular() {
 			return fmt.Errorf("committed template fill cleanup marker must be a regular non-symlinked file: %s", markerPath)
 		}
+		if filepath.Ext(markerPath) != templateFillCommittedCleanupMarkerExt {
+			continue
+		}
 		rawDebt, err := os.ReadFile(markerPath)
 		if err != nil {
 			return fmt.Errorf("read committed template fill cleanup marker %s: %w", markerPath, err)
@@ -844,9 +896,6 @@ func (s *TaskService) sweepCommittedTemplateFillPromotions(ctx context.Context, 
 		}
 		if debt.TaskID != task.ID {
 			return fmt.Errorf("template fill cleanup marker task = %q, expected %q", debt.TaskID, task.ID)
-		}
-		if filepath.Ext(markerPath) == ".pending" && (debt.TargetStatus == debt.ExpectedStatus || task.Status != debt.TargetStatus) {
-			continue
 		}
 		attemptPath := debt.AttemptPath
 		claimPath := filepath.Dir(attemptPath)
@@ -874,7 +923,7 @@ func writeTemplateFillPendingCleanupMarker(staged *stagedProjectPromotion, taskI
 	if err := os.MkdirAll(debtRoot, 0o700); err != nil {
 		return "", fmt.Errorf("create committed template fill cleanup debt directory: %w", err)
 	}
-	markerPath := filepath.Join(debtRoot, filepath.Base(staged.attemptRoot)+".pending")
+	markerPath := filepath.Join(debtRoot, filepath.Base(staged.attemptRoot)+templateFillPendingCleanupMarkerExt)
 	rawDebt, err := json.Marshal(templateFillCleanupDebt{
 		TaskID:         taskID,
 		AttemptPath:    staged.attemptRoot,
@@ -884,10 +933,104 @@ func writeTemplateFillPendingCleanupMarker(staged *stagedProjectPromotion, taskI
 	if err != nil {
 		return "", fmt.Errorf("encode pending template fill cleanup marker: %w", err)
 	}
-	if err := os.WriteFile(markerPath, append(rawDebt, '\n'), 0o600); err != nil {
+	if err := writeTemplateFillCleanupMarkerAtomically(
+		markerPath,
+		append(rawDebt, '\n'),
+		defaultTemplateFillCleanupMarkerOps(),
+	); err != nil {
 		return "", fmt.Errorf("write pending template fill cleanup marker: %w", err)
 	}
 	return markerPath, nil
+}
+
+func defaultTemplateFillCleanupMarkerOps() templateFillCleanupMarkerOps {
+	return templateFillCleanupMarkerOps{
+		createTemp: os.CreateTemp,
+		write: func(file *os.File, raw []byte) (int, error) {
+			return file.Write(raw)
+		},
+		rename:        os.Rename,
+		remove:        os.Remove,
+		syncDirectory: syncTemplateFillCleanupMarkerDirectory,
+	}
+}
+
+func writeTemplateFillCleanupMarkerAtomically(
+	markerPath string,
+	raw []byte,
+	ops templateFillCleanupMarkerOps,
+) (resultErr error) {
+	defaults := defaultTemplateFillCleanupMarkerOps()
+	if ops.createTemp == nil {
+		ops.createTemp = defaults.createTemp
+	}
+	if ops.write == nil {
+		ops.write = defaults.write
+	}
+	if ops.rename == nil {
+		ops.rename = defaults.rename
+	}
+	if ops.remove == nil {
+		ops.remove = defaults.remove
+	}
+	if ops.syncDirectory == nil {
+		ops.syncDirectory = defaults.syncDirectory
+	}
+
+	markerDirectory := filepath.Dir(markerPath)
+	temporary, err := ops.createTemp(markerDirectory, "."+filepath.Base(markerPath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create cleanup marker temporary file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	closed := false
+	defer func() {
+		if !closed {
+			if closeErr := temporary.Close(); resultErr == nil && closeErr != nil {
+				resultErr = closeErr
+			}
+		}
+		if removeErr := ops.remove(temporaryPath); removeErr != nil && !os.IsNotExist(removeErr) {
+			resultErr = errors.Join(resultErr, fmt.Errorf("remove cleanup marker temporary file: %w", removeErr))
+		}
+	}()
+	if err := temporary.Chmod(0o600); err != nil {
+		return fmt.Errorf("set cleanup marker temporary file mode: %w", err)
+	}
+	written, err := ops.write(temporary, raw)
+	if err != nil {
+		return fmt.Errorf("write cleanup marker temporary file: %w", err)
+	}
+	if written != len(raw) {
+		return fmt.Errorf("write cleanup marker temporary file: %w", io.ErrShortWrite)
+	}
+	if err := temporary.Sync(); err != nil {
+		return fmt.Errorf("sync cleanup marker temporary file: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		closed = true
+		return fmt.Errorf("close cleanup marker temporary file: %w", err)
+	}
+	closed = true
+	if err := ops.rename(temporaryPath, markerPath); err != nil {
+		return fmt.Errorf("publish cleanup marker: %w", err)
+	}
+	if err := ops.syncDirectory(markerDirectory); err != nil {
+		return fmt.Errorf("sync cleanup marker directory: %w", err)
+	}
+	return nil
+}
+
+func syncTemplateFillCleanupMarkerDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	return directory.Close()
 }
 
 func errorString(err error) string {
