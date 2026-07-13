@@ -77,6 +77,9 @@ func TestRouteExecutionPolicyAllowsBeautifyIntakeButBlocksWorkflow(t *testing.T)
 	if policy.FailureMessage == "" {
 		t.Fatalf("beautify policy should explain the workflow block: %#v", policy)
 	}
+	if policy.FailureMessage != "route beautify source intake is complete, but the full workflow is deferred to SPEC-04" {
+		t.Fatalf("beautify failure message = %q, want visible SPEC-04 handoff", policy.FailureMessage)
+	}
 }
 
 func TestRouteExecutionPolicyRejectsMissingSelection(t *testing.T) {

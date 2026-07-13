@@ -66,7 +66,7 @@ func routeExecutionPolicyFor(selection *routeSelection) routeExecutionPolicy {
 			Executable:         true,
 			WorkflowExecutable: false,
 			FailurePhase:       routeFailureWorkflowNotEnabled,
-			FailureMessage:     "route beautify source intake is complete, but the full workflow is not enabled in SPEC-02",
+			FailureMessage:     "route beautify source intake is complete, but the full workflow is deferred to SPEC-04",
 			UnsupportedAfter:   PhaseSourcePrepare,
 			NextSpec:           "SPEC-04-Beautify-PPTX.md",
 			SupportedRoutes:    supportedRoutes,

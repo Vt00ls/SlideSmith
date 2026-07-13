@@ -589,11 +589,12 @@ def snapshot_external_pycache_manifest(
     external_root: Path,
 ) -> tuple[tuple[str, tuple[str, ...]], ...]:
     entries: list[tuple[str, tuple[str, ...]]] = []
-    if snapshot_filesystem_node(external_root)[0] != "directory":
+    skill_root = external_root / "skills" / "ppt-master"
+    if snapshot_filesystem_node(skill_root)[0] != "directory":
         return tuple(entries)
 
-    for current, directory_names, _ in os.walk(external_root, topdown=True, followlinks=False):
-        directory_names.sort()
+    for current, directory_names, _ in os.walk(skill_root, topdown=True, followlinks=False):
+        directory_names[:] = sorted(name for name in directory_names if name != ".git")
         current_path = Path(current)
         cache_names = [name for name in directory_names if name == "__pycache__"]
         for name in cache_names:
@@ -604,6 +605,25 @@ def snapshot_external_pycache_manifest(
                 entries.append((path.as_posix(), node))
         directory_names[:] = [name for name in directory_names if name != "__pycache__"]
     return tuple(sorted(entries, key=lambda item: item[0]))
+
+
+def snapshot_external_skill_tree_manifest(
+    external_root: Path,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    skill_root = external_root / "skills" / "ppt-master"
+    root_snapshot = snapshot_filesystem_node(skill_root)
+    entries: list[tuple[str, tuple[str, ...]]] = [(".", root_snapshot)]
+    if root_snapshot[0] != "directory":
+        return tuple(entries)
+
+    for current, directory_names, file_names in os.walk(skill_root, topdown=True, followlinks=False):
+        directory_names[:] = sorted(name for name in directory_names if name != ".git")
+        file_names = sorted(name for name in file_names if name != ".git")
+        current_path = Path(current)
+        for name in [*directory_names, *file_names]:
+            path = current_path / name
+            entries.append((path.relative_to(skill_root).as_posix(), snapshot_filesystem_node(path)))
+    return tuple(entries)
 
 
 def snapshot_git_status(root: Path) -> tuple[int, str, str]:
@@ -637,6 +657,7 @@ def capture_template_fill_safety_snapshot(
         ),
         "external ppt-master Git status": snapshot_git_status(external_root),
         "external ppt-master __pycache__": snapshot_external_pycache_manifest(external_root),
+        "external ppt-master skill tree": snapshot_external_skill_tree_manifest(external_root),
         "repository runtime .slidesmith": snapshot_tree_manifest(repository_state),
     }
 
@@ -658,6 +679,10 @@ def assert_template_fill_safety_unchanged(snapshot: dict[str, object]) -> None:
         (
             "external ppt-master __pycache__",
             lambda: snapshot_external_pycache_manifest(snapshot["external_root"]),
+        ),
+        (
+            "external ppt-master skill tree",
+            lambda: snapshot_external_skill_tree_manifest(snapshot["external_root"]),
         ),
         (
             "repository runtime .slidesmith",
@@ -763,7 +788,11 @@ class RealTemplateFillSafetyGuardTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         self.assertEqual(initialized.returncode, 0, initialized.stdout + initialized.stderr)
-        (external_root / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
+        (external_root / ".gitignore").write_text(
+            "__pycache__/\n*.log\n.cache/\n**/projects/**\n",
+            encoding="utf-8",
+        )
+        (external_root / "skills" / "ppt-master").mkdir(parents=True)
         fixture = external_root / "fixture.pptx"
         content = external_root / "content.md"
         fixture.write_bytes(b"fixture")
@@ -814,7 +843,7 @@ class RealTemplateFillSafetyGuardTests(unittest.TestCase):
             leaked_state = repository_state / "status.json"
             leaked_state.write_bytes(b'{"a":1}\n')
             state_stat = leaked_state.stat()
-            pycache = external_root / "skills" / "scripts" / "__pycache__"
+            pycache = external_root / "skills" / "ppt-master" / "scripts" / "__pycache__"
             pycache.mkdir(parents=True)
             cached_module = pycache / "module.pyc"
             cached_module.write_bytes(b"old bytecode")
@@ -838,6 +867,43 @@ class RealTemplateFillSafetyGuardTests(unittest.TestCase):
             self.assertIn("repository runtime .slidesmith", message)
             self.assertIn("external ppt-master Git status", message)
             self.assertIn("external ppt-master __pycache__", message)
+
+    def test_safety_guard_detects_ignored_external_skill_tree_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources, external_root, repository_state = self.make_safety_context(root)
+            skill_root = external_root / "skills" / "ppt-master"
+            (skill_root / "logs").mkdir()
+            ignored_log = skill_root / "logs" / "smoke.log"
+            ignored_log.write_bytes(b"before-log!")
+            (skill_root / ".cache").mkdir()
+            ignored_cache = skill_root / ".cache" / "state.bin"
+            ignored_cache.write_bytes(b"before-cache")
+            ignored_project = skill_root / "projects" / "leak" / "output.json"
+            ignored_project.parent.mkdir(parents=True)
+            ignored_project.write_bytes(b'{"before":1}')
+            snapshot = capture_template_fill_safety_snapshot(
+                sources,
+                external_root=external_root,
+                repository_state=repository_state,
+            )
+            git_status_before = snapshot_git_status(external_root)
+            skill_manifest = dict(snapshot["external ppt-master skill tree"])
+            self.assertEqual(skill_manifest["logs"], ("directory",))
+            self.assertEqual(skill_manifest["logs/smoke.log"][:2], ("file", "11"))
+            self.assertEqual(len(skill_manifest["logs/smoke.log"][2]), 64)
+
+            ignored_log.write_bytes(b"after--log!")
+            ignored_cache.write_bytes(b"after--cache")
+            ignored_project.write_bytes(b'{"after-":1}')
+
+            self.assertEqual(
+                snapshot_git_status(external_root),
+                git_status_before,
+                "ignored writes should prove why Git status alone is insufficient",
+            )
+            with self.assertRaisesRegex(AssertionError, "external ppt-master skill tree"):
+                assert_template_fill_safety_unchanged(snapshot)
 
     def test_safety_finalizer_preserves_primary_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -874,10 +940,11 @@ class RealTemplateFillSafetyGuardTests(unittest.TestCase):
             repository_state.mkdir(parents=True)
             state_file = repository_state / "status.json"
             state_file.write_text('{"state":"before"}\n', encoding="utf-8")
-            pycache = external_root / "skills" / "scripts" / "__pycache__"
+            pycache = external_root / "skills" / "ppt-master" / "scripts" / "__pycache__"
             pycache.mkdir(parents=True)
             cached_module = pycache / "module.pyc"
             cached_module.write_bytes(b"before bytecode")
+            ignored_skill_log = external_root / "skills" / "ppt-master" / "runner.log"
             capture_fault = {"enabled": False}
             real_snapshot_node = snapshot_filesystem_node
 
@@ -903,6 +970,7 @@ class RealTemplateFillSafetyGuardTests(unittest.TestCase):
                     )
                     state_file.write_text('{"state":"after"}\n', encoding="utf-8")
                     cached_module.write_bytes(b"after bytecode!")
+                    ignored_skill_log.write_text("ignored external write\n", encoding="utf-8")
                     (external_root / "unexpected.txt").write_text("dirty\n", encoding="utf-8")
                     capture_fault["enabled"] = True
                     inner_self.fail("forced primary phase failure")
@@ -916,6 +984,7 @@ class RealTemplateFillSafetyGuardTests(unittest.TestCase):
             self.assertIn("forced primary phase failure", diagnostics)
             self.assertIn("external ppt-master Git status", diagnostics)
             self.assertIn("external ppt-master __pycache__", diagnostics)
+            self.assertIn("external ppt-master skill tree", diagnostics)
             self.assertIn("repository runtime .slidesmith", diagnostics)
             self.assertIn("source fixtures capture failed", diagnostics)
 

@@ -25,6 +25,7 @@ async function loadAppHelpersModule() {
     "splitRetryOptions",
     "templateFillPlanInputRecoveryNote",
     "templateFillPlanStatuses",
+    "templateFillPlanReadableStatuses",
   ]);
   const functionNames = new Set([
     "isConfirmationStatus",
@@ -36,6 +37,11 @@ async function loadAppHelpersModule() {
     "templateFillActionState",
     "templateFillBasename",
     "templateFillPageKey",
+    "taskDetailPageKey",
+    "createTaskDetailRequestScope",
+    "loadTaskDetailData",
+    "taskDetailRetryTaskID",
+    "templateFillPlanReadableStatus",
     "createTemplateFillRequestScope",
     "templateFillScopedTaskID",
     "scopedTemplateFillRequest",
@@ -404,6 +410,125 @@ test("Template Fill task switches fail closed and discard late task responses", 
   );
 });
 
+test("task detail discards delayed A and older overlapping poll snapshots", async () => {
+  const {
+    createTaskDetailRequestScope,
+    loadTaskDetailData,
+    taskDetailPageKey,
+    taskDetailRetryTaskID,
+    templateFillPlanReadableStatus,
+  } = await loadAppHelpersModule();
+
+  assert.notEqual(taskDetailPageKey("task-a"), taskDetailPageKey("task-b"), "task IDs must remount detail state");
+  assert.equal(templateFillPlanReadableStatus({ route: "template-fill", status: "awaiting_template_fill_confirm" }), true);
+  assert.equal(templateFillPlanReadableStatus({ route: "template-fill", status: "publishing" }), true);
+  assert.equal(templateFillPlanReadableStatus({ route: "template-fill", status: "template_fill_planning" }), false);
+  assert.equal(templateFillPlanReadableStatus({ route: "template-fill", status: "source_converting" }), false);
+  assert.equal(templateFillPlanReadableStatus({ route: "template-fill", status: "cancelled" }), false);
+  assert.equal(templateFillPlanReadableStatus({ route: "main", status: "completed" }), false);
+
+  const deferred = () => {
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+  };
+  const requestSet = (task, waits = {}) => ({
+    getTask: () => waits.task?.promise || Promise.resolve(task),
+    listEvents: () => waits.events?.promise || Promise.resolve([{ task_id: task.id, kind: "event" }]),
+    listArtifacts: () => waits.artifacts?.promise || Promise.resolve([{ task_id: task.id, kind: "artifact" }]),
+    listRuntimeRuns: () => waits.runtimeRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "runtime" }]),
+    listPhaseRuns: () => waits.phaseRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "phase" }]),
+    getTemplateFillPlan: () => waits.preview?.promise || Promise.resolve({ task_id: task.id, plan: { title: task.id } }),
+  });
+
+  let currentTaskId = "task-a";
+  const delayedATask = deferred();
+  const scopeA = createTaskDetailRequestScope("task-a", () => currentTaskId === "task-a");
+  const pendingA = loadTaskDetailData(
+    scopeA,
+    "task-a",
+    requestSet({ id: "task-a", route: "template-fill", status: "completed" }, { task: delayedATask }),
+  );
+
+  currentTaskId = "task-b";
+  const scopeB = createTaskDetailRequestScope("task-b", () => currentTaskId === "task-b");
+  const snapshotB = await loadTaskDetailData(
+    scopeB,
+    "task-b",
+    requestSet({ id: "task-b", route: "template-fill", status: "completed" }),
+  );
+  assert.equal(snapshotB.task.id, "task-b");
+  assert.equal(snapshotB.events[0].task_id, "task-b");
+  assert.equal(snapshotB.artifacts[0].task_id, "task-b");
+  assert.equal(snapshotB.runtimeRuns[0].task_id, "task-b");
+  assert.equal(snapshotB.phaseRuns[0].task_id, "task-b");
+  assert.equal(snapshotB.templateFillPreview.task_id, "task-b");
+  delayedATask.resolve({ id: "task-a", route: "template-fill", status: "completed" });
+  assert.equal(await pendingA, undefined, "late A must not produce a commit-ready snapshot at the B URL");
+  assert.equal(taskDetailRetryTaskID(scopeA, "task-a", "task-a"), "", "retry must not call A from the B URL");
+  assert.equal(taskDetailRetryTaskID(scopeB, "task-b", "task-b"), "task-b");
+
+  const oldTask = deferred();
+  const oldEvents = deferred();
+  currentTaskId = "task-b";
+  const oldPoll = loadTaskDetailData(
+    scopeB,
+    "task-b",
+    requestSet({ id: "task-b", route: "template-fill", status: "completed" }, { task: oldTask, events: oldEvents }),
+  );
+  const newPoll = await loadTaskDetailData(
+    scopeB,
+    "task-b",
+    requestSet({ id: "task-b", route: "template-fill", status: "completed" }),
+  );
+  assert.equal(newPoll.task.id, "task-b");
+  oldTask.resolve({ id: "task-b", route: "template-fill", status: "completed" });
+  oldEvents.resolve([{ task_id: "task-b", generation: "old" }]);
+  assert.equal(await oldPoll, undefined, "an older overlapping poll must not regress the latest snapshot");
+
+  const strictTask = deferred();
+  const strictProbe = loadTaskDetailData(
+    scopeB,
+    "task-b",
+    requestSet({ id: "task-b", route: "template-fill", status: "completed" }, { task: strictTask }),
+  );
+  scopeB.deactivate();
+  const strictLive = await loadTaskDetailData(
+    scopeB,
+    "task-b",
+    requestSet({ id: "task-b", route: "template-fill", status: "completed" }),
+  );
+  strictTask.resolve({ id: "task-b", route: "template-fill", status: "completed" });
+  assert.equal(await strictProbe, undefined, "StrictMode cleanup must invalidate the first setup");
+  assert.equal(strictLive.task.id, "task-b", "StrictMode's second setup must remain usable");
+});
+
+test("task detail preview requests are gated to backend-readable statuses", async () => {
+  const { createTaskDetailRequestScope, loadTaskDetailData } = await loadAppHelpersModule();
+  for (const status of ["template_fill_planning", "source_converting", "cancelled"]) {
+    let previewCalls = 0;
+    const scope = createTaskDetailRequestScope(`task-${status}`, () => true);
+    const task = { id: `task-${status}`, route: "template-fill", status };
+    const snapshot = await loadTaskDetailData(scope, task.id, {
+      getTask: async () => task,
+      listEvents: async () => [],
+      listArtifacts: async () => [],
+      listRuntimeRuns: async () => [],
+      listPhaseRuns: async () => [],
+      getTemplateFillPlan: async () => {
+        previewCalls += 1;
+        return { task_id: task.id };
+      },
+    });
+    assert.equal(previewCalls, 0, `${status} must not request the unreadable plan endpoint`);
+    assert.equal(snapshot.templateFillPreview, null);
+  }
+});
+
 test("Template Fill basename fallback tolerates malformed runtime input", async () => {
   const { templateFillBasename } = await loadAppHelpersModule();
   assert.equal(templateFillBasename("/workspace/projects/demo/sources/company.pptx"), "company.pptx");
@@ -572,6 +697,7 @@ test("Template Fill component uses production helpers and required actions", () 
   const detail = appFunctionSource("TaskDetailPage");
   const previewPage = appFunctionSource("PreviewPage");
   assert.match(app, /route\.name === "templateFill"[\s\S]*?<TemplateFillPlanPage key=\{templateFillPageKey\(route\.id\)\} taskId=\{route\.id\}/);
+  assert.match(app, /route\.name === "task"[\s\S]*?<TaskDetailPage key=\{taskDetailPageKey\(route\.id\)\} taskId=\{route\.id\}/);
   for (const label of ["返回", "重新生成计划", "保存 JSON", "检查计划", "确认并导出", "打开填充计划"]) {
     assert.ok(appSource.includes(label), `missing Template Fill action ${label}`);
   }
@@ -587,6 +713,9 @@ test("Template Fill component uses production helpers and required actions", () 
   assert.match(detail, /visibleTaskArtifacts\s*\(/);
   assert.match(detail, /canOpenTemplateFillPlan\s*\(/);
   assert.match(detail, /completedTaskRoute\s*\(/);
+  assert.match(detail, /createTaskDetailRequestScope\([\s\S]*?taskRouteMatches\(parseRoute\(\), "task", taskId\)/);
+  assert.match(detail, /loadTaskDetailData\s*\(/);
+  assert.match(detail, /taskDetailRetryTaskID\s*\(/);
   assert.match(detail, /taskRoute !== "template-fill"[\s\S]*?<span>SVG<\/span>/);
   assert.match(previewPage, /loadPreviewPageData\([\s\S]*?replaceRoute/);
   assert.match(app, /route\.name === "preview"[\s\S]*?<PreviewPage key=\{previewPageKey\(route\.id\)\} taskId=\{route\.id\}/);
@@ -612,12 +741,18 @@ test("save and check refetch canonical previews while only confirm advances", ()
   assert.match(confirm, /go\(\{ name: "task", id: taskId \}\)/);
 });
 
-test("task detail fetches Template Fill preview best-effort outside core loading", () => {
+test("task detail commits one generation-scoped snapshot", () => {
   const detail = appFunctionSource("TaskDetailPage");
-  const core = detail.match(/Promise\.all\(\[([\s\S]*?)\]\)/)?.[1] || "";
-  assert.ok(core, "missing task-detail core Promise.all");
-  assert.doesNotMatch(core, /getTemplateFillPlan/);
-  assert.match(detail, /if \(nextTask\.route === "template-fill"\)[\s\S]*?try[\s\S]*?api\.getTemplateFillPlan[\s\S]*?catch[\s\S]*?setTemplateFillPreview\(null\)/);
+  assert.match(detail, /const next = await loadTaskDetailData\(/);
+  assert.match(detail, /if \(next\)[\s\S]*?setDetail\(next\)/);
+  assert.doesNotMatch(detail, /setTask\(|setEvents\(|setArtifacts\(|setRuntimeRuns\(|setPhaseRuns\(|setTemplateFillPreview\(/);
+  assert.match(detail, /return \(\) => \{[\s\S]*?requestScope\.deactivate\(\)/);
+});
+
+test("Template Fill deep link cannot regenerate a non-Template-Fill task", () => {
+  const page = appFunctionSource("TemplateFillPlanPage");
+  assert.match(page, /if \(nextTask\.route !== "template-fill"\)[\s\S]*?replaceRoute\(\{ name: "task", id: nextTask\.id \}\)/);
+  assert.match(page, /const canRegenerate = task\?\.route === "template-fill"[\s\S]*?task\?\.status === "failed"/);
 });
 
 test("Template Fill layout is stable and collapses without narrow-screen overflow", () => {

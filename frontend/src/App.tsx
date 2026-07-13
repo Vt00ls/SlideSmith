@@ -86,6 +86,16 @@ const templateFillPlanStatuses: TaskStatus[] = [
   "failed",
 ];
 
+const templateFillPlanReadableStatuses: TaskStatus[] = [
+  "awaiting_template_fill_confirm",
+  "template_fill_checking",
+  "template_fill_applying",
+  "template_fill_validating",
+  "publishing",
+  "completed",
+  "failed",
+];
+
 const templateSelectionKey = "slidesmith.newTask.templateId";
 const supportedSourceAccept = [
   ".md", ".markdown", ".txt", ".text", ".csv", ".tsv", ".pdf",
@@ -203,7 +213,11 @@ function templateFillPageKey(taskId: string) {
   return `template-fill:${taskId}`;
 }
 
-function taskRouteMatches(route: Route, routeName: "templateFill" | "preview", taskId: string) {
+function taskDetailPageKey(taskId: string) {
+  return `task-detail:${taskId}`;
+}
+
+function taskRouteMatches(route: Route, routeName: "task" | "templateFill" | "preview", taskId: string) {
   return route.name === routeName && "id" in route && route.id === taskId;
 }
 
@@ -274,6 +288,105 @@ async function scopedTemplateFillRequest<T>(
     }
     return undefined;
   }
+}
+
+function createTaskDetailRequestScope(taskId: string, isRouteCurrent: () => boolean = () => true) {
+  let nextGeneration = 0;
+  let activeGeneration = 0;
+  return {
+    taskId,
+    activate() {
+      nextGeneration += 1;
+      activeGeneration = nextGeneration;
+      return activeGeneration;
+    },
+    deactivate() {
+      activeGeneration = 0;
+    },
+    isGenerationCurrent(generation: number, currentTaskId: string) {
+      return generation !== 0
+        && generation === activeGeneration
+        && currentTaskId === taskId
+        && isRouteCurrent();
+    },
+    isCurrent(currentTaskId: string) {
+      return activeGeneration !== 0 && currentTaskId === taskId && isRouteCurrent();
+    },
+  };
+}
+
+function templateFillPlanReadableStatus(task?: Pick<Task, "route" | "status">) {
+  return !!task
+    && task.route === "template-fill"
+    && templateFillPlanReadableStatuses.includes(task.status);
+}
+
+async function loadTaskDetailData<
+  TTask extends Pick<Task, "id" | "route" | "status">,
+  TEvent,
+  TArtifact,
+  TRuntimeRun,
+  TPhaseRun,
+  TPreview,
+>(
+  scope: ReturnType<typeof createTaskDetailRequestScope>,
+  currentTaskId: string,
+  requests: {
+    getTask: (id: string) => Promise<TTask>;
+    listEvents: (id: string) => Promise<TEvent[]>;
+    listArtifacts: (id: string) => Promise<TArtifact[]>;
+    listRuntimeRuns: (id: string) => Promise<TRuntimeRun[]>;
+    listPhaseRuns: (id: string) => Promise<TPhaseRun[]>;
+    getTemplateFillPlan: (id: string) => Promise<TPreview>;
+  },
+) {
+  const generation = scope.activate();
+  if (!scope.isGenerationCurrent(generation, currentTaskId)) {
+    return undefined;
+  }
+  let core;
+  try {
+    core = await Promise.all([
+      requests.getTask(scope.taskId),
+      requests.listEvents(scope.taskId),
+      requests.listArtifacts(scope.taskId),
+      requests.listRuntimeRuns(scope.taskId),
+      requests.listPhaseRuns(scope.taskId),
+    ]);
+  } catch (err) {
+    if (scope.isGenerationCurrent(generation, currentTaskId)) {
+      throw err;
+    }
+    return undefined;
+  }
+  if (!scope.isGenerationCurrent(generation, currentTaskId) || core[0].id !== scope.taskId) {
+    return undefined;
+  }
+
+  const [task, events, artifacts, runtimeRuns, phaseRuns] = core;
+  let templateFillPreview: TPreview | null = null;
+  if (templateFillPlanReadableStatus(task)) {
+    try {
+      templateFillPreview = await requests.getTemplateFillPlan(scope.taskId);
+    } catch (err) {
+      if (!scope.isGenerationCurrent(generation, currentTaskId)) {
+        return undefined;
+      }
+      templateFillPreview = null;
+    }
+  }
+  if (!scope.isGenerationCurrent(generation, currentTaskId)) {
+    return undefined;
+  }
+  return { task, events, artifacts, runtimeRuns, phaseRuns, templateFillPreview };
+}
+
+function taskDetailRetryTaskID(
+  scope: ReturnType<typeof createTaskDetailRequestScope>,
+  currentTaskId: string,
+  loadedTaskId: string,
+) {
+  return scope.isCurrent(currentTaskId) && loadedTaskId === scope.taskId ? scope.taskId : "";
 }
 
 function retryOptionsForFailure(failurePhase: string, taskRoute = "main"): Array<{ phase: RetryPhase; label: string }> {
@@ -463,7 +576,7 @@ export function App() {
       <main className="main-surface">
         {route.name === "tasks" && <TaskListPage />}
         {route.name === "new" && <NewTaskPage />}
-        {route.name === "task" && <TaskDetailPage taskId={route.id} />}
+        {route.name === "task" && <TaskDetailPage key={taskDetailPageKey(route.id)} taskId={route.id} />}
         {route.name === "confirm" && <ConfirmPage taskId={route.id} />}
         {route.name === "spec" && <SpecPreviewPage taskId={route.id} />}
         {route.name === "templateFill" && (
@@ -921,49 +1034,51 @@ function writeStoredTemplateID(templateID: string) {
 }
 
 function TaskDetailPage({ taskId }: { taskId: string }) {
-  const [task, setTask] = useState<Task | null>(null);
-  const [events, setEvents] = useState<TaskEvent[]>([]);
-  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
-  const [runtimeRuns, setRuntimeRuns] = useState<RuntimeRun[]>([]);
-  const [phaseRuns, setPhaseRuns] = useState<TaskPhaseRun[]>([]);
-  const [templateFillPreview, setTemplateFillPreview] = useState<TemplateFillPlanPreview | null>(null);
+  const [requestScope] = useState(() => createTaskDetailRequestScope(
+    taskId,
+    () => taskRouteMatches(parseRoute(), "task", taskId),
+  ));
+  const [detail, setDetail] = useState(() => ({
+    task: null as Task | null,
+    events: [] as TaskEvent[],
+    artifacts: [] as Artifact[],
+    runtimeRuns: [] as RuntimeRun[],
+    phaseRuns: [] as TaskPhaseRun[],
+    templateFillPreview: null as TemplateFillPlanPreview | null,
+  }));
   const [retrying, setRetrying] = useState<RetryPhase | "">("");
   const [error, setError] = useState("");
+  const { task, events, artifacts, runtimeRuns, phaseRuns, templateFillPreview } = detail;
 
   const load = useCallback(async () => {
     try {
-      const [nextTask, nextEvents, nextArtifacts, nextRuntimeRuns, nextPhaseRuns] = await Promise.all([
-        api.getTask(taskId),
-        api.listEvents(taskId),
-        api.listArtifacts(taskId),
-        api.listRuntimeRuns(taskId),
-        api.listPhaseRuns(taskId),
-      ]);
-      setTask(nextTask);
-      setEvents(nextEvents);
-      setArtifacts(nextArtifacts);
-      setRuntimeRuns(nextRuntimeRuns);
-      setPhaseRuns(nextPhaseRuns);
-      setError("");
-      if (nextTask.route === "template-fill") {
-        try {
-          setTemplateFillPreview(await api.getTemplateFillPlan(taskId));
-        } catch {
-          setTemplateFillPreview(null);
-        }
-      } else {
-        setTemplateFillPreview(null);
+      const next = await loadTaskDetailData(requestScope, taskId, {
+        getTask: api.getTask,
+        listEvents: api.listEvents,
+        listArtifacts: api.listArtifacts,
+        listRuntimeRuns: api.listRuntimeRuns,
+        listPhaseRuns: api.listPhaseRuns,
+        getTemplateFillPlan: api.getTemplateFillPlan,
+      });
+      if (next) {
+        setDetail(next);
+        setError("");
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (requestScope.isCurrent(taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     }
-  }, [taskId]);
+  }, [requestScope, taskId]);
 
   useEffect(() => {
     void load();
     const timer = window.setInterval(() => void load(), 2500);
-    return () => window.clearInterval(timer);
-  }, [load]);
+    return () => {
+      window.clearInterval(timer);
+      requestScope.deactivate();
+    };
+  }, [load, requestScope]);
 
   const pptx = artifacts.find((artifact) => artifact.kind === "pptx");
   const svgFinalCount = artifacts.filter((artifact) => artifact.kind === "svg_final").length;
@@ -982,19 +1097,26 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const displayedArtifacts = visibleTaskArtifacts(artifacts, taskRoute);
 
   async function retry(phase: RetryPhase) {
-    if (!task || retrying) {
+    const loadedTaskId = task?.id || "";
+    const retryTaskId = taskDetailRetryTaskID(requestScope, taskId, loadedTaskId);
+    if (!retryTaskId || retrying) {
       return;
     }
     setRetrying(phase);
     setError("");
     try {
-      const nextTask = await api.retryTask(task.id, phase);
-      setTask(nextTask);
-      await load();
+      await api.retryTask(retryTaskId, phase);
+      if (taskDetailRetryTaskID(requestScope, taskId, loadedTaskId) === retryTaskId) {
+        await load();
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (taskDetailRetryTaskID(requestScope, taskId, loadedTaskId) === retryTaskId) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
     } finally {
-      setRetrying("");
+      if (taskDetailRetryTaskID(requestScope, taskId, loadedTaskId) === retryTaskId) {
+        setRetrying("");
+      }
     }
   }
 
@@ -1336,6 +1458,10 @@ function TemplateFillPlanPage({ taskId }: { taskId: string }) {
       if (!nextTask) {
         return;
       }
+      if (nextTask.route !== "template-fill") {
+        replaceRoute({ name: "task", id: nextTask.id });
+        return;
+      }
       setTask(nextTask);
       const nextPreview = await scopedTemplateFillRequest(requestScope, taskId, api.getTemplateFillPlan, generation);
       if (!nextPreview) {
@@ -1371,7 +1497,8 @@ function TemplateFillPlanPage({ taskId }: { taskId: string }) {
   });
   const slideRows = preview ? templateFillSlideRows(preview.plan) : [];
   const checkRows = preview ? templateFillCheckRows(preview.check_report) : [];
-  const canRegenerate = task?.status === "awaiting_template_fill_confirm" || task?.status === "failed";
+  const canRegenerate = task?.route === "template-fill"
+    && (task?.status === "awaiting_template_fill_confirm" || task?.status === "failed");
   const recoveryGuidance = task ? retryGuidanceForFailure(task.failure_phase || "") : "";
   const sourcePptxName = preview
     ? templateFillText(preview.summary.source_pptx_name) !== "-"
