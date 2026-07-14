@@ -50,6 +50,7 @@ CHART_VERIFICATION_MODES = {
     "not-data-driven",
 }
 NOTES_HEADING_PATTERN = re.compile(r"^##\s+(P[0-9]{2})\s*\|\s*(.+?)\s*$")
+SPEC_PAGE_HEADING_PATTERN = re.compile(r"(?im)^\s*#{1,6}\s+(P[0-9]{2})\b")
 SPEC_PAGE_LINE_PATTERN = re.compile(r"(?im)^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(P[0-9]{2})\b")
 NOTES_PLACEHOLDERS = ("lorem ipsum", "todo", "tbd", "speaker notes here")
 
@@ -221,7 +222,10 @@ def confirmed_canvas(project: Path) -> tuple[str, float, float, int]:
 def validate_spec_page_mapping(project: Path, expected_pages: int) -> None:
     wanted = [f"P{page:02d}" for page in range(1, expected_pages + 1)]
     design_text = project_file(project, "design_spec.md").read_text(encoding="utf-8")
-    design_ids = list(dict.fromkeys(SPEC_PAGE_LINE_PATTERN.findall(design_text)))
+    design_matches = SPEC_PAGE_HEADING_PATTERN.findall(design_text)
+    if not design_matches:
+        design_matches = SPEC_PAGE_LINE_PATTERN.findall(design_text)
+    design_ids = list(dict.fromkeys(design_matches))
     if design_ids != wanted:
         raise ContractError("page_mapping_invalid", f"design spec page IDs are {design_ids}, expected {wanted}")
     lock_text = project_file(project, "spec_lock.md").read_text(encoding="utf-8")

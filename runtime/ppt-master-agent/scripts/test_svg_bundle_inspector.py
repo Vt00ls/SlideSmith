@@ -176,6 +176,19 @@ class SVGBundleInspectorTests(unittest.TestCase):
         (self.project / "design_spec.md").write_text("# Design Spec\n\nP01 Cover\nP03 Wrong\n", encoding="utf-8")
         self.assert_contract_error("page_mapping_invalid")
 
+    def test_design_spec_page_references_do_not_override_ordered_page_headings(self) -> None:
+        (self.project / "design_spec.md").write_text(
+            "# Design Spec\n\n"
+            "P02 chart data must retain its source citation.\n\n"
+            "#### P01 - Cover\n\n"
+            "#### P02 - Evidence\n",
+            encoding="utf-8",
+        )
+
+        inventory = inspector.inspect_bundle(self.project)
+
+        self.assertEqual([page["page_id"] for page in inventory["pages"]], ["P01", "P02"])
+
     def test_xml_and_static_security_rejections(self) -> None:
         cases = [
             ("xml_invalid", "<g>"),
