@@ -93,6 +93,7 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"never write null or placeholders",
 		"flat canonical fields prompt_or_query, source_reference",
 		"stable canonical ID P01, P02",
+		"must declare one required chart_template requirement and one required chart_data requirement",
 	}
 	for _, want := range specRequired {
 		if !strings.Contains(specPrompt, want) {
@@ -109,6 +110,11 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"Read projects/task_1_ppt169_20260707/design_spec.md",
 		"Create exactly the confirmed page_count SVG pages",
 		"Create projects/task_1_ppt169_20260707/notes/total.md",
+		`"svg": "svg_output/01_safe_slug.svg"`,
+		`"resources": []`,
+		`"source_citation": {"file": "sources/input.md", "section": "Section heading"}`,
+		`"plot_area": [120, 160, 1160, 620]`,
+		"Never use svg_path, resource_bindings, fallback_bindings, data_hash_sha256",
 		"Do not run svg_quality_checker.py, finalize_svg.py, svg_to_pptx.py",
 		"Do not create or modify projects/task_1_ppt169_20260707/exports/",
 	}

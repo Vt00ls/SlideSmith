@@ -434,6 +434,11 @@ class SVGBundleInspectorTests(unittest.TestCase):
         inventory = inspector.inspect_bundle(self.project)
         self.assertEqual(inventory["chart_summary"], {"charts": 1})
 
+        chart_value["charts"][0]["categories"] = ["Q2", "Q1"]
+        chart_path.write_text(json.dumps(chart_value), encoding="utf-8")
+        self.assert_contract_error("chart_usage_invalid")
+
+        chart_value["charts"][0]["categories"] = ["Q1", "Q2"]
         chart_value["charts"][0]["data_sha256"] = "0" * 64
         chart_path.write_text(json.dumps(chart_value), encoding="utf-8")
         self.assert_contract_error("chart_usage_invalid")
