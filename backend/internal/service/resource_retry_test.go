@@ -86,7 +86,7 @@ func TestRetryResourcePhaseRejectsStalePlanBeforeCleanup(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "stale spec contract") {
 		t.Fatalf("stale retry error = %v", err)
 	}
-	assertPathExists(t, filepath.Join(projectPath, "svg_output", "01.svg"))
+	assertPathExists(t, filepath.Join(projectPath, "svg_output", "01_page_01.svg"))
 	persisted, getErr := repo.GetTask(context.Background(), task.ID)
 	if getErr != nil {
 		t.Fatal(getErr)

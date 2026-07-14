@@ -94,6 +94,7 @@ func (s *TaskService) runFullRuntimePreflight(ctx context.Context, task *model.T
 	}
 	add("publisher_script", filepath.Join(workspace.HostDir, "scripts", "ppt_runner.py"), true, requireReadableRegularFile(filepath.Join(workspace.HostDir, "scripts", "ppt_runner.py")))
 	add("resource_runner", filepath.Join(workspace.HostDir, "scripts", "resource_runner.py"), true, requireReadableRegularFile(filepath.Join(workspace.HostDir, "scripts", "resource_runner.py")))
+	add("svg_bundle_inspector", filepath.Join(workspace.HostDir, "scripts", "svg_bundle_inspector.py"), true, requireReadableRegularFile(filepath.Join(workspace.HostDir, "scripts", "svg_bundle_inspector.py")))
 
 	add("runtime_python3", "python3", false, fmt.Errorf("validated inside the agent runtime during full prepare"))
 	add("runtime_python_imports", "pptx,PIL", false, fmt.Errorf("validated inside the agent runtime during full prepare"))

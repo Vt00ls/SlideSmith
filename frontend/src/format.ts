@@ -103,6 +103,11 @@ export const artifactKindLabel: Record<string, string> = {
   formula_manifest: "公式清单",
   chart_data: "图表数据",
   chart_template: "图表模板",
+  svg_inventory: "SVG Inventory",
+  svg_resource_usage: "SVG 资源绑定",
+  chart_usage: "图表绑定",
+  notes_inventory: "讲稿 Inventory",
+  speaker_notes: "逐页讲稿",
   other: "其他",
 };
 

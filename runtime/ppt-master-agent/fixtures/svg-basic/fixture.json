@@ -1,0 +1,10 @@
+{
+  "schema": "slidesmith.svg_fixture.v1",
+  "name": "svg-basic",
+  "expected": "pass",
+  "canvas": "ppt169",
+  "page_count": 3,
+  "resources": [],
+  "charts": [],
+  "notes": "per-page"
+}

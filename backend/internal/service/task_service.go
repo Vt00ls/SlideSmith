@@ -2279,51 +2279,163 @@ func (s *TaskService) runFullPPTMasterSVGPhase(ctx context.Context, task *model.
 		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".resource_contract", err, nil, map[string]any{"project_path": projectPath})
 		return nil, projectPath, err
 	}
+	if fileExists(filepath.Join(projectPath, "analysis", "svg_inventory.json")) {
+		return s.recoverValidatedSVGBundlePhase(ctx, task, workspace, projectPath)
+	}
 	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSVGExecute, PhaseRunnerAgent, fullPhaseInput(task, workspace, projectPath, PhaseSVGExecute, PhaseSpecGenerate))
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute), err, nil, map[string]any{"workspace_path": workspace.HostDir})
 		return nil, projectPath, err
 	}
-	run, err := s.runAgent(ctx, task, string(PhaseSVGExecute), AgentRunRequest{
-		Prompt:      s.fullPPTMasterSVGPrompt(task, projectPath),
+	inspectorOnlyRecovery := hasRecoverableSVGInspectorInputs(projectPath)
+	var run *model.TaskRuntimeRun
+	if inspectorOnlyRecovery {
+		_ = s.event(ctx, task.ID, model.EventTypeRuntime, "recovering", "Recovering SVG phase from authored bundle; running inspector only", map[string]any{
+			"phase": string(PhaseSVGExecute), "project_path": s.projectRel(task, projectPath),
+		})
+	} else {
+		run, err = s.runAgent(ctx, task, string(PhaseSVGExecute), AgentRunRequest{
+			Prompt:      s.fullPPTMasterSVGPrompt(task, projectPath),
+			WorkDir:     workspace.HostDir,
+			ComposeFile: workspace.CLIComposeFile,
+			Detached:    true,
+		})
+		applyRuntimeRunToPhaseRun(phaseRun, run)
+		if persistErr := s.applyRuntimeRunToTask(ctx, task, run); persistErr != nil {
+			_ = s.finishPhaseRun(context.WithoutCancel(ctx), phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), persistErr)
+			if !errors.Is(persistErr, errTaskStateChanged) {
+				_ = s.failWithMetadata(context.WithoutCancel(ctx), task, string(PhaseSVGExecute)+".runtime", persistErr, run, map[string]any{"workspace_path": workspace.HostDir})
+			}
+			return run, projectPath, persistErr
+		}
+		if err != nil {
+			_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
+			_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".agent", err, run, map[string]any{"workspace_path": workspace.HostDir})
+			return run, projectPath, err
+		}
+		projectPath, err = s.syncRuntimeProject(ctx, task, workspace, run.WorkspacePath)
+		if err != nil {
+			_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
+			_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".sync", err, run, map[string]any{"workspace_path": run.WorkspacePath})
+			return run, projectPath, err
+		}
+	}
+	projectRel := s.projectRel(task, projectPath)
+	inspectorCommand := fmt.Sprintf(
+		"python3 scripts/svg_bundle_inspector.py %s --resources-manifest %s --resource-usage %s --chart-usage %s --notes %s",
+		shellArg(projectRel),
+		shellArg(".slidesmith/resources_manifest.json"),
+		shellArg("analysis/svg_resource_usage.json"),
+		shellArg("analysis/chart_usage.json"),
+		shellArg("notes/total.md"),
+	)
+	inspectorRun, inspectorErr := s.runAgent(ctx, task, string(PhaseSVGExecute), AgentRunRequest{
+		Command:     inspectorCommand,
 		WorkDir:     workspace.HostDir,
 		ComposeFile: workspace.CLIComposeFile,
-		Detached:    true,
 	})
-	applyRuntimeRunToPhaseRun(phaseRun, run)
-	if persistErr := s.applyRuntimeRunToTask(ctx, task, run); persistErr != nil {
-		_ = s.finishPhaseRun(context.WithoutCancel(ctx), phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), persistErr)
+	applyRuntimeRunToPhaseRun(phaseRun, inspectorRun)
+	if persistErr := s.applyRuntimeRunToTask(ctx, task, inspectorRun); persistErr != nil {
+		_ = s.finishPhaseRun(context.WithoutCancel(ctx), phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(inspectorRun), persistErr)
 		if !errors.Is(persistErr, errTaskStateChanged) {
-			_ = s.failWithMetadata(context.WithoutCancel(ctx), task, string(PhaseSVGExecute)+".runtime", persistErr, run, map[string]any{"workspace_path": workspace.HostDir})
+			_ = s.failWithMetadata(context.WithoutCancel(ctx), task, string(PhaseSVGExecute)+".runtime", persistErr, inspectorRun, map[string]any{"workspace_path": workspace.HostDir})
 		}
-		return run, projectPath, persistErr
+		return inspectorRun, projectPath, persistErr
 	}
+	if inspectorErr != nil {
+		failurePhase, inspectorCode := svgInspectorFailure(inspectorRun)
+		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(inspectorRun), inspectorErr)
+		_ = s.failWithMetadata(ctx, task, failurePhase, inspectorErr, inspectorRun, map[string]any{
+			"project_path": projectRel, "inspector_error_code": inspectorCode,
+		})
+		return inspectorRun, projectPath, inspectorErr
+	}
+	projectPath, err = s.syncRuntimeProject(ctx, task, workspace, inspectorRun.WorkspacePath)
 	if err != nil {
-		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
-		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".agent", err, run, map[string]any{"workspace_path": workspace.HostDir})
-		return run, projectPath, err
+		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(inspectorRun), err)
+		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".sync", err, inspectorRun, map[string]any{"workspace_path": inspectorRun.WorkspacePath})
+		return inspectorRun, projectPath, err
 	}
-	projectPath, err = s.syncRuntimeProject(ctx, task, workspace, run.WorkspacePath)
-	if err != nil {
-		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
-		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".sync", err, run, map[string]any{"workspace_path": run.WorkspacePath})
-		return run, projectPath, err
-	}
-	contract, err := validateSVGExecuteContract(projectPath)
+	contract, err := validateSVGExecuteContract(projectPath, task.ID)
 	if err == nil {
-		contract, err = bindFullPhaseContract(projectPath, PhaseSVGExecute, contract, task, workspace, runtimeRunID(run))
+		contract["task_id"] = task.ID
+		contract["route"] = task.Route
+		contract["phase_run_id"] = phaseRun.ID
+		contract["agent_runtime_run_id"] = runtimeRunID(run)
+		contract["inspector_runtime_run_id"] = runtimeRunID(inspectorRun)
+		contract, err = bindFullPhaseContract(projectPath, PhaseSVGExecute, contract, task, workspace, runtimeRunID(inspectorRun))
 	}
 	if err != nil {
-		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
-		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".contract", err, run, map[string]any{"project_path": projectPath})
-		return run, projectPath, err
+		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(inspectorRun), err)
+		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".contract", err, inspectorRun, map[string]any{"project_path": projectRel})
+		return inspectorRun, projectPath, err
 	}
-	output := fullPhaseOutput(task, run, projectPath, PhaseSVGExecute)
+	if err := s.publishSVGBundleArtifacts(ctx, task, projectPath, phaseRun.ID, contract); err != nil {
+		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(inspectorRun), err)
+		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".publish", err, inspectorRun, map[string]any{"project_path": projectRel})
+		return inspectorRun, projectPath, err
+	}
+	output := fullPhaseOutput(task, inspectorRun, projectPath, PhaseSVGExecute)
+	output["agent_runtime_run_id"] = runtimeRunID(run)
+	output["inspector_runtime_run_id"] = runtimeRunID(inspectorRun)
+	output["inspector_only_recovery"] = inspectorOnlyRecovery
 	output["contract"] = contract
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
-		return run, projectPath, err
+		return inspectorRun, projectPath, err
 	}
-	return run, projectPath, nil
+	return inspectorRun, projectPath, nil
+}
+
+func hasRecoverableSVGInspectorInputs(projectPath string) bool {
+	if fileExists(filepath.Join(projectPath, "analysis", "svg_inventory.json")) {
+		return false
+	}
+	for _, path := range []string{
+		filepath.Join(projectPath, "analysis", "svg_resource_usage.json"),
+		filepath.Join(projectPath, "analysis", "chart_usage.json"),
+		filepath.Join(projectPath, "notes", "total.md"),
+	} {
+		if requireNonEmptyFile(path) != nil {
+			return false
+		}
+	}
+	count, err := countRegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
+	return err == nil && count == confirmedPageCount(projectPath)
+}
+
+func (s *TaskService) recoverValidatedSVGBundlePhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
+	contract, err := validateSVGExecuteContract(projectPath, task.ID)
+	if err != nil {
+		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".contract_stale", err, nil, map[string]any{"project_path": s.projectRel(task, projectPath)})
+		return nil, projectPath, err
+	}
+	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSVGExecute, PhaseRunnerWorker, fullPhaseInput(task, workspace, projectPath, PhaseSVGExecute, PhaseSpecGenerate))
+	if err != nil {
+		return nil, projectPath, err
+	}
+	contract["recovered"] = true
+	contract["task_id"] = task.ID
+	contract["route"] = task.Route
+	contract["phase_run_id"] = phaseRun.ID
+	contract, err = bindFullPhaseContract(projectPath, PhaseSVGExecute, contract, task, workspace, "")
+	if err == nil {
+		err = s.publishSVGBundleArtifacts(ctx, task, projectPath, phaseRun.ID, contract)
+	}
+	if err != nil {
+		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, map[string]any{"recovered": true}, err)
+		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".contract_stale", err, nil, map[string]any{"project_path": s.projectRel(task, projectPath)})
+		return nil, projectPath, err
+	}
+	output := fullPhaseOutput(task, nil, projectPath, PhaseSVGExecute)
+	output["recovered"] = true
+	output["contract"] = contract
+	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
+		return nil, projectPath, err
+	}
+	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "recovered", "Recovered validated SVG bundle without rerunning the authoring agent", map[string]any{
+		"phase_run_id": phaseRun.ID, "project_path": s.projectRel(task, projectPath),
+	})
+	return nil, projectPath, nil
 }
 
 func (s *TaskService) runFullPPTMasterQualityPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
@@ -2384,6 +2496,11 @@ func (s *TaskService) runFullPPTMasterCommandPhase(ctx context.Context, task *mo
 		_ = s.failWithMetadata(ctx, task, string(phase)+".sync", err, run, map[string]any{"workspace_path": run.WorkspacePath})
 		return run, projectPath, err
 	}
+	if _, err := validateFullSVGUpstreamContract(projectPath, upstreamContractPhase, task); err != nil {
+		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
+		_ = s.failWithMetadata(ctx, task, string(phase)+".upstream_mutation", err, run, map[string]any{"project_path": s.projectRel(task, projectPath)})
+		return run, projectPath, err
+	}
 	output := fullPhaseOutput(task, run, projectPath, phase)
 	if validate != nil {
 		contract, err := validate(projectPath)
@@ -2437,6 +2554,10 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, ".slidesmith", "resources_manifest.json"),
 			filepath.Join(projectPath, "analysis", "resource_requirements.json"),
 			filepath.Join(projectPath, "analysis", "image_analysis.csv"),
+			filepath.Join(projectPath, "analysis", "svg_inventory.json"),
+			filepath.Join(projectPath, "analysis", "svg_resource_usage.json"),
+			filepath.Join(projectPath, "analysis", "chart_usage.json"),
+			filepath.Join(projectPath, "analysis", "notes_inventory.json"),
 			filepath.Join(projectPath, "images"),
 			filepath.Join(projectPath, "icons"),
 			filepath.Join(projectPath, "charts"),
@@ -2457,6 +2578,10 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
 			filepath.Join(projectPath, "svg_output"),
 			filepath.Join(projectPath, "notes"),
+			filepath.Join(projectPath, "analysis", "svg_inventory.json"),
+			filepath.Join(projectPath, "analysis", "svg_resource_usage.json"),
+			filepath.Join(projectPath, "analysis", "chart_usage.json"),
+			filepath.Join(projectPath, "analysis", "notes_inventory.json"),
 			filepath.Join(projectPath, "svg_final"),
 			filepath.Join(projectPath, "exports"),
 		)
@@ -2470,6 +2595,10 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
 			filepath.Join(projectPath, "svg_output"),
 			filepath.Join(projectPath, "notes"),
+			filepath.Join(projectPath, "analysis", "svg_inventory.json"),
+			filepath.Join(projectPath, "analysis", "svg_resource_usage.json"),
+			filepath.Join(projectPath, "analysis", "chart_usage.json"),
+			filepath.Join(projectPath, "analysis", "notes_inventory.json"),
 			filepath.Join(projectPath, "svg_final"),
 			filepath.Join(projectPath, "exports"),
 		)
@@ -3429,6 +3558,11 @@ func (s *TaskService) retryPipelinePhase(ctx context.Context, task *model.Task, 
 			return nil, fmt.Errorf("cleanup published outputs before retry %s: %w", phase, err)
 		}
 	}
+	if phase == PhaseSpecGenerate || phase == PhaseImageAcquire || phase == PhaseSVGExecute {
+		if err := s.cleanupSVGBundleArtifacts(ctx, task.ID); err != nil {
+			return nil, fmt.Errorf("cleanup SVG bundle artifacts before retry %s: %w", phase, err)
+		}
+	}
 	if err := cleanupFullPPTMasterOutputsForRetry(projectPath, phase); err != nil {
 		return nil, fmt.Errorf("cleanup before retry %s: %w", phase, err)
 	}
@@ -4130,10 +4264,11 @@ Required output contract:
 1. Create or overwrite %[2]s/design_spec.md with a real PPT Master design specification.
 2. Create or overwrite %[2]s/spec_lock.md and keep it consistent with design_spec.md.
 3. The spec must match the confirmed page_count exactly when it is a valid integer from 3 to 10. If it is missing or invalid, use 3 slides.
-4. Create or overwrite %[2]s/.slidesmith/resource_plan.json using schema slidesmith.resource_plan.v1. It must contain task_id %[1]s, the confirmed page_count, SHA-256 values for design_spec.md, spec_lock.md and confirm_ui/result.json, and a requirements array (which may be empty). The three SHA-256 fields must be non-empty 64-character lowercase hexadecimal strings; never write null or placeholders.
-5. Every requirement must have a stable lowercase ID matching [a-z0-9][a-z0-9._-]{0,95}, a valid page, type, purpose, required flag, canonical acquire_via, approved fallback, safe output_name, placement, and source/prompt fields required by its type. Use the flat canonical fields prompt_or_query, source_reference, parent_id, expression, provider, data, citation, parameters, and publishable. Do not invent nested source or prompt objects.
-6. Include each non-empty resource ID verbatim in both design_spec.md and spec_lock.md so the human and machine contracts agree.
-7. Formula requirements only declare expression and policy; do not render formulas in this phase. Chart data must retain a source citation.
+4. Assign every planned page the stable canonical ID P01, P02, ... in order. Each ID must appear as the leading identifier of its page entry in design_spec.md; if spec_lock.md contains page entries, it must contain the exact same ordered ID set.
+5. Create or overwrite %[2]s/.slidesmith/resource_plan.json using schema slidesmith.resource_plan.v1. It must contain task_id %[1]s, the confirmed page_count, SHA-256 values for design_spec.md, spec_lock.md and confirm_ui/result.json, and a requirements array (which may be empty). The three SHA-256 fields must be non-empty 64-character lowercase hexadecimal strings; never write null or placeholders.
+6. Every requirement must have a stable lowercase ID matching [a-z0-9][a-z0-9._-]{0,95}, a valid page, type, purpose, required flag, canonical acquire_via, approved fallback, safe output_name, placement, and source/prompt fields required by its type. Use the flat canonical fields prompt_or_query, source_reference, parent_id, expression, provider, data, citation, parameters, and publishable. Do not invent nested source or prompt objects.
+7. Include each non-empty resource ID verbatim in both design_spec.md and spec_lock.md so the human and machine contracts agree.
+8. Formula requirements only declare expression and policy; do not render formulas in this phase. Chart data must retain a source citation.
 
 Strict prohibitions for this phase:
 - Do not create %[2]s/svg_output/*.svg.
@@ -4173,12 +4308,15 @@ Hard boundaries:
 - You must actually execute shell commands and write files in the workspace. A text-only explanation is a failed run.
 
 Required output contract:
-1. Create exactly the confirmed page_count SVG pages under %[2]s/svg_output/.
-2. Create %[2]s/notes/total.md.
-3. Re-read %[2]s/spec_lock.md and resources_manifest.json before generating each page.
-4. Author SVG pages one page at a time. Do not write or run Python/Node/shell generators that loop over page data, template SVG pages, or batch-generate SVG files.
-5. Mark every consumed resource with data-resource-id="<manifest-id>" on the owning SVG group or write %[2]s/analysis/svg_resource_usage.json with equivalent per-page bindings.
-6. Associate chart groups with their chart_data resource ID.
+1. Create exactly the confirmed page_count SVG pages under %[2]s/svg_output/ using canonical names <NN>_<safe-slug>.svg, with NN continuous from 01. The slug must contain only Unicode letters/numbers, '-' or '_', in NFC form.
+2. Every root must use the SVG namespace, the confirmed numeric width/height/viewBox, and matching data-page-id="PNN" plus data-spec-page-id="PNN".
+3. Create %[2]s/notes/total.md with exactly one ordered section per page in the form "## PNN | Title". Every section must exist and the deck cannot have all-empty notes.
+4. Create %[2]s/analysis/svg_resource_usage.json with schema slidesmith.svg_resource_usage.v1. Include every page, canonical SVG path and live SVG SHA-256, plus formal resource_id/element_id/usage/href/fallback bindings.
+5. Create %[2]s/analysis/chart_usage.json with schema slidesmith.chart_usage.v1. The file is mandatory even when charts is an empty array; every chart must bind page/svg/element, chart type, verification mode, template/data resource IDs, data hash, source citation, plot area, series and categories.
+6. Give every resource owning element/group a stable id and matching data-resource-id. Ready hrefs must be on that owner or a controlled descendant. Give every chart owner a stable id plus data-chart-id, data-chart-data-resource-id and data-chart-template-resource-id.
+7. Do not create %[2]s/analysis/svg_inventory.json or %[2]s/analysis/notes_inventory.json. Those two authoritative inventories are generated by the platform inspector from live files.
+8. Re-read %[2]s/spec_lock.md and resources_manifest.json before generating each page.
+9. Author SVG pages one page at a time. Do not write or run Python/Node/shell generators that loop over page data, template SVG pages, or batch-generate SVG files.
 
 Strict prohibitions for this phase:
 - Do not change the strategy in %[2]s/design_spec.md.
@@ -4188,11 +4326,13 @@ Strict prohibitions for this phase:
 - Do not run svg_quality_checker.py, finalize_svg.py, svg_to_pptx.py, or scripts/ppt_runner.py publish.
 - Do not create or modify %[2]s/svg_final/.
 - Do not create or modify %[2]s/exports/.
+- Do not use script, foreignObject, iframe, object, embed, on* event attributes, JavaScript/data/external/file URIs, DOCTYPE/entities, absolute paths, or paths that escape the project.
 
 Before stopping:
 - Verify with shell commands that the SVG count under %[2]s/svg_output/ equals confirmed page_count.
 - Verify that %[2]s/notes/total.md exists and is non-empty.
 - Verify that every local image href maps to a ready manifest output and that every required resource is used or has an explicit fallback binding.
+- Verify both draft sidecars contain the current resources manifest hash and current canonical page/SVG hashes.
 - Verify that %[2]s/exports/ contains no .pptx files.
 `, task.ID, projectRel)
 }

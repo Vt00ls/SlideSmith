@@ -46,6 +46,7 @@ func Register(engine *gin.Engine, handlers Handlers) {
 	api.POST("/tasks/:id/confirmations", handlers.Tasks.SubmitConfirmations)
 	api.GET("/tasks/:id/artifacts", handlers.Tasks.ListArtifacts)
 	api.GET("/tasks/:id/resources", handlers.Tasks.GetResources)
+	api.GET("/tasks/:id/svg-bundle", handlers.Tasks.GetSVGBundle)
 	api.GET("/tasks/:id/artifacts/:artifactId/content", handlers.Tasks.GetArtifactContent)
 	api.GET("/tasks/:id/download/pptx", handlers.Tasks.DownloadPPTX)
 }

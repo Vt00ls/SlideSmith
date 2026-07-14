@@ -92,6 +92,7 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"Do not run svg_quality_checker.py, finalize_svg.py, svg_to_pptx.py",
 		"never write null or placeholders",
 		"flat canonical fields prompt_or_query, source_reference",
+		"stable canonical ID P01, P02",
 	}
 	for _, want := range specRequired {
 		if !strings.Contains(specPrompt, want) {

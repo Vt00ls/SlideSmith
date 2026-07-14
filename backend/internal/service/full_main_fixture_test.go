@@ -35,7 +35,12 @@ func (a *fullMainFixtureAgent) Up(context.Context, AgentRunRequest) error { retu
 func (a *fullMainFixtureAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
 	switch req.Phase {
 	case string(PhaseSpecGenerate):
-		mustWriteFileNoTest(a.projectPath, "design_spec.md", fmt.Sprintf("# Design Spec\n\nSlides: %d\n", a.pageCount))
+		var design strings.Builder
+		design.WriteString("# Design Spec\n\n")
+		for page := 1; page <= a.pageCount; page++ {
+			design.WriteString(fmt.Sprintf("P%02d Page %d\n", page, page))
+		}
+		mustWriteFileNoTest(a.projectPath, "design_spec.md", design.String())
 		mustWriteFileNoTest(a.projectPath, "spec_lock.md", fmt.Sprintf("# Spec Lock\n\npage_count: %d\n", a.pageCount))
 		mustWriteEmptyResourcePlanNoTest(a.projectPath, a.taskID, a.pageCount)
 	case string(PhaseImageAcquire):
@@ -45,10 +50,7 @@ func (a *fullMainFixtureAgent) Run(_ context.Context, req AgentRunRequest) (*Age
 		}
 		mustWriteEmptyResourceManifestNoTest(a.projectPath, a.taskID, policy.PhaseRunID)
 	case string(PhaseSVGExecute):
-		for index := 1; index <= a.pageCount; index++ {
-			mustWriteFileNoTest(a.projectPath, filepath.Join("svg_output", fmt.Sprintf("%02d.svg", index)), `<svg viewBox="0 0 1280 720"></svg>`+"\n")
-		}
-		mustWriteFileNoTest(a.projectPath, filepath.Join("notes", "total.md"), "# Notes\n")
+		writeValidSVGBundleNoTest(a.projectPath, a.taskID, a.pageCount)
 	case string(PhaseQualityCheck):
 		mustWriteFileNoTest(a.projectPath, filepath.Join("logs", "quality.log"), "ok\n")
 	case string(PhaseFinalizeExport):
