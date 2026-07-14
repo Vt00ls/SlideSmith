@@ -37,6 +37,11 @@ export SLIDESMITH_AGENT_COMPOSE_SESSION_ROOT=/root/slidesmith-agent-compose-data
 export SLIDESMITH_PPT_RUNNER_PROFILE=full-ppt-master
 export SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=false
 export SLIDESMITH_FULL_PPT_PREFLIGHT_STRICT=true
+export SLIDESMITH_RESOURCE_PHASE_ENABLED=true
+export SLIDESMITH_RESOURCE_NETWORK_ENABLED=false
+export SLIDESMITH_RESOURCE_WEB_IMAGE_ENABLED=false
+export SLIDESMITH_RESOURCE_AI_IMAGE_ENABLED=false
+export SLIDESMITH_RESOURCE_FORMULA_NETWORK_ENABLED=false
 ```
 
 `SLIDESMITH_AGENT_COMPOSE_WORKDIR` is the seed directory that contains
@@ -73,6 +78,15 @@ maps only newly locked full requests to `real-lite`. Production must keep
 scripts, Python, imports, writable workspace, or locked template roots then
 fails at `source_prepare.full_runtime_preflight` before confirmation.
 
+Full main tasks run `image_acquire` as a required worker phase between the
+approved spec and SVG execution. It writes a hash-bound resource policy,
+requirements snapshot, and canonical `.slidesmith/resources_manifest.json`.
+SVG execution remains blocked until paths, hashes, MIME types, limits,
+fallbacks, and resource-use bindings pass validation. Disabling the resource
+phase fails a locked full task instead of silently skipping it. Web, AI, and
+network-backed formula paths additionally require confirmation, deployment
+switches, and an allowlisted provider; all are offline by default.
+
 ## Core API
 
 ```text
@@ -84,6 +98,7 @@ GET  /api/tasks/{id}/events/stream
 GET  /api/tasks/{id}/confirmations
 POST /api/tasks/{id}/confirmations
 GET  /api/tasks/{id}/artifacts
+GET  /api/tasks/{id}/resources
 GET  /api/tasks/{id}/artifacts/{artifactId}/content
 GET  /api/tasks/{id}/download/pptx
 ```
@@ -101,5 +116,5 @@ The API moves tasks into queued business states; the worker advances:
 
 ```text
 runtime_preparing -> source_converting -> awaiting_confirm
-spec_generating   -> svg_generating -> quality_checking -> exporting -> publishing -> completed
+spec_generating -> image_acquiring -> svg_generating -> quality_checking -> exporting -> publishing -> completed
 ```

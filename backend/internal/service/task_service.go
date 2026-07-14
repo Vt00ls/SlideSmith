@@ -36,6 +36,7 @@ type TaskService struct {
 const (
 	retryPhasePrepare              = "prepare"
 	retryPhaseSpecGenerate         = "spec_generate"
+	retryPhaseImageAcquire         = "image_acquire"
 	retryPhaseSVGExecute           = "svg_execute"
 	retryPhaseQualityCheck         = "quality_check"
 	retryPhaseFinalizeExport       = "finalize_export"
@@ -255,6 +256,7 @@ func (s *TaskService) ProcessQueuedTasks(ctx context.Context, limit int) (int, e
 		model.TaskStatusTemplateFillApplying,
 		model.TaskStatusTemplateFillValidating,
 		model.TaskStatusSpecGenerating,
+		model.TaskStatusImageAcquiring,
 		model.TaskStatusSVGGenerating,
 		model.TaskStatusQualityChecking,
 		model.TaskStatusExporting,
@@ -330,6 +332,8 @@ func (s *TaskService) processClaimedTask(ctx context.Context, task *model.Task) 
 		return s.processTemplateFillValidate(ctx, task)
 	case model.TaskStatusSpecGenerating:
 		return s.processGenerate(ctx, task)
+	case model.TaskStatusImageAcquiring:
+		return s.processResourceAcquire(ctx, task)
 	case model.TaskStatusSVGGenerating:
 		return s.processFullPPTMasterQueuedPhase(ctx, task, PhaseSVGExecute)
 	case model.TaskStatusQualityChecking:
@@ -352,6 +356,7 @@ func isWorkerTaskStatus(status string) bool {
 		model.TaskStatusTemplateFillApplying,
 		model.TaskStatusTemplateFillValidating,
 		model.TaskStatusSpecGenerating,
+		model.TaskStatusImageAcquiring,
 		model.TaskStatusSVGGenerating,
 		model.TaskStatusQualityChecking,
 		model.TaskStatusExporting,
@@ -2125,10 +2130,10 @@ func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *m
 			})
 			return nil
 		}
-		if err := s.queueSVGAfterSpecApproval(ctx, task, projectPath, specRun.ID); err != nil {
+		if err := s.queueResourceAfterSpecApproval(ctx, task, projectPath, specRun.ID); err != nil {
 			return err
 		}
-		startPhase = PhaseSVGExecute
+		return nil
 	}
 
 	if startPhase == PhaseSVGExecute {
@@ -2187,32 +2192,25 @@ func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *m
 	return fmt.Errorf("unsupported full-ppt-master start phase %q", startPhase)
 }
 
-func (s *TaskService) queueSVGAfterSpecApproval(ctx context.Context, task *model.Task, projectPath, previousRuntimeRunID string) error {
+func (s *TaskService) queueResourceAfterSpecApproval(ctx context.Context, task *model.Task, projectPath, previousRuntimeRunID string) error {
 	if !s.useFullPPTMaster(task) || task.Route != model.TaskRouteMain {
-		return fmt.Errorf("image acquire compatibility skip requires full-ppt-master main route")
+		return fmt.Errorf("resource acquisition requires full-ppt-master main route")
 	}
-	if err := s.transition(ctx, task, model.TaskStatusImageAcquiring, "Image acquire skipped", map[string]any{
+	if _, err := validateExistingSpecContract(projectPath, task, s.resolveTaskWorkspace(task)); err != nil {
+		return fmt.Errorf("resource acquisition requires valid spec contract: %w", err)
+	}
+	if err := s.transition(ctx, task, model.TaskStatusImageAcquiring, "Resource acquisition queued", map[string]any{
 		"runtime_run_id": previousRuntimeRunID,
-		"reason":         "resource acquisition is deferred to SPEC-05",
-		"implementation": "deferred_to_SPEC05",
 		"runner_profile": task.RunnerProfile,
+		"project_path":   projectPath,
 	}); err != nil {
 		return err
 	}
-	if err := s.recordSkippedPhaseRun(ctx, task, PhaseImageAcquire, PhaseRunnerWorker, map[string]any{
-		"reason":                  "resource acquisition is deferred to SPEC-05",
-		"implementation":          "deferred_to_SPEC05",
-		"acquired":                false,
-		"runner_profile":          task.RunnerProfile,
-		"project_path":            projectPath,
-		"previous_runtime_run_id": previousRuntimeRunID,
-	}); err != nil {
-		return err
-	}
-	return s.transition(ctx, task, model.TaskStatusSVGGenerating, "SVG executing", map[string]any{
+	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", "Resource acquisition queued for worker", map[string]any{
 		"previous_runtime_run_id": previousRuntimeRunID,
 		"project_path":            projectPath,
 	})
+	return nil
 }
 
 func (s *TaskService) runFullPPTMasterSpecPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
@@ -2250,7 +2248,12 @@ func (s *TaskService) runFullPPTMasterSpecPhase(ctx context.Context, task *model
 		_ = s.failWithMetadata(ctx, task, string(PhaseSpecGenerate)+".sync", err, run, map[string]any{"workspace_path": run.WorkspacePath})
 		return run, projectPath, err
 	}
-	contract, err := validateSpecGenerateContract(projectPath)
+	if err := bindGeneratedResourcePlanHashes(projectPath, task.ID); err != nil {
+		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
+		_ = s.failWithMetadata(ctx, task, string(PhaseSpecGenerate)+".contract", err, run, map[string]any{"project_path": projectPath})
+		return run, projectPath, err
+	}
+	contract, err := validateSpecGenerateContract(projectPath, task.ID)
 	if err == nil {
 		contract, err = bindFullPhaseContract(projectPath, PhaseSpecGenerate, contract, task, workspace, runtimeRunID(run))
 	}
@@ -2270,6 +2273,10 @@ func (s *TaskService) runFullPPTMasterSpecPhase(ctx context.Context, task *model
 func (s *TaskService) runFullPPTMasterSVGPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
 	if _, err := validateExistingSpecContract(projectPath, task, workspace); err != nil {
 		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".spec_contract", err, nil, map[string]any{"project_path": projectPath})
+		return nil, projectPath, err
+	}
+	if _, err := validateExistingResourceContract(projectPath, task, workspace); err != nil {
+		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".resource_contract", err, nil, map[string]any{"project_path": projectPath})
 		return nil, projectPath, err
 	}
 	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSVGExecute, PhaseRunnerAgent, fullPhaseInput(task, workspace, projectPath, PhaseSVGExecute, PhaseSpecGenerate))
@@ -2425,8 +2432,29 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "design_spec.md"),
 			filepath.Join(projectPath, "spec_lock.md"),
 			filepath.Join(projectPath, ".slidesmith", "spec_contract.json"),
+			filepath.Join(projectPath, ".slidesmith", "resource_plan.json"),
+			filepath.Join(projectPath, ".slidesmith", "resource_policy.json"),
+			filepath.Join(projectPath, ".slidesmith", "resources_manifest.json"),
+			filepath.Join(projectPath, "analysis", "resource_requirements.json"),
+			filepath.Join(projectPath, "analysis", "image_analysis.csv"),
+			filepath.Join(projectPath, "images"),
+			filepath.Join(projectPath, "icons"),
+			filepath.Join(projectPath, "charts"),
 			filepath.Join(projectPath, ".slidesmith", "contracts"),
 			filepath.Join(projectPath, ".slidesmith", "quality_report.json"),
+			filepath.Join(projectPath, "svg_output"),
+			filepath.Join(projectPath, "notes"),
+			filepath.Join(projectPath, "svg_final"),
+			filepath.Join(projectPath, "exports"),
+		)
+	case PhaseImageAcquire:
+		paths = append(paths,
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseImageAcquire)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseSVGExecute)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseQualityCheck)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseFinalizeExport)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePublish)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
 			filepath.Join(projectPath, "svg_output"),
 			filepath.Join(projectPath, "notes"),
 			filepath.Join(projectPath, "svg_final"),
@@ -3254,6 +3282,8 @@ func (s *TaskService) RetryTask(ctx context.Context, taskID, phase string) (*mod
 		return s.retryPrepare(ctx, task)
 	case retryPhaseSpecGenerate:
 		return s.retryPipelinePhase(ctx, task, PhaseSpecGenerate, model.TaskStatusSpecGenerating)
+	case retryPhaseImageAcquire:
+		return s.retryPipelinePhase(ctx, task, PhaseImageAcquire, model.TaskStatusImageAcquiring)
 	case retryPhaseSVGExecute:
 		return s.retryPipelinePhase(ctx, task, PhaseSVGExecute, model.TaskStatusSVGGenerating)
 	case retryPhaseQualityCheck:
@@ -3298,10 +3328,10 @@ func (s *TaskService) ContinueTask(ctx context.Context, taskID, phase string) (*
 		if _, err := validateExistingSpecContract(projectPath, task, workspace); err != nil {
 			return nil, fmt.Errorf("spec preview contract failed: %w", err)
 		}
-		if err := s.queueSVGAfterSpecApproval(ctx, task, projectPath, task.LastRuntimeRunID); err != nil {
+		if err := s.queueResourceAfterSpecApproval(ctx, task, projectPath, task.LastRuntimeRunID); err != nil {
 			return nil, err
 		}
-		_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", "SVG generation queued after spec confirmation", map[string]any{
+		_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", "Resource acquisition queued after spec confirmation", map[string]any{
 			"project_path": projectPath,
 		})
 	case "spec", "spec_generate", "regenerate":
@@ -3387,6 +3417,18 @@ func (s *TaskService) retryPipelinePhase(ctx context.Context, task *model.Task, 
 	if err != nil {
 		return nil, fmt.Errorf("cannot retry %s before prepared project exists: %w", phase, err)
 	}
+	if phase == PhaseImageAcquire {
+		workspace := s.resolveTaskWorkspace(task)
+		if _, err := validateExistingSpecContract(projectPath, task, workspace); err != nil {
+			return nil, fmt.Errorf("cannot retry %s with stale spec contract: %w", phase, err)
+		}
+		if _, _, err := validateResourcePlanContract(projectPath, task.ID); err != nil {
+			return nil, fmt.Errorf("cannot retry %s with stale resource plan: %w", phase, err)
+		}
+		if err := s.cleanupDownstreamPublishedArtifactsForResourceRetry(ctx, task.ID); err != nil {
+			return nil, fmt.Errorf("cleanup published outputs before retry %s: %w", phase, err)
+		}
+	}
 	if err := cleanupFullPPTMasterOutputsForRetry(projectPath, phase); err != nil {
 		return nil, fmt.Errorf("cleanup before retry %s: %w", phase, err)
 	}
@@ -3401,6 +3443,20 @@ func (s *TaskService) retryPipelinePhase(ctx context.Context, task *model.Task, 
 		"project_path": projectPath,
 	})
 	return task, nil
+}
+
+func (s *TaskService) cleanupDownstreamPublishedArtifactsForResourceRetry(ctx context.Context, taskID string) error {
+	prefix := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts")) + "/"
+	artifacts, err := s.repo.ListArtifactsByObjectKeyPrefix(ctx, taskID, prefix)
+	if err != nil {
+		return err
+	}
+	for _, artifact := range artifacts {
+		if err := s.storage.DeleteObject(ctx, artifact.ObjectKey); err != nil {
+			return err
+		}
+	}
+	return s.repo.DeleteArtifactsByIDsOrObjectKeyPrefix(ctx, taskID, prefix, nil)
 }
 
 func (s *TaskService) retryTemplateFillPhase(ctx context.Context, task *model.Task, phase PipelinePhase, status string) (_ *model.Task, resultErr error) {
@@ -3499,6 +3555,8 @@ func normalizeRetryPhase(requested, failurePhase string) (string, error) {
 		return retryPhasePrepare, nil
 	case "confirmation", "confirmation_result", "confirmation_result_write", "write_confirmation", "spec", "generate", "generation", "spec_generating", "spec_generate":
 		return retryPhaseSpecGenerate, nil
+	case "resource", "resources", "image", "image_acquiring", "image_acquire":
+		return retryPhaseImageAcquire, nil
 	case "svg", "svg_generating", "svg_execute":
 		return retryPhaseSVGExecute, nil
 	case "quality", "quality_checking", "quality_check":
@@ -3530,6 +3588,8 @@ func inferRetryPhase(failurePhase string) string {
 		return retryPhasePrepare
 	case strings.HasPrefix(value, string(PhaseSVGExecute)), strings.HasPrefix(value, "svg"):
 		return retryPhaseSVGExecute
+	case strings.HasPrefix(value, string(PhaseImageAcquire)), strings.HasPrefix(value, "resource"), strings.HasPrefix(value, "image_acquir"):
+		return retryPhaseImageAcquire
 	case strings.HasPrefix(value, string(PhaseQualityCheck)), strings.HasPrefix(value, "quality"):
 		return retryPhaseQualityCheck
 	case strings.HasPrefix(value, string(PhaseFinalizeExport)), strings.HasPrefix(value, "export"), strings.HasPrefix(value, "finalize"):
@@ -4050,38 +4110,44 @@ func (s *TaskService) fullPPTMasterSpecPrompt(task *model.Task, projectPath stri
 	return fmt.Sprintf(`You are running inside the SlideSmith PPT Master runtime workspace.
 
 Goal:
-Generate only the PPT Master strategist artifacts for SlideSmith task %s.
+Generate only the PPT Master strategist artifacts and resource declarations for SlideSmith task %[1]s.
 
 Hard boundaries:
-- Use the already prepared project directory: %s
+- Use the already prepared project directory: %[2]s
 - Read .slidesmith/runtime_manifest.json first.
 - If .slidesmith/template_lock.json exists, read it and treat its selected template as immutable for this task.
 - Read .slidesmith/template_resolution.json when present and use its template_root as the selected template package.
 - Read the core PPT Master skill declared by runtime_manifest.json: skills/ppt-master/SKILL.md.
 - Read strategist references when present: skills/ppt-master/references/strategist.md, skills/ppt-master/templates/design_spec_reference.md, and skills/ppt-master/templates/spec_lock_reference.md.
 - Prefer the selected template package listed in runtime_manifest.json template_roots when deriving visual structure, colors, page roles, and style.
-- Treat %s/sources/ as the source material. Keep facts grounded in those files.
-- Read %s/confirm_ui/result.json and follow the confirmed canvas, page_count, language, audience, mode, visual_style, color, typography, icons, formula_policy, image_usage, generation_mode, and refine_spec.
+- Treat %[2]s/sources/ as the source material. Keep facts grounded in those files.
+- Read %[2]s/confirm_ui/result.json and follow the confirmed canvas, page_count, language, audience, mode, visual_style, color, typography, icons, formula_policy, image_usage, generation_mode, and refine_spec.
 - Do not ask the user questions. The confirmation file is final for this run.
-- Do not create a different project unless %s is missing.
+- Do not create a different project unless %[2]s is missing.
 - You must actually execute shell commands and write files in the workspace. A text-only explanation is a failed run.
 
 Required output contract:
-1. Create or overwrite %s/design_spec.md with a real PPT Master design specification.
-2. Create or overwrite %s/spec_lock.md and keep it consistent with design_spec.md.
+1. Create or overwrite %[2]s/design_spec.md with a real PPT Master design specification.
+2. Create or overwrite %[2]s/spec_lock.md and keep it consistent with design_spec.md.
 3. The spec must match the confirmed page_count exactly when it is a valid integer from 3 to 10. If it is missing or invalid, use 3 slides.
+4. Create or overwrite %[2]s/.slidesmith/resource_plan.json using schema slidesmith.resource_plan.v1. It must contain task_id %[1]s, the confirmed page_count, SHA-256 values for design_spec.md, spec_lock.md and confirm_ui/result.json, and a requirements array (which may be empty). The three SHA-256 fields must be non-empty 64-character lowercase hexadecimal strings; never write null or placeholders.
+5. Every requirement must have a stable lowercase ID matching [a-z0-9][a-z0-9._-]{0,95}, a valid page, type, purpose, required flag, canonical acquire_via, approved fallback, safe output_name, placement, and source/prompt fields required by its type. Use the flat canonical fields prompt_or_query, source_reference, parent_id, expression, provider, data, citation, parameters, and publishable. Do not invent nested source or prompt objects.
+6. Include each non-empty resource ID verbatim in both design_spec.md and spec_lock.md so the human and machine contracts agree.
+7. Formula requirements only declare expression and policy; do not render formulas in this phase. Chart data must retain a source citation.
 
 Strict prohibitions for this phase:
-- Do not create %s/svg_output/*.svg.
-- Do not create or modify %s/svg_final/.
-- Do not create or modify %s/exports/.
+- Do not create %[2]s/svg_output/*.svg.
+- Do not create or modify %[2]s/svg_final/.
+- Do not create or modify %[2]s/exports/.
+- Do not acquire, download, generate, render, copy, or slice resource binaries. Do not run analyze_images.py, icon_sync.py, latex_render.py, image_search.py, image_gen.py, or slice_images.py.
 - Do not run svg_quality_checker.py, finalize_svg.py, svg_to_pptx.py, or scripts/ppt_runner.py publish.
 - Do not write or run Python/Node/shell generators for SVG pages.
 
 Before stopping:
-- Verify with shell commands that %s/design_spec.md and %s/spec_lock.md exist and are non-empty.
-- Verify that %s/svg_output has no .svg files.
-`, task.ID, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel)
+- Verify with shell commands that %[2]s/design_spec.md, %[2]s/spec_lock.md, and %[2]s/.slidesmith/resource_plan.json exist and are non-empty.
+- Recompute and verify all three SHA-256 bindings in resource_plan.json.
+- Verify that %[2]s/svg_output has no .svg files and that no new resource binaries were created.
+`, task.ID, projectRel)
 }
 
 func (s *TaskService) fullPPTMasterSVGPrompt(task *model.Task, projectPath string) string {
@@ -4089,40 +4155,46 @@ func (s *TaskService) fullPPTMasterSVGPrompt(task *model.Task, projectPath strin
 	return fmt.Sprintf(`You are running inside the SlideSmith PPT Master runtime workspace.
 
 Goal:
-Generate only the PPT Master executor SVG pages for SlideSmith task %s.
+Generate only the PPT Master executor SVG pages for SlideSmith task %[1]s.
 
 Hard boundaries:
-- Use the already prepared project directory: %s
+- Use the already prepared project directory: %[2]s
 - Read .slidesmith/runtime_manifest.json first.
 - If .slidesmith/template_lock.json exists, read it and treat its selected template as immutable for this task.
 - Read .slidesmith/template_resolution.json when present and use its template_root as the selected template package.
 - Read the core PPT Master skill declared by runtime_manifest.json: skills/ppt-master/SKILL.md.
-- Read %s/design_spec.md and %s/spec_lock.md before writing any SVG.
+- Read %[2]s/design_spec.md, %[2]s/spec_lock.md, and %[2]s/.slidesmith/resources_manifest.json before writing any SVG.
+- Treat resources_manifest.json as the only authority for resources. Use only ready output paths or degraded fallback contracts.
 - Prefer the selected template package listed in runtime_manifest.json template_roots when executing page layout and style.
 - Read executor references when present: skills/ppt-master/references/executor-base.md and skills/ppt-master/references/shared-standards.md.
-- Treat %s/sources/ as the source material. Keep facts grounded in those files.
-- Read %s/confirm_ui/result.json and follow the confirmed canvas, page_count, language, visual_style, color, typography, icons, formula_policy, image_usage, and generation_mode.
+- Treat %[2]s/sources/ as the source material. Keep facts grounded in those files.
+- Read %[2]s/confirm_ui/result.json and follow the confirmed canvas, page_count, language, visual_style, color, typography, icons, formula_policy, image_usage, and generation_mode.
 - Do not ask the user questions. The confirmation file and spec files are final for this run.
 - You must actually execute shell commands and write files in the workspace. A text-only explanation is a failed run.
 
 Required output contract:
-1. Create exactly the confirmed page_count SVG pages under %s/svg_output/.
-2. Create %s/notes/total.md.
-3. Re-read %s/spec_lock.md before generating each page.
+1. Create exactly the confirmed page_count SVG pages under %[2]s/svg_output/.
+2. Create %[2]s/notes/total.md.
+3. Re-read %[2]s/spec_lock.md and resources_manifest.json before generating each page.
 4. Author SVG pages one page at a time. Do not write or run Python/Node/shell generators that loop over page data, template SVG pages, or batch-generate SVG files.
+5. Mark every consumed resource with data-resource-id="<manifest-id>" on the owning SVG group or write %[2]s/analysis/svg_resource_usage.json with equivalent per-page bindings.
+6. Associate chart groups with their chart_data resource ID.
 
 Strict prohibitions for this phase:
-- Do not change the strategy in %s/design_spec.md.
-- Do not change final confirmations in %s/confirm_ui/result.json.
+- Do not change the strategy in %[2]s/design_spec.md.
+- Do not change final confirmations in %[2]s/confirm_ui/result.json.
+- Do not run image search, image generation, icon sync, formula rendering, image analysis, or slicing scripts.
+- Do not access the network, use http://, https://, file://, absolute paths, or files outside resources_manifest.json.
 - Do not run svg_quality_checker.py, finalize_svg.py, svg_to_pptx.py, or scripts/ppt_runner.py publish.
-- Do not create or modify %s/svg_final/.
-- Do not create or modify %s/exports/.
+- Do not create or modify %[2]s/svg_final/.
+- Do not create or modify %[2]s/exports/.
 
 Before stopping:
-- Verify with shell commands that the SVG count under %s/svg_output/ equals confirmed page_count.
-- Verify that %s/notes/total.md exists and is non-empty.
-- Verify that %s/exports/ contains no .pptx files.
-`, task.ID, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel)
+- Verify with shell commands that the SVG count under %[2]s/svg_output/ equals confirmed page_count.
+- Verify that %[2]s/notes/total.md exists and is non-empty.
+- Verify that every local image href maps to a ready manifest output and that every required resource is used or has an explicit fallback binding.
+- Verify that %[2]s/exports/ contains no .pptx files.
+`, task.ID, projectRel)
 }
 
 func (s *TaskService) projectRel(task *model.Task, projectPath string) string {

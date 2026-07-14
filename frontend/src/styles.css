@@ -778,6 +778,114 @@ select:focus {
   color: #9b3d2f;
 }
 
+.kv-grid.compact {
+  grid-template-columns: 76px minmax(0, 1fr);
+}
+
+.resource-panel {
+  grid-column: 1 / -1;
+  min-height: 0;
+}
+
+.resource-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.resource-summary-grid > span {
+  display: grid;
+  gap: 4px;
+  border: 1px solid #e1e1d8;
+  border-radius: 7px;
+  background: #f8f7f1;
+  color: #68716c;
+  padding: 9px 10px;
+  font-size: 11px;
+}
+
+.resource-summary-grid strong {
+  color: #202522;
+  font-size: 16px;
+}
+
+.resource-groups {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.resource-group {
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #d8d8ce;
+  border-radius: 8px;
+  background: #fbfaf5;
+}
+
+.resource-group.degraded {
+  border-color: #e4cda7;
+}
+
+.resource-group.failed {
+  border-color: #e0c0ba;
+}
+
+.resource-group-title {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid #e7e7df;
+  padding: 0 10px;
+  color: #4c5651;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.resource-item {
+  display: grid;
+  gap: 7px;
+  border-bottom: 1px solid #ecece4;
+  padding: 10px;
+  font-size: 12px;
+}
+
+.resource-item:last-child {
+  border-bottom: 0;
+}
+
+.resource-item > div,
+.resource-item-meta {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 9px;
+}
+
+.resource-item > div:first-child {
+  justify-content: space-between;
+}
+
+.resource-item span {
+  color: #68716c;
+  overflow-wrap: anywhere;
+}
+
+.resource-item span.bad {
+  color: #9b3d2f;
+}
+
+.resource-preview-link {
+  color: #2f665d;
+  font-weight: 720;
+}
+
+.resource-preview-link:hover {
+  text-decoration: underline;
+}
+
 .artifact-list {
   display: flex;
   flex-wrap: wrap;
@@ -1493,11 +1601,16 @@ select:focus {
 
   .metric-grid,
   .detail-grid,
+  .resource-groups,
   .confirm-grid,
   .new-task-layout,
   .spec-layout,
   .preview-layout {
     grid-template-columns: 1fr;
+  }
+
+  .resource-summary-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .new-task-form {
@@ -1526,6 +1639,10 @@ select:focus {
 }
 
 @media (max-width: 620px) {
+  .resource-summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .plan-slide-row,
   .check-report-row {
     grid-template-columns: 1fr;

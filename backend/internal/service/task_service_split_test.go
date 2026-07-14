@@ -18,6 +18,7 @@ import (
 
 type splitGenerateFakeAgent struct {
 	projectPath string
+	taskID      string
 }
 
 func (a splitGenerateFakeAgent) Up(context.Context, AgentRunRequest) error {
@@ -29,6 +30,13 @@ func (a splitGenerateFakeAgent) Run(_ context.Context, req AgentRunRequest) (*Ag
 	case string(PhaseSpecGenerate):
 		mustWriteFileNoTest(a.projectPath, "design_spec.md", "# Design Spec\n\nSlides: 3\n")
 		mustWriteFileNoTest(a.projectPath, "spec_lock.md", "# Spec Lock\n\npage_count: 3\n")
+		mustWriteEmptyResourcePlanNoTest(a.projectPath, a.taskID, 3)
+	case string(PhaseImageAcquire):
+		policy, err := loadResourcePolicy(a.projectPath)
+		if err != nil {
+			return nil, err
+		}
+		mustWriteEmptyResourceManifestNoTest(a.projectPath, a.taskID, policy.PhaseRunID)
 	case string(PhaseSVGExecute):
 		for _, name := range []string{"01.svg", "02.svg", "03.svg"} {
 			mustWriteFileNoTest(a.projectPath, filepath.Join("svg_output", name), `<svg viewBox="0 0 1280 720"></svg>`+"\n")
@@ -91,18 +99,31 @@ func TestProcessFullPPTMasterSplitCompletesWithSeparatePhaseRuns(t *testing.T) {
 	service := NewTaskService(
 		repo,
 		storage,
-		splitGenerateFakeAgent{projectPath: projectPath},
+		splitGenerateFakeAgent{projectPath: projectPath, taskID: task.ID},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
 			Enabled:               true,
 			RunnerProfile:         "full-ppt-master",
 			FullPPTDefaultEnabled: true,
+			ResourcePhaseEnabled:  true,
 			WorkspaceRoot:         workspaceRoot,
 		},
 	)
 	writeRuntimeProfileManifestForTest(t, workspaceRoot, task)
 	if err := service.processGenerate(ctx, task); err != nil {
 		t.Fatalf("processGenerate() error = %v", err)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		current, err := repo.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Status == model.TaskStatusCompleted {
+			break
+		}
+		if err := service.ProcessTask(ctx, task.ID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	updated, err := repo.GetTask(ctx, task.ID)
 	if err != nil {
@@ -122,7 +143,7 @@ func TestProcessFullPPTMasterSplitCompletesWithSeparatePhaseRuns(t *testing.T) {
 		statusByPhase[run.Phase] = run.Status
 		runnerByPhase[run.Phase] = run.Runner
 	}
-	for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePublish} {
+	for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePublish} {
 		if statusByPhase[string(phase)] != PhaseRunStatusSucceeded {
 			t.Fatalf("phase %s status = %q, runs=%#v", phase, statusByPhase[string(phase)], phaseRuns)
 		}
@@ -133,7 +154,7 @@ func TestProcessFullPPTMasterSplitCompletesWithSeparatePhaseRuns(t *testing.T) {
 	if runnerByPhase[string(PhaseSVGExecute)] != PhaseRunnerAgent {
 		t.Fatalf("svg runner = %q", runnerByPhase[string(PhaseSVGExecute)])
 	}
-	if statusByPhase[string(PhaseImageAcquire)] != PhaseRunStatusSkipped {
+	if statusByPhase[string(PhaseImageAcquire)] != PhaseRunStatusSucceeded {
 		t.Fatalf("image_acquire status = %q", statusByPhase[string(PhaseImageAcquire)])
 	}
 
@@ -145,7 +166,7 @@ func TestProcessFullPPTMasterSplitCompletesWithSeparatePhaseRuns(t *testing.T) {
 	for _, run := range runtimeRuns {
 		seenRuntimePhase[run.Phase] = true
 	}
-	for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport} {
+	for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport} {
 		if !seenRuntimePhase[string(phase)] {
 			t.Fatalf("runtime phase %s missing, runs=%#v", phase, runtimeRuns)
 		}
@@ -237,11 +258,20 @@ func TestProcessFullPPTMasterSplitPausesForSpecPreviewAndContinues(t *testing.T)
 	if err != nil {
 		t.Fatalf("ContinueTask() error = %v", err)
 	}
-	if continued.Status != model.TaskStatusSVGGenerating {
-		t.Fatalf("continued status = %q, want svg_generating", continued.Status)
+	if continued.Status != model.TaskStatusImageAcquiring {
+		t.Fatalf("continued status = %q, want image_acquiring", continued.Status)
 	}
-	if err := service.ProcessTask(ctx, task.ID); err != nil {
-		t.Fatalf("ProcessTask() error = %v", err)
+	for attempt := 0; attempt < 3; attempt++ {
+		current, err := repo.GetTask(ctx, task.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.Status == model.TaskStatusCompleted {
+			break
+		}
+		if err := service.ProcessTask(ctx, task.ID); err != nil {
+			t.Fatalf("ProcessTask() error = %v", err)
+		}
 	}
 	completed, err := repo.GetTask(ctx, task.ID)
 	if err != nil {
@@ -351,12 +381,13 @@ func splitPreviewTestService(t *testing.T) (*TaskService, *repository.Repository
 	service := NewTaskService(
 		repo,
 		storage,
-		splitGenerateFakeAgent{projectPath: projectPath},
+		splitGenerateFakeAgent{projectPath: projectPath, taskID: task.ID},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
 			Enabled:               true,
 			RunnerProfile:         "full-ppt-master",
 			FullPPTDefaultEnabled: true,
+			ResourcePhaseEnabled:  true,
 			WorkspaceRoot:         workspaceRoot,
 		},
 	)

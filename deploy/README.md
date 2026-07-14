@@ -36,6 +36,11 @@ SLIDESMITH_AGENT_COMPOSE_DATA_ROOT=/root/slidesmith-compose/data/agent-compose
 SLIDESMITH_AGENT_COMPOSE_HOST_SESSION_ROOT=/root/slidesmith-compose/data/agent-compose/sessions
 SLIDESMITH_RUNTIME_SEED_HOST=/root/slidesmith/runtime/ppt-master-agent
 SLIDESMITH_PPT_MASTER_SKILL_DIR_HOST=/root/slidesmith-deps/ppt-master/skills/ppt-master
+SLIDESMITH_RESOURCE_PHASE_ENABLED=true
+SLIDESMITH_RESOURCE_NETWORK_ENABLED=false
+SLIDESMITH_RESOURCE_WEB_IMAGE_ENABLED=false
+SLIDESMITH_RESOURCE_AI_IMAGE_ENABLED=false
+SLIDESMITH_RESOURCE_FORMULA_NETWORK_ENABLED=false
 POSTGRES_PASSWORD=<strong password>
 ```
 
@@ -115,6 +120,8 @@ debugging only.
 5. Confirm Tier 2.
 6. Wait for `completed`.
 7. Verify SVG preview and PPTX download.
+8. Verify `image_acquire` is `succeeded` (never `skipped`) and
+   `GET /api/tasks/{id}/resources` returns a safe summary.
 
 Expected published storage layout:
 
@@ -128,6 +135,11 @@ tasks/{task_id}/artifacts/
   exports/*.pptx
   logs/
   manifest/runtime_artifacts.json
+tasks/{task_id}/resources/{phase_run_id}/
+  .slidesmith/resource_plan.json
+  .slidesmith/resource_policy.json
+  .slidesmith/resources_manifest.json
+  analysis/resource_requirements.json
 ```
 
 ## Switch To Full PPT Master
@@ -154,6 +166,14 @@ Run the repository full-main fixture command before production rollout. To
 roll back new tasks, set `SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=false` and restart
 API/worker. Already locked full tasks remain full and must never be silently
 rerouted to `real-lite`.
+
+SPEC-05 resource acquisition is a separate fail-closed gate. Keep the first
+rollout offline (`RESOURCE_NETWORK/WEB/AI/FORMULA_NETWORK=false`); local user
+images, icons, chart snapshots, placeholders, and approved fallbacks still
+work. Enabling Web or AI requires the matching user confirmation, the global
+network switch, the per-capability switch, and an allowlisted provider. Once
+SPEC-05 is stable, setting `RESOURCE_PHASE_ENABLED=false` is an emergency
+fail-fast rollback for new full tasks, not a compatibility skip.
 
 ## Current MVP Limits
 

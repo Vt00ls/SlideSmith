@@ -144,6 +144,7 @@ export type TaskPhaseRun = {
 export type RetryPhase =
   | "prepare"
   | "spec_generate"
+  | "image_acquire"
   | "template_fill_plan"
   | "template_fill_check"
   | "template_fill_apply"
@@ -171,6 +172,49 @@ export type SpecPreview = {
   summary: Record<string, unknown>;
   confirmation: Record<string, unknown>;
   contract: Record<string, unknown>;
+};
+
+export type ResourceSummary = {
+  total: number;
+  ready: number;
+  degraded: number;
+  failed: number;
+  pending: number;
+  required_failed: number;
+  bytes: number;
+};
+
+export type ResourceFallback = {
+  type: string;
+  reason: string;
+};
+
+export type TaskResourceItem = {
+  id: string;
+  page: number;
+  type: string;
+  purpose: string;
+  required: boolean;
+  acquire_via: string;
+  provider: string;
+  status: string;
+  fallback: ResourceFallback;
+  publishable: boolean;
+  artifact_id?: string;
+  mime_type?: string;
+  size?: number;
+  width?: number;
+  height?: number;
+  error_code?: string;
+  error?: string;
+};
+
+export type TaskResources = {
+  task_id: string;
+  phase_status: string;
+  summary: ResourceSummary;
+  resources: TaskResourceItem[];
+  manifest_sha256: string;
 };
 
 export type TemplateFillInputs = {
@@ -346,6 +390,7 @@ export const api = {
       body: JSON.stringify({ values }),
     }),
   listArtifacts: (id: string) => request<Artifact[]>(`/tasks/${encodeURIComponent(id)}/artifacts`),
+  getResources: (id: string) => request<TaskResources>(`/tasks/${encodeURIComponent(id)}/resources`),
   artifactContentUrl: (taskId: string, artifactId: string) =>
     `${API_BASE}/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
   pptxDownloadUrl: (taskId: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/download/pptx`,

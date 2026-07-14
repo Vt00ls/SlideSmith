@@ -1,0 +1,41 @@
+{
+  "name": "resource-icons-chart",
+  "confirmation_sources": ["none"],
+  "requirements": [
+    {
+      "id": "res-icon-chart",
+      "page": 1,
+      "type": "icon",
+      "purpose": "chart icon",
+      "required": true,
+      "acquire_via": "icon",
+      "fallback": "",
+      "output_name": "chart.svg",
+      "source_reference": "tabler-outline/chart"
+    },
+    {
+      "id": "res-chart-template",
+      "page": 2,
+      "type": "chart_template",
+      "purpose": "bar chart scaffold",
+      "required": true,
+      "acquire_via": "chart_template",
+      "fallback": "",
+      "output_name": "bar-chart.svg",
+      "source_reference": "bar_chart"
+    },
+    {
+      "id": "res-chart-data",
+      "page": 2,
+      "type": "chart_data",
+      "purpose": "bar chart facts",
+      "required": true,
+      "acquire_via": "source",
+      "fallback": "",
+      "output_name": "bar-data.json",
+      "source_reference": "sources/input.md#metrics",
+      "data": {"labels": ["A", "B"], "values": [10, 20]},
+      "citation": {"source_file": "sources/input.md", "section": "metrics"}
+    }
+  ]
+}

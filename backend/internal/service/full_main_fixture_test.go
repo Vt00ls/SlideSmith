@@ -25,6 +25,7 @@ type fullMainFixture struct {
 
 type fullMainFixtureAgent struct {
 	projectPath string
+	taskID      string
 	pageCount   int
 	t           *testing.T
 }
@@ -36,6 +37,13 @@ func (a *fullMainFixtureAgent) Run(_ context.Context, req AgentRunRequest) (*Age
 	case string(PhaseSpecGenerate):
 		mustWriteFileNoTest(a.projectPath, "design_spec.md", fmt.Sprintf("# Design Spec\n\nSlides: %d\n", a.pageCount))
 		mustWriteFileNoTest(a.projectPath, "spec_lock.md", fmt.Sprintf("# Spec Lock\n\npage_count: %d\n", a.pageCount))
+		mustWriteEmptyResourcePlanNoTest(a.projectPath, a.taskID, a.pageCount)
+	case string(PhaseImageAcquire):
+		policy, err := loadResourcePolicy(a.projectPath)
+		if err != nil {
+			return nil, err
+		}
+		mustWriteEmptyResourceManifestNoTest(a.projectPath, a.taskID, policy.PhaseRunID)
 	case string(PhaseSVGExecute):
 		for index := 1; index <= a.pageCount; index++ {
 			mustWriteFileNoTest(a.projectPath, filepath.Join("svg_output", fmt.Sprintf("%02d.svg", index)), `<svg viewBox="0 0 1280 720"></svg>`+"\n")
@@ -105,10 +113,11 @@ func TestFullMainFixedFixtures(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			service := NewTaskService(repo, storage, &fullMainFixtureAgent{projectPath: projectPath, pageCount: fixture.PageCount, t: t}, NewRuntimeWorkspacePublisher(storage), config.AgentComposeConfig{
+			service := NewTaskService(repo, storage, &fullMainFixtureAgent{projectPath: projectPath, taskID: task.ID, pageCount: fixture.PageCount, t: t}, NewRuntimeWorkspacePublisher(storage), config.AgentComposeConfig{
 				Enabled:               true,
 				RunnerProfile:         model.RunnerProfileFullPPTMaster,
 				FullPPTDefaultEnabled: true,
+				ResourcePhaseEnabled:  true,
 				WorkspaceRoot:         workspaceRoot,
 			})
 			writeRuntimeProfileManifestForTest(t, workspaceRoot, task)
@@ -122,6 +131,15 @@ func TestFullMainFixedFixtures(t *testing.T) {
 				}
 				if _, err := service.ContinueTask(context.Background(), task.ID, string(PhaseSVGExecute)); err != nil {
 					t.Fatal(err)
+				}
+			}
+			for attempt := 0; attempt < 4; attempt++ {
+				current, err := repo.GetTask(context.Background(), task.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if current.Status == model.TaskStatusCompleted {
+					break
 				}
 				if err := service.ProcessTask(context.Background(), task.ID); err != nil {
 					t.Fatal(err)
@@ -138,19 +156,16 @@ func TestFullMainFixedFixtures(t *testing.T) {
 			statusByPhase := map[string]string{}
 			for _, run := range phaseRuns {
 				statusByPhase[run.Phase] = run.Status
-				if run.Phase == string(PhaseImageAcquire) && !strings.Contains(run.OutputJSON, `"implementation":"deferred_to_SPEC05"`) {
-					t.Fatalf("image acquire skip lacks SPEC-05 metadata: %s", run.OutputJSON)
-				}
-				if run.Phase != string(PhaseImageAcquire) && !strings.Contains(run.InputJSON, model.RunnerProfileFullPPTMaster) {
+				if !strings.Contains(run.InputJSON, model.RunnerProfileFullPPTMaster) {
 					t.Fatalf("phase %s input missing locked profile: %s", run.Phase, run.InputJSON)
 				}
 			}
-			for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePublish} {
+			for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePublish} {
 				if statusByPhase[string(phase)] != PhaseRunStatusSucceeded {
 					t.Fatalf("phase %s status = %q", phase, statusByPhase[string(phase)])
 				}
 			}
-			if statusByPhase[string(PhaseImageAcquire)] != PhaseRunStatusSkipped {
+			if statusByPhase[string(PhaseImageAcquire)] != PhaseRunStatusSucceeded {
 				t.Fatalf("image acquire status = %q", statusByPhase[string(PhaseImageAcquire)])
 			}
 			if _, err := countPPTXSlides(filepath.Join(projectPath, "exports", "result.pptx")); err != nil {

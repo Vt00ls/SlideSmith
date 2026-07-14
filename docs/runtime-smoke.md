@@ -204,6 +204,10 @@ Runtime workspace should contain:
 .slidesmith/artifacts.json
 projects/smoke_deck/design_spec.md
 projects/smoke_deck/spec_lock.md
+projects/smoke_deck/.slidesmith/resource_plan.json
+projects/smoke_deck/.slidesmith/resource_policy.json
+projects/smoke_deck/.slidesmith/resources_manifest.json
+projects/smoke_deck/analysis/resource_requirements.json
 projects/smoke_deck/svg_output/*.svg
 projects/smoke_deck/svg_final/*.svg
 projects/smoke_deck/exports/*.pptx
@@ -220,7 +224,8 @@ obeys its own output contract. The platform publisher is the only publish
 entrypoint. `/opt/ppt-master` remains a runtime fallback, not the primary skill
 source.
 
-Run the deterministic three-fixture SPEC-04 contract smoke locally with:
+Run the deterministic full-main plus four-resource-fixture SPEC-05 contract
+smoke locally with:
 
 ```bash
 python3 runtime/ppt-master-agent/scripts/full_main_smoke.py

@@ -16,7 +16,7 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 )
 
-func validateSpecGenerateContract(projectPath string) (map[string]any, error) {
+func validateSpecGenerateContract(projectPath string, expectedTaskID ...string) (map[string]any, error) {
 	designSpec := filepath.Join(projectPath, "design_spec.md")
 	specLock := filepath.Join(projectPath, "spec_lock.md")
 	if err := requireNonEmptyFile(designSpec); err != nil {
@@ -33,13 +33,22 @@ func validateSpecGenerateContract(projectPath string) (map[string]any, error) {
 		return nil, fmt.Errorf("spec_generate must not create svg_output files, found %d", svgCount)
 	}
 	pageCount := confirmedPageCount(projectPath)
+	taskID := ""
+	if len(expectedTaskID) > 0 {
+		taskID = expectedTaskID[0]
+	}
+	_, resourcePlanContract, err := validateResourcePlanContract(projectPath, taskID)
+	if err != nil {
+		return nil, err
+	}
 	contract := map[string]any{
-		"phase":        string(PhaseSpecGenerate),
-		"project_path": projectPath,
-		"design_spec":  designSpec,
-		"spec_lock":    specLock,
-		"page_count":   pageCount,
-		"checked_at":   time.Now().UTC().Format(time.RFC3339Nano),
+		"phase":         string(PhaseSpecGenerate),
+		"project_path":  projectPath,
+		"design_spec":   designSpec,
+		"spec_lock":     specLock,
+		"page_count":    pageCount,
+		"checked_at":    time.Now().UTC().Format(time.RFC3339Nano),
+		"resource_plan": resourcePlanContract,
 	}
 	if err := writeJSONPretty(filepath.Join(projectPath, ".slidesmith", "spec_contract.json"), contract); err != nil {
 		return nil, err
@@ -70,13 +79,18 @@ func validateSVGExecuteContract(projectPath string) (map[string]any, error) {
 	if pptxCount > 0 {
 		return nil, fmt.Errorf("svg_execute must not create pptx exports, found %d", pptxCount)
 	}
+	resourceBindings, err := validateSVGResourceBindings(projectPath)
+	if err != nil {
+		return nil, err
+	}
 	contract := map[string]any{
-		"phase":          string(PhaseSVGExecute),
-		"project_path":   projectPath,
-		"expected_pages": expectedPageCount,
-		"svg_count":      svgCount,
-		"notes":          notesPath,
-		"checked_at":     time.Now().UTC().Format(time.RFC3339Nano),
+		"phase":             string(PhaseSVGExecute),
+		"project_path":      projectPath,
+		"expected_pages":    expectedPageCount,
+		"svg_count":         svgCount,
+		"notes":             notesPath,
+		"checked_at":        time.Now().UTC().Format(time.RFC3339Nano),
+		"resource_bindings": resourceBindings,
 	}
 	if _, err := writeContractReport(projectPath, string(PhaseSVGExecute), contract); err != nil {
 		return nil, err
@@ -192,12 +206,33 @@ func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map
 		}
 		contract["design_spec_sha256"] = designSHA
 		contract["spec_lock_sha256"] = lockSHA
+		planSHA, err := sha256File(filepath.Join(projectPath, ".slidesmith", "resource_plan.json"))
+		if err != nil {
+			return nil, err
+		}
+		contract["resource_plan_sha256"] = planSHA
+	case PhaseImageAcquire:
+		manifestSHA, err := sha256File(filepath.Join(projectPath, ".slidesmith", "resources_manifest.json"))
+		if err != nil {
+			return nil, err
+		}
+		planSHA, err := sha256File(filepath.Join(projectPath, ".slidesmith", "resource_plan.json"))
+		if err != nil {
+			return nil, err
+		}
+		contract["resources_manifest_sha256"] = manifestSHA
+		contract["resource_plan_sha256"] = planSHA
 	case PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport:
 		svgSHA, err := sha256RegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
 		if err != nil {
 			return nil, err
 		}
 		contract["svg_output_sha256"] = svgSHA
+		manifestSHA, err := sha256File(filepath.Join(projectPath, ".slidesmith", "resources_manifest.json"))
+		if err != nil {
+			return nil, err
+		}
+		contract["resources_manifest_sha256"] = manifestSHA
 	}
 	if phase == PhaseFinalizeExport {
 		pptxSHA, err := sha256RegularFiles(filepath.Join(projectPath, "exports"), "*.pptx")

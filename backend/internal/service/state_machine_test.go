@@ -18,6 +18,7 @@ func TestStateMachineAllowsMVPPath(t *testing.T) {
 		model.TaskStatusAwaitingRealizationConfirm,
 		model.TaskStatusSpecGenerating,
 		model.TaskStatusAwaitingSpecConfirm,
+		model.TaskStatusImageAcquiring,
 		model.TaskStatusSVGGenerating,
 		model.TaskStatusQualityChecking,
 		model.TaskStatusExporting,
@@ -50,6 +51,15 @@ func TestStateMachineRejectsSkippingConfirmation(t *testing.T) {
 	machine := NewStateMachine()
 	if machine.CanTransition(model.TaskStatusSourceConverting, model.TaskStatusSpecGenerating) {
 		t.Fatal("source_converting should not skip awaiting_confirm")
+	}
+}
+
+func TestStateMachineRejectsSkippingResourceGate(t *testing.T) {
+	machine := NewStateMachine()
+	for _, status := range []string{model.TaskStatusSpecGenerating, model.TaskStatusAwaitingSpecConfirm} {
+		if machine.CanTransition(status, model.TaskStatusSVGGenerating) {
+			t.Fatalf("%s should not skip image_acquiring", status)
+		}
 	}
 }
 
