@@ -31,6 +31,8 @@ async function loadAppHelpersModule() {
     "isConfirmationStatus",
     "isWaitingStatus",
     "numberFromSummary",
+    "emptyTaskResources",
+    "resourceItemsByStatus",
     "templateFillText",
     "templateFillSlideRows",
     "templateFillCheckRows",
@@ -162,6 +164,31 @@ test("Template Fill API surface includes every status, phase, type field, and en
   }
 });
 
+test("resource API surface exposes only safe summary and artifact-bound preview fields", () => {
+  const retryPhase = typeAliasSource(apiSource, "api.ts", "RetryPhase");
+  const summary = typeAliasSource(apiSource, "api.ts", "ResourceSummary");
+  const item = typeAliasSource(apiSource, "api.ts", "TaskResourceItem");
+  const resources = typeAliasSource(apiSource, "api.ts", "TaskResources");
+  assert.match(retryPhase, /\| "image_acquire"/);
+  for (const field of ["total", "ready", "degraded", "failed", "pending", "required_failed", "bytes"]) {
+    assert.match(summary, new RegExp(`\\b${field}:`));
+  }
+  for (const field of [
+    "id", "page", "type", "purpose", "required", "acquire_via", "provider", "status",
+    "fallback", "publishable", "artifact_id", "mime_type", "size", "width", "height", "error_code", "error",
+  ]) {
+    assert.match(item, new RegExp(`\\b${field}\\??:`), `missing TaskResourceItem.${field}`);
+  }
+  for (const forbidden of ["path", "prompt", "source_url", "credential"]) {
+    assert.doesNotMatch(item, new RegExp(`\\b${forbidden}\\??:`), `unsafe TaskResourceItem.${forbidden}`);
+  }
+  for (const field of ["task_id", "phase_status", "summary", "resources", "manifest_sha256"]) {
+    assert.match(resources, new RegExp(`\\b${field}:`));
+  }
+  assert.match(apiSource, /getResources:\s*\(id: string\)\s*=>\s*request<TaskResources>/);
+  assert.match(apiSource, /\/tasks\/\$\{encodeURIComponent\(id\)\}\/resources/);
+});
+
 test("Template Fill router parses and serializes the plan hash", async () => {
   globalThis.window = { location: { hash: "#/tasks/task%20one/template-fill" } };
   const { parseRoute, routeToHash } = await loadSourceModule(routerSource, "router.ts");
@@ -229,8 +256,8 @@ test("Template Fill labels and status classifications are exact", async () => {
   assert.equal(helpers.isConfirmationStatus("awaiting_template_fill_confirm"), false);
 });
 
-test("runner profiles expose locked engine labels and compatibility skip copy", async () => {
-  const { runnerProfileLabel, runnerProfileSourceLabel, taskRunnerProfileLabel } = await loadSourceModule(formatSource, "format.ts");
+test("runner profiles expose locked engine labels and resource phase copy", async () => {
+  const { phaseLabel, runnerProfileLabel, runnerProfileSourceLabel, statusLabel, taskRunnerProfileLabel } = await loadSourceModule(formatSource, "format.ts");
   assert.equal(runnerProfileLabel["full-ppt-master"], "Full PPT Master");
   assert.match(runnerProfileLabel["real-lite"], /测试\/降级/);
   assert.equal(runnerProfileLabel.smoke, "Smoke（测试 fixture）");
@@ -240,8 +267,26 @@ test("runner profiles expose locked engine labels and compatibility skip copy", 
   for (const field of ["runner_profile", "runner_profile_source", "runner_profile_locked_at"]) {
     assert.match(apiSource, new RegExp(`\\b${field}`), `missing Task.${field}`);
   }
-  assert.match(appSource, /资源阶段尚未启用（兼容跳过）/);
+  assert.doesNotMatch(appSource, /资源阶段尚未启用（兼容跳过）/);
+  assert.equal(statusLabel.image_acquiring, "正在准备图片、图标、公式与图表资源");
+  assert.equal(phaseLabel.image_acquire, "资源准备");
   assert.match(appSource, /任务已进入运行阶段但引擎尚未锁定/);
+});
+
+test("resource grouping keeps ready, degraded, and blocking states separate", async () => {
+  const { emptyTaskResources, resourceItemsByStatus } = await loadAppHelpersModule();
+  assert.equal(emptyTaskResources("task-resource").task_id, "task-resource");
+  assert.deepEqual(emptyTaskResources().resources, []);
+  const grouped = resourceItemsByStatus([
+    { id: "ready", status: "ready" },
+    { id: "degraded", status: "degraded" },
+    { id: "skipped", status: "skipped" },
+    { id: "failed", status: "failed" },
+    { id: "pending", status: "pending" },
+  ]);
+  assert.deepEqual(grouped.ready.map((item) => item.id), ["ready"]);
+  assert.deepEqual(grouped.degraded.map((item) => item.id), ["degraded", "skipped"]);
+  assert.deepEqual(grouped.failed.map((item) => item.id), ["failed", "pending"]);
 });
 
 test("slide rows preserve rationale, notes presence, and edit counts while tolerating malformed values", async () => {
@@ -455,6 +500,7 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
     getTask: () => waits.task?.promise || Promise.resolve(task),
     listEvents: () => waits.events?.promise || Promise.resolve([{ task_id: task.id, kind: "event" }]),
     listArtifacts: () => waits.artifacts?.promise || Promise.resolve([{ task_id: task.id, kind: "artifact" }]),
+    getResources: () => waits.resources?.promise || Promise.resolve({ task_id: task.id, summary: { total: 1 }, resources: [{ id: `resource-${task.id}` }] }),
     listRuntimeRuns: () => waits.runtimeRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "runtime" }]),
     listPhaseRuns: () => waits.phaseRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "phase" }]),
     getTemplateFillPlan: () => waits.preview?.promise || Promise.resolve({ task_id: task.id, plan: { title: task.id } }),
@@ -479,6 +525,8 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
   assert.equal(snapshotB.task.id, "task-b");
   assert.equal(snapshotB.events[0].task_id, "task-b");
   assert.equal(snapshotB.artifacts[0].task_id, "task-b");
+  assert.equal(snapshotB.resources.task_id, "task-b");
+  assert.equal(snapshotB.resources.resources[0].id, "resource-task-b");
   assert.equal(snapshotB.runtimeRuns[0].task_id, "task-b");
   assert.equal(snapshotB.phaseRuns[0].task_id, "task-b");
   assert.equal(snapshotB.templateFillPreview.task_id, "task-b");
@@ -520,6 +568,15 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
   strictTask.resolve({ id: "task-b", route: "template-fill", status: "completed" });
   assert.equal(await strictProbe, undefined, "StrictMode cleanup must invalidate the first setup");
   assert.equal(strictLive.task.id, "task-b", "StrictMode's second setup must remain usable");
+
+  const mismatchedResources = await loadTaskDetailData(
+    scopeB,
+    "task-b",
+    requestSet({ id: "task-b", route: "main", status: "completed" }, {
+      resources: { promise: Promise.resolve({ task_id: "task-a", summary: { total: 9 }, resources: [{ id: "leak" }] }) },
+    }),
+  );
+  assert.equal(mismatchedResources, undefined, "a resource response for another task must never be committed");
 });
 
 test("task detail preview requests are gated to backend-readable statuses", async () => {
@@ -532,6 +589,7 @@ test("task detail preview requests are gated to backend-readable statuses", asyn
       getTask: async () => task,
       listEvents: async () => [],
       listArtifacts: async () => [],
+      getResources: async () => ({ task_id: task.id, summary: { total: 0 }, resources: [] }),
       listRuntimeRuns: async () => [],
       listPhaseRuns: async () => [],
       getTemplateFillPlan: async () => {
@@ -575,7 +633,8 @@ test("Template Fill retry recovery is failure-phase-aware and main retry behavio
     { phase: "publish", label: "重新发布" },
   ]);
   assert.deepEqual(retryOptionsForFailure("template_resolve", "main"), [{ phase: "prepare", label: "重新准备" }]);
-  assert.equal(retryOptionsForFailure("publish.contract", "main").length, 5);
+  assert.equal(retryOptionsForFailure("publish.contract", "main").length, 6);
+  assert.ok(retryOptionsForFailure("image_acquire.contract", "main").some((option) => option.phase === "image_acquire"));
   assert.match(retryGuidanceForFailure("template_fill_plan.inputs"), /多个.*PPTX/);
   assert.match(retryGuidanceForFailure("template_fill_plan.inputs"), /没有源文件删除 API/);
   assert.match(retryGuidanceForFailure("template_fill_plan.inputs"), /恰好一个.*\.pptx.*可读内容/);
@@ -730,6 +789,10 @@ test("Template Fill component uses production helpers and required actions", () 
   assert.match(detail, /completedTaskRoute\s*\(/);
   assert.match(detail, /createTaskDetailRequestScope\([\s\S]*?taskRouteMatches\(parseRoute\(\), "task", taskId\)/);
   assert.match(detail, /loadTaskDetailData\s*\(/);
+  assert.match(detail, /getResources:\s*api\.getResources/);
+  assert.match(detail, /resourceItemsByStatus\s*\(/);
+  assert.match(detail, /api\.artifactContentUrl\(task\.id, item\.artifact_id\)/);
+  assert.match(detail, /retry\("image_acquire"\)/);
   assert.match(detail, /taskDetailRetryTaskID\s*\(/);
   assert.match(detail, /taskRoute !== "template-fill"[\s\S]*?<span>SVG<\/span>/);
   assert.match(previewPage, /loadPreviewPageData\([\s\S]*?replaceRoute/);

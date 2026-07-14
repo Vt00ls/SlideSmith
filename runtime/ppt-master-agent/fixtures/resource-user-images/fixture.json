@@ -1,0 +1,17 @@
+{
+  "name": "resource-user-images",
+  "confirmation_sources": ["provided"],
+  "requirements": [
+    {
+      "id": "res-user-hero",
+      "page": 1,
+      "type": "image",
+      "purpose": "user supplied hero",
+      "required": true,
+      "acquire_via": "user",
+      "fallback": "",
+      "output_name": "user-hero.png",
+      "source_reference": "sources/user.png"
+    }
+  ]
+}

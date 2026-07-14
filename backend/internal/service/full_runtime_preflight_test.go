@@ -26,6 +26,12 @@ func fullPreflightFixture(t *testing.T) (*TaskService, *model.Task, *TaskWorkspa
 		filepath.Join("templates", "design_spec_reference.md"),
 		filepath.Join("templates", "spec_lock_reference.md"),
 		filepath.Join("scripts", "project_manager.py"),
+		filepath.Join("scripts", "analyze_images.py"),
+		filepath.Join("scripts", "icon_sync.py"),
+		filepath.Join("scripts", "latex_render.py"),
+		filepath.Join("scripts", "image_search.py"),
+		filepath.Join("scripts", "image_gen.py"),
+		filepath.Join("scripts", "slice_images.py"),
 		filepath.Join("scripts", "svg_quality_checker.py"),
 		filepath.Join("scripts", "finalize_svg.py"),
 		filepath.Join("scripts", "svg_to_pptx.py"),
@@ -33,6 +39,7 @@ func fullPreflightFixture(t *testing.T) (*TaskService, *model.Task, *TaskWorkspa
 		mustWriteFile(t, filepath.Join(workspace.SkillDir, rel), "fixture\n")
 	}
 	mustWriteFile(t, filepath.Join(root, "scripts", "ppt_runner.py"), "print('fixture')\n")
+	mustWriteFile(t, filepath.Join(root, "scripts", "resource_runner.py"), "print('fixture')\n")
 	task := &model.Task{ID: "preflight-task", Route: model.TaskRouteMain}
 	lockRunnerProfileForTest(task, model.RunnerProfileFullPPTMaster)
 	service := &TaskService{agentCfg: config.AgentComposeConfig{

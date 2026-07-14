@@ -79,6 +79,12 @@ func (s *TaskService) runFullRuntimePreflight(ctx context.Context, task *model.T
 		{"design_spec_reference", filepath.Join("templates", "design_spec_reference.md")},
 		{"spec_lock_reference", filepath.Join("templates", "spec_lock_reference.md")},
 		{"project_manager", filepath.Join("scripts", "project_manager.py")},
+		{"analyze_images", filepath.Join("scripts", "analyze_images.py")},
+		{"icon_sync", filepath.Join("scripts", "icon_sync.py")},
+		{"latex_render", filepath.Join("scripts", "latex_render.py")},
+		{"image_search", filepath.Join("scripts", "image_search.py")},
+		{"image_gen", filepath.Join("scripts", "image_gen.py")},
+		{"slice_images", filepath.Join("scripts", "slice_images.py")},
 		{"svg_quality_checker", filepath.Join("scripts", "svg_quality_checker.py")},
 		{"finalize_svg", filepath.Join("scripts", "finalize_svg.py")},
 		{"svg_to_pptx", filepath.Join("scripts", "svg_to_pptx.py")},
@@ -87,6 +93,7 @@ func (s *TaskService) runFullRuntimePreflight(ctx context.Context, task *model.T
 		add(item.name, path, true, requireReadableRegularFile(path))
 	}
 	add("publisher_script", filepath.Join(workspace.HostDir, "scripts", "ppt_runner.py"), true, requireReadableRegularFile(filepath.Join(workspace.HostDir, "scripts", "ppt_runner.py")))
+	add("resource_runner", filepath.Join(workspace.HostDir, "scripts", "resource_runner.py"), true, requireReadableRegularFile(filepath.Join(workspace.HostDir, "scripts", "resource_runner.py")))
 
 	add("runtime_python3", "python3", false, fmt.Errorf("validated inside the agent runtime during full prepare"))
 	add("runtime_python_imports", "pptx,PIL", false, fmt.Errorf("validated inside the agent runtime during full prepare"))

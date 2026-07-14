@@ -186,7 +186,7 @@ var pipelinePhaseRegistry = map[PipelinePhase]PipelinePhaseDefinition{
 		Runner:            PhaseRunnerAgent,
 		Retryable:         true,
 		RequiredArtifacts: []string{"confirm_ui/result.json"},
-		OutputArtifacts:   []string{"design_spec.md", "spec_lock.md", ".slidesmith/spec_contract.json"},
+		OutputArtifacts:   []string{"design_spec.md", "spec_lock.md", ".slidesmith/resource_plan.json", ".slidesmith/spec_contract.json"},
 	},
 	PhaseSpecRefine: {
 		Phase:             PhaseSpecRefine,
@@ -201,13 +201,13 @@ var pipelinePhaseRegistry = map[PipelinePhase]PipelinePhaseDefinition{
 	},
 	PhaseImageAcquire: {
 		Phase:             PhaseImageAcquire,
-		DisplayName:       "Image Acquire",
+		DisplayName:       "Resource Acquire",
 		RequiredStatuses:  []string{model.TaskStatusImageAcquiring},
 		NextStatus:        model.TaskStatusSVGGenerating,
 		Runner:            PhaseRunnerWorker,
 		Retryable:         true,
-		RequiredArtifacts: []string{"design_spec.md", "spec_lock.md"},
-		OutputArtifacts:   []string{"images/", "analysis/image_analysis.csv"},
+		RequiredArtifacts: []string{"design_spec.md", "spec_lock.md", "confirm_ui/result.json", ".slidesmith/resource_plan.json"},
+		OutputArtifacts:   []string{".slidesmith/resource_policy.json", "analysis/resource_requirements.json", ".slidesmith/resources_manifest.json", ".slidesmith/contracts/image_acquire.json", "images/", "icons/", "charts/", "analysis/image_analysis.csv"},
 	},
 	PhaseSVGExecute: {
 		Phase:             PhaseSVGExecute,
@@ -216,7 +216,7 @@ var pipelinePhaseRegistry = map[PipelinePhase]PipelinePhaseDefinition{
 		NextStatus:        model.TaskStatusQualityChecking,
 		Runner:            PhaseRunnerAgent,
 		Retryable:         true,
-		RequiredArtifacts: []string{"design_spec.md", "spec_lock.md"},
+		RequiredArtifacts: []string{"design_spec.md", "spec_lock.md", ".slidesmith/resources_manifest.json", ".slidesmith/contracts/image_acquire.json"},
 		OutputArtifacts:   []string{"svg_output/*.svg", "notes/total.md"},
 	},
 	PhaseQualityCheck: {

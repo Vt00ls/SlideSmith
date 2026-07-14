@@ -90,6 +90,8 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"Create or overwrite projects/task_1_ppt169_20260707/spec_lock.md",
 		"Do not create projects/task_1_ppt169_20260707/svg_output/*.svg",
 		"Do not run svg_quality_checker.py, finalize_svg.py, svg_to_pptx.py",
+		"never write null or placeholders",
+		"flat canonical fields prompt_or_query, source_reference",
 	}
 	for _, want := range specRequired {
 		if !strings.Contains(specPrompt, want) {

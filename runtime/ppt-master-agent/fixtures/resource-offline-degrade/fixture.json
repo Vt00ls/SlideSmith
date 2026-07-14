@@ -1,0 +1,17 @@
+{
+  "name": "resource-offline-degrade",
+  "confirmation_sources": ["web"],
+  "requirements": [
+    {
+      "id": "res-web-optional",
+      "page": 1,
+      "type": "image",
+      "purpose": "optional web evidence",
+      "required": false,
+      "acquire_via": "web",
+      "fallback": "diagram",
+      "output_name": "web-evidence.jpg",
+      "prompt_or_query": "secure enterprise workflow"
+    }
+  ]
+}

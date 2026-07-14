@@ -294,6 +294,15 @@ func (h *TaskHandler) ListArtifacts(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, gin.H{"data": artifacts})
 }
 
+func (h *TaskHandler) GetResources(ctx *gin.Context) {
+	resources, err := h.tasks.GetResources(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": resources})
+}
+
 func (h *TaskHandler) GetArtifactContent(ctx *gin.Context) {
 	artifact, path, err := h.tasks.ArtifactFile(ctx.Request.Context(), ctx.Param("id"), ctx.Param("artifactId"))
 	if err != nil {

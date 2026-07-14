@@ -34,6 +34,8 @@ import {
   Task,
   TaskEvent,
   TaskPhaseRun,
+  TaskResourceItem,
+  TaskResources,
   TaskStatus,
   TemplateCatalogItem,
   TemplateFillPlanPreview,
@@ -79,6 +81,7 @@ function isWaitingStatus(status?: TaskStatus) {
 
 const splitRetryOptions: Array<{ phase: RetryPhase; label: string }> = [
   { phase: "spec_generate", label: "重试规格" },
+  { phase: "image_acquire", label: "重试资源准备" },
   { phase: "svg_execute", label: "重试 SVG" },
   { phase: "quality_check", label: "重跑质检" },
   { phase: "finalize_export", label: "重新导出" },
@@ -123,6 +126,24 @@ const templateKindFilters = [
 
 function numberFromSummary(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function emptyTaskResources(taskId = ""): TaskResources {
+  return {
+    task_id: taskId,
+    phase_status: "",
+    summary: { total: 0, ready: 0, degraded: 0, failed: 0, pending: 0, required_failed: 0, bytes: 0 },
+    resources: [],
+    manifest_sha256: "",
+  };
+}
+
+function resourceItemsByStatus(items: TaskResourceItem[]) {
+  return {
+    ready: items.filter((item) => item.status === "ready"),
+    degraded: items.filter((item) => item.status === "degraded" || item.status === "skipped"),
+    failed: items.filter((item) => !["ready", "degraded", "skipped"].includes(item.status)),
+  };
 }
 
 function templateFillText(value: unknown) {
@@ -335,6 +356,7 @@ async function loadTaskDetailData<
   TTask extends Pick<Task, "id" | "route" | "status">,
   TEvent,
   TArtifact,
+  TResources extends { task_id: string },
   TRuntimeRun,
   TPhaseRun,
   TPreview,
@@ -345,6 +367,7 @@ async function loadTaskDetailData<
     getTask: (id: string) => Promise<TTask>;
     listEvents: (id: string) => Promise<TEvent[]>;
     listArtifacts: (id: string) => Promise<TArtifact[]>;
+    getResources: (id: string) => Promise<TResources>;
     listRuntimeRuns: (id: string) => Promise<TRuntimeRun[]>;
     listPhaseRuns: (id: string) => Promise<TPhaseRun[]>;
     getTemplateFillPlan: (id: string) => Promise<TPreview>;
@@ -360,6 +383,7 @@ async function loadTaskDetailData<
       requests.getTask(scope.taskId),
       requests.listEvents(scope.taskId),
       requests.listArtifacts(scope.taskId),
+      requests.getResources(scope.taskId),
       requests.listRuntimeRuns(scope.taskId),
       requests.listPhaseRuns(scope.taskId),
     ]);
@@ -373,7 +397,10 @@ async function loadTaskDetailData<
     return undefined;
   }
 
-  const [task, events, artifacts, runtimeRuns, phaseRuns] = core;
+  const [task, events, artifacts, resources, runtimeRuns, phaseRuns] = core;
+  if (resources.task_id !== scope.taskId) {
+    return undefined;
+  }
   let templateFillPreview: TPreview | null = null;
   if (templateFillPlanReadableStatus(task)) {
     try {
@@ -388,7 +415,7 @@ async function loadTaskDetailData<
   if (!scope.isGenerationCurrent(generation, currentTaskId)) {
     return undefined;
   }
-  return { task, events, artifacts, runtimeRuns, phaseRuns, templateFillPreview };
+  return { task, events, artifacts, resources, runtimeRuns, phaseRuns, templateFillPreview };
 }
 
 function taskDetailRetryTaskID(
@@ -528,6 +555,8 @@ function retryPhaseIcon(phase: RetryPhase, active: boolean) {
       return <RefreshCw size={16} />;
     case "spec_generate":
       return <FileText size={16} />;
+    case "image_acquire":
+      return <ImageIcon size={16} />;
     case "template_fill_plan":
       return <FileText size={16} />;
     case "template_fill_check":
@@ -1052,13 +1081,14 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
     task: null as Task | null,
     events: [] as TaskEvent[],
     artifacts: [] as Artifact[],
+    resources: emptyTaskResources(taskId),
     runtimeRuns: [] as RuntimeRun[],
     phaseRuns: [] as TaskPhaseRun[],
     templateFillPreview: null as TemplateFillPlanPreview | null,
   }));
   const [retrying, setRetrying] = useState<RetryPhase | "">("");
   const [error, setError] = useState("");
-  const { task, events, artifacts, runtimeRuns, phaseRuns, templateFillPreview } = detail;
+  const { task, events, artifacts, resources, runtimeRuns, phaseRuns, templateFillPreview } = detail;
 
   const load = useCallback(async () => {
     try {
@@ -1066,6 +1096,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
         getTask: api.getTask,
         listEvents: api.listEvents,
         listArtifacts: api.listArtifacts,
+        getResources: api.getResources,
         listRuntimeRuns: api.listRuntimeRuns,
         listPhaseRuns: api.listPhaseRuns,
         getTemplateFillPlan: api.getTemplateFillPlan,
@@ -1112,6 +1143,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const retryOptions = task?.status === "failed" ? retryOptionsForFailure(task.failure_phase || "", taskRoute) : [];
   const retryGuidance = task?.status === "failed" ? retryGuidanceForFailure(task.failure_phase || "") : "";
   const displayedArtifacts = visibleTaskArtifacts(artifacts, taskRoute);
+  const resourceGroups = resourceItemsByStatus(resources.resources);
 
   async function retry(phase: RetryPhase) {
     const loadedTaskId = task?.id || "";
@@ -1231,6 +1263,74 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 )}
               </div>
             </div>
+
+            {taskRoute === "main" && (
+              <div className="status-panel resource-panel">
+                <div className="section-title">
+                  <ImageIcon size={17} />
+                  <span>资源准备</span>
+                </div>
+                <div className="resource-summary-grid">
+                  <span>总数<strong>{resources.summary.total}</strong></span>
+                  <span>可用<strong>{resources.summary.ready}</strong></span>
+                  <span>降级<strong>{resources.summary.degraded}</strong></span>
+                  <span>失败<strong>{resources.summary.failed + resources.summary.pending}</strong></span>
+                  <span>体积<strong>{formatBytes(resources.summary.bytes)}</strong></span>
+                </div>
+                <div className="kv-grid compact">
+                  <span>阶段状态</span>
+                  <strong className="mono">{resources.phase_status || "-"}</strong>
+                  <span>Manifest</span>
+                  <strong className="mono">{resources.manifest_sha256 ? resources.manifest_sha256.slice(0, 12) : "-"}</strong>
+                </div>
+                <div className="resource-groups">
+                  {([
+                    ["ready", "可用", resourceGroups.ready],
+                    ["degraded", "已降级", resourceGroups.degraded],
+                    ["failed", "失败 / 待处理", resourceGroups.failed],
+                  ] as const).map(([key, label, items]) => (
+                    <div className={`resource-group ${key}`} key={key}>
+                      <div className="resource-group-title">
+                        <span>{label}</span>
+                        <strong>{items.length}</strong>
+                      </div>
+                      {items.map((item) => (
+                        <div className="resource-item" key={item.id}>
+                          <div>
+                            <strong className="mono">{item.id}</strong>
+                            <span>{item.purpose || item.type} · 第 {item.page} 页</span>
+                          </div>
+                          <div className="resource-item-meta">
+                            <span>{item.status}</span>
+                            {item.fallback?.type && <span>{item.fallback.type}: {item.fallback.reason || "已批准降级"}</span>}
+                            {item.error_code && <span className="bad">{item.error_code}{item.error ? ` · ${item.error}` : ""}</span>}
+                            {item.artifact_id && (
+                              <a
+                                className="resource-preview-link"
+                                href={api.artifactContentUrl(task.id, item.artifact_id)}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                预览
+                              </a>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                  {resources.resources.length === 0 && <span className="muted">尚无资源清单</span>}
+                </div>
+                {task.status === "failed" && task.failure_phase.toLowerCase().startsWith("image_acquire") && (
+                  <div className="button-row left">
+                    <button className="secondary-button" disabled={!!retrying} onClick={() => void retry("image_acquire")}>
+                      {retryPhaseIcon("image_acquire", retrying === "image_acquire")}
+                      <span>重试资源准备</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="status-panel">
               <div className="section-title">
@@ -1413,7 +1513,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
             <div className="phase-run-list">
               {phaseRuns.map((run) => (
                 <div className="phase-run-row" key={run.id}>
-                  <span>{run.phase === "image_acquire" && run.status === "skipped" ? "资源阶段尚未启用（兼容跳过）" : phaseLabel[run.phase] || run.phase}</span>
+                  <span>{phaseLabel[run.phase] || run.phase}</span>
                   <span className="mono">{run.phase}</span>
                   <span className={`run-status ${run.status === "failed" ? "bad" : ""}`}>{run.status}</span>
                   <span className="mono">#{run.attempt}</span>

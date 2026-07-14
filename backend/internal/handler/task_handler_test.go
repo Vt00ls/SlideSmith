@@ -168,6 +168,35 @@ func TestTemplateFillPlanRouteReturnsNotFoundForMissingTask(t *testing.T) {
 	}
 }
 
+func TestTaskResourcesRouteReturnsTaskScopedSafeView(t *testing.T) {
+	fixture := newTemplateFillRouterFixture(t)
+	req := httptest.NewRequest(http.MethodGet, "/api/tasks/"+fixture.task.ID+"/resources", nil)
+	rec := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("resource route status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var response struct {
+		Data struct {
+			TaskID    string `json:"task_id"`
+			Resources []any  `json:"resources"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Data.TaskID != fixture.task.ID || len(response.Data.Resources) != 0 {
+		t.Fatalf("resource route response = %#v", response.Data)
+	}
+
+	missingReq := httptest.NewRequest(http.MethodGet, "/api/tasks/missing/resources", nil)
+	missingRec := httptest.NewRecorder()
+	fixture.engine.ServeHTTP(missingRec, missingReq)
+	if missingRec.Code != http.StatusNotFound {
+		t.Fatalf("missing resource route status = %d, body = %s", missingRec.Code, missingRec.Body.String())
+	}
+}
+
 func TestTemplateFillPlanRoutesAllowFailedCheckSaveThenConfirm(t *testing.T) {
 	fixture := newTemplateFillRouterFixture(t)
 	fixture.task.Status = model.TaskStatusFailed

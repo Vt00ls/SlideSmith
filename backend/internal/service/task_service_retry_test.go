@@ -948,12 +948,13 @@ func retryTestService(t *testing.T) (*TaskService, *repository.Repository, *mode
 	service := NewTaskService(
 		repo,
 		storage,
-		splitGenerateFakeAgent{projectPath: projectPath},
+		splitGenerateFakeAgent{projectPath: projectPath, taskID: task.ID},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
 			Enabled:               true,
 			RunnerProfile:         "full-ppt-master",
 			FullPPTDefaultEnabled: true,
+			ResourcePhaseEnabled:  true,
 			WorkspaceRoot:         workspaceRoot,
 		},
 	)
@@ -973,6 +974,8 @@ func mustWriteRetryProjectFiles(projectPath string) {
 	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "quality_report.json"), `{"errors":1}`+"\n")
 	mustWriteFileNoTest(projectPath, filepath.Join("svg_final", "01.svg"), `<svg></svg>`+"\n")
 	mustWritePPTXNoTest(projectPath, filepath.Join("exports", "stale.pptx"), 3)
+	workspaceRoot := filepath.Dir(filepath.Dir(projectPath))
+	mustWriteEmptyResourceContractNoTest(projectPath, workspaceRoot, "task-retry", "resource-retry-fixture")
 	svgSHA, err := sha256RegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
 	if err != nil {
 		panic(err)
@@ -986,7 +989,6 @@ func mustWriteRetryProjectFiles(projectPath string) {
 			panic(err)
 		}
 	}
-	workspaceRoot := filepath.Dir(filepath.Dir(projectPath))
 	manifestPath := filepath.Join(workspaceRoot, ".slidesmith", "runtime_manifest.json")
 	if manifestSHA, err := sha256File(manifestPath); err == nil {
 		designSHA, designErr := sha256File(filepath.Join(projectPath, "design_spec.md"))

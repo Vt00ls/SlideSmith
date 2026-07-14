@@ -91,14 +91,12 @@ func NewStateMachine() *StateMachine {
 		model.TaskStatusSpecGenerating: allow(
 			model.TaskStatusAwaitingSpecConfirm,
 			model.TaskStatusImageAcquiring,
-			model.TaskStatusSVGGenerating,
 			model.TaskStatusCancelled,
 			model.TaskStatusFailed,
 		),
 		model.TaskStatusAwaitingSpecConfirm: allow(
 			model.TaskStatusSpecGenerating,
 			model.TaskStatusImageAcquiring,
-			model.TaskStatusSVGGenerating,
 			model.TaskStatusCancelled,
 			model.TaskStatusFailed,
 		),
@@ -134,6 +132,7 @@ func NewStateMachine() *StateMachine {
 			model.TaskStatusTemplateFillApplying,
 			model.TaskStatusTemplateFillValidating,
 			model.TaskStatusSpecGenerating,
+			model.TaskStatusImageAcquiring,
 			model.TaskStatusSVGGenerating,
 			model.TaskStatusQualityChecking,
 			model.TaskStatusExporting,

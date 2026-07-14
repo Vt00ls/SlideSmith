@@ -45,6 +45,18 @@ type AgentComposeConfig struct {
 	RunnerProfileExplicit  bool
 	FullPPTDefaultEnabled  bool
 	FullPPTPreflightStrict bool
+	ResourcePhaseEnabled   bool
+	ResourceNetworkEnabled bool
+	ResourceWebEnabled     bool
+	ResourceAIEnabled      bool
+	ResourceAIPaths        string
+	ResourceMaxFiles       int
+	ResourceMaxTotalBytes  int64
+	ResourceMaxSingleBytes int64
+	ResourceTimeout        time.Duration
+	ResourceWebProviders   string
+	ResourceAIProviders    string
+	ResourceFormulaNetwork bool
 	SessionDataRoot        string
 	Timeout                time.Duration
 }
@@ -87,6 +99,18 @@ func Load() Config {
 			RunnerProfileExplicit:  runnerProfileExplicit,
 			FullPPTDefaultEnabled:  envBool("SLIDESMITH_FULL_PPT_DEFAULT_ENABLED", false),
 			FullPPTPreflightStrict: envBool("SLIDESMITH_FULL_PPT_PREFLIGHT_STRICT", true),
+			ResourcePhaseEnabled:   envBool("SLIDESMITH_RESOURCE_PHASE_ENABLED", false),
+			ResourceNetworkEnabled: envBool("SLIDESMITH_RESOURCE_NETWORK_ENABLED", false),
+			ResourceWebEnabled:     envBool("SLIDESMITH_RESOURCE_WEB_IMAGE_ENABLED", false),
+			ResourceAIEnabled:      envBool("SLIDESMITH_RESOURCE_AI_IMAGE_ENABLED", false),
+			ResourceAIPaths:        env("SLIDESMITH_RESOURCE_AI_PATHS", "api"),
+			ResourceMaxFiles:       envInt("SLIDESMITH_RESOURCE_MAX_FILES", 100),
+			ResourceMaxTotalBytes:  envInt64("SLIDESMITH_RESOURCE_MAX_TOTAL_BYTES", 524288000),
+			ResourceMaxSingleBytes: envInt64("SLIDESMITH_RESOURCE_MAX_SINGLE_BYTES", 52428800),
+			ResourceTimeout:        envDuration("SLIDESMITH_RESOURCE_TIMEOUT", 20*time.Minute),
+			ResourceWebProviders:   env("SLIDESMITH_RESOURCE_ALLOWED_WEB_PROVIDERS", "openverse,wikimedia"),
+			ResourceAIProviders:    env("SLIDESMITH_RESOURCE_ALLOWED_AI_PROVIDERS", ""),
+			ResourceFormulaNetwork: envBool("SLIDESMITH_RESOURCE_FORMULA_NETWORK_ENABLED", false),
 			SessionDataRoot:        env("SLIDESMITH_AGENT_COMPOSE_SESSION_ROOT", ""),
 			Timeout:                envDuration("SLIDESMITH_AGENT_COMPOSE_TIMEOUT", 30*time.Minute),
 		},
@@ -137,6 +161,18 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envInt64(key string, fallback int64) int64 {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return fallback
 	}

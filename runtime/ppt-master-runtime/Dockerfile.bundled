@@ -52,6 +52,8 @@ RUN if [ "${PY_DEPS_PROFILE}" = "mock" ]; then \
         --prefix /opt/slidesmith-node; \
       rm -rf /tmp/slidesmith-npm-cache; \
     fi && \
-    fc-cache -f
+    if command -v fc-cache >/dev/null 2>&1; then \
+      fc-cache -f; \
+    fi
 
 WORKDIR /workspace
