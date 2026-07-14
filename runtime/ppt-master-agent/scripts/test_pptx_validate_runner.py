@@ -104,6 +104,41 @@ class PPTXValidateRunnerTest(unittest.TestCase):
     def test_unicode_and_whitespace_normalization(self) -> None:
         self.assertEqual(pptx_validate_runner.normalize_text("Ａ  \r\n 中\u00a0文"), "A 中 文")
 
+    def test_text_fidelity_ignores_layout_only_whitespace(self) -> None:
+        units = [
+            {
+                "element_id": "body",
+                "text": "生成页面结构 与基础视觉",
+                "normalized": "生成页面结构 与基础视觉",
+                "role": "body",
+                "required_fidelity": "error",
+            },
+            {
+                "element_id": "mixed",
+                "text": "转换为 PPTX 发布形态",
+                "normalized": "转换为 PPTX 发布形态",
+                "role": "body",
+                "required_fidelity": "error",
+            },
+            {
+                "element_id": "summary",
+                "text": "发布按顺序串联, 阻断级问题必须拦截。",
+                "normalized": "发布按顺序串联, 阻断级问题必须拦截。",
+                "role": "body",
+                "required_fidelity": "error",
+            },
+        ]
+        pages, findings, coverage = pptx_validate_runner.compare_text(
+            [{"page_id": "P01", "units": units}],
+            [["生成页面结构与基础视觉", "转换为 PPTX发布形态", "发布按顺序串联，阻断级问题必须拦截。"]],
+        )
+        self.assertEqual(findings, [])
+        self.assertEqual(coverage, 1.0)
+        self.assertEqual(
+            pages[0]["pptx_aggregate"],
+            "生成页面结构与基础视觉 转换为 PPTX发布形态 发布按顺序串联,阻断级问题必须拦截。",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

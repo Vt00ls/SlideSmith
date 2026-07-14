@@ -78,6 +78,11 @@ def normalize_text(value: str) -> str:
     return " ".join(value.split())
 
 
+def fidelity_match_key(value: str) -> str:
+    """Ignore layout-only whitespace while retaining report/readback text."""
+    return re.sub(r"\s+", "", normalize_text(value))
+
+
 def package_target(source_part: str, target: str) -> str:
     decoded = unquote(target).split("#", 1)[0]
     if "\\" in decoded or decoded.startswith("/"):
@@ -238,6 +243,7 @@ def compare_text(svg_pages: list[dict[str, Any]], pptx_text: list[list[str]]) ->
         page_id = str(svg_page["page_id"])
         runs = pptx_text[index] if index < len(pptx_text) else []
         aggregate = normalize_text(" ".join(runs))
+        aggregate_key = fidelity_match_key(aggregate)
         page_total = 0
         page_matched = 0
         missing: list[dict[str, Any]] = []
@@ -245,7 +251,8 @@ def compare_text(svg_pages: list[dict[str, Any]], pptx_text: list[list[str]]) ->
             page_total += 1
             total += 1
             value = str(unit["normalized"])
-            if value and value in aggregate:
+            value_key = fidelity_match_key(value)
+            if value_key and value_key in aggregate_key:
                 page_matched += 1
                 matched += 1
                 continue
