@@ -96,6 +96,9 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"must declare one required chart_template requirement and one required chart_data requirement",
 		"complete purpose string verbatim from resource_plan.json",
 		"do not translate, abbreviate, paraphrase, or omit the purpose",
+		`use "page": 2; never use "page": "P02" or "page": "2"`,
+		`fallback must be exactly one of "", "diagram", "shape", "text", "placeholder", or "omit_optional"`,
+		`"type":"chart_data"`,
 	}
 	for _, want := range specRequired {
 		if !strings.Contains(specPrompt, want) {
