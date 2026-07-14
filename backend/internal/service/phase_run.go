@@ -98,25 +98,6 @@ func runtimeRunPhaseOutput(runtimeRun *model.TaskRuntimeRun) map[string]any {
 	}
 }
 
-func (s *TaskService) recordLegacyCompletedPhaseRuns(ctx context.Context, task *model.Task, runtimeRun *model.TaskRuntimeRun, phases ...PipelinePhase) error {
-	for _, phase := range phases {
-		phaseRun, err := s.beginPhaseRun(ctx, task, phase, PhaseRunnerLegacyAgentBundle, map[string]any{
-			"bundled_by":     "generate",
-			"runtime_run_id": runtimeRunID(runtimeRun),
-		})
-		if err != nil {
-			return err
-		}
-		applyRuntimeRunToPhaseRun(phaseRun, runtimeRun)
-		output := runtimeRunPhaseOutput(runtimeRun)
-		output["legacy_bundled"] = true
-		if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (s *TaskService) recordSkippedPhaseRun(ctx context.Context, task *model.Task, phase PipelinePhase, runner string, output any) error {
 	phaseRun, err := s.beginPhaseRun(ctx, task, phase, runner, nil)
 	if err != nil {

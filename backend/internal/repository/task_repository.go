@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +17,8 @@ import (
 type Repository struct {
 	db *gorm.DB
 }
+
+var ErrTaskRunnerProfileImmutable = errors.New("task runner profile is immutable")
 
 func New(db *gorm.DB) *Repository {
 	return &Repository{db: db}
@@ -86,6 +89,88 @@ func (r *Repository) GetTask(ctx context.Context, id string) (*model.Task, error
 func (r *Repository) SaveTask(ctx context.Context, task *model.Task) error {
 	task.UpdatedAt = time.Now().UTC()
 	return r.db.WithContext(ctx).Save(task).Error
+}
+
+func (r *Repository) LockTaskRunnerProfile(
+	ctx context.Context,
+	taskID string,
+	expectedStatuses []string,
+	profile string,
+	source string,
+	lockedAt time.Time,
+) (bool, error) {
+	if strings.TrimSpace(taskID) == "" || strings.TrimSpace(profile) == "" || strings.TrimSpace(source) == "" {
+		return false, fmt.Errorf("task id, runner profile, and profile source are required")
+	}
+	if len(expectedStatuses) == 0 {
+		return false, fmt.Errorf("expected task statuses are required")
+	}
+	lockedAt = lockedAt.UTC()
+	locked := false
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var task model.Task
+		if err := tx.First(&task, "id = ?", taskID).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrNotFound
+			}
+			return err
+		}
+		statusAllowed := false
+		for _, expected := range expectedStatuses {
+			if task.Status == expected {
+				statusAllowed = true
+				break
+			}
+		}
+		if !statusAllowed {
+			return nil
+		}
+		if task.RunnerProfile != "" {
+			if task.RunnerProfile != profile {
+				return fmt.Errorf("%w: task %s is locked to %q, cannot set %q", ErrTaskRunnerProfileImmutable, taskID, task.RunnerProfile, profile)
+			}
+			updates := map[string]any{}
+			if task.RunnerProfileSource == "" {
+				updates["runner_profile_source"] = source
+			}
+			if task.RunnerProfileLockedAt == nil {
+				updates["runner_profile_locked_at"] = lockedAt
+			}
+			if len(updates) > 0 {
+				updates["updated_at"] = lockedAt
+				if err := tx.Model(&model.Task{}).Where("id = ?", taskID).Updates(updates).Error; err != nil {
+					return err
+				}
+			}
+			locked = true
+			return nil
+		}
+		result := tx.Model(&model.Task{}).
+			Where("id = ? AND status IN ? AND runner_profile = ''", taskID, expectedStatuses).
+			Updates(map[string]any{
+				"runner_profile":           profile,
+				"runner_profile_source":    source,
+				"runner_profile_locked_at": lockedAt,
+				"updated_at":               lockedAt,
+			})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 1 {
+			locked = true
+			return nil
+		}
+		var current model.Task
+		if err := tx.First(&current, "id = ?", taskID).Error; err != nil {
+			return err
+		}
+		if current.RunnerProfile != "" && current.RunnerProfile != profile {
+			return fmt.Errorf("%w: task %s is locked to %q, cannot set %q", ErrTaskRunnerProfileImmutable, taskID, current.RunnerProfile, profile)
+		}
+		locked = current.RunnerProfile == profile
+		return nil
+	})
+	return locked, err
 }
 
 func (r *Repository) SaveTaskIfStatus(ctx context.Context, task *model.Task, expectedStatus, expectedClaimToken string) (bool, error) {

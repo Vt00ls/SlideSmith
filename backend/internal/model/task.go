@@ -38,6 +38,20 @@ const (
 )
 
 const (
+	RunnerProfileFullPPTMaster      = "full-ppt-master"
+	RunnerProfileRealLite           = "real-lite"
+	RunnerProfileSmoke              = "smoke"
+	RunnerProfileNativeTemplateFill = "native-template-fill"
+)
+
+const (
+	RunnerProfileSourceDeploymentDefault = "deployment_default"
+	RunnerProfileSourceExplicitConfig    = "explicit_config"
+	RunnerProfileSourceLegacyManifest    = "legacy_manifest"
+	RunnerProfileSourceLegacyEvidence    = "legacy_evidence"
+)
+
+const (
 	EventTypeStatus       = "status"
 	EventTypeLog          = "log"
 	EventTypeRuntime      = "runtime"
@@ -85,6 +99,9 @@ type Task struct {
 	RouteStandaloneWorkflow string     `json:"route_standalone_workflow" gorm:"not null;size:64;default:''"`
 	RouteSelectionJSON      string     `json:"route_selection_json" gorm:"not null;type:text;default:'{}'"`
 	RouteSelectedAt         *time.Time `json:"route_selected_at,omitempty"`
+	RunnerProfile           string     `json:"runner_profile" gorm:"not null;size:64;default:'';index"`
+	RunnerProfileSource     string     `json:"runner_profile_source" gorm:"not null;size:64;default:''"`
+	RunnerProfileLockedAt   *time.Time `json:"runner_profile_locked_at,omitempty"`
 	ErrorMessage            string     `json:"error_message" gorm:"not null;type:text;default:''"`
 	FailurePhase            string     `json:"failure_phase" gorm:"not null;size:128;default:''"`
 	FailureMetadata         string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`

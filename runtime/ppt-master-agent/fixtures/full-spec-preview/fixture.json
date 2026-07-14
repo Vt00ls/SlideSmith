@@ -1,0 +1,6 @@
+{
+  "name": "full-spec-preview",
+  "page_count": 3,
+  "refine_spec": true,
+  "sources": ["preview.md"]
+}

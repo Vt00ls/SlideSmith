@@ -70,11 +70,13 @@ func TestFindGeneratedRuntimeWorkspaceCandidates(t *testing.T) {
 }
 
 func TestProcessLegacyGenerateRecoveryFinishesSpecPhaseBeforeAdvancing(t *testing.T) {
-	service, repo, task, _, _ := newTemplateFillWorkflowService(t, model.TaskStatusSpecGenerating, &failedLegacyRecoveryAgent{})
+	service, repo, task, _, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusSpecGenerating, &failedLegacyRecoveryAgent{})
 	task.Route = model.TaskRouteMain
+	lockRunnerProfileForTest(task, model.RunnerProfileRealLite)
 	if err := repo.SaveTask(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
+	writeRuntimeProfileManifestForTest(t, filepath.Dir(workspacePath), task)
 	recoveryRoot := t.TempDir()
 	service.agentCfg.SessionDataRoot = recoveryRoot
 	createPublishableRuntimeCandidate(t, recoveryRoot, "recovered-session", task.RuntimeProject+"_ppt169_20260713")
@@ -99,6 +101,9 @@ func TestProcessLegacyGenerateRecoveryFinishesSpecPhaseBeforeAdvancing(t *testin
 			t.Fatalf("recovery left running phase: %#v", phaseRun)
 		}
 		if phaseRun.Phase != string(PhaseSpecGenerate) {
+			if phaseRun.Phase != string(PhasePublish) {
+				t.Fatalf("legacy recovery fabricated split phase: %#v", phaseRun)
+			}
 			continue
 		}
 		specRuns++
@@ -113,11 +118,13 @@ func TestProcessLegacyGenerateRecoveryFinishesSpecPhaseBeforeAdvancing(t *testin
 
 func TestLegacyGenerateRecoveryStopsWhenSpecPhaseCannotBeOwned(t *testing.T) {
 	agent := &failedLegacyRecoveryAgent{}
-	service, repo, task, _, _ := newTemplateFillWorkflowService(t, model.TaskStatusSpecGenerating, agent)
+	service, repo, task, _, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusSpecGenerating, agent)
 	task.Route = model.TaskRouteMain
+	lockRunnerProfileForTest(task, model.RunnerProfileRealLite)
 	if err := repo.SaveTask(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
+	writeRuntimeProfileManifestForTest(t, filepath.Dir(workspacePath), task)
 	recoveryRoot := t.TempDir()
 	service.agentCfg.SessionDataRoot = recoveryRoot
 	createPublishableRuntimeCandidate(t, recoveryRoot, "recovered-session", task.RuntimeProject+"_ppt169_20260713")

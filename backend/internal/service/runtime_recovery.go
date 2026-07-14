@@ -73,9 +73,6 @@ func (s *TaskService) tryRecoverGeneratedRuntimeArtifacts(
 		"latest_artifact_at":   candidate.LatestArtifactTime.Format(time.RFC3339Nano),
 		"has_manifest":         candidate.HasManifest,
 	})
-	if err := s.recordLegacyCompletedPhaseRuns(ctx, task, run, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport); err != nil {
-		return true, err
-	}
 	for _, status := range []string{
 		model.TaskStatusImageAcquiring,
 		model.TaskStatusSVGGenerating,

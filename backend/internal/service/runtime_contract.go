@@ -150,6 +150,173 @@ func validatePPTXExportContract(projectPath string) (map[string]any, error) {
 	return contract, nil
 }
 
+func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map[string]any, task *model.Task, workspace *TaskWorkspace, runtimeRunID string) (map[string]any, error) {
+	if contract == nil {
+		contract = map[string]any{}
+	}
+	if task == nil || task.RunnerProfile != model.RunnerProfileFullPPTMaster || task.RunnerProfileLockedAt == nil {
+		return nil, fmt.Errorf("full phase %s requires a locked full-ppt-master task profile", phase)
+	}
+	contract["runner_profile"] = task.RunnerProfile
+	contract["runner_profile_locked_at"] = task.RunnerProfileLockedAt.UTC().Format(time.RFC3339Nano)
+	contract["runtime_run_id"] = runtimeRunID
+	if workspace != nil {
+		manifestPath := filepath.Join(workspace.HostDir, ".slidesmith", "runtime_manifest.json")
+		manifestSHA, err := sha256File(manifestPath)
+		if err != nil {
+			return nil, fmt.Errorf("hash runtime manifest: %w", err)
+		}
+		contract["runtime_manifest_sha256"] = manifestSHA
+		for key, rel := range map[string]string{
+			"skill_lock_sha256":    filepath.Join(".slidesmith", "skill_lock.json"),
+			"template_lock_sha256": filepath.Join(".slidesmith", "template_lock.json"),
+		} {
+			path := filepath.Join(workspace.HostDir, rel)
+			if sha, err := sha256File(path); err == nil {
+				contract[key] = sha
+			} else if !os.IsNotExist(err) {
+				return nil, err
+			}
+		}
+	}
+
+	switch phase {
+	case PhaseSpecGenerate:
+		designSHA, err := sha256File(filepath.Join(projectPath, "design_spec.md"))
+		if err != nil {
+			return nil, err
+		}
+		lockSHA, err := sha256File(filepath.Join(projectPath, "spec_lock.md"))
+		if err != nil {
+			return nil, err
+		}
+		contract["design_spec_sha256"] = designSHA
+		contract["spec_lock_sha256"] = lockSHA
+	case PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport:
+		svgSHA, err := sha256RegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
+		if err != nil {
+			return nil, err
+		}
+		contract["svg_output_sha256"] = svgSHA
+	}
+	if phase == PhaseFinalizeExport {
+		pptxSHA, err := sha256RegularFiles(filepath.Join(projectPath, "exports"), "*.pptx")
+		if err != nil {
+			return nil, err
+		}
+		contract["pptx_output_sha256"] = pptxSHA
+	}
+	if _, err := writeContractReport(projectPath, string(phase), contract); err != nil {
+		return nil, err
+	}
+	if phase == PhaseSpecGenerate {
+		if err := writeJSONPretty(filepath.Join(projectPath, ".slidesmith", "spec_contract.json"), contract); err != nil {
+			return nil, err
+		}
+	}
+	return contract, nil
+}
+
+func validateExistingSpecContract(projectPath string, task *model.Task, workspace *TaskWorkspace) (map[string]any, error) {
+	contractPath := filepath.Join(projectPath, ".slidesmith", "spec_contract.json")
+	raw, err := os.ReadFile(contractPath)
+	if err != nil {
+		return nil, err
+	}
+	var contract map[string]any
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		return nil, err
+	}
+	if value, _ := contract["runner_profile"].(string); task == nil || value != task.RunnerProfile {
+		return nil, fmt.Errorf("spec contract runner profile %q does not match task lock", value)
+	}
+	checks := []struct {
+		field string
+		path  string
+	}{
+		{"design_spec_sha256", filepath.Join(projectPath, "design_spec.md")},
+		{"spec_lock_sha256", filepath.Join(projectPath, "spec_lock.md")},
+	}
+	if workspace != nil {
+		checks = append(checks, struct {
+			field string
+			path  string
+		}{"runtime_manifest_sha256", filepath.Join(workspace.HostDir, ".slidesmith", "runtime_manifest.json")})
+		for field, relativePath := range map[string]string{
+			"skill_lock_sha256":    filepath.Join(".slidesmith", "skill_lock.json"),
+			"template_lock_sha256": filepath.Join(".slidesmith", "template_lock.json"),
+		} {
+			if expected, _ := contract[field].(string); expected != "" {
+				checks = append(checks, struct {
+					field string
+					path  string
+				}{field, filepath.Join(workspace.HostDir, relativePath)})
+			}
+		}
+	}
+	for _, check := range checks {
+		expected, _ := contract[check.field].(string)
+		if expected == "" {
+			return nil, fmt.Errorf("spec contract missing %s", check.field)
+		}
+		actual, err := sha256File(check.path)
+		if err != nil {
+			return nil, err
+		}
+		if actual != expected {
+			return nil, fmt.Errorf("spec contract stale: %s changed", check.path)
+		}
+	}
+	return contract, nil
+}
+
+func sha256RegularFiles(root, pattern string) (string, error) {
+	files, err := listRegularFiles(root, pattern)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	for _, path := range files {
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return "", err
+		}
+		fileSHA, err := sha256File(path)
+		if err != nil {
+			return "", err
+		}
+		_, _ = io.WriteString(hash, filepath.ToSlash(rel)+"\x00"+fileSHA+"\n")
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func validateFullSVGUpstreamContract(projectPath string, upstream PipelinePhase, task *model.Task) (map[string]any, error) {
+	path := filepath.Join(projectPath, ".slidesmith", "contracts", string(upstream)+".json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s upstream contract: %w", upstream, err)
+	}
+	var contract map[string]any
+	if err := json.Unmarshal(raw, &contract); err != nil {
+		return nil, err
+	}
+	if profile, _ := contract["runner_profile"].(string); task == nil || profile != task.RunnerProfile {
+		return nil, fmt.Errorf("%s upstream contract runner profile %q does not match task lock", upstream, profile)
+	}
+	expected, _ := contract["svg_output_sha256"].(string)
+	if expected == "" {
+		return nil, fmt.Errorf("%s upstream contract missing svg_output_sha256", upstream)
+	}
+	actual, err := sha256RegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
+	if err != nil {
+		return nil, err
+	}
+	if actual != expected {
+		return nil, fmt.Errorf("%s upstream contract is stale: SVG input changed", upstream)
+	}
+	return contract, nil
+}
+
 func buildPublishedArtifactsContract(projectPath string, storage StorageService, artifacts []model.Artifact, publishVersion, route string) (map[string]any, error) {
 	if len(artifacts) == 0 {
 		return nil, fmt.Errorf("publish produced no platform artifacts")

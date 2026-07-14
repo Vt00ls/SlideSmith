@@ -41,6 +41,7 @@ func TestRuntimeWorkspaceBuilderBuildsTaskWorkspace(t *testing.T) {
 		ID:             "task-1",
 		RuntimeProject: "task_1",
 	}
+	lockRunnerProfileForTest(task, model.RunnerProfileRealLite)
 	workspace, err := builder.Build(context.Background(), task, []model.Artifact{{
 		TaskID:    task.ID,
 		Kind:      model.ArtifactKindSource,
@@ -90,6 +91,16 @@ func TestRuntimeWorkspaceBuilderBuildsTaskWorkspace(t *testing.T) {
 	if !strings.Contains(string(rawManifest), `"project_path": "projects/task_1_ppt169_20260707"`) {
 		t.Fatalf("manifest did not record actual project path:\n%s", rawManifest)
 	}
+	var manifest runtimeManifest
+	if err := json.Unmarshal(rawManifest, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if manifest.Schema != "slidesmith.runtime_manifest.v2" || manifest.Runner.EffectiveProfile != model.RunnerProfileRealLite || manifest.Runner.Source != model.RunnerProfileSourceExplicitConfig || manifest.Runner.LockedAt == "" {
+		t.Fatalf("runtime manifest runner contract = %#v", manifest)
+	}
+	if manifest.Skill.Root != "skills/ppt-master" || manifest.Skill.LockPath != ".slidesmith/skill_lock.json" {
+		t.Fatalf("runtime manifest skill contract = %#v", manifest.Skill)
+	}
 }
 
 func TestRuntimeWorkspaceBuilderWritesSourceInputsManifest(t *testing.T) {
@@ -117,6 +128,7 @@ func TestRuntimeWorkspaceBuilderWritesSourceInputsManifest(t *testing.T) {
 	}
 	builder := NewRuntimeWorkspaceBuilder(cfg, storage)
 	task := &model.Task{ID: "task-1", RuntimeProject: "task_1"}
+	lockRunnerProfileForTest(task, model.RunnerProfileRealLite)
 	inputSHA := strings.Repeat("a", 64)
 	deckSHA := strings.Repeat("b", 64)
 	workspace, err := builder.Build(context.Background(), task, []model.Artifact{
@@ -255,6 +267,7 @@ func TestRuntimeWorkspaceBuilderAppliesTemplateLock(t *testing.T) {
 		SelectedTemplateID: lock.TemplateID,
 		TemplateLockJSON:   string(rawLock),
 	}
+	lockRunnerProfileForTest(task, model.RunnerProfileRealLite)
 	workspace, err := builder.Build(context.Background(), task, []model.Artifact{{
 		TaskID:    task.ID,
 		Kind:      model.ArtifactKindSource,

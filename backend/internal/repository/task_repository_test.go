@@ -2,8 +2,10 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -11,6 +13,80 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 	"gorm.io/gorm"
 )
+
+func TestLockTaskRunnerProfileIsIdempotentAndImmutable(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&model.Task{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	task := &model.Task{ID: "profile-task", Title: "Profile", Status: model.TaskStatusUploaded}
+	if err := repo.CreateTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	lockedAt := time.Date(2026, 7, 13, 10, 0, 0, 0, time.UTC)
+	for attempt := 0; attempt < 2; attempt++ {
+		locked, err := repo.LockTaskRunnerProfile(context.Background(), task.ID, []string{model.TaskStatusUploaded}, model.RunnerProfileFullPPTMaster, model.RunnerProfileSourceDeploymentDefault, lockedAt)
+		if err != nil || !locked {
+			t.Fatalf("lock attempt %d = %v, %v", attempt, locked, err)
+		}
+	}
+	if _, err := repo.LockTaskRunnerProfile(context.Background(), task.ID, []string{model.TaskStatusUploaded}, model.RunnerProfileRealLite, model.RunnerProfileSourceExplicitConfig, lockedAt); !errors.Is(err, ErrTaskRunnerProfileImmutable) {
+		t.Fatalf("conflicting lock error = %v", err)
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.RunnerProfile != model.RunnerProfileFullPPTMaster || persisted.RunnerProfileSource != model.RunnerProfileSourceDeploymentDefault || persisted.RunnerProfileLockedAt == nil || !persisted.RunnerProfileLockedAt.Equal(lockedAt) {
+		t.Fatalf("persisted profile lock = %#v", persisted)
+	}
+}
+
+func TestConcurrentTaskRunnerProfileLockHasSingleWinner(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open("file:runner-profile-lock?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	if err := db.AutoMigrate(&model.Task{}); err != nil {
+		t.Fatal(err)
+	}
+	repo := New(db)
+	task := &model.Task{ID: "concurrent-profile-task", Title: "Profile", Status: model.TaskStatusUploaded}
+	if err := repo.CreateTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	profiles := []string{model.RunnerProfileFullPPTMaster, model.RunnerProfileRealLite}
+	results := make(chan string, len(profiles))
+	var wg sync.WaitGroup
+	for _, profile := range profiles {
+		wg.Add(1)
+		go func(profile string) {
+			defer wg.Done()
+			locked, err := repo.LockTaskRunnerProfile(context.Background(), task.ID, []string{model.TaskStatusUploaded}, profile, model.RunnerProfileSourceExplicitConfig, time.Now().UTC())
+			if locked && err == nil {
+				results <- profile
+			}
+		}(profile)
+	}
+	wg.Wait()
+	close(results)
+	winners := []string{}
+	for profile := range results {
+		winners = append(winners, profile)
+	}
+	if len(winners) != 1 {
+		t.Fatalf("concurrent lock winners = %#v, want exactly one", winners)
+	}
+}
 
 func TestReplaceArtifactsByObjectKeyPrefixPopulatesCallerAfterCommit(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})

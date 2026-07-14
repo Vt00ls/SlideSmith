@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -289,7 +290,13 @@ func (a *legacyGenerateCASAgent) Run(_ context.Context, req AgentRunRequest) (*A
 
 func TestLegacyGenerateRuntimeResultDoesNotResurrectCancellation(t *testing.T) {
 	agent := &legacyGenerateCASAgent{}
-	service, repo, task, _, _ := newTemplateFillWorkflowService(t, model.TaskStatusSpecGenerating, agent)
+	service, repo, task, _, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusSpecGenerating, agent)
+	task.Route = model.TaskRouteMain
+	lockRunnerProfileForTest(task, model.RunnerProfileRealLite)
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	writeRuntimeProfileManifestForTest(t, filepath.Dir(workspacePath), task)
 	hook := installCancelBeforeTaskUpdate(t, repo.DB(), task.ID)
 	agent.arm = func() { hook.Arm(1) }
 

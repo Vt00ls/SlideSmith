@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +10,16 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/config"
 	"github.com/slidesmith/slidesmith/backend/internal/model"
 )
+
+func TestOneShotFullPPTMasterPromptIsNotCalledByProductionCode(t *testing.T) {
+	raw, err := os.ReadFile("task_service.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := strings.Count(string(raw), "fullPPTMasterPrompt("); count != 0 {
+		t.Fatalf("one-shot full prompt reference count = %d, want none", count)
+	}
+}
 
 type prepareCommandRecordingAgent struct {
 	request AgentRunRequest
@@ -63,43 +74,6 @@ func TestPrepareCommandIncludesSourceManifestAndFallbackInput(t *testing.T) {
 		}
 	}
 	t.Fatal("source_prepare phase run not found")
-}
-
-func TestFullPPTMasterPromptPreservesSkillBoundaries(t *testing.T) {
-	service := &TaskService{
-		agentCfg: config.AgentComposeConfig{WorkDir: "/workspace"},
-	}
-	task := &model.Task{ID: "task-1"}
-
-	prompt := service.fullPPTMasterPrompt(task, "/workspace/projects/task_1_ppt169_20260707")
-
-	required := []string{
-		"Read .slidesmith/runtime_manifest.json first",
-		"skills/ppt-master/SKILL.md",
-		"Follow the PPT Master mandatory serial workflow rules",
-		"Match the confirmed page_count exactly",
-		"SVG pages must be hand-authored one page at a time",
-		"Do not write or run Python/Node/shell generators",
-		"python3 skills/ppt-master/scripts/svg_quality_checker.py",
-		"python3 skills/ppt-master/scripts/finalize_svg.py",
-		"python3 skills/ppt-master/scripts/svg_to_pptx.py",
-		"python3 scripts/ppt_runner.py publish",
-	}
-	for _, want := range required {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt missing %q\n%s", want, prompt)
-		}
-	}
-
-	forbidden := []string{
-		"small Python scripts to write",
-		"target 3 slides unless",
-	}
-	for _, needle := range forbidden {
-		if strings.Contains(prompt, needle) {
-			t.Fatalf("prompt contains forbidden phrase %q\n%s", needle, prompt)
-		}
-	}
 }
 
 func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {

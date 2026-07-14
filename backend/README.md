@@ -34,7 +34,9 @@ export SLIDESMITH_AGENT_COMPOSE_WORKSPACE_ROOT=../runtime/ppt-master-agent/task-
 export SLIDESMITH_AGENT_COMPOSE_RUNTIME_IMAGE=slidesmith/ppt-master-runtime:dev
 export SLIDESMITH_PPT_MASTER_SKILL_DIR=/Users/vt/Dev_space/ppt-master/skills/ppt-master
 export SLIDESMITH_AGENT_COMPOSE_SESSION_ROOT=/root/slidesmith-agent-compose-data
-export SLIDESMITH_PPT_RUNNER_PROFILE=real-lite
+export SLIDESMITH_PPT_RUNNER_PROFILE=full-ppt-master
+export SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=false
+export SLIDESMITH_FULL_PPT_PREFLIGHT_STRICT=true
 ```
 
 `SLIDESMITH_AGENT_COMPOSE_WORKDIR` is the seed directory that contains
@@ -49,15 +51,27 @@ skills/ppt-master/scripts/
 .slidesmith/skill_lock.json
 ```
 
-The full PPT Master prompt reads the workspace manifest and
+Each task locks its effective runner profile before entering runtime prepare.
+The runtime manifest uses `slidesmith.runtime_manifest.v2`, and retries and
+worker recovery read the immutable task lock instead of the current process
+environment. Changing deployment configuration affects only tasks that have
+not yet locked a profile.
+
+The split full PPT Master phases read the workspace manifest and
 `skills/ppt-master/SKILL.md`; `/opt/ppt-master` is only a runtime fallback when a
 workspace script is missing.
 
 `SLIDESMITH_PPT_RUNNER_PROFILE` accepts:
 
-- `real-lite`: platform default; reads uploaded source text and confirmation values before generating specs, SVG, and PPTX.
+- `real-lite`: explicit smoke/fallback path; reads uploaded source text and confirmation values before generating specs, SVG, and PPTX.
 - `smoke`: fixed runtime/export health check deck.
-- `full-ppt-master`: uses `real-lite` only for prepare/confirmation scaffolding, then calls `agent-compose run --prompt` so the Codex agent executes the full PPT Master workflow for design spec, SVG, and PPTX generation. This requires a working agent-compose LLM provider/facade config on the daemon.
+- `full-ppt-master` (or alias `full`): standard main-route request. With `SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=true`, it runs independent strategist spec, executor SVG, quality, export, and platform publish phases. It never falls back after a task is locked.
+
+`SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=false` is the rollout/rollback gate and
+maps only newly locked full requests to `real-lite`. Production must keep
+`SLIDESMITH_FULL_PPT_PREFLIGHT_STRICT=true`; missing compose, skill references,
+scripts, Python, imports, writable workspace, or locked template roots then
+fails at `source_prepare.full_runtime_preflight` before confirmation.
 
 ## Core API
 

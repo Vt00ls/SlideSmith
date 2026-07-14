@@ -182,6 +182,9 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) (*model.Task
 	if task.Status != model.TaskStatusUploaded && task.Status != model.TaskStatusFailed {
 		return nil, fmt.Errorf("task must be uploaded or failed before start, got %q", task.Status)
 	}
+	if err := s.ensureTaskRunnerProfile(ctx, task); err != nil {
+		return nil, err
+	}
 	if task.RuntimeProject == "" {
 		task.RuntimeProject = runtimeProjectName(task.ID)
 	}
@@ -306,6 +309,14 @@ func (s *TaskService) processTaskOnce(ctx context.Context, taskID string) (claim
 }
 
 func (s *TaskService) processClaimedTask(ctx context.Context, task *model.Task) error {
+	if err := s.ensureTaskRunnerProfile(ctx, task); err != nil {
+		phase := runnerProfileFailurePhase(err)
+		_ = s.failWithMetadata(ctx, task, phase, err, nil, map[string]any{
+			"effective_profile": task.RunnerProfile,
+			"task_status":       task.Status,
+		})
+		return err
+	}
 	switch task.Status {
 	case model.TaskStatusRuntimePreparing, model.TaskStatusSourceConverting:
 		return s.processPrepare(ctx, task)
@@ -360,6 +371,9 @@ func (s *TaskService) taskExecutionLeaseDuration() time.Duration {
 }
 
 func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) error {
+	if err := s.ensureTaskRunnerProfile(ctx, task); err != nil {
+		return err
+	}
 	if task.Status == model.TaskStatusRuntimePreparing {
 		transitioned, err := s.transitionIfCurrent(ctx, task, model.TaskStatusSourceConverting, "Source converting", nil)
 		if err != nil {
@@ -371,6 +385,18 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 	} else if task.Status != model.TaskStatusSourceConverting {
 		return fmt.Errorf("source preparation cannot resume from status %q", task.Status)
 	}
+	if !s.agentCfg.Enabled && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+		workspace := s.resolveTaskWorkspace(task)
+		report, err := s.runFullRuntimePreflight(ctx, task, workspace)
+		if err == nil {
+			err = fmt.Errorf("full runtime preflight failed: agent-compose is disabled")
+		}
+		_ = s.failWithMetadata(ctx, task, "source_prepare.full_runtime_preflight", err, nil, map[string]any{
+			"effective_profile": task.RunnerProfile,
+			"preflight":         report,
+		})
+		return err
+	}
 	if !s.agentCfg.Enabled {
 		_, err := s.transitionIfCurrent(ctx, task, model.TaskStatusAwaitingAnchorConfirm, "Awaiting anchor confirmation", map[string]any{"runtime": "disabled"})
 		return err
@@ -378,7 +404,21 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 
 	workspace, err := s.buildTaskWorkspace(ctx, task)
 	if err != nil {
-		_ = s.failWithMetadata(ctx, task, "prepare.workspace", err, nil, nil)
+		failurePhase := "prepare.workspace"
+		extra := map[string]any{}
+		if task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+			selection, selectionErr := s.selectRoute(ctx, task)
+			if selectionErr == nil && selection.Route == model.TaskRouteMain {
+				failurePhase = "source_prepare.full_runtime_preflight"
+				resolved := s.resolveTaskWorkspace(task)
+				report, preflightErr := s.runFullRuntimePreflight(ctx, task, resolved)
+				extra["preflight"] = report
+				if preflightErr != nil {
+					err = errors.Join(err, preflightErr)
+				}
+			}
+		}
+		_ = s.failWithMetadata(ctx, task, failurePhase, err, nil, extra)
 		return err
 	}
 	selection, err := s.runRouteSelect(ctx, task, workspace)
@@ -404,19 +444,49 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 		})
 		return err
 	}
+	if err := s.workspaces.WriteRuntimeManifest(workspace, task, ""); err != nil {
+		_ = s.failWithMetadata(ctx, task, string(PhaseRouteSelect)+".runtime_manifest", err, nil, map[string]any{"workspace_path": workspace.HostDir})
+		return err
+	}
+	var fullPreflight *fullRuntimePreflightReport
+	if selection.Route == model.TaskRouteMain && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+		preflight, err := s.runFullRuntimePreflight(ctx, task, workspace)
+		fullPreflight = preflight
+		if err != nil {
+			_ = s.failWithMetadata(ctx, task, "source_prepare.full_runtime_preflight", err, nil, map[string]any{
+				"workspace_path":    workspace.HostDir,
+				"effective_profile": task.RunnerProfile,
+				"preflight":         preflight,
+			})
+			return err
+		}
+	}
+	if err := s.validateTaskRuntimeProfile(task, workspace); err != nil {
+		_ = s.failWithMetadata(ctx, task, failurePhaseRuntimeProfileMismatch, err, nil, map[string]any{
+			"workspace_path":    workspace.HostDir,
+			"effective_profile": task.RunnerProfile,
+		})
+		return err
+	}
 	command := fmt.Sprintf(
 		"node workflows/ppt_workflow.js prepare --profile %s --sources-manifest %s --input %s --project %s",
-		shellArg(s.commandRunnerProfile()),
+		shellArg(s.commandRunnerProfile(task)),
 		shellArg(".slidesmith/source_inputs.json"),
 		shellArg(workspace.InputPath),
 		shellArg(task.RuntimeProject),
 	)
-	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSourcePrepare, PhaseRunnerAgent, map[string]any{
-		"command":          command,
-		"workspace_path":   workspace.HostDir,
-		"sources_manifest": ".slidesmith/source_inputs.json",
-		"input_path":       workspace.InputPath,
-	})
+	phaseInput := map[string]any{
+		"command":                  command,
+		"workspace_path":           workspace.HostDir,
+		"sources_manifest":         ".slidesmith/source_inputs.json",
+		"input_path":               workspace.InputPath,
+		"runner_profile":           task.RunnerProfile,
+		"runner_profile_locked_at": task.RunnerProfileLockedAt,
+	}
+	if fullPreflight != nil {
+		phaseInput["full_runtime_preflight"] = fullPreflight
+	}
+	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSourcePrepare, PhaseRunnerAgent, phaseInput)
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(PhaseSourcePrepare), err, nil, map[string]any{"workspace_path": workspace.HostDir})
 		return err
@@ -440,8 +510,16 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 				map[string]any{"workspace_path": workspace.HostDir},
 			)
 		}
+		failurePhase := string(PhaseSourcePrepare) + ".agent"
+		stderrTail := ""
+		if run != nil {
+			stderrTail = run.StderrTail
+		}
+		if task.RunnerProfile == model.RunnerProfileFullPPTMaster && strings.Contains(strings.ToLower(err.Error()+" "+stderrTail), "full runtime preflight") {
+			failurePhase = "source_prepare.full_runtime_preflight"
+		}
 		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
-		_ = s.failWithMetadata(ctx, task, string(PhaseSourcePrepare)+".agent", err, run, nil)
+		_ = s.failWithMetadata(ctx, task, failurePhase, err, run, nil)
 		return err
 	}
 	var preparedProjectPath string
@@ -470,6 +548,21 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 			_ = s.failWithMetadata(ctx, task, string(PhaseSourcePrepare)+".manifest", err, run, map[string]any{"project_path": projectPath})
 			return err
 		}
+	}
+	if task.RunnerProfile == model.RunnerProfileFullPPTMaster && selection.Route == model.TaskRouteMain {
+		runtimePreflight, err := validateRuntimeFullPreflightContract(preparedProjectPath, task.RunnerProfile)
+		if err != nil {
+			output := runtimeRunPhaseOutput(run)
+			output["project_path"] = preparedProjectPath
+			output["full_runtime_preflight"] = runtimePreflight
+			_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, output, err)
+			_ = s.failWithMetadata(ctx, task, "source_prepare.full_runtime_preflight", err, run, map[string]any{
+				"project_path": preparedProjectPath,
+				"preflight":    runtimePreflight,
+			})
+			return err
+		}
+		fullPreflight = runtimePreflight
 	}
 	sourceContract, err := validateSourcePrepareContractWithSourceCount(preparedProjectPath, selection.Route, workspace.SourceCount)
 	if err != nil {
@@ -542,6 +635,10 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 	output["project_path"] = preparedProjectPath
 	output["source_contract"] = sourceContract
 	output["source_intake_artifact_count"] = len(sourceArtifacts)
+	output["runner_profile"] = task.RunnerProfile
+	if fullPreflight != nil {
+		output["full_runtime_preflight"] = fullPreflight
+	}
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
 		cause := fmt.Errorf("source_prepare.finalize: %w", err)
 		return s.recoverSourcePrepareFailure(
@@ -1862,6 +1959,10 @@ func (s *TaskService) recoverSourcePrepareFailure(
 }
 
 func (s *TaskService) processGenerate(ctx context.Context, task *model.Task) error {
+	if err := s.ensureTaskRunnerProfile(ctx, task); err != nil {
+		_ = s.failWithMetadata(ctx, task, runnerProfileFailurePhase(err), err, nil, map[string]any{"task_status": task.Status})
+		return err
+	}
 	if !s.agentCfg.Enabled {
 		err := fmt.Errorf("agent compose disabled; worker cannot generate")
 		_ = s.failWithMetadata(ctx, task, "generate.agent_disabled", err, nil, nil)
@@ -1875,18 +1976,26 @@ func (s *TaskService) processGenerate(ctx context.Context, task *model.Task) err
 		return err
 	}
 
-	if s.useFullPPTMaster() {
+	if s.useFullPPTMaster(task) {
 		return s.processFullPPTMasterSplit(ctx, task, workspace)
 	}
 	return s.processLegacyCommandGenerate(ctx, task, workspace)
 }
 
 func (s *TaskService) processLegacyCommandGenerate(ctx context.Context, task *model.Task, workspace *TaskWorkspace) error {
+	if task.RunnerProfile != model.RunnerProfileRealLite && task.RunnerProfile != model.RunnerProfileSmoke {
+		return fmt.Errorf("legacy generate requires real-lite or smoke runner profile, got %q", task.RunnerProfile)
+	}
+	if err := s.validateTaskRuntimeProfile(task, workspace); err != nil {
+		_ = s.failWithMetadata(ctx, task, failurePhaseRuntimeProfileMismatch, err, nil, map[string]any{"workspace_path": workspace.HostDir})
+		return err
+	}
 	input := map[string]any{
 		"workspace_path":     workspace.HostDir,
 		"runtime_project":    task.RuntimeProject,
 		"full_ppt_master":    false,
 		"legacy_bundle_note": "current generate run still covers spec, svg, quality, export, and runtime publish",
+		"runner_profile":     task.RunnerProfile,
 	}
 	if task.SelectedTemplateID != "" {
 		input["selected_template_id"] = task.SelectedTemplateID
@@ -1901,7 +2010,7 @@ func (s *TaskService) processLegacyCommandGenerate(ctx context.Context, task *mo
 
 	command := fmt.Sprintf(
 		"node workflows/ppt_workflow.js generate --profile %s --project %s --confirmation existing",
-		shellArg(s.commandRunnerProfile()),
+		shellArg(s.commandRunnerProfile(task)),
 		shellArg(task.RuntimeProject),
 	)
 	run, err := s.runAgent(ctx, task, "generate", AgentRunRequest{
@@ -1935,10 +2044,6 @@ func (s *TaskService) processLegacyCommandGenerate(ctx context.Context, task *mo
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, runtimeRunPhaseOutput(run), nil); err != nil {
 		return err
 	}
-	if err := s.recordLegacyCompletedPhaseRuns(ctx, task, run, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport); err != nil {
-		return err
-	}
-
 	for _, status := range []string{
 		model.TaskStatusImageAcquiring,
 		model.TaskStatusSVGGenerating,
@@ -1963,7 +2068,7 @@ func (s *TaskService) processFullPPTMasterQueuedPhase(ctx context.Context, task 
 		_ = s.failWithMetadata(ctx, task, string(phase)+".agent_disabled", err, nil, nil)
 		return err
 	}
-	if !s.useFullPPTMaster() {
+	if !s.useFullPPTMaster(task) {
 		err := fmt.Errorf("phase retry %s requires full-ppt-master profile", phase)
 		_ = s.failWithMetadata(ctx, task, string(phase)+".unsupported_profile", err, nil, nil)
 		return err
@@ -1972,6 +2077,19 @@ func (s *TaskService) processFullPPTMasterQueuedPhase(ctx context.Context, task 
 }
 
 func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, startPhase PipelinePhase) error {
+	if !s.useFullPPTMaster(task) {
+		err := fmt.Errorf("full phase %s requires a locked full-ppt-master main task", startPhase)
+		_ = s.failWithMetadata(ctx, task, string(startPhase)+".unsupported_profile", err, nil, map[string]any{"effective_profile": task.RunnerProfile})
+		return err
+	}
+	if err := s.validateTaskRuntimeProfile(task, workspace); err != nil {
+		_ = s.failWithMetadata(ctx, task, failurePhaseRuntimeProfileMismatch, err, nil, map[string]any{
+			"workspace_path":     workspace.HostDir,
+			"effective_profile":  task.RunnerProfile,
+			"started_from_phase": string(startPhase),
+		})
+		return err
+	}
 	projectPath, err := s.findPersistentProjectPath(task)
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(startPhase)+".project", err, nil, map[string]any{
@@ -2070,14 +2188,22 @@ func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *m
 }
 
 func (s *TaskService) queueSVGAfterSpecApproval(ctx context.Context, task *model.Task, projectPath, previousRuntimeRunID string) error {
+	if !s.useFullPPTMaster(task) || task.Route != model.TaskRouteMain {
+		return fmt.Errorf("image acquire compatibility skip requires full-ppt-master main route")
+	}
 	if err := s.transition(ctx, task, model.TaskStatusImageAcquiring, "Image acquire skipped", map[string]any{
 		"runtime_run_id": previousRuntimeRunID,
-		"reason":         "image acquisition not split in milestone 2",
+		"reason":         "resource acquisition is deferred to SPEC-05",
+		"implementation": "deferred_to_SPEC05",
+		"runner_profile": task.RunnerProfile,
 	}); err != nil {
 		return err
 	}
 	if err := s.recordSkippedPhaseRun(ctx, task, PhaseImageAcquire, PhaseRunnerWorker, map[string]any{
-		"reason":                  "image acquisition not split in milestone 2",
+		"reason":                  "resource acquisition is deferred to SPEC-05",
+		"implementation":          "deferred_to_SPEC05",
+		"acquired":                false,
+		"runner_profile":          task.RunnerProfile,
 		"project_path":            projectPath,
 		"previous_runtime_run_id": previousRuntimeRunID,
 	}); err != nil {
@@ -2090,7 +2216,11 @@ func (s *TaskService) queueSVGAfterSpecApproval(ctx context.Context, task *model
 }
 
 func (s *TaskService) runFullPPTMasterSpecPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
-	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSpecGenerate, PhaseRunnerAgent, templateResolvePhaseInput(task, workspace, projectPath))
+	input := fullPhaseInput(task, workspace, projectPath, PhaseSpecGenerate)
+	for key, value := range templateResolvePhaseInput(task, workspace, projectPath) {
+		input[key] = value
+	}
+	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSpecGenerate, PhaseRunnerAgent, input)
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(PhaseSpecGenerate), err, nil, map[string]any{"workspace_path": workspace.HostDir})
 		return nil, projectPath, err
@@ -2121,13 +2251,15 @@ func (s *TaskService) runFullPPTMasterSpecPhase(ctx context.Context, task *model
 		return run, projectPath, err
 	}
 	contract, err := validateSpecGenerateContract(projectPath)
+	if err == nil {
+		contract, err = bindFullPhaseContract(projectPath, PhaseSpecGenerate, contract, task, workspace, runtimeRunID(run))
+	}
 	if err != nil {
 		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
 		_ = s.failWithMetadata(ctx, task, string(PhaseSpecGenerate)+".contract", err, run, map[string]any{"project_path": projectPath})
 		return run, projectPath, err
 	}
-	output := runtimeRunPhaseOutput(run)
-	output["project_path"] = projectPath
+	output := fullPhaseOutput(task, run, projectPath, PhaseSpecGenerate)
 	output["contract"] = contract
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
 		return run, projectPath, err
@@ -2136,11 +2268,11 @@ func (s *TaskService) runFullPPTMasterSpecPhase(ctx context.Context, task *model
 }
 
 func (s *TaskService) runFullPPTMasterSVGPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
-	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSVGExecute, PhaseRunnerAgent, map[string]any{
-		"workspace_path":  workspace.HostDir,
-		"project_path":    projectPath,
-		"runtime_project": task.RuntimeProject,
-	})
+	if _, err := validateExistingSpecContract(projectPath, task, workspace); err != nil {
+		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".spec_contract", err, nil, map[string]any{"project_path": projectPath})
+		return nil, projectPath, err
+	}
+	phaseRun, err := s.beginPhaseRun(ctx, task, PhaseSVGExecute, PhaseRunnerAgent, fullPhaseInput(task, workspace, projectPath, PhaseSVGExecute, PhaseSpecGenerate))
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute), err, nil, map[string]any{"workspace_path": workspace.HostDir})
 		return nil, projectPath, err
@@ -2171,13 +2303,15 @@ func (s *TaskService) runFullPPTMasterSVGPhase(ctx context.Context, task *model.
 		return run, projectPath, err
 	}
 	contract, err := validateSVGExecuteContract(projectPath)
+	if err == nil {
+		contract, err = bindFullPhaseContract(projectPath, PhaseSVGExecute, contract, task, workspace, runtimeRunID(run))
+	}
 	if err != nil {
 		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, runtimeRunPhaseOutput(run), err)
 		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".contract", err, run, map[string]any{"project_path": projectPath})
 		return run, projectPath, err
 	}
-	output := runtimeRunPhaseOutput(run)
-	output["project_path"] = projectPath
+	output := fullPhaseOutput(task, run, projectPath, PhaseSVGExecute)
 	output["contract"] = contract
 	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, output, nil); err != nil {
 		return run, projectPath, err
@@ -2194,8 +2328,7 @@ func (s *TaskService) runFullPPTMasterQualityPhase(ctx context.Context, task *mo
 func (s *TaskService) runFullPPTMasterExportPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
 	projectRel := s.projectRel(task, projectPath)
 	command := fmt.Sprintf(
-		"python3 skills/ppt-master/scripts/finalize_svg.py %s --quiet && python3 skills/ppt-master/scripts/svg_to_pptx.py %s --no-notes -t none && python3 scripts/ppt_runner.py publish --project-path %s",
-		shellArg(projectRel),
+		"python3 skills/ppt-master/scripts/finalize_svg.py %s --quiet && python3 skills/ppt-master/scripts/svg_to_pptx.py %s --no-notes -t none",
 		shellArg(projectRel),
 		shellArg(projectRel),
 	)
@@ -2203,11 +2336,19 @@ func (s *TaskService) runFullPPTMasterExportPhase(ctx context.Context, task *mod
 }
 
 func (s *TaskService) runFullPPTMasterCommandPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string, phase PipelinePhase, command string, validate func(string) (map[string]any, error)) (*model.TaskRuntimeRun, string, error) {
-	phaseRun, err := s.beginPhaseRun(ctx, task, phase, PhaseRunnerWorker, map[string]any{
-		"workspace_path": workspace.HostDir,
-		"project_path":   projectPath,
-		"command":        command,
-	})
+	upstream := []PipelinePhase{PhaseSVGExecute}
+	upstreamContractPhase := PhaseSVGExecute
+	if phase == PhaseFinalizeExport {
+		upstream = []PipelinePhase{PhaseSVGExecute, PhaseQualityCheck}
+		upstreamContractPhase = PhaseQualityCheck
+	}
+	if _, err := validateFullSVGUpstreamContract(projectPath, upstreamContractPhase, task); err != nil {
+		_ = s.failWithMetadata(ctx, task, string(phase)+".upstream_contract", err, nil, map[string]any{"project_path": projectPath})
+		return nil, projectPath, err
+	}
+	input := fullPhaseInput(task, workspace, projectPath, phase, upstream...)
+	input["command"] = command
+	phaseRun, err := s.beginPhaseRun(ctx, task, phase, PhaseRunnerWorker, input)
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(phase), err, nil, map[string]any{"workspace_path": workspace.HostDir})
 		return nil, projectPath, err
@@ -2236,10 +2377,12 @@ func (s *TaskService) runFullPPTMasterCommandPhase(ctx context.Context, task *mo
 		_ = s.failWithMetadata(ctx, task, string(phase)+".sync", err, run, map[string]any{"workspace_path": run.WorkspacePath})
 		return run, projectPath, err
 	}
-	output := runtimeRunPhaseOutput(run)
-	output["project_path"] = projectPath
+	output := fullPhaseOutput(task, run, projectPath, phase)
 	if validate != nil {
 		contract, err := validate(projectPath)
+		if err == nil {
+			contract, err = bindFullPhaseContract(projectPath, phase, contract, task, workspace, runtimeRunID(run))
+		}
 		if err != nil {
 			_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, output, err)
 			_ = s.failWithMetadata(ctx, task, string(phase)+".contract", err, run, map[string]any{"project_path": projectPath})
@@ -2328,9 +2471,61 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 	default:
 		return fmt.Errorf("unsupported cleanup phase %q", phase)
 	}
+	if err := inspectFullPPTMasterRetryCleanupPaths(projectPath, paths); err != nil {
+		return err
+	}
 	for _, path := range paths {
 		if err := os.RemoveAll(path); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func inspectFullPPTMasterRetryCleanupPaths(projectPath string, paths []string) error {
+	if err := requireRealProjectDirectory(projectPath, "full PPT Master retry project"); err != nil {
+		return err
+	}
+	projectRoot, err := filepath.Abs(projectPath)
+	if err != nil {
+		return err
+	}
+	workspaceRoot, err := filepath.Abs(filepath.Dir(filepath.Dir(projectPath)))
+	if err != nil {
+		return err
+	}
+	for _, path := range paths {
+		candidate, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		allowedRoot := projectRoot
+		if !pathWithinRoot(projectRoot, candidate) {
+			allowedRoot = workspaceRoot
+		}
+		if candidate == allowedRoot || !pathWithinRoot(allowedRoot, candidate) {
+			return fmt.Errorf("full PPT Master retry output %s is outside allowed roots", path)
+		}
+		relative, err := filepath.Rel(allowedRoot, candidate)
+		if err != nil {
+			return err
+		}
+		current := allowedRoot
+		for index, part := range strings.Split(relative, string(filepath.Separator)) {
+			current = filepath.Join(current, part)
+			info, err := os.Lstat(current)
+			if os.IsNotExist(err) {
+				break
+			}
+			if err != nil {
+				return err
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("full PPT Master retry output must not contain a symlink: %s", current)
+			}
+			if index < len(strings.Split(relative, string(filepath.Separator)))-1 && !info.IsDir() {
+				return fmt.Errorf("full PPT Master retry output parent must be a directory: %s", current)
+			}
 		}
 	}
 	return nil
@@ -2467,9 +2662,17 @@ func (s *TaskService) processPublish(ctx context.Context, task *model.Task, work
 	if workspace == nil {
 		workspace = s.resolveTaskWorkspace(task)
 	}
+	if task.Route == model.TaskRouteMain && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+		if err := s.validateTaskRuntimeProfile(task, workspace); err != nil {
+			_ = s.failWithMetadata(ctx, task, failurePhaseRuntimeProfileMismatch, err, nil, map[string]any{"workspace_path": workspace.HostDir})
+			return err
+		}
+	}
 	phaseRun, err := s.beginPhaseRun(ctx, task, PhasePublish, PhaseRunnerPublisher, map[string]any{
-		"workspace_path":          task.RuntimeWorkspacePath,
-		"resolved_workspace_path": workspace.HostDir,
+		"workspace_path":           task.RuntimeWorkspacePath,
+		"resolved_workspace_path":  workspace.HostDir,
+		"runner_profile":           task.RunnerProfile,
+		"runner_profile_locked_at": task.RunnerProfileLockedAt,
 	})
 	if err != nil {
 		return err
@@ -2490,6 +2693,7 @@ func (s *TaskService) processPublish(ctx context.Context, task *model.Task, work
 		"workspace_path":          task.RuntimeWorkspacePath,
 		"resolved_workspace_path": workspace.HostDir,
 		"contract":                contract,
+		"runner_profile":          task.RunnerProfile,
 	}, nil); err != nil {
 		return err
 	}
@@ -3021,6 +3225,9 @@ func (s *TaskService) RetryTask(ctx context.Context, taskID, phase string) (*mod
 	if task.Status != model.TaskStatusFailed {
 		return nil, fmt.Errorf("only failed tasks can be retried")
 	}
+	if err := s.ensureTaskRunnerProfile(ctx, task); err != nil {
+		return nil, err
+	}
 	phase, err = normalizeRetryPhase(phase, task.FailurePhase)
 	if err != nil {
 		return nil, err
@@ -3068,6 +3275,16 @@ func (s *TaskService) ContinueTask(ctx context.Context, taskID, phase string) (*
 	if task.Status != model.TaskStatusAwaitingSpecConfirm {
 		return nil, fmt.Errorf("task must be awaiting spec confirmation before continue, got %q", task.Status)
 	}
+	if err := s.ensureTaskRunnerProfile(ctx, task); err != nil {
+		return nil, err
+	}
+	if !s.useFullPPTMaster(task) {
+		return nil, fmt.Errorf("spec continue requires a locked full-ppt-master main task")
+	}
+	workspace := s.resolveTaskWorkspace(task)
+	if err := s.validateTaskRuntimeProfile(task, workspace); err != nil {
+		return nil, err
+	}
 	value := strings.ToLower(strings.TrimSpace(phase))
 	if value == "" {
 		value = string(PhaseSVGExecute)
@@ -3078,7 +3295,7 @@ func (s *TaskService) ContinueTask(ctx context.Context, taskID, phase string) (*
 	}
 	switch value {
 	case "svg", "svg_execute", "svg_generating":
-		if _, err := validateSpecGenerateContract(projectPath); err != nil {
+		if _, err := validateExistingSpecContract(projectPath, task, workspace); err != nil {
 			return nil, fmt.Errorf("spec preview contract failed: %w", err)
 		}
 		if err := s.queueSVGAfterSpecApproval(ctx, task, projectPath, task.LastRuntimeRunID); err != nil {
@@ -3136,6 +3353,9 @@ func (s *TaskService) GetSpecPreview(ctx context.Context, taskID string) (*TaskS
 }
 
 func (s *TaskService) retryPrepare(ctx context.Context, task *model.Task) (*model.Task, error) {
+	if err := s.ensureTaskRunnerProfile(ctx, task); err != nil {
+		return nil, err
+	}
 	if task.RuntimeProject == "" {
 		task.RuntimeProject = runtimeProjectName(task.ID)
 	}
@@ -3154,8 +3374,14 @@ func (s *TaskService) retryPrepare(ctx context.Context, task *model.Task) (*mode
 }
 
 func (s *TaskService) retryPipelinePhase(ctx context.Context, task *model.Task, phase PipelinePhase, status string) (*model.Task, error) {
-	if phase != PhaseSpecGenerate && !s.useFullPPTMaster() {
-		return nil, fmt.Errorf("cannot retry %s with runner profile %q", phase, s.commandRunnerProfile())
+	if err := s.ensureTaskRunnerProfile(ctx, task); err != nil {
+		return nil, err
+	}
+	if !s.useFullPPTMaster(task) {
+		return nil, fmt.Errorf("cannot retry %s with runner profile %q", phase, task.RunnerProfile)
+	}
+	if err := s.validateTaskRuntimeProfile(task, s.resolveTaskWorkspace(task)); err != nil {
+		return nil, err
 	}
 	projectPath, err := s.findPersistentProjectPath(task)
 	if err != nil {
@@ -3248,6 +3474,11 @@ func (s *TaskService) retryTemplateFillPhase(ctx context.Context, task *model.Ta
 }
 
 func (s *TaskService) retryPublish(ctx context.Context, task *model.Task) (*model.Task, error) {
+	if task.Route == model.TaskRouteMain && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+		if err := s.validateTaskRuntimeProfile(task, s.resolveTaskWorkspace(task)); err != nil {
+			return nil, err
+		}
+	}
 	if _, err := s.findPersistentProjectPath(task); err != nil {
 		return nil, fmt.Errorf("cannot retry publish before prepared project exists: %w", err)
 	}
@@ -3416,6 +3647,11 @@ func (s *TaskService) failWithMetadata(ctx context.Context, task *model.Task, ph
 			phase = run.Phase
 		}
 	}
+	if extra == nil {
+		extra = map[string]any{}
+	}
+	extra["effective_profile"] = task.RunnerProfile
+	extra["task_status"] = expectedStatus
 	metadata := buildFailureMetadata(phase, cause, run, extra)
 	task.ErrorMessage = cause.Error()
 	task.FailurePhase = phase
@@ -3795,31 +4031,18 @@ func runtimeProjectName(taskID string) string {
 	return "task_" + value
 }
 
-func (s *TaskService) normalizedRunnerProfile() string {
-	switch strings.ToLower(strings.TrimSpace(s.agentCfg.RunnerProfile)) {
-	case "smoke", "real-lite", "full", "full-ppt-master":
-		return strings.ToLower(strings.TrimSpace(s.agentCfg.RunnerProfile))
-	default:
-		return "real-lite"
+func (s *TaskService) commandRunnerProfile(task *model.Task) string {
+	if task == nil {
+		return ""
 	}
+	if task.Route == model.TaskRouteTemplateFill || task.RunnerProfile == model.RunnerProfileNativeTemplateFill {
+		return "prepare-only"
+	}
+	return task.RunnerProfile
 }
 
-func (s *TaskService) commandRunnerProfile() string {
-	switch s.normalizedRunnerProfile() {
-	case "smoke":
-		return "smoke"
-	default:
-		return "real-lite"
-	}
-}
-
-func (s *TaskService) useFullPPTMaster() bool {
-	switch s.normalizedRunnerProfile() {
-	case "full", "full-ppt-master":
-		return true
-	default:
-		return false
-	}
+func (s *TaskService) useFullPPTMaster(task *model.Task) bool {
+	return task != nil && task.Route != model.TaskRouteTemplateFill && task.RunnerProfile == model.RunnerProfileFullPPTMaster
 }
 
 func (s *TaskService) fullPPTMasterSpecPrompt(task *model.Task, projectPath string) string {
@@ -3900,54 +4123,6 @@ Before stopping:
 - Verify that %s/notes/total.md exists and is non-empty.
 - Verify that %s/exports/ contains no .pptx files.
 `, task.ID, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel)
-}
-
-func (s *TaskService) fullPPTMasterPrompt(task *model.Task, projectPath string) string {
-	projectRel := s.projectRel(task, projectPath)
-
-	return fmt.Sprintf(`You are running inside the SlideSmith PPT Master runtime workspace.
-
-Goal:
-Generate the final PPTX for SlideSmith task %s by using the full PPT Master workflow, not the SlideSmith real-lite mock generator.
-
-Hard boundaries:
-- Use the already prepared project directory: %s
-- Read .slidesmith/runtime_manifest.json first.
-- If .slidesmith/template_lock.json exists, read it and treat its selected template as immutable for this task.
-- Read .slidesmith/template_resolution.json when present and use its template_root as the selected template package.
-- Read the core PPT Master skill declared by runtime_manifest.json: skills/ppt-master/SKILL.md.
-- Follow the PPT Master mandatory serial workflow rules from that workspace skill.
-- Prefer the selected template package listed in runtime_manifest.json template_roots when deriving style and executing page layouts.
-- Use workspace scripts from skills/ppt-master/scripts. If and only if a required workspace script is missing, fall back to /opt/ppt-master/skills/ppt-master/scripts and explicitly log that fallback.
-- Treat %s/sources/ as the source material. Keep facts grounded in those files.
-- Read %s/confirm_ui/result.json and follow the confirmed canvas, page_count, language, audience, mode, visual_style, color, typography, icons, formula_policy, image_usage, generation_mode, and refine_spec.
-- Do not ask the user questions. The confirmation file is the final user confirmation for this run.
-- Do not create a different project unless %s is missing.
-- Keep all final artifacts inside %s.
-- You must actually execute shell commands and write files in the workspace. A text-only explanation is a failed run.
-- Match the confirmed page_count exactly when it is a valid integer from 3 to 10. If it is missing or invalid, generate 3 slides.
-- SVG pages must be hand-authored one page at a time. Do not write or run Python/Node/shell generators that loop over page data, template SVG pages, or batch-generate SVG files.
-
-Required output contract:
-1. Create or overwrite %s/design_spec.md with a real PPT Master design specification.
-2. Create or overwrite %s/spec_lock.md and keep it consistent with design_spec.md.
-3. Create SVG pages under %s/svg_output/.
-4. Run PPT Master quality/finalization/export commands:
-   - python3 skills/ppt-master/scripts/svg_quality_checker.py %s
-   - python3 skills/ppt-master/scripts/finalize_svg.py %s --quiet
-   - python3 skills/ppt-master/scripts/svg_to_pptx.py %s --no-notes -t none
-5. Run python3 scripts/ppt_runner.py publish --project-path %s so .slidesmith/artifacts.json is written for the platform.
-6. Verify with shell commands that at least one PPTX exists under %s/exports/ and that .slidesmith/artifacts.json exists before stopping.
-
-Implementation notes:
-- Prefer local icons/shapes and deterministic SVG composition for this MVP run.
-- If external image acquisition is unavailable, continue with icons, diagrams, charts, and structured visual blocks rather than failing only because images are unavailable.
-- Keep slide count aligned with confirm_ui/result.json when feasible.
-- If a command fails, inspect the error, fix the project artifacts, and rerun the failed command before stopping.
-- Do not print long script help output or large source excerpts. Read files quietly, then act.
-- Use shell heredocs when writing design_spec.md, spec_lock.md, and individual SVG files; author each SVG file explicitly rather than generating SVGs from code.
-- Keep each SVG simple and valid, using local text, shapes, and inline icon-like line drawings; avoid external images for this run.
-`, task.ID, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel, projectRel)
 }
 
 func (s *TaskService) projectRel(task *model.Task, projectPath string) string {
