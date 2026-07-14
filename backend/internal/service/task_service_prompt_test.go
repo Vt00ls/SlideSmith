@@ -94,6 +94,8 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"flat canonical fields prompt_or_query, source_reference",
 		"stable canonical ID P01, P02",
 		"must declare one required chart_template requirement and one required chart_data requirement",
+		"Every chart_template requirement must have a matching chart_data requirement",
+		"Never declare a chart_template for a non-data-driven timeline, roadmap, process, or decorative diagram",
 		"complete purpose string verbatim from resource_plan.json",
 		"do not translate, abbreviate, paraphrase, or omit the purpose",
 		`use "page": 2; never use "page": "P02" or "page": "2"`,
