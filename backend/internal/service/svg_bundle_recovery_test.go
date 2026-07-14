@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/slidesmith/slidesmith/backend/internal/model"
@@ -108,6 +109,73 @@ func TestSVGRecoveryRunsInspectorOnlyWhenInventoriesAreMissing(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("recovery inventory missing: %s (%v)", path, err)
 		}
+	}
+}
+
+func TestRetrySVGPreservesRecoverableAuthoredBundleForInspector(t *testing.T) {
+	service, repo, task, projectPath := retryTestService(t)
+	mustWriteRetryProjectFiles(projectPath)
+	for _, path := range []string{
+		filepath.Join(projectPath, "analysis", "svg_inventory.json"),
+		filepath.Join(projectPath, "analysis", "notes_inventory.json"),
+	} {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	task.FailurePhase = "svg_execute.bundle"
+	task.ErrorMessage = "inspector session failed"
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeSVG, err := sha256File(filepath.Join(projectPath, "svg_output", "01_page_01.svg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeNotes, err := sha256File(filepath.Join(projectPath, "notes", "total.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	retried, err := service.RetryTask(context.Background(), task.ID, retryPhaseSVGExecute)
+	if err != nil {
+		t.Fatalf("RetryTask() error = %v", err)
+	}
+	if retried.Status != model.TaskStatusSVGGenerating {
+		t.Fatalf("retry status = %q", retried.Status)
+	}
+	for path, want := range map[string]string{
+		filepath.Join(projectPath, "svg_output", "01_page_01.svg"): beforeSVG,
+		filepath.Join(projectPath, "notes", "total.md"):            beforeNotes,
+	} {
+		got, err := sha256File(path)
+		if err != nil || got != want {
+			t.Fatalf("preserved authored input %s hash = %q, %v; want %q", path, got, err, want)
+		}
+	}
+	for _, path := range []string{
+		filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseSVGExecute)+".json"),
+		filepath.Join(projectPath, ".slidesmith", "quality_report.json"),
+		filepath.Join(projectPath, "exports"),
+		filepath.Join(projectPath, "validation"),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("downstream retry output still exists: %s (%v)", path, err)
+		}
+	}
+	events, err := repo.ListEvents(context.Background(), task.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundRecovery := false
+	for _, event := range events {
+		if event.Type == model.EventTypeRuntime && event.Status == "queued" && strings.Contains(event.Payload, `"inspector_only_recovery":true`) {
+			foundRecovery = true
+		}
+	}
+	if !foundRecovery {
+		t.Fatalf("retry recovery event missing: %#v", events)
 	}
 }
 

@@ -2762,6 +2762,31 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 	default:
 		return fmt.Errorf("unsupported cleanup phase %q", phase)
 	}
+	return cleanupFullPPTMasterRetryPaths(projectPath, paths)
+}
+
+func cleanupFullPPTMasterOutputsForSVGInspectorRetry(projectPath string) error {
+	paths := []string{
+		filepath.Join(projectPath, ".slidesmith", "artifacts.json"),
+		filepath.Join(projectPath, ".slidesmith-artifacts.json"),
+		filepath.Join(filepath.Dir(filepath.Dir(projectPath)), ".slidesmith", "artifacts.json"),
+		filepath.Join(projectPath, ".slidesmith", "quality_report.json"),
+		filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseSVGExecute)+".json"),
+		filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseQualityCheck)+".json"),
+		filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseFinalizeExport)+".json"),
+		filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePPTXValidate)+".json"),
+		filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePublish)+".json"),
+		filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
+		filepath.Join(projectPath, "analysis", "svg_inventory.json"),
+		filepath.Join(projectPath, "analysis", "notes_inventory.json"),
+		filepath.Join(projectPath, "svg_final"),
+		filepath.Join(projectPath, "exports"),
+		filepath.Join(projectPath, "validation"),
+	}
+	return cleanupFullPPTMasterRetryPaths(projectPath, paths)
+}
+
+func cleanupFullPPTMasterRetryPaths(projectPath string, paths []string) error {
 	if err := inspectFullPPTMasterRetryCleanupPaths(projectPath, paths); err != nil {
 		return err
 	}
@@ -3707,19 +3732,25 @@ func (s *TaskService) retryPipelinePhase(ctx context.Context, task *model.Task, 
 			return nil, fmt.Errorf("cleanup SVG bundle artifacts before retry %s: %w", phase, err)
 		}
 	}
-	if err := cleanupFullPPTMasterOutputsForRetry(projectPath, phase); err != nil {
+	preserveAuthoredSVGBundle := phase == PhaseSVGExecute && hasRecoverableSVGInspectorInputs(projectPath)
+	if preserveAuthoredSVGBundle {
+		if err := cleanupFullPPTMasterOutputsForSVGInspectorRetry(projectPath); err != nil {
+			return nil, fmt.Errorf("cleanup before inspector-only retry %s: %w", phase, err)
+		}
+	} else if err := cleanupFullPPTMasterOutputsForRetry(projectPath, phase); err != nil {
 		return nil, fmt.Errorf("cleanup before retry %s: %w", phase, err)
 	}
-	if err := s.transition(ctx, task, status, "Retry queued from "+string(phase), map[string]any{
+	retryPayload := map[string]any{
 		"retry_phase":  string(phase),
 		"project_path": projectPath,
-	}); err != nil {
+	}
+	if preserveAuthoredSVGBundle {
+		retryPayload["inspector_only_recovery"] = true
+	}
+	if err := s.transition(ctx, task, status, "Retry queued from "+string(phase), retryPayload); err != nil {
 		return nil, err
 	}
-	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", "Phase retry queued for worker", map[string]any{
-		"retry_phase":  string(phase),
-		"project_path": projectPath,
-	})
+	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", "Phase retry queued for worker", retryPayload)
 	return task, nil
 }
 
