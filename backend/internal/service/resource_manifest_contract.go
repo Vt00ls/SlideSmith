@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -435,107 +434,6 @@ func validateExistingResourceContract(projectPath string, task *model.Task, work
 		}
 	}
 	return contract, nil
-}
-
-var (
-	svgHrefPattern             = regexp.MustCompile(`(?i)(?:href|xlink:href)\s*=\s*["']([^"']+)["']`)
-	svgNamespaceDeclarationURI = regexp.MustCompile(`(?i)xmlns(?::[a-z0-9_-]+)?\s*=\s*["']https?://[^"']+["']`)
-)
-
-func validateSVGResourceBindings(projectPath string) (map[string]any, error) {
-	manifestPath := filepath.Join(projectPath, ".slidesmith", "resources_manifest.json")
-	raw, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return nil, err
-	}
-	var manifest resourcesManifest
-	if err := json.Unmarshal(raw, &manifest); err != nil {
-		return nil, err
-	}
-	allowedPaths := map[string]string{}
-	required := map[string]resourceManifestItem{}
-	for _, item := range manifest.Resources {
-		if item.Status == "ready" && item.Output != nil {
-			allowedPaths[filepath.ToSlash(filepath.Clean(filepath.FromSlash(item.Output.Path)))] = item.ID
-		}
-		if item.Required {
-			required[item.ID] = item
-		}
-	}
-	usedIDs := map[string]bool{}
-	usedPaths := map[string]bool{}
-	svgFiles, err := listRegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
-	if err != nil {
-		return nil, err
-	}
-	projectRoot, err := filepath.Abs(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	for _, svgPath := range svgFiles {
-		svgRaw, err := os.ReadFile(svgPath)
-		if err != nil {
-			return nil, err
-		}
-		// XML namespace declarations use URI identifiers (for example
-		// http://www.w3.org/2000/svg) but do not fetch network resources.
-		// Remove only those declarations before the broad external-URI gate.
-		lower := strings.ToLower(string(svgNamespaceDeclarationURI.ReplaceAll(svgRaw, nil)))
-		if strings.Contains(lower, "http://") || strings.Contains(lower, "https://") || strings.Contains(lower, "file://") {
-			return nil, fmt.Errorf("SVG %s contains an external resource URI", svgPath)
-		}
-		for _, item := range manifest.Resources {
-			if bytes.Contains(svgRaw, []byte(`data-resource-id="`+item.ID+`"`)) || bytes.Contains(svgRaw, []byte("data-resource-id='"+item.ID+"'")) {
-				usedIDs[item.ID] = true
-			}
-		}
-		for _, match := range svgHrefPattern.FindAllSubmatch(svgRaw, -1) {
-			href := string(match[1])
-			if href == "" || strings.HasPrefix(href, "#") {
-				continue
-			}
-			if strings.HasPrefix(strings.ToLower(href), "data:") {
-				return nil, fmt.Errorf("SVG %s contains an unregistered data URI resource", svgPath)
-			}
-			if filepath.IsAbs(href) || strings.Contains(href, "://") {
-				return nil, fmt.Errorf("SVG %s contains forbidden href %q", svgPath, href)
-			}
-			resolved := filepath.Clean(filepath.Join(filepath.Dir(svgPath), filepath.FromSlash(href)))
-			if !pathWithinRoot(projectRoot, resolved) {
-				return nil, fmt.Errorf("SVG %s href escapes project: %q", svgPath, href)
-			}
-			rel, err := filepath.Rel(projectRoot, resolved)
-			if err != nil {
-				return nil, err
-			}
-			rel = filepath.ToSlash(rel)
-			resourceID, ok := allowedPaths[rel]
-			if !ok {
-				return nil, fmt.Errorf("SVG %s href %q is not a ready manifest resource", svgPath, href)
-			}
-			usedIDs[resourceID] = true
-			usedPaths[rel] = true
-		}
-	}
-	usagePath := filepath.Join(projectPath, "analysis", "svg_resource_usage.json")
-	if usageRaw, readErr := os.ReadFile(usagePath); readErr == nil {
-		for _, item := range manifest.Resources {
-			if bytes.Contains(usageRaw, []byte(`"`+item.ID+`"`)) {
-				usedIDs[item.ID] = true
-			}
-		}
-	}
-	for id, item := range required {
-		if !usedIDs[id] {
-			return nil, fmt.Errorf("required resource %s (%s) is not bound in SVG output", id, item.Status)
-		}
-	}
-	return map[string]any{
-		"manifest_resource_count": len(manifest.Resources),
-		"bound_resource_count":    len(usedIDs),
-		"bound_output_count":      len(usedPaths),
-		"required_resource_count": len(required),
-	}, nil
 }
 
 func minInt(a, b int) int {

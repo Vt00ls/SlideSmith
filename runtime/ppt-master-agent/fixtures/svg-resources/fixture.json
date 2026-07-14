@@ -1,0 +1,14 @@
+{
+  "schema": "slidesmith.svg_fixture.v1",
+  "name": "svg-resources",
+  "expected": "pass",
+  "canvas": "ppt169",
+  "page_count": 3,
+  "resources": [
+    {"id": "res-image", "type": "image", "status": "ready"},
+    {"id": "res-icon", "type": "icon", "status": "ready"},
+    {"id": "res-formula", "type": "formula", "status": "ready"}
+  ],
+  "charts": [],
+  "notes": "per-page"
+}

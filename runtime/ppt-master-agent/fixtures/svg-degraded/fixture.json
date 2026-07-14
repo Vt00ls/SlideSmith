@@ -1,0 +1,14 @@
+{
+  "schema": "slidesmith.svg_fixture.v1",
+  "name": "svg-degraded",
+  "expected": "pass",
+  "canvas": "ppt169",
+  "page_count": 3,
+  "resources": [
+    {"id": "res-diagram", "type": "image", "status": "degraded", "fallback": "diagram"},
+    {"id": "res-text", "type": "image", "status": "degraded", "fallback": "text"},
+    {"id": "res-omit", "type": "image", "status": "degraded", "fallback": "omit_optional"}
+  ],
+  "charts": [],
+  "notes": "per-page"
+}

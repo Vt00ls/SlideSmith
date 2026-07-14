@@ -122,6 +122,9 @@ debugging only.
 7. Verify SVG preview and PPTX download.
 8. Verify `image_acquire` is `succeeded` (never `skipped`) and
    `GET /api/tasks/{id}/resources` returns a safe summary.
+9. Verify `svg_execute` is `succeeded`, `GET /api/tasks/{id}/svg-bundle`
+   reports `passed: true`, and every page has a canonical filename, artifact
+   ID, resource/chart counts, and a notes section.
 
 Expected published storage layout:
 
@@ -140,6 +143,14 @@ tasks/{task_id}/resources/{phase_run_id}/
   .slidesmith/resource_policy.json
   .slidesmith/resources_manifest.json
   analysis/resource_requirements.json
+tasks/{task_id}/svg-bundle/{phase_run_id}/
+  svg_output/*.svg
+  notes/total.md
+  analysis/svg_inventory.json
+  analysis/svg_resource_usage.json
+  analysis/chart_usage.json
+  analysis/notes_inventory.json
+  .slidesmith/contracts/svg_execute.json
 ```
 
 ## Switch To Full PPT Master

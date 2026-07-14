@@ -31,6 +31,7 @@ import {
   RetryPhase,
   RuntimeRun,
   SpecPreview,
+  SVGBundleSummary,
   Task,
   TaskEvent,
   TaskPhaseRun,
@@ -135,6 +136,25 @@ function emptyTaskResources(taskId = ""): TaskResources {
     summary: { total: 0, ready: 0, degraded: 0, failed: 0, pending: 0, required_failed: 0, bytes: 0 },
     resources: [],
     manifest_sha256: "",
+  };
+}
+
+function emptySVGBundle(taskId = ""): SVGBundleSummary {
+  return {
+    task_id: taskId,
+    phase_status: "",
+    passed: false,
+    canvas: { id: "", width: 0, height: 0 },
+    page_count: 0,
+    pages: [],
+    resource_summary: {},
+    chart_summary: {},
+    notes: { present: false, page_count: 0, empty_pages: 0 },
+    errors: [],
+    warnings: [],
+    artifact_ids: {},
+    inventory_sha256: "",
+    phase_run_id: "",
   };
 }
 
@@ -357,6 +377,7 @@ async function loadTaskDetailData<
   TEvent,
   TArtifact,
   TResources extends { task_id: string },
+  TBundle extends { task_id: string },
   TRuntimeRun,
   TPhaseRun,
   TPreview,
@@ -368,6 +389,7 @@ async function loadTaskDetailData<
     listEvents: (id: string) => Promise<TEvent[]>;
     listArtifacts: (id: string) => Promise<TArtifact[]>;
     getResources: (id: string) => Promise<TResources>;
+    getSVGBundle: (id: string) => Promise<TBundle>;
     listRuntimeRuns: (id: string) => Promise<TRuntimeRun[]>;
     listPhaseRuns: (id: string) => Promise<TPhaseRun[]>;
     getTemplateFillPlan: (id: string) => Promise<TPreview>;
@@ -384,6 +406,7 @@ async function loadTaskDetailData<
       requests.listEvents(scope.taskId),
       requests.listArtifacts(scope.taskId),
       requests.getResources(scope.taskId),
+      requests.getSVGBundle(scope.taskId),
       requests.listRuntimeRuns(scope.taskId),
       requests.listPhaseRuns(scope.taskId),
     ]);
@@ -397,8 +420,8 @@ async function loadTaskDetailData<
     return undefined;
   }
 
-  const [task, events, artifacts, resources, runtimeRuns, phaseRuns] = core;
-  if (resources.task_id !== scope.taskId) {
+  const [task, events, artifacts, resources, svgBundle, runtimeRuns, phaseRuns] = core;
+  if (resources.task_id !== scope.taskId || svgBundle.task_id !== scope.taskId) {
     return undefined;
   }
   let templateFillPreview: TPreview | null = null;
@@ -415,7 +438,7 @@ async function loadTaskDetailData<
   if (!scope.isGenerationCurrent(generation, currentTaskId)) {
     return undefined;
   }
-  return { task, events, artifacts, resources, runtimeRuns, phaseRuns, templateFillPreview };
+  return { task, events, artifacts, resources, svgBundle, runtimeRuns, phaseRuns, templateFillPreview };
 }
 
 function taskDetailRetryTaskID(
@@ -1082,13 +1105,14 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
     events: [] as TaskEvent[],
     artifacts: [] as Artifact[],
     resources: emptyTaskResources(taskId),
+    svgBundle: emptySVGBundle(taskId),
     runtimeRuns: [] as RuntimeRun[],
     phaseRuns: [] as TaskPhaseRun[],
     templateFillPreview: null as TemplateFillPlanPreview | null,
   }));
   const [retrying, setRetrying] = useState<RetryPhase | "">("");
   const [error, setError] = useState("");
-  const { task, events, artifacts, resources, runtimeRuns, phaseRuns, templateFillPreview } = detail;
+  const { task, events, artifacts, resources, svgBundle, runtimeRuns, phaseRuns, templateFillPreview } = detail;
 
   const load = useCallback(async () => {
     try {
@@ -1097,6 +1121,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
         listEvents: api.listEvents,
         listArtifacts: api.listArtifacts,
         getResources: api.getResources,
+        getSVGBundle: api.getSVGBundle,
         listRuntimeRuns: api.listRuntimeRuns,
         listPhaseRuns: api.listPhaseRuns,
         getTemplateFillPlan: api.getTemplateFillPlan,
@@ -1326,6 +1351,56 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                     <button className="secondary-button" disabled={!!retrying} onClick={() => void retry("image_acquire")}>
                       {retryPhaseIcon("image_acquire", retrying === "image_acquire")}
                       <span>重试资源准备</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {taskRoute === "main" && (
+              <div className="status-panel executor-panel">
+                <div className="section-title">
+                  <Layers size={17} />
+                  <span>Executor / SVG 契约</span>
+                </div>
+                <div className="resource-summary-grid executor-summary-grid">
+                  <span>页数<strong>{svgBundle.page_count}</strong></span>
+                  <span>画布<strong>{svgBundle.canvas.id || "-"}</strong></span>
+                  <span>资源绑定<strong>{svgBundle.resource_summary.bindings || 0}</strong></span>
+                  <span>图表<strong>{svgBundle.chart_summary.charts || 0}</strong></span>
+                  <span>讲稿<strong>{svgBundle.notes.present ? `${svgBundle.notes.page_count} 页` : "-"}</strong></span>
+                </div>
+                <div className="kv-grid compact">
+                  <span>契约状态</span>
+                  <strong className={svgBundle.errors.length ? "bad" : ""}>
+                    {svgBundle.passed ? "已通过" : svgBundle.phase_status || "等待生成"}
+                  </strong>
+                  <span>Inventory</span>
+                  <strong className="mono">{svgBundle.inventory_sha256 ? svgBundle.inventory_sha256.slice(0, 12) : "-"}</strong>
+                  <span>结构错误</span>
+                  <strong className={svgBundle.errors.length ? "bad" : ""}>{svgBundle.errors.join(" · ") || "0"}</strong>
+                  <span>警告</span>
+                  <strong>{svgBundle.warnings.length}</strong>
+                </div>
+                <div className="executor-page-list">
+                  {svgBundle.pages.map((page) => (
+                    <div className="executor-page-row" key={page.page_id}>
+                      <strong className="mono">{page.page_id}</strong>
+                      <span className="mono">{page.filename}</span>
+                      <span>文本 {page.text_count}</span>
+                      <span>图片 {page.image_count}</span>
+                      <span>图表 {page.chart_count}</span>
+                      <span>资源 {page.resource_count}</span>
+                      <span>{page.notes_present ? "讲稿 ✓" : "讲稿缺失"}</span>
+                    </div>
+                  ))}
+                  {svgBundle.pages.length === 0 && <span className="muted">尚无已通过契约的 SVG bundle</span>}
+                </div>
+                {task.status === "failed" && task.failure_phase.toLowerCase().startsWith("svg_execute") && (
+                  <div className="button-row left">
+                    <button className="secondary-button" disabled={!!retrying} onClick={() => void retry("svg_execute")}>
+                      {retryPhaseIcon("svg_execute", retrying === "svg_execute")}
+                      <span>重试 SVG</span>
                     </button>
                   </div>
                 )}

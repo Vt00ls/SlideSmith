@@ -280,7 +280,7 @@ func TestRetryMainAndBeautifyQualityRecoveryRemainsUnchanged(t *testing.T) {
 			if updated.Status != model.TaskStatusQualityChecking {
 				t.Fatalf("status = %q, want %q", updated.Status, model.TaskStatusQualityChecking)
 			}
-			assertPathExists(t, filepath.Join(projectPath, "svg_output", "01.svg"))
+			assertPathExists(t, filepath.Join(projectPath, "svg_output", "01_page_01.svg"))
 			assertPathMissing(t, filepath.Join(projectPath, "exports"))
 		})
 	}
@@ -440,7 +440,7 @@ func TestRetryQualityCheckCleansOnlyDownstreamArtifacts(t *testing.T) {
 	}
 	assertPathExists(t, filepath.Join(projectPath, "design_spec.md"))
 	assertPathExists(t, filepath.Join(projectPath, "spec_lock.md"))
-	assertPathExists(t, filepath.Join(projectPath, "svg_output", "01.svg"))
+	assertPathExists(t, filepath.Join(projectPath, "svg_output", "01_page_01.svg"))
 	assertPathMissing(t, filepath.Join(projectPath, ".slidesmith", "quality_report.json"))
 	assertPathMissing(t, filepath.Join(projectPath, "svg_final"))
 	assertPathMissing(t, filepath.Join(projectPath, "exports"))
@@ -529,7 +529,7 @@ func TestProcessTaskContinuesFromFinalizeExportRetry(t *testing.T) {
 	if updated.Status != model.TaskStatusExporting {
 		t.Fatalf("status = %q, want exporting", updated.Status)
 	}
-	assertPathExists(t, filepath.Join(projectPath, "svg_output", "01.svg"))
+	assertPathExists(t, filepath.Join(projectPath, "svg_output", "01_page_01.svg"))
 	assertPathExists(t, filepath.Join(projectPath, "notes", "total.md"))
 	assertPathExists(t, filepath.Join(projectPath, ".slidesmith", "quality_report.json"))
 	assertPathMissing(t, filepath.Join(projectPath, "svg_final"))
@@ -948,7 +948,7 @@ func retryTestService(t *testing.T) (*TaskService, *repository.Repository, *mode
 	service := NewTaskService(
 		repo,
 		storage,
-		splitGenerateFakeAgent{projectPath: projectPath, taskID: task.ID},
+		splitGenerateFakeAgent{projectPath: projectPath, taskID: task.ID, t: t},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
 			Enabled:               true,
@@ -964,7 +964,7 @@ func retryTestService(t *testing.T) (*TaskService, *repository.Repository, *mode
 
 func mustWriteRetryProjectFiles(projectPath string) {
 	mustWriteFileNoTest(projectPath, filepath.Join("sources", "input.md"), "# Source\n")
-	mustWriteFileNoTest(projectPath, filepath.Join("confirm_ui", "result.json"), `{"page_count":3}`+"\n")
+	mustWriteFileNoTest(projectPath, filepath.Join("confirm_ui", "result.json"), `{"canvas":"ppt169","page_count":3}`+"\n")
 	mustWriteFileNoTest(projectPath, "design_spec.md", "# Design Spec\n")
 	mustWriteFileNoTest(projectPath, "spec_lock.md", "# Spec Lock\n")
 	mustWriteFileNoTest(projectPath, filepath.Join("svg_output", "01.svg"), `<svg viewBox="0 0 1280 720"></svg>`+"\n")
@@ -976,16 +976,25 @@ func mustWriteRetryProjectFiles(projectPath string) {
 	mustWritePPTXNoTest(projectPath, filepath.Join("exports", "stale.pptx"), 3)
 	workspaceRoot := filepath.Dir(filepath.Dir(projectPath))
 	mustWriteEmptyResourceContractNoTest(projectPath, workspaceRoot, "task-retry", "resource-retry-fixture")
+	writeValidSVGBundleNoTest(projectPath, "task-retry", 3)
 	svgSHA, err := sha256RegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
 	if err != nil {
 		panic(err)
 	}
+	hashes, err := svgBundleContractHashes(projectPath)
+	if err != nil {
+		panic(err)
+	}
 	for _, phase := range []PipelinePhase{PhaseSVGExecute, PhaseQualityCheck} {
-		if err := writeJSONPretty(filepath.Join(projectPath, ".slidesmith", "contracts", string(phase)+".json"), map[string]any{
+		contract := map[string]any{
 			"phase":             string(phase),
 			"runner_profile":    model.RunnerProfileFullPPTMaster,
 			"svg_output_sha256": svgSHA,
-		}); err != nil {
+		}
+		for field, hash := range hashes {
+			contract[field] = hash
+		}
+		if err := writeJSONPretty(filepath.Join(projectPath, ".slidesmith", "contracts", string(phase)+".json"), contract); err != nil {
 			panic(err)
 		}
 	}

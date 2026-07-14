@@ -40,6 +40,7 @@ func fullPreflightFixture(t *testing.T) (*TaskService, *model.Task, *TaskWorkspa
 	}
 	mustWriteFile(t, filepath.Join(root, "scripts", "ppt_runner.py"), "print('fixture')\n")
 	mustWriteFile(t, filepath.Join(root, "scripts", "resource_runner.py"), "print('fixture')\n")
+	mustWriteFile(t, filepath.Join(root, "scripts", "svg_bundle_inspector.py"), "print('fixture')\n")
 	task := &model.Task{ID: "preflight-task", Route: model.TaskRouteMain}
 	lockRunnerProfileForTest(task, model.RunnerProfileFullPPTMaster)
 	service := &TaskService{agentCfg: config.AgentComposeConfig{

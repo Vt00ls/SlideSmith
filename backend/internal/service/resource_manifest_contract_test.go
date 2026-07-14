@@ -264,43 +264,6 @@ func TestValidateResourceOutputRejectsUnsafeSVG(t *testing.T) {
 	}
 }
 
-func TestValidateSVGResourceBindingsAllowsManifestResourceAndRejectsUnregisteredHref(t *testing.T) {
-	requirement, item := readyManifestRequirement()
-	fixture := newResourceManifestFixture(t, requirement, item)
-	fixture.manifest.Resources[0].Output = writeResourcePNG(t, fixture.projectPath, "images/ready.png")
-	fixture.recomputeSummary()
-	fixture.write(t)
-	mustWriteFile(t, filepath.Join(fixture.projectPath, "svg_output", "01.svg"), `<svg xmlns="http://www.w3.org/2000/svg"><image data-resource-id="res-ready" href="../images/ready.png"/></svg>`)
-	if _, err := validateSVGResourceBindings(fixture.projectPath); err != nil {
-		t.Fatalf("manifest-bound SVG rejected: %v", err)
-	}
-	mustWriteFile(t, filepath.Join(fixture.projectPath, "images", "unregistered.png"), "not registered")
-	mustWriteFile(t, filepath.Join(fixture.projectPath, "svg_output", "01.svg"), `<svg xmlns="http://www.w3.org/2000/svg"><image href="../images/unregistered.png"/></svg>`)
-	if _, err := validateSVGResourceBindings(fixture.projectPath); err == nil || !strings.Contains(err.Error(), "not a ready manifest resource") {
-		t.Fatalf("unregistered href error = %v", err)
-	}
-}
-
-func TestValidateSVGResourceBindingsRejectsExternalAndMissingRequiredUse(t *testing.T) {
-	requirement, item := readyManifestRequirement()
-	fixture := newResourceManifestFixture(t, requirement, item)
-	fixture.manifest.Resources[0].Output = writeResourcePNG(t, fixture.projectPath, "images/ready.png")
-	fixture.recomputeSummary()
-	fixture.write(t)
-	mustWriteFile(t, filepath.Join(fixture.projectPath, "svg_output", "01.svg"), `<svg xmlns="http://www.w3.org/2000/svg"><image href="https://example.com/hero.png"/></svg>`)
-	if _, err := validateSVGResourceBindings(fixture.projectPath); err == nil || !strings.Contains(err.Error(), "external resource URI") {
-		t.Fatalf("external href error = %v", err)
-	}
-	mustWriteFile(t, filepath.Join(fixture.projectPath, "svg_output", "01.svg"), `<svg xmlns="http://www.w3.org/2000/svg"><image href="data:image/png;base64,AAAA"/></svg>`)
-	if _, err := validateSVGResourceBindings(fixture.projectPath); err == nil || !strings.Contains(err.Error(), "unregistered data URI") {
-		t.Fatalf("data URI error = %v", err)
-	}
-	mustWriteFile(t, filepath.Join(fixture.projectPath, "svg_output", "01.svg"), `<svg xmlns="http://www.w3.org/2000/svg"></svg>`)
-	if _, err := validateSVGResourceBindings(fixture.projectPath); err == nil || !strings.Contains(err.Error(), "is not bound") {
-		t.Fatalf("required usage error = %v", err)
-	}
-}
-
 func TestValidateResourceManifestContractEnforcesPurposeFallbackAndProjectBindings(t *testing.T) {
 	tests := []struct {
 		name   string

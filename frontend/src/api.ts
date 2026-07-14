@@ -217,6 +217,43 @@ export type TaskResources = {
   manifest_sha256: string;
 };
 
+export type SVGCanvasSummary = {
+  id: string;
+  width: number;
+  height: number;
+};
+
+export type SVGPageSummary = {
+  page_id: string;
+  page: number;
+  filename: string;
+  sha256: string;
+  text_count: number;
+  image_count: number;
+  chart_count: number;
+  resource_count: number;
+  notes_present: boolean;
+  warnings: string[];
+  artifact_id?: string;
+};
+
+export type SVGBundleSummary = {
+  task_id: string;
+  phase_status: string;
+  passed: boolean;
+  canvas: SVGCanvasSummary;
+  page_count: number;
+  pages: SVGPageSummary[];
+  resource_summary: Record<string, number>;
+  chart_summary: Record<string, number>;
+  notes: { present: boolean; page_count: number; empty_pages: number };
+  errors: string[];
+  warnings: string[];
+  artifact_ids: Record<string, string>;
+  inventory_sha256: string;
+  phase_run_id: string;
+};
+
 export type TemplateFillInputs = {
   project_path: string;
   source_pptx: string;
@@ -391,6 +428,7 @@ export const api = {
     }),
   listArtifacts: (id: string) => request<Artifact[]>(`/tasks/${encodeURIComponent(id)}/artifacts`),
   getResources: (id: string) => request<TaskResources>(`/tasks/${encodeURIComponent(id)}/resources`),
+  getSVGBundle: (id: string) => request<SVGBundleSummary>(`/tasks/${encodeURIComponent(id)}/svg-bundle`),
   artifactContentUrl: (taskId: string, artifactId: string) =>
     `${API_BASE}/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
   pptxDownloadUrl: (taskId: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/download/pptx`,

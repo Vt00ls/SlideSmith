@@ -32,6 +32,7 @@ async function loadAppHelpersModule() {
     "isWaitingStatus",
     "numberFromSummary",
     "emptyTaskResources",
+    "emptySVGBundle",
     "resourceItemsByStatus",
     "templateFillText",
     "templateFillSlideRows",
@@ -189,6 +190,31 @@ test("resource API surface exposes only safe summary and artifact-bound preview 
   assert.match(apiSource, /\/tasks\/\$\{encodeURIComponent\(id\)\}\/resources/);
 });
 
+test("SVG bundle API and Executor summary stay task-scoped and expose no SVG XML", () => {
+  const bundle = typeAliasSource(apiSource, "api.ts", "SVGBundleSummary");
+  const page = typeAliasSource(apiSource, "api.ts", "SVGPageSummary");
+  for (const field of [
+    "task_id", "phase_status", "passed", "canvas", "page_count", "pages", "resource_summary",
+    "chart_summary", "notes", "errors", "warnings", "artifact_ids", "inventory_sha256", "phase_run_id",
+  ]) {
+    assert.match(bundle, new RegExp(`\\b${field}:`), `missing SVGBundleSummary.${field}`);
+  }
+  for (const field of [
+    "page_id", "page", "filename", "sha256", "text_count", "image_count", "chart_count",
+    "resource_count", "notes_present", "warnings", "artifact_id",
+  ]) {
+    assert.match(page, new RegExp(`\\b${field}\\??:`), `missing SVGPageSummary.${field}`);
+  }
+  for (const forbidden of ["project_path", "svg_xml", "source_xml", "host_path"]) {
+    assert.doesNotMatch(bundle, new RegExp(`\\b${forbidden}:`));
+    assert.doesNotMatch(page, new RegExp(`\\b${forbidden}:`));
+  }
+  assert.match(apiSource, /getSVGBundle:\s*\(id: string\)\s*=>\s*request<SVGBundleSummary>/);
+  assert.match(apiSource, /\/tasks\/\$\{encodeURIComponent\(id\)\}\/svg-bundle/);
+  assert.match(appSource, /Executor \/ SVG 契约/);
+  assert.match(appSource, /尚无已通过契约的 SVG bundle/);
+});
+
 test("Template Fill router parses and serializes the plan hash", async () => {
   globalThis.window = { location: { hash: "#/tasks/task%20one/template-fill" } };
   const { parseRoute, routeToHash } = await loadSourceModule(routerSource, "router.ts");
@@ -274,9 +300,11 @@ test("runner profiles expose locked engine labels and resource phase copy", asyn
 });
 
 test("resource grouping keeps ready, degraded, and blocking states separate", async () => {
-  const { emptyTaskResources, resourceItemsByStatus } = await loadAppHelpersModule();
+  const { emptySVGBundle, emptyTaskResources, resourceItemsByStatus } = await loadAppHelpersModule();
   assert.equal(emptyTaskResources("task-resource").task_id, "task-resource");
   assert.deepEqual(emptyTaskResources().resources, []);
+  assert.equal(emptySVGBundle("task-svg").task_id, "task-svg");
+  assert.deepEqual(emptySVGBundle().pages, []);
   const grouped = resourceItemsByStatus([
     { id: "ready", status: "ready" },
     { id: "degraded", status: "degraded" },
@@ -501,6 +529,7 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
     listEvents: () => waits.events?.promise || Promise.resolve([{ task_id: task.id, kind: "event" }]),
     listArtifacts: () => waits.artifacts?.promise || Promise.resolve([{ task_id: task.id, kind: "artifact" }]),
     getResources: () => waits.resources?.promise || Promise.resolve({ task_id: task.id, summary: { total: 1 }, resources: [{ id: `resource-${task.id}` }] }),
+    getSVGBundle: () => waits.svgBundle?.promise || Promise.resolve({ task_id: task.id, passed: true, pages: [{ page_id: `page-${task.id}` }] }),
     listRuntimeRuns: () => waits.runtimeRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "runtime" }]),
     listPhaseRuns: () => waits.phaseRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "phase" }]),
     getTemplateFillPlan: () => waits.preview?.promise || Promise.resolve({ task_id: task.id, plan: { title: task.id } }),
@@ -527,6 +556,8 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
   assert.equal(snapshotB.artifacts[0].task_id, "task-b");
   assert.equal(snapshotB.resources.task_id, "task-b");
   assert.equal(snapshotB.resources.resources[0].id, "resource-task-b");
+  assert.equal(snapshotB.svgBundle.task_id, "task-b");
+  assert.equal(snapshotB.svgBundle.pages[0].page_id, "page-task-b");
   assert.equal(snapshotB.runtimeRuns[0].task_id, "task-b");
   assert.equal(snapshotB.phaseRuns[0].task_id, "task-b");
   assert.equal(snapshotB.templateFillPreview.task_id, "task-b");
@@ -577,6 +608,15 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
     }),
   );
   assert.equal(mismatchedResources, undefined, "a resource response for another task must never be committed");
+
+  const mismatchedBundle = await loadTaskDetailData(
+    scopeB,
+    "task-b",
+    requestSet({ id: "task-b", route: "main", status: "completed" }, {
+      svgBundle: { promise: Promise.resolve({ task_id: "task-a", passed: true, pages: [{ page_id: "leak" }] }) },
+    }),
+  );
+  assert.equal(mismatchedBundle, undefined, "an SVG bundle response for another task must never be committed");
 });
 
 test("task detail preview requests are gated to backend-readable statuses", async () => {
@@ -590,6 +630,7 @@ test("task detail preview requests are gated to backend-readable statuses", asyn
       listEvents: async () => [],
       listArtifacts: async () => [],
       getResources: async () => ({ task_id: task.id, summary: { total: 0 }, resources: [] }),
+      getSVGBundle: async () => ({ task_id: task.id, passed: false, pages: [] }),
       listRuntimeRuns: async () => [],
       listPhaseRuns: async () => [],
       getTemplateFillPlan: async () => {
