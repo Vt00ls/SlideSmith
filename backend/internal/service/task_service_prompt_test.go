@@ -94,6 +94,8 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"flat canonical fields prompt_or_query, source_reference",
 		"stable canonical ID P01, P02",
 		"must declare one required chart_template requirement and one required chart_data requirement",
+		"complete purpose string verbatim from resource_plan.json",
+		"do not translate, abbreviate, paraphrase, or omit the purpose",
 	}
 	for _, want := range specRequired {
 		if !strings.Contains(specPrompt, want) {

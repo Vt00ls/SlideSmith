@@ -4267,7 +4267,7 @@ Required output contract:
 4. Assign every planned page the stable canonical ID P01, P02, ... in order. Each ID must appear as the leading identifier of its page entry in design_spec.md; if spec_lock.md contains page entries, it must contain the exact same ordered ID set.
 5. Create or overwrite %[2]s/.slidesmith/resource_plan.json using schema slidesmith.resource_plan.v1. It must contain task_id %[1]s, the confirmed page_count, SHA-256 values for design_spec.md, spec_lock.md and confirm_ui/result.json, and a requirements array. The array may be empty only when no planned page needs any external, template, icon, formula, chart-template, or chart-data resource. The three SHA-256 fields must be non-empty 64-character lowercase hexadecimal strings; never write null or placeholders.
 6. Every requirement must have a stable lowercase ID matching [a-z0-9][a-z0-9._-]{0,95}, a valid page, type, purpose, required flag, canonical acquire_via, approved fallback, safe output_name, placement, and source/prompt fields required by its type. Use the flat canonical fields prompt_or_query, source_reference, parent_id, expression, provider, data, citation, parameters, and publishable. Do not invent nested source or prompt objects.
-7. Include each non-empty resource ID verbatim in both design_spec.md and spec_lock.md so the human and machine contracts agree.
+7. For every requirement, include one declaration line in design_spec.md and one declaration line in spec_lock.md that copy the requirement ID, canonical page ID, and complete purpose string verbatim from resource_plan.json. Keep all three values on the same line; do not translate, abbreviate, paraphrase, or omit the purpose. This exact ID + page + purpose binding is required so the human and machine contracts agree.
 8. Formula requirements only declare expression and policy; do not render formulas in this phase. Chart data must retain a source citation.
 9. When any planned page contains a data-driven chart, requirements must declare one required chart_template requirement and one required chart_data requirement for that chart. The chart_template must use acquire_via "chart_template" and a real chart name from skills/ppt-master/templates/charts/charts_index.json in source_reference. The chart_data must use acquire_via "source", a project-relative sources/... source_reference, a citation object with file and section, and canonical data shaped as {"categories":[...],"series":[{"name":"...","values":[...]}]}. Never leave requirements empty for a data-driven chart.
 
@@ -4282,6 +4282,7 @@ Strict prohibitions for this phase:
 Before stopping:
 - Verify with shell commands that %[2]s/design_spec.md, %[2]s/spec_lock.md, and %[2]s/.slidesmith/resource_plan.json exist and are non-empty.
 - Recompute and verify all three SHA-256 bindings in resource_plan.json.
+- Iterate over every requirements entry and verify that its exact ID, canonical page ID, and complete purpose string occur together on one line in both design_spec.md and spec_lock.md.
 - Verify that %[2]s/svg_output has no .svg files and that no new resource binaries were created.
 `, task.ID, projectRel)
 }
