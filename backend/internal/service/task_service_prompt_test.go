@@ -98,6 +98,8 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"do not translate, abbreviate, paraphrase, or omit the purpose",
 		`use "page": 2; never use "page": "P02" or "page": "2"`,
 		`fallback must be exactly one of "", "diagram", "shape", "text", "placeholder", or "omit_optional"`,
+		`source_reference must be exactly the confirmed icons value followed by "/" and a safe icon name`,
+		`"tabler-outline/chart-bar"`,
 		`"type":"chart_data"`,
 	}
 	for _, want := range specRequired {
