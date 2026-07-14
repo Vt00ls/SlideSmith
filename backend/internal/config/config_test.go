@@ -49,6 +49,29 @@ func TestLoadTracksExplicitRunnerAndFlags(t *testing.T) {
 	}
 }
 
+func TestLoadQualityGateDefaultsAndOverrides(t *testing.T) {
+	for _, key := range []string{
+		"SLIDESMITH_QUALITY_GATE_ENABLED", "SLIDESMITH_QUALITY_GATE_STRICT",
+		"SLIDESMITH_PPTX_VALIDATE_ENABLED", "SLIDESMITH_VISUAL_REVIEW_ENABLED",
+		"SLIDESMITH_VISUAL_REVIEW_DEFAULT",
+	} {
+		t.Setenv(key, "")
+	}
+	defaults := Load().AgentCompose
+	if defaults.QualityGateEnabled || !defaults.QualityGateStrict || defaults.PPTXValidateEnabled || defaults.VisualReviewEnabled || defaults.VisualReviewDefault {
+		t.Fatalf("quality defaults = %#v", defaults)
+	}
+	t.Setenv("SLIDESMITH_QUALITY_GATE_ENABLED", "true")
+	t.Setenv("SLIDESMITH_QUALITY_GATE_STRICT", "false")
+	t.Setenv("SLIDESMITH_PPTX_VALIDATE_ENABLED", "true")
+	t.Setenv("SLIDESMITH_VISUAL_REVIEW_ENABLED", "true")
+	t.Setenv("SLIDESMITH_VISUAL_REVIEW_DEFAULT", "true")
+	overrides := Load().AgentCompose
+	if !overrides.QualityGateEnabled || overrides.QualityGateStrict || !overrides.PPTXValidateEnabled || !overrides.VisualReviewEnabled || !overrides.VisualReviewDefault {
+		t.Fatalf("quality overrides = %#v", overrides)
+	}
+}
+
 func TestLoadResourcePolicyDefaultsOfflineAndFailClosed(t *testing.T) {
 	for _, key := range []string{
 		"SLIDESMITH_RESOURCE_PHASE_ENABLED", "SLIDESMITH_RESOURCE_NETWORK_ENABLED",

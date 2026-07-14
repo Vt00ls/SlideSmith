@@ -231,15 +231,24 @@ func hasPublishedArtifactObjectRel(artifacts []model.Artifact, objectRel string)
 
 func TestArtifactKindFromRuntimePathTemplateFill(t *testing.T) {
 	tests := map[string]string{
-		"analysis/fill_plan.json":          model.ArtifactKindTemplateFillPlan,
-		"analysis/check_report.json":       model.ArtifactKindTemplateFillCheckReport,
-		"validation/validate_report.json":  model.ArtifactKindTemplateFillValidateReport,
-		"validation/readback.md":           model.ArtifactKindTemplateFillReadback,
-		"analysis/svg_inventory.json":      model.ArtifactKindSVGInventory,
-		"analysis/svg_resource_usage.json": model.ArtifactKindSVGResourceUsage,
-		"analysis/chart_usage.json":        model.ArtifactKindChartUsage,
-		"analysis/notes_inventory.json":    model.ArtifactKindNotesInventory,
-		"notes/total.md":                   model.ArtifactKindSpeakerNotes,
+		"analysis/fill_plan.json":              model.ArtifactKindTemplateFillPlan,
+		"analysis/check_report.json":           model.ArtifactKindTemplateFillCheckReport,
+		"validation/validate_report.json":      model.ArtifactKindTemplateFillValidateReport,
+		"validation/readback.md":               model.ArtifactKindTemplateFillReadback,
+		"analysis/svg_inventory.json":          model.ArtifactKindSVGInventory,
+		"analysis/svg_resource_usage.json":     model.ArtifactKindSVGResourceUsage,
+		"analysis/chart_usage.json":            model.ArtifactKindChartUsage,
+		"analysis/notes_inventory.json":        model.ArtifactKindNotesInventory,
+		"notes/total.md":                       model.ArtifactKindSpeakerNotes,
+		"validation/svg_quality_report.json":   model.ArtifactKindSVGQualityReport,
+		"validation/chart_verify_report.json":  model.ArtifactKindChartVerifyReport,
+		"validation/quality_summary.json":      model.ArtifactKindQualitySummary,
+		"validation/pptx_readback.md":          model.ArtifactKindPPTXReadback,
+		"validation/pptx_text_inventory.json":  model.ArtifactKindPPTXTextInventory,
+		"validation/pptx_validate_report.json": model.ArtifactKindPPTXValidateReport,
+		"validation/render/output.pdf":         model.ArtifactKindRenderedPDF,
+		"validation/render/slide-01.png":       model.ArtifactKindRenderedSlide,
+		"validation/render/contact_sheet.png":  model.ArtifactKindContactSheet,
 	}
 	for path, want := range tests {
 		if got := artifactKindFromRuntimePath(path); got != want {

@@ -20,6 +20,7 @@ export const statusLabel: Record<TaskStatus, string> = {
   svg_generating: "生成 SVG",
   quality_checking: "质量检查",
   exporting: "导出 PPTX",
+  pptx_validating: "校验 PPTX",
   publishing: "发布产物",
   completed: "已完成",
   failed: "失败",
@@ -46,6 +47,7 @@ export const statusTone: Record<TaskStatus, "idle" | "active" | "waiting" | "don
   svg_generating: "active",
   quality_checking: "active",
   exporting: "active",
+  pptx_validating: "active",
   publishing: "active",
   completed: "done",
   failed: "bad",
@@ -69,6 +71,7 @@ export const phaseLabel: Record<string, string> = {
   svg_execute: "SVG 生成",
   quality_check: "质量检查",
   finalize_export: "最终导出",
+  pptx_validate: "PPTX 校验",
   publish: "发布产物",
 };
 
@@ -108,6 +111,16 @@ export const artifactKindLabel: Record<string, string> = {
   chart_usage: "图表绑定",
   notes_inventory: "讲稿 Inventory",
   speaker_notes: "逐页讲稿",
+  svg_quality_report: "SVG 质量报告",
+  chart_verify_report: "图表校验报告",
+  quality_summary: "质量摘要",
+  pptx_readback: "PPTX 回读",
+  pptx_text_inventory: "PPTX 文本清单",
+  pptx_validate_report: "PPTX 校验报告",
+  rendered_pdf: "渲染 PDF",
+  rendered_slide: "渲染页",
+  contact_sheet: "联系表",
+  visual_review_report: "视觉审查报告",
   other: "其他",
 };
 

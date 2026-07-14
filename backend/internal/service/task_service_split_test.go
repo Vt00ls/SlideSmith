@@ -41,12 +41,14 @@ func (a splitGenerateFakeAgent) Run(_ context.Context, req AgentRunRequest) (*Ag
 	case string(PhaseSVGExecute):
 		writeValidSVGBundleNoTest(a.projectPath, a.taskID, 3)
 	case string(PhaseQualityCheck):
-		mustWriteFileNoTest(a.projectPath, filepath.Join("logs", "quality.log"), "ok\n")
+		writePassingQualityReportsNoTest(a.projectPath, a.taskID, phaseRunIDFromCommandNoTest(req.Command))
 	case string(PhaseFinalizeExport):
 		for _, name := range []string{"01.svg", "02.svg", "03.svg"} {
 			mustWriteFileNoTest(a.projectPath, filepath.Join("svg_final", name), `<svg viewBox="0 0 1280 720"></svg>`+"\n")
 		}
 		mustWritePPTXNoTest(a.projectPath, filepath.Join("exports", "result.pptx"), 3)
+	case string(PhasePPTXValidate):
+		writePassingPPTXValidateReportsNoTest(a.projectPath, a.taskID, phaseRunIDFromCommandNoTest(req.Command))
 	default:
 		return &AgentRunResult{Status: "failed"}, nil
 	}
@@ -141,7 +143,7 @@ func TestProcessFullPPTMasterSplitCompletesWithSeparatePhaseRuns(t *testing.T) {
 		statusByPhase[run.Phase] = run.Status
 		runnerByPhase[run.Phase] = run.Runner
 	}
-	for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePublish} {
+	for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePPTXValidate, PhasePublish} {
 		if statusByPhase[string(phase)] != PhaseRunStatusSucceeded {
 			t.Fatalf("phase %s status = %q, runs=%#v", phase, statusByPhase[string(phase)], phaseRuns)
 		}
@@ -164,7 +166,7 @@ func TestProcessFullPPTMasterSplitCompletesWithSeparatePhaseRuns(t *testing.T) {
 	for _, run := range runtimeRuns {
 		seenRuntimePhase[run.Phase] = true
 	}
-	for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport} {
+	for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePPTXValidate} {
 		if !seenRuntimePhase[string(phase)] {
 			t.Fatalf("runtime phase %s missing, runs=%#v", phase, runtimeRuns)
 		}

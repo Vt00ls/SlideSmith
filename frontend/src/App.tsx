@@ -35,6 +35,7 @@ import {
   Task,
   TaskEvent,
   TaskPhaseRun,
+  TaskQuality,
   TaskResourceItem,
   TaskResources,
   TaskStatus,
@@ -67,6 +68,7 @@ const activeStatuses: TaskStatus[] = [
   "svg_generating",
   "quality_checking",
   "exporting",
+  "pptx_validating",
   "publishing",
 ];
 
@@ -86,6 +88,7 @@ const splitRetryOptions: Array<{ phase: RetryPhase; label: string }> = [
   { phase: "svg_execute", label: "重试 SVG" },
   { phase: "quality_check", label: "重跑质检" },
   { phase: "finalize_export", label: "重新导出" },
+  { phase: "pptx_validate", label: "重新校验 PPTX" },
   { phase: "publish", label: "重新发布" },
 ];
 
@@ -156,6 +159,34 @@ function emptySVGBundle(taskId = ""): SVGBundleSummary {
     inventory_sha256: "",
     phase_run_id: "",
   };
+}
+
+function emptyTaskQuality(taskId = ""): TaskQuality {
+  const empty = { blocking: 0, error: 0, warning: 0, info: 0, decision: "pending" };
+  return {
+    task_id: taskId,
+    current_gate: "pending",
+    decision: "pending",
+    warning_badge: 0,
+    svg_summary: { ...empty },
+    pptx_summary: { ...empty },
+    findings: [],
+    chart_receipts: [],
+    text_coverage: 0,
+    render_artifact_ids: [],
+    contact_sheet_artifact_id: "",
+    readback_artifact_id: "",
+    allowed_retry_phases: [],
+  };
+}
+
+function qualityDecisionText(decision: string) {
+  switch (decision) {
+    case "pass": return "通过";
+    case "pass_with_warnings": return "有警告";
+    case "fail": return "未通过";
+    default: return "等待检查";
+  }
 }
 
 function resourceItemsByStatus(items: TaskResourceItem[]) {
@@ -378,6 +409,7 @@ async function loadTaskDetailData<
   TArtifact,
   TResources extends { task_id: string },
   TBundle extends { task_id: string },
+  TQuality extends { task_id: string },
   TRuntimeRun,
   TPhaseRun,
   TPreview,
@@ -390,6 +422,7 @@ async function loadTaskDetailData<
     listArtifacts: (id: string) => Promise<TArtifact[]>;
     getResources: (id: string) => Promise<TResources>;
     getSVGBundle: (id: string) => Promise<TBundle>;
+    getQuality: (id: string) => Promise<TQuality>;
     listRuntimeRuns: (id: string) => Promise<TRuntimeRun[]>;
     listPhaseRuns: (id: string) => Promise<TPhaseRun[]>;
     getTemplateFillPlan: (id: string) => Promise<TPreview>;
@@ -407,6 +440,7 @@ async function loadTaskDetailData<
       requests.listArtifacts(scope.taskId),
       requests.getResources(scope.taskId),
       requests.getSVGBundle(scope.taskId),
+      requests.getQuality(scope.taskId),
       requests.listRuntimeRuns(scope.taskId),
       requests.listPhaseRuns(scope.taskId),
     ]);
@@ -420,8 +454,8 @@ async function loadTaskDetailData<
     return undefined;
   }
 
-  const [task, events, artifacts, resources, svgBundle, runtimeRuns, phaseRuns] = core;
-  if (resources.task_id !== scope.taskId || svgBundle.task_id !== scope.taskId) {
+  const [task, events, artifacts, resources, svgBundle, quality, runtimeRuns, phaseRuns] = core;
+  if (resources.task_id !== scope.taskId || svgBundle.task_id !== scope.taskId || quality.task_id !== scope.taskId) {
     return undefined;
   }
   let templateFillPreview: TPreview | null = null;
@@ -438,7 +472,7 @@ async function loadTaskDetailData<
   if (!scope.isGenerationCurrent(generation, currentTaskId)) {
     return undefined;
   }
-  return { task, events, artifacts, resources, svgBundle, runtimeRuns, phaseRuns, templateFillPreview };
+  return { task, events, artifacts, resources, svgBundle, quality, runtimeRuns, phaseRuns, templateFillPreview };
 }
 
 function taskDetailRetryTaskID(
@@ -1106,13 +1140,14 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
     artifacts: [] as Artifact[],
     resources: emptyTaskResources(taskId),
     svgBundle: emptySVGBundle(taskId),
+    quality: emptyTaskQuality(taskId),
     runtimeRuns: [] as RuntimeRun[],
     phaseRuns: [] as TaskPhaseRun[],
     templateFillPreview: null as TemplateFillPlanPreview | null,
   }));
   const [retrying, setRetrying] = useState<RetryPhase | "">("");
   const [error, setError] = useState("");
-  const { task, events, artifacts, resources, svgBundle, runtimeRuns, phaseRuns, templateFillPreview } = detail;
+  const { task, events, artifacts, resources, svgBundle, quality, runtimeRuns, phaseRuns, templateFillPreview } = detail;
 
   const load = useCallback(async () => {
     try {
@@ -1122,6 +1157,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
         listArtifacts: api.listArtifacts,
         getResources: api.getResources,
         getSVGBundle: api.getSVGBundle,
+        getQuality: api.getQuality,
         listRuntimeRuns: api.listRuntimeRuns,
         listPhaseRuns: api.listPhaseRuns,
         getTemplateFillPlan: api.getTemplateFillPlan,
@@ -1280,6 +1316,10 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 <strong>{pptx ? formatBytes(pptx.size) : "-"}</strong>
                 <span>发布版本</span>
                 <strong className="mono">{pptx?.publish_version || "-"}</strong>
+                <span>质量门禁</span>
+                <strong className={quality.decision === "fail" ? "bad" : ""}>
+                  {qualityDecisionText(quality.decision)}{quality.warning_badge > 0 ? ` · ${quality.warning_badge} 警告` : ""}
+                </strong>
                 {task.status === "failed" && (
                   <>
                     <span>失败阶段</span>
@@ -1404,6 +1444,70 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                     </button>
                   </div>
                 )}
+              </div>
+            )}
+
+            {taskRoute === "main" && (
+              <div className={`status-panel quality-panel quality-${quality.decision}`}>
+                <div className="section-title">
+                  <CheckCircle2 size={17} />
+                  <span>生成质量门禁</span>
+                  {quality.warning_badge > 0 && <span className="quality-warning-badge">{quality.warning_badge}</span>}
+                </div>
+                <div className="resource-summary-grid quality-summary-grid">
+                  <span>总体<strong>{qualityDecisionText(quality.decision)}</strong></span>
+                  <span>SVG<strong>{qualityDecisionText(quality.svg_summary.decision)}</strong></span>
+                  <span>图表<strong>{quality.chart_receipts.length}</strong></span>
+                  <span>PPTX<strong>{qualityDecisionText(quality.pptx_summary.decision)}</strong></span>
+                  <span>文本覆盖<strong>{quality.text_coverage > 0 ? `${Math.round(quality.text_coverage * 100)}%` : "-"}</strong></span>
+                </div>
+                <div className="kv-grid compact">
+                  <span>当前门禁</span>
+                  <strong className="mono">{phaseLabel[quality.current_gate] || quality.current_gate}</strong>
+                  <span>阻断 / 错误</span>
+                  <strong className={(quality.svg_summary.blocking + quality.svg_summary.error + quality.pptx_summary.blocking + quality.pptx_summary.error) > 0 ? "bad" : ""}>
+                    {quality.svg_summary.blocking + quality.pptx_summary.blocking} / {quality.svg_summary.error + quality.pptx_summary.error}
+                  </strong>
+                  <span>警告</span>
+                  <strong>{quality.warning_badge}</strong>
+                </div>
+                {quality.chart_receipts.length > 0 && (
+                  <div className="quality-receipts">
+                    {quality.chart_receipts.map((receipt) => (
+                      <span key={`${receipt.page_id}:${receipt.chart_id}`}>
+                        <strong>{receipt.page_id}</strong> {receipt.chart_id} · {receipt.mode} · {qualityDecisionText(receipt.decision)}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <div className="quality-findings">
+                  {quality.findings.map((finding) => (
+                    <div className={`quality-finding severity-${finding.severity}`} key={finding.id}>
+                      <span className="quality-severity">{finding.severity}</span>
+                      <strong>{finding.page_id || "Deck"} · {finding.rule}</strong>
+                      <span>{finding.message}</span>
+                      <small>{finding.retry_phase ? `建议重试：${phaseLabel[finding.retry_phase] || finding.retry_phase}` : finding.artifact}</small>
+                    </div>
+                  ))}
+                  {quality.findings.length === 0 && <span className="muted">尚无质量问题</span>}
+                </div>
+                <div className="button-row left quality-artifact-actions">
+                  {quality.contact_sheet_artifact_id && (
+                    <a className="secondary-button" href={api.artifactContentUrl(task.id, quality.contact_sheet_artifact_id)} target="_blank" rel="noreferrer">
+                      <Eye size={16} /><span>联系表</span>
+                    </a>
+                  )}
+                  {quality.readback_artifact_id && (
+                    <a className="secondary-button" href={api.artifactContentUrl(task.id, quality.readback_artifact_id)} target="_blank" rel="noreferrer">
+                      <FileText size={16} /><span>PPTX 回读</span>
+                    </a>
+                  )}
+                  {quality.render_artifact_ids.slice(0, 6).map((artifactId, index) => (
+                    <a className="secondary-button compact-button" href={api.artifactContentUrl(task.id, artifactId)} target="_blank" rel="noreferrer" key={artifactId}>
+                      P{String(index + 1).padStart(2, "0")}
+                    </a>
+                  ))}
+                </div>
               </div>
             )}
 

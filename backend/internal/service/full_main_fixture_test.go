@@ -52,7 +52,7 @@ func (a *fullMainFixtureAgent) Run(_ context.Context, req AgentRunRequest) (*Age
 	case string(PhaseSVGExecute):
 		writeValidSVGBundleNoTest(a.projectPath, a.taskID, a.pageCount)
 	case string(PhaseQualityCheck):
-		mustWriteFileNoTest(a.projectPath, filepath.Join("logs", "quality.log"), "ok\n")
+		writePassingQualityReportsNoTest(a.projectPath, a.taskID, phaseRunIDFromCommandNoTest(req.Command))
 	case string(PhaseFinalizeExport):
 		if strings.Contains(req.Command, "ppt_runner.py publish") {
 			a.t.Fatalf("finalize export command called runtime publish: %s", req.Command)
@@ -61,6 +61,8 @@ func (a *fullMainFixtureAgent) Run(_ context.Context, req AgentRunRequest) (*Age
 			mustWriteFileNoTest(a.projectPath, filepath.Join("svg_final", fmt.Sprintf("%02d.svg", index)), `<svg viewBox="0 0 1280 720"></svg>`+"\n")
 		}
 		mustWritePPTXNoTest(a.projectPath, filepath.Join("exports", "result.pptx"), a.pageCount)
+	case string(PhasePPTXValidate):
+		writePassingPPTXValidateReportsNoTest(a.projectPath, a.taskID, phaseRunIDFromCommandNoTest(req.Command))
 	default:
 		return nil, fmt.Errorf("unexpected fixture phase %s", req.Phase)
 	}
@@ -162,7 +164,7 @@ func TestFullMainFixedFixtures(t *testing.T) {
 					t.Fatalf("phase %s input missing locked profile: %s", run.Phase, run.InputJSON)
 				}
 			}
-			for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePublish} {
+			for _, phase := range []PipelinePhase{PhaseSpecGenerate, PhaseImageAcquire, PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePPTXValidate, PhasePublish} {
 				if statusByPhase[string(phase)] != PhaseRunStatusSucceeded {
 					t.Fatalf("phase %s status = %q", phase, statusByPhase[string(phase)])
 				}

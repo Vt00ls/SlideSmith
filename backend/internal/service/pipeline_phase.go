@@ -22,6 +22,7 @@ const (
 	PhaseSVGExecute         PipelinePhase = "svg_execute"
 	PhaseQualityCheck       PipelinePhase = "quality_check"
 	PhaseFinalizeExport     PipelinePhase = "finalize_export"
+	PhasePPTXValidate       PipelinePhase = "pptx_validate"
 	PhasePublish            PipelinePhase = "publish"
 )
 
@@ -65,6 +66,7 @@ var pipelinePhaseOrder = []PipelinePhase{
 	PhaseSVGExecute,
 	PhaseQualityCheck,
 	PhaseFinalizeExport,
+	PhasePPTXValidate,
 	PhasePublish,
 }
 
@@ -224,24 +226,45 @@ var pipelinePhaseRegistry = map[PipelinePhase]PipelinePhaseDefinition{
 		},
 	},
 	PhaseQualityCheck: {
-		Phase:             PhaseQualityCheck,
-		DisplayName:       "Quality Check",
-		RequiredStatuses:  []string{model.TaskStatusQualityChecking},
-		NextStatus:        model.TaskStatusExporting,
-		Runner:            PhaseRunnerWorker,
-		Retryable:         true,
-		RequiredArtifacts: []string{"svg_output/*.svg"},
-		OutputArtifacts:   []string{".slidesmith/quality_report.json"},
+		Phase:            PhaseQualityCheck,
+		DisplayName:      "Quality Check",
+		RequiredStatuses: []string{model.TaskStatusQualityChecking},
+		NextStatus:       model.TaskStatusExporting,
+		Runner:           PhaseRunnerWorker,
+		Retryable:        true,
+		RequiredArtifacts: []string{
+			"svg_output/*.svg", "analysis/svg_inventory.json", "analysis/svg_resource_usage.json",
+			"analysis/chart_usage.json", "analysis/notes_inventory.json", ".slidesmith/contracts/svg_execute.json",
+		},
+		OutputArtifacts: []string{
+			"validation/svg_quality_report.json", "validation/chart_verify_report.json",
+			"validation/quality_summary.json", ".slidesmith/quality_report.json",
+			".slidesmith/contracts/quality_check.json",
+		},
 	},
 	PhaseFinalizeExport: {
 		Phase:             PhaseFinalizeExport,
 		DisplayName:       "Finalize Export",
 		RequiredStatuses:  []string{model.TaskStatusExporting},
+		NextStatus:        model.TaskStatusPPTXValidating,
+		Runner:            PhaseRunnerWorker,
+		Retryable:         true,
+		RequiredArtifacts: []string{"svg_output/*.svg", ".slidesmith/contracts/quality_check.json"},
+		OutputArtifacts:   []string{"svg_final/*.svg", "exports/*.pptx", "exports/export_manifest.json", ".slidesmith/contracts/finalize_export.json"},
+	},
+	PhasePPTXValidate: {
+		Phase:             PhasePPTXValidate,
+		DisplayName:       "PPTX Validate",
+		RequiredStatuses:  []string{model.TaskStatusPPTXValidating},
 		NextStatus:        model.TaskStatusPublishing,
 		Runner:            PhaseRunnerWorker,
 		Retryable:         true,
-		RequiredArtifacts: []string{"svg_output/*.svg"},
-		OutputArtifacts:   []string{"svg_final/*.svg", "exports/*.pptx"},
+		RequiredArtifacts: []string{"exports/*.pptx", ".slidesmith/contracts/finalize_export.json", "validation/quality_summary.json"},
+		OutputArtifacts: []string{
+			"validation/pptx_readback.md", "validation/pptx_text_inventory.json",
+			"validation/pptx_validate_report.json", "validation/render/*.png",
+			"validation/render/contact_sheet.png", ".slidesmith/contracts/pptx_validate.json",
+		},
 	},
 	PhasePublish: {
 		Phase:             PhasePublish,

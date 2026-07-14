@@ -215,6 +215,30 @@ test("SVG bundle API and Executor summary stay task-scoped and expose no SVG XML
   assert.match(appSource, /尚无已通过契约的 SVG bundle/);
 });
 
+test("quality API and completed warning view remain task-scoped", () => {
+  const quality = typeAliasSource(apiSource, "api.ts", "TaskQuality");
+  const finding = typeAliasSource(apiSource, "api.ts", "QualityFinding");
+  for (const field of [
+    "task_id", "current_gate", "decision", "warning_badge", "svg_summary", "pptx_summary",
+    "findings", "chart_receipts", "text_coverage", "render_artifact_ids",
+    "contact_sheet_artifact_id", "readback_artifact_id", "allowed_retry_phases",
+  ]) {
+    assert.match(quality, new RegExp(`\\b${field}:`), `missing TaskQuality.${field}`);
+  }
+  for (const field of ["rule", "severity", "page_id", "message", "owner_phase", "retry_phase"]) {
+    assert.match(finding, new RegExp(`\\b${field}:`), `missing QualityFinding.${field}`);
+  }
+  for (const forbidden of ["evidence", "host_path", "project_path", "svg_xml"]) {
+    assert.doesNotMatch(finding, new RegExp(`\\b${forbidden}:`));
+  }
+  assert.match(apiSource, /getQuality:\s*\(id: string\)\s*=>\s*request<TaskQuality>/);
+  assert.match(apiSource, /\/tasks\/\$\{encodeURIComponent\(id\)\}\/quality/);
+  assert.match(appSource, /生成质量门禁/);
+  assert.match(appSource, /quality\.warning_badge/);
+  assert.match(appSource, /联系表/);
+  assert.match(appSource, /PPTX 回读/);
+});
+
 test("Template Fill router parses and serializes the plan hash", async () => {
   globalThis.window = { location: { hash: "#/tasks/task%20one/template-fill" } };
   const { parseRoute, routeToHash } = await loadSourceModule(routerSource, "router.ts");
@@ -530,6 +554,7 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
     listArtifacts: () => waits.artifacts?.promise || Promise.resolve([{ task_id: task.id, kind: "artifact" }]),
     getResources: () => waits.resources?.promise || Promise.resolve({ task_id: task.id, summary: { total: 1 }, resources: [{ id: `resource-${task.id}` }] }),
     getSVGBundle: () => waits.svgBundle?.promise || Promise.resolve({ task_id: task.id, passed: true, pages: [{ page_id: `page-${task.id}` }] }),
+    getQuality: () => waits.quality?.promise || Promise.resolve({ task_id: task.id, decision: "pass", findings: [] }),
     listRuntimeRuns: () => waits.runtimeRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "runtime" }]),
     listPhaseRuns: () => waits.phaseRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "phase" }]),
     getTemplateFillPlan: () => waits.preview?.promise || Promise.resolve({ task_id: task.id, plan: { title: task.id } }),
@@ -558,6 +583,7 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
   assert.equal(snapshotB.resources.resources[0].id, "resource-task-b");
   assert.equal(snapshotB.svgBundle.task_id, "task-b");
   assert.equal(snapshotB.svgBundle.pages[0].page_id, "page-task-b");
+  assert.equal(snapshotB.quality.task_id, "task-b");
   assert.equal(snapshotB.runtimeRuns[0].task_id, "task-b");
   assert.equal(snapshotB.phaseRuns[0].task_id, "task-b");
   assert.equal(snapshotB.templateFillPreview.task_id, "task-b");
@@ -631,6 +657,7 @@ test("task detail preview requests are gated to backend-readable statuses", asyn
       listArtifacts: async () => [],
       getResources: async () => ({ task_id: task.id, summary: { total: 0 }, resources: [] }),
       getSVGBundle: async () => ({ task_id: task.id, passed: false, pages: [] }),
+      getQuality: async () => ({ task_id: task.id, decision: "pending", findings: [] }),
       listRuntimeRuns: async () => [],
       listPhaseRuns: async () => [],
       getTemplateFillPlan: async () => {
@@ -674,7 +701,7 @@ test("Template Fill retry recovery is failure-phase-aware and main retry behavio
     { phase: "publish", label: "重新发布" },
   ]);
   assert.deepEqual(retryOptionsForFailure("template_resolve", "main"), [{ phase: "prepare", label: "重新准备" }]);
-  assert.equal(retryOptionsForFailure("publish.contract", "main").length, 6);
+  assert.equal(retryOptionsForFailure("publish.contract", "main").length, 7);
   assert.ok(retryOptionsForFailure("image_acquire.contract", "main").some((option) => option.phase === "image_acquire"));
   assert.match(retryGuidanceForFailure("template_fill_plan.inputs"), /多个.*PPTX/);
   assert.match(retryGuidanceForFailure("template_fill_plan.inputs"), /没有源文件删除 API/);

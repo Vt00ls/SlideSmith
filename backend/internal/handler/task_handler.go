@@ -312,6 +312,15 @@ func (h *TaskHandler) GetSVGBundle(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, gin.H{"data": bundle})
 }
 
+func (h *TaskHandler) GetQuality(ctx *gin.Context) {
+	quality, err := h.tasks.GetQuality(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": quality})
+}
+
 func (h *TaskHandler) GetArtifactContent(ctx *gin.Context) {
 	artifact, path, err := h.tasks.ArtifactFile(ctx.Request.Context(), ctx.Param("id"), ctx.Param("artifactId"))
 	if err != nil {

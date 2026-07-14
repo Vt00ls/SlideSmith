@@ -40,6 +40,7 @@ const (
 	retryPhaseSVGExecute           = "svg_execute"
 	retryPhaseQualityCheck         = "quality_check"
 	retryPhaseFinalizeExport       = "finalize_export"
+	retryPhasePPTXValidate         = "pptx_validate"
 	retryPhaseTemplateFillPlan     = "template_fill_plan"
 	retryPhaseTemplateFillCheck    = "template_fill_check"
 	retryPhaseTemplateFillApply    = "template_fill_apply"
@@ -260,6 +261,7 @@ func (s *TaskService) ProcessQueuedTasks(ctx context.Context, limit int) (int, e
 		model.TaskStatusSVGGenerating,
 		model.TaskStatusQualityChecking,
 		model.TaskStatusExporting,
+		model.TaskStatusPPTXValidating,
 		model.TaskStatusPublishing,
 	}, staleBefore, limit)
 	if err != nil {
@@ -340,6 +342,8 @@ func (s *TaskService) processClaimedTask(ctx context.Context, task *model.Task) 
 		return s.processFullPPTMasterQueuedPhase(ctx, task, PhaseQualityCheck)
 	case model.TaskStatusExporting:
 		return s.processFullPPTMasterQueuedPhase(ctx, task, PhaseFinalizeExport)
+	case model.TaskStatusPPTXValidating:
+		return s.processFullPPTMasterQueuedPhase(ctx, task, PhasePPTXValidate)
 	case model.TaskStatusPublishing:
 		return s.processPublish(ctx, task, nil, map[string]any{"queued_status": model.TaskStatusPublishing})
 	default:
@@ -360,6 +364,7 @@ func isWorkerTaskStatus(status string) bool {
 		model.TaskStatusSVGGenerating,
 		model.TaskStatusQualityChecking,
 		model.TaskStatusExporting,
+		model.TaskStatusPPTXValidating,
 		model.TaskStatusPublishing:
 		return true
 	default:
@@ -2054,6 +2059,7 @@ func (s *TaskService) processLegacyCommandGenerate(ctx context.Context, task *mo
 		model.TaskStatusSVGGenerating,
 		model.TaskStatusQualityChecking,
 		model.TaskStatusExporting,
+		model.TaskStatusPPTXValidating,
 		model.TaskStatusPublishing,
 	} {
 		if err := s.transition(ctx, task, status, status, map[string]any{"runtime_run_id": run.ID}); err != nil {
@@ -2165,18 +2171,54 @@ func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *m
 	}
 
 	if startPhase == PhaseFinalizeExport {
-		exportRun, nextProjectPath, err := s.runFullPPTMasterExportPhase(ctx, task, workspace, projectPath)
-		if err != nil {
+		recovered, recoverErr := s.tryRecoverCompletedFullPhase(ctx, task, workspace, projectPath, PhaseFinalizeExport, func() (map[string]any, error) {
+			return validateExistingPPTXExportContract(projectPath, task)
+		})
+		if recoverErr != nil {
+			return recoverErr
+		}
+		var exportRun *model.TaskRuntimeRun
+		if !recovered {
+			var nextProjectPath string
+			exportRun, nextProjectPath, err = s.runFullPPTMasterExportPhase(ctx, task, workspace, projectPath)
+			if err != nil {
+				return err
+			}
+			projectPath = nextProjectPath
+		}
+		if err := s.transition(ctx, task, model.TaskStatusPPTXValidating, "PPTX validating", map[string]any{
+			"runtime_run_id": runtimeRunID(exportRun),
+			"recovered":      recovered,
+		}); err != nil {
 			return err
 		}
-		projectPath = nextProjectPath
+		startPhase = PhasePPTXValidate
+	}
+
+	if startPhase == PhasePPTXValidate {
+		recovered, recoverErr := s.tryRecoverCompletedFullPhase(ctx, task, workspace, projectPath, PhasePPTXValidate, func() (map[string]any, error) {
+			return validatePPTXValidateContract(projectPath)
+		})
+		if recoverErr != nil {
+			return recoverErr
+		}
+		var validateRun *model.TaskRuntimeRun
+		if !recovered {
+			var nextProjectPath string
+			validateRun, nextProjectPath, err = s.runFullPPTMasterValidatePhase(ctx, task, workspace, projectPath)
+			if err != nil {
+				return err
+			}
+			projectPath = nextProjectPath
+		}
 		if err := s.transition(ctx, task, model.TaskStatusPublishing, "Publishing", map[string]any{
-			"runtime_run_id": exportRun.ID,
+			"runtime_run_id": runtimeRunID(validateRun),
+			"recovered":      recovered,
 		}); err != nil {
 			return err
 		}
 		return s.processPublish(ctx, task, workspace, map[string]any{
-			"runtime_run_id": exportRun.ID,
+			"runtime_run_id": runtimeRunID(validateRun),
 			"split_generate": true,
 			"project_path":   projectPath,
 		})
@@ -2190,6 +2232,37 @@ func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *m
 	}
 
 	return fmt.Errorf("unsupported full-ppt-master start phase %q", startPhase)
+}
+
+func (s *TaskService) tryRecoverCompletedFullPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string, phase PipelinePhase, validate func() (map[string]any, error)) (bool, error) {
+	contractPath := filepath.Join(projectPath, ".slidesmith", "contracts", string(phase)+".json")
+	if _, err := os.Lstat(contractPath); os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	contract, err := validate()
+	if err != nil {
+		failurePhase := string(phase) + ".contract_stale"
+		_ = s.failWithMetadata(ctx, task, failurePhase, err, nil, map[string]any{"project_path": s.projectRel(task, projectPath)})
+		return false, err
+	}
+	if valueString(contract, "task_id", "") != task.ID || valueString(contract, "runner_profile", "") != task.RunnerProfile {
+		err := fmt.Errorf("%s recovery contract task/profile binding mismatch", phase)
+		_ = s.failWithMetadata(ctx, task, string(phase)+".contract_stale", err, nil, nil)
+		return false, err
+	}
+	phaseRun, err := s.beginPhaseRun(ctx, task, phase, PhaseRunnerWorker, map[string]any{
+		"recovered": true, "project_path": s.projectRel(task, projectPath), "runner_profile": task.RunnerProfile,
+	})
+	if err != nil {
+		return false, err
+	}
+	if err := s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusSucceeded, map[string]any{"recovered": true, "contract": contract}, nil); err != nil {
+		return false, err
+	}
+	_ = s.event(ctx, task.ID, model.EventTypeRuntime, "recovered", "Recovered completed phase contract without rerunning tools", map[string]any{"phase": phase, "phase_run_id": phaseRun.ID})
+	return true, nil
 }
 
 func (s *TaskService) queueResourceAfterSpecApproval(ctx context.Context, task *model.Task, projectPath, previousRuntimeRunID string) error {
@@ -2440,36 +2513,67 @@ func (s *TaskService) recoverValidatedSVGBundlePhase(ctx context.Context, task *
 
 func (s *TaskService) runFullPPTMasterQualityPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
 	projectRel := s.projectRel(task, projectPath)
-	command := fmt.Sprintf("python3 skills/ppt-master/scripts/svg_quality_checker.py %s", shellArg(projectRel))
-	return s.runFullPPTMasterCommandPhase(ctx, task, workspace, projectPath, PhaseQualityCheck, command, validateQualityCheckContract)
+	command := func(phaseRunID string) string {
+		return fmt.Sprintf("python3 scripts/quality_runner.py svg %s --phase-run-id %s", shellArg(projectRel), shellArg(phaseRunID))
+	}
+	return s.runFullPPTMasterCommandPhase(ctx, task, workspace, projectPath, PhaseQualityCheck, command, validateQualityCheckContractForRun)
 }
 
 func (s *TaskService) runFullPPTMasterExportPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
 	projectRel := s.projectRel(task, projectPath)
-	command := fmt.Sprintf(
-		"python3 skills/ppt-master/scripts/finalize_svg.py %s --quiet && python3 skills/ppt-master/scripts/svg_to_pptx.py %s --no-notes -t none",
-		shellArg(projectRel),
-		shellArg(projectRel),
-	)
-	return s.runFullPPTMasterCommandPhase(ctx, task, workspace, projectPath, PhaseFinalizeExport, command, validatePPTXExportContract)
+	command := func(string) string {
+		return fmt.Sprintf(
+			"python3 skills/ppt-master/scripts/finalize_svg.py %s --quiet && python3 skills/ppt-master/scripts/svg_to_pptx.py %s --no-notes -t none",
+			shellArg(projectRel),
+			shellArg(projectRel),
+		)
+	}
+	return s.runFullPPTMasterCommandPhase(ctx, task, workspace, projectPath, PhaseFinalizeExport, command, func(path, _ string) (map[string]any, error) {
+		return validatePPTXExportContract(path)
+	})
 }
 
-func (s *TaskService) runFullPPTMasterCommandPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string, phase PipelinePhase, command string, validate func(string) (map[string]any, error)) (*model.TaskRuntimeRun, string, error) {
+func (s *TaskService) runFullPPTMasterValidatePhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
+	projectRel := s.projectRel(task, projectPath)
+	command := func(phaseRunID string) string {
+		return fmt.Sprintf(
+			"python3 scripts/pptx_validate_runner.py %s --export-contract .slidesmith/contracts/finalize_export.json --phase-run-id %s",
+			shellArg(projectRel), shellArg(phaseRunID),
+		)
+	}
+	return s.runFullPPTMasterCommandPhase(ctx, task, workspace, projectPath, PhasePPTXValidate, command, validatePPTXValidateContractForRun)
+}
+
+func (s *TaskService) runFullPPTMasterCommandPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string, phase PipelinePhase, commandBuilder func(string) string, validate func(string, string) (map[string]any, error)) (*model.TaskRuntimeRun, string, error) {
 	upstream := []PipelinePhase{PhaseSVGExecute}
 	upstreamContractPhase := PhaseSVGExecute
 	if phase == PhaseFinalizeExport {
 		upstream = []PipelinePhase{PhaseSVGExecute, PhaseQualityCheck}
 		upstreamContractPhase = PhaseQualityCheck
+	} else if phase == PhasePPTXValidate {
+		upstream = []PipelinePhase{PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport}
+		upstreamContractPhase = PhaseFinalizeExport
 	}
 	if _, err := validateFullSVGUpstreamContract(projectPath, upstreamContractPhase, task); err != nil {
 		_ = s.failWithMetadata(ctx, task, string(phase)+".upstream_contract", err, nil, map[string]any{"project_path": projectPath})
 		return nil, projectPath, err
 	}
+	if phase == PhaseFinalizeExport || phase == PhasePPTXValidate {
+		if err := cleanupFullPPTMasterOutputsForRetry(projectPath, phase); err != nil {
+			_ = s.failWithMetadata(ctx, task, string(phase)+".cleanup", err, nil, map[string]any{"project_path": s.projectRel(task, projectPath)})
+			return nil, projectPath, err
+		}
+	}
 	input := fullPhaseInput(task, workspace, projectPath, phase, upstream...)
-	input["command"] = command
 	phaseRun, err := s.beginPhaseRun(ctx, task, phase, PhaseRunnerWorker, input)
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(phase), err, nil, map[string]any{"workspace_path": workspace.HostDir})
+		return nil, projectPath, err
+	}
+	command := commandBuilder(phaseRun.ID)
+	input["command"] = command
+	phaseRun.InputJSON = encodeAnyJSON(input)
+	if err := s.repo.SavePhaseRun(ctx, phaseRun); err != nil {
 		return nil, projectPath, err
 	}
 	run, err := s.runAgent(ctx, task, string(phase), AgentRunRequest{
@@ -2503,13 +2607,15 @@ func (s *TaskService) runFullPPTMasterCommandPhase(ctx context.Context, task *mo
 	}
 	output := fullPhaseOutput(task, run, projectPath, phase)
 	if validate != nil {
-		contract, err := validate(projectPath)
+		contract, err := validate(projectPath, phaseRun.ID)
 		if err == nil {
+			contract["phase_run_id"] = phaseRun.ID
 			contract, err = bindFullPhaseContract(projectPath, phase, contract, task, workspace, runtimeRunID(run))
 		}
 		if err != nil {
 			_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, output, err)
-			_ = s.failWithMetadata(ctx, task, string(phase)+".contract", err, run, map[string]any{"project_path": projectPath})
+			failurePhase, ruleIDs := qualityContractFailurePhase(projectPath, phase)
+			_ = s.failWithMetadata(ctx, task, failurePhase, err, run, map[string]any{"project_path": s.projectRel(task, projectPath), "rule_ids": ruleIDs})
 			return run, projectPath, err
 		}
 		output["contract"] = contract
@@ -2567,6 +2673,7 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "notes"),
 			filepath.Join(projectPath, "svg_final"),
 			filepath.Join(projectPath, "exports"),
+			filepath.Join(projectPath, "validation"),
 		)
 	case PhaseImageAcquire:
 		paths = append(paths,
@@ -2574,6 +2681,7 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseSVGExecute)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseQualityCheck)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseFinalizeExport)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePPTXValidate)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePublish)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
 			filepath.Join(projectPath, "svg_output"),
@@ -2584,6 +2692,7 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "analysis", "notes_inventory.json"),
 			filepath.Join(projectPath, "svg_final"),
 			filepath.Join(projectPath, "exports"),
+			filepath.Join(projectPath, "validation"),
 		)
 	case PhaseSVGExecute:
 		paths = append(paths,
@@ -2591,6 +2700,7 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseSVGExecute)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseQualityCheck)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseFinalizeExport)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePPTXValidate)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePublish)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
 			filepath.Join(projectPath, "svg_output"),
@@ -2601,24 +2711,48 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "analysis", "notes_inventory.json"),
 			filepath.Join(projectPath, "svg_final"),
 			filepath.Join(projectPath, "exports"),
+			filepath.Join(projectPath, "validation"),
 		)
 	case PhaseQualityCheck:
 		paths = append(paths,
 			filepath.Join(projectPath, ".slidesmith", "quality_report.json"),
+			filepath.Join(projectPath, "validation", "svg_quality_report.json"),
+			filepath.Join(projectPath, "validation", "chart_verify_report.json"),
+			filepath.Join(projectPath, "validation", "quality_summary.json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseQualityCheck)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseFinalizeExport)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePPTXValidate)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePublish)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
 			filepath.Join(projectPath, "svg_final"),
 			filepath.Join(projectPath, "exports"),
+			filepath.Join(projectPath, "validation", "pptx_readback.md"),
+			filepath.Join(projectPath, "validation", "pptx_text_inventory.json"),
+			filepath.Join(projectPath, "validation", "pptx_validate_report.json"),
+			filepath.Join(projectPath, "validation", "render"),
 		)
 	case PhaseFinalizeExport:
 		paths = append(paths,
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseFinalizeExport)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePPTXValidate)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePublish)+".json"),
 			filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
 			filepath.Join(projectPath, "svg_final"),
 			filepath.Join(projectPath, "exports"),
+			filepath.Join(projectPath, "validation", "pptx_readback.md"),
+			filepath.Join(projectPath, "validation", "pptx_text_inventory.json"),
+			filepath.Join(projectPath, "validation", "pptx_validate_report.json"),
+			filepath.Join(projectPath, "validation", "render"),
+		)
+	case PhasePPTXValidate:
+		paths = append(paths,
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePPTXValidate)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePublish)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
+			filepath.Join(projectPath, "validation", "pptx_readback.md"),
+			filepath.Join(projectPath, "validation", "pptx_text_inventory.json"),
+			filepath.Join(projectPath, "validation", "pptx_validate_report.json"),
+			filepath.Join(projectPath, "validation", "render"),
 		)
 	case PhasePublish:
 		paths = append(paths,
@@ -2823,6 +2957,14 @@ func (s *TaskService) processPublish(ctx context.Context, task *model.Task, work
 		if err := s.validateTaskRuntimeProfile(task, workspace); err != nil {
 			_ = s.failWithMetadata(ctx, task, failurePhaseRuntimeProfileMismatch, err, nil, map[string]any{"workspace_path": workspace.HostDir})
 			return err
+		}
+		projectPath, projectErr := s.findPersistentProjectPath(task)
+		if projectErr == nil {
+			_, projectErr = validatePublishQualityChain(projectPath)
+		}
+		if projectErr != nil {
+			_ = s.failWithMetadata(ctx, task, "publish.quality_gate", projectErr, nil, map[string]any{"project_path": projectPath})
+			return projectErr
 		}
 	}
 	phaseRun, err := s.beginPhaseRun(ctx, task, PhasePublish, PhaseRunnerPublisher, map[string]any{
@@ -3419,6 +3561,8 @@ func (s *TaskService) RetryTask(ctx context.Context, taskID, phase string) (*mod
 		return s.retryPipelinePhase(ctx, task, PhaseQualityCheck, model.TaskStatusQualityChecking)
 	case retryPhaseFinalizeExport:
 		return s.retryPipelinePhase(ctx, task, PhaseFinalizeExport, model.TaskStatusExporting)
+	case retryPhasePPTXValidate:
+		return s.retryPipelinePhase(ctx, task, PhasePPTXValidate, model.TaskStatusPPTXValidating)
 	case retryPhasePublish:
 		return s.retryPublish(ctx, task)
 	default:
@@ -3672,6 +3816,15 @@ func (s *TaskService) retryPublish(ctx context.Context, task *model.Task) (*mode
 	if _, err := s.findPersistentProjectPath(task); err != nil {
 		return nil, fmt.Errorf("cannot retry publish before prepared project exists: %w", err)
 	}
+	if task.Route == model.TaskRouteMain && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+		projectPath, err := s.findPersistentProjectPath(task)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := validatePublishQualityChain(projectPath); err != nil {
+			return nil, fmt.Errorf("cannot retry publish with stale quality chain: %w", err)
+		}
+	}
 	if err := s.transition(ctx, task, model.TaskStatusPublishing, "Retry queued from publish", map[string]any{"retry_phase": retryPhasePublish}); err != nil {
 		return nil, err
 	}
@@ -3697,6 +3850,8 @@ func normalizeRetryPhase(requested, failurePhase string) (string, error) {
 		return retryPhaseQualityCheck, nil
 	case "export", "exporting", "finalize", "finalize_export":
 		return retryPhaseFinalizeExport, nil
+	case "pptx", "pptx_validate", "pptx_validating", "validate_pptx", "render":
+		return retryPhasePPTXValidate, nil
 	case "template_fill_plan", "fill_plan", "plan", "template_fill_planning":
 		return retryPhaseTemplateFillPlan, nil
 	case "template_fill_check", "fill_check", "check", "template_fill_checking":
@@ -3728,6 +3883,8 @@ func inferRetryPhase(failurePhase string) string {
 		return retryPhaseQualityCheck
 	case strings.HasPrefix(value, string(PhaseFinalizeExport)), strings.HasPrefix(value, "export"), strings.HasPrefix(value, "finalize"):
 		return retryPhaseFinalizeExport
+	case strings.HasPrefix(value, string(PhasePPTXValidate)), strings.HasPrefix(value, "pptx"), strings.HasPrefix(value, "render"):
+		return retryPhasePPTXValidate
 	case strings.HasPrefix(value, string(PhaseTemplateFillPlan)):
 		return retryPhaseTemplateFillPlan
 	case strings.HasPrefix(value, string(PhaseTemplateFillCheck)):
@@ -4326,8 +4483,8 @@ Required output contract:
    Each resources entry must be exactly shaped as:
    {"resource_id": "resource-id", "element_id": "owner-id", "usage": "image", "href": "../images/file.png", "fallback": ""}
    Use these exact field names and shapes for every chart entry:
-   {"chart_id": "chart-id", "page_id": "P01", "svg": "svg_output/01_safe_slug.svg", "element_id": "chart-owner-id", "chart_type": "bar", "verification_mode": "direct-calc", "template_resource_id": "template-id", "data_resource_id": "data-id", "data_sha256": "<64 lowercase hex>", "source_citation": {"file": "sources/input.md", "section": "Section heading"}, "plot_area": [120, 160, 1160, 620], "series": ["Series name"], "categories": ["A", "B"]}
-   Never use svg_path, resource_bindings, fallback_bindings, data_hash_sha256, a string source_citation, an object plot_area, or series objects. The svg value is always project-relative starting with svg_output/, never projects/... . verification_mode must be one of direct-calc, decomposable-calc, partial-calc, formula-verify, manual-verify, or not-data-driven.
+   {"chart_id": "chart-id", "page_id": "P01", "svg": "svg_output/01_safe_slug.svg", "element_id": "chart-owner-id", "chart_type": "bar", "verification_mode": "direct-calc", "template_resource_id": "template-id", "data_resource_id": "data-id", "data_sha256": "<64 lowercase hex>", "source_citation": {"file": "sources/input.md", "section": "Section heading"}, "plot_area": [120, 160, 1160, 620], "series": ["Series name"], "categories": ["A", "B"], "comparisons": [{"element_id": "bar-a", "attribute": "height", "expected": 220.0, "actual": 220.0, "tolerance": 1.0}]}
+   Never use svg_path, resource_bindings, fallback_bindings, data_hash_sha256, a string source_citation, an object plot_area, or series objects. The svg value is always project-relative starting with svg_output/, never projects/... . verification_mode must be one of direct-calc, decomposable-calc, partial-calc, formula-verify, manual-verify, or not-data-driven. direct-calc and formula-verify must include non-empty comparisons calculated from the bound data; manual-verify uses an empty comparisons array and is surfaced as a warning.
    Only declare a chart when both referenced chart_template and chart_data resources are ready in resources_manifest.json. Otherwise use the manifest-approved fallback without data-chart-* attributes and do not invent resource IDs.
 6. Give every resource owning element/group a stable id and matching data-resource-id. Every ready manifest resource must have a real href attribute on that owner or a controlled descendant whose resolved project path is exactly the manifest output path. For example: <g id="p01-icon" data-resource-id="icon.p01.chart-bar"><image id="p01-icon-image" href="../icons/tabler-outline/chart-bar.svg" ... /></g>. Do not inline or copy ready image/icon SVG paths into the page, and never put an href in the sidecar unless that exact href exists under the declared owner. Give every chart owner a stable id plus data-chart-id, data-chart-data-resource-id and data-chart-template-resource-id.
 7. Do not create %[2]s/analysis/svg_inventory.json or %[2]s/analysis/notes_inventory.json. Those two authoritative inventories are generated by the platform inspector from live files.

@@ -1,0 +1,1 @@
+{"name":"quality-chart-mismatch","stage":"quality_check","expected_decision":"fail","expected_rule":"chart.geometry_mismatch"}

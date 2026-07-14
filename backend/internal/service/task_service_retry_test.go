@@ -985,7 +985,7 @@ func mustWriteRetryProjectFiles(projectPath string) {
 	if err != nil {
 		panic(err)
 	}
-	for _, phase := range []PipelinePhase{PhaseSVGExecute, PhaseQualityCheck} {
+	for _, phase := range []PipelinePhase{PhaseSVGExecute} {
 		contract := map[string]any{
 			"phase":             string(phase),
 			"runner_profile":    model.RunnerProfileFullPPTMaster,
@@ -998,6 +998,11 @@ func mustWriteRetryProjectFiles(projectPath string) {
 			panic(err)
 		}
 	}
+	writePassingQualityReportsNoTest(projectPath, "task-retry", "quality-existing")
+	if _, err := validatePPTXExportContract(projectPath); err != nil {
+		panic(err)
+	}
+	writePassingPPTXValidateReportsNoTest(projectPath, "task-retry", "validate-existing")
 	manifestPath := filepath.Join(workspaceRoot, ".slidesmith", "runtime_manifest.json")
 	if manifestSHA, err := sha256File(manifestPath); err == nil {
 		designSHA, designErr := sha256File(filepath.Join(projectPath, "design_spec.md"))

@@ -69,6 +69,77 @@ func TestFindGeneratedRuntimeWorkspaceCandidates(t *testing.T) {
 	}
 }
 
+func bindQualityRecoveryContractsNoTest(projectPath string, task *model.Task) {
+	exportPath := filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseFinalizeExport)+".json")
+	export := readJSONMap(exportPath)
+	export["task_id"] = task.ID
+	export["runner_profile"] = task.RunnerProfile
+	qualitySHA, _ := sha256File(filepath.Join(projectPath, "validation", "quality_summary.json"))
+	qualityContractSHA, _ := sha256File(filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseQualityCheck)+".json"))
+	export["quality_summary_sha256"] = qualitySHA
+	export["quality_contract_sha256"] = qualityContractSHA
+	if err := writeJSONPretty(exportPath, export); err != nil {
+		panic(err)
+	}
+	writePassingPPTXValidateReportsNoTest(projectPath, task.ID, "validate-recovery-existing")
+	validatePath := filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePPTXValidate)+".json")
+	validate := readJSONMap(validatePath)
+	validate["task_id"] = task.ID
+	validate["runner_profile"] = task.RunnerProfile
+	if err := writeJSONPretty(validatePath, validate); err != nil {
+		panic(err)
+	}
+}
+
+func TestRecoveryQueuesValidateFromFreshExportContract(t *testing.T) {
+	service, repo, task, projectPath := retryTestService(t)
+	mustWriteRetryProjectFiles(projectPath)
+	bindQualityRecoveryContractsNoTest(projectPath, task)
+	task.Status = model.TaskStatusExporting
+	task.FailurePhase = ""
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ProcessTask(context.Background(), task.ID); err != nil {
+		t.Fatalf("ProcessTask() recovery error = %v", err)
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil || persisted.Status != model.TaskStatusCompleted {
+		t.Fatalf("recovered task = %#v, %v", persisted, err)
+	}
+	runs, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered := map[string]bool{}
+	for _, run := range runs {
+		if strings.Contains(run.OutputJSON, `"recovered":true`) {
+			recovered[run.Phase] = true
+		}
+	}
+	if !recovered[string(PhaseFinalizeExport)] || !recovered[string(PhasePPTXValidate)] {
+		t.Fatalf("recovered phases = %#v, runs=%#v", recovered, runs)
+	}
+}
+
+func TestRecoveryQueuesPublishFromFreshValidateContract(t *testing.T) {
+	service, repo, task, projectPath := retryTestService(t)
+	mustWriteRetryProjectFiles(projectPath)
+	bindQualityRecoveryContractsNoTest(projectPath, task)
+	task.Status = model.TaskStatusPPTXValidating
+	task.FailurePhase = ""
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.ProcessTask(context.Background(), task.ID); err != nil {
+		t.Fatalf("ProcessTask() recovery error = %v", err)
+	}
+	persisted, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil || persisted.Status != model.TaskStatusCompleted {
+		t.Fatalf("recovered task = %#v, %v", persisted, err)
+	}
+}
+
 func TestProcessLegacyGenerateRecoveryFinishesSpecPhaseBeforeAdvancing(t *testing.T) {
 	service, repo, task, _, workspacePath := newTemplateFillWorkflowService(t, model.TaskStatusSpecGenerating, &failedLegacyRecoveryAgent{})
 	task.Route = model.TaskRouteMain

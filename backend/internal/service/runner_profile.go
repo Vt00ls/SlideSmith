@@ -135,7 +135,7 @@ func (s *TaskService) resolveLegacyRunnerProfile(ctx context.Context, task *mode
 			return model.RunnerProfileRealLite, model.RunnerProfileSourceLegacyEvidence, true, nil
 		}
 		switch PipelinePhase(run.Phase) {
-		case PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport:
+		case PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePPTXValidate:
 			return model.RunnerProfileFullPPTMaster, model.RunnerProfileSourceLegacyEvidence, true, nil
 		case PhaseSpecGenerate:
 			if run.Runner == PhaseRunnerAgent {
@@ -151,7 +151,7 @@ func (s *TaskService) resolveLegacyRunnerProfile(ctx context.Context, task *mode
 		phase := strings.ToLower(strings.TrimSpace(run.Phase))
 		command := strings.ToLower(run.Command)
 		switch phase {
-		case string(PhaseSVGExecute), string(PhaseQualityCheck), string(PhaseFinalizeExport):
+		case string(PhaseSVGExecute), string(PhaseQualityCheck), string(PhaseFinalizeExport), string(PhasePPTXValidate):
 			return model.RunnerProfileFullPPTMaster, model.RunnerProfileSourceLegacyEvidence, true, nil
 		case "generate", string(PhaseSpecGenerate):
 			if strings.Contains(command, "--profile full-ppt-master") {
