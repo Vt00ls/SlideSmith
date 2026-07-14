@@ -124,6 +124,9 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		`"source_citation": {"file": "sources/input.md", "section": "Section heading"}`,
 		`"plot_area": [120, 160, 1160, 620]`,
 		"Never use svg_path, resource_bindings, fallback_bindings, data_hash_sha256",
+		`<g id="p01-icon" data-resource-id="icon.p01.chart-bar"><image id="p01-icon-image" href="../icons/tabler-outline/chart-bar.svg"`,
+		"Do not inline or copy ready image/icon SVG paths into the page",
+		"an inlined icon with no href is not a valid ready-resource use",
 		"Do not run svg_quality_checker.py, finalize_svg.py, svg_to_pptx.py",
 		"Do not create or modify projects/task_1_ppt169_20260707/exports/",
 	}
