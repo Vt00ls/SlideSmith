@@ -1,0 +1,6 @@
+{
+  "name": "full-local-text",
+  "page_count": 3,
+  "refine_spec": false,
+  "sources": ["input.md"]
+}

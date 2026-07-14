@@ -219,6 +219,7 @@ func TestRetryTemplateFillPhasesRejectOtherRoutesWithoutMutation(t *testing.T) {
 			if err := repo.SaveTask(context.Background(), task); err != nil {
 				t.Fatal(err)
 			}
+			writeRuntimeProfileManifestForTest(t, service.agentCfg.WorkspaceRoot, task)
 			mustWriteRetryProjectFiles(projectPath)
 			preserved := filepath.Join(projectPath, "exports", "stale.pptx")
 
@@ -269,6 +270,7 @@ func TestRetryMainAndBeautifyQualityRecoveryRemainsUnchanged(t *testing.T) {
 			if err := repo.SaveTask(context.Background(), task); err != nil {
 				t.Fatal(err)
 			}
+			writeRuntimeProfileManifestForTest(t, service.agentCfg.WorkspaceRoot, task)
 			mustWriteRetryProjectFiles(projectPath)
 
 			updated, err := service.RetryTask(context.Background(), task.ID, string(PhaseQualityCheck))
@@ -423,6 +425,8 @@ func TestRetryTemplateFillCASLossRestoresOutputsAndPreservesNewStatus(t *testing
 func TestRetryQualityCheckCleansOnlyDownstreamArtifacts(t *testing.T) {
 	service, repo, task, projectPath := retryTestService(t)
 	mustWriteRetryProjectFiles(projectPath)
+	service.agentCfg.RunnerProfile = model.RunnerProfileRealLite
+	service.agentCfg.FullPPTDefaultEnabled = false
 
 	updated, err := service.RetryTask(context.Background(), task.ID, string(PhaseQualityCheck))
 	if err != nil {
@@ -430,6 +434,9 @@ func TestRetryQualityCheckCleansOnlyDownstreamArtifacts(t *testing.T) {
 	}
 	if updated.Status != model.TaskStatusQualityChecking {
 		t.Fatalf("status = %q, want quality_checking", updated.Status)
+	}
+	if updated.RunnerProfile != model.RunnerProfileFullPPTMaster {
+		t.Fatalf("retry changed locked profile: %#v", updated)
 	}
 	assertPathExists(t, filepath.Join(projectPath, "design_spec.md"))
 	assertPathExists(t, filepath.Join(projectPath, "spec_lock.md"))
@@ -445,6 +452,30 @@ func TestRetryQualityCheckCleansOnlyDownstreamArtifacts(t *testing.T) {
 	if latest.FailurePhase != "" || latest.ErrorMessage != "" {
 		t.Fatalf("failure fields not cleared: phase=%q error=%q", latest.FailurePhase, latest.ErrorMessage)
 	}
+}
+
+func TestFullRetryCleanupRejectsSymlinkEscape(t *testing.T) {
+	service, repo, task, projectPath := retryTestService(t)
+	mustWriteRetryProjectFiles(projectPath)
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "preserve.txt")
+	if err := os.WriteFile(outsideFile, []byte("preserve\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Join(projectPath, "svg_final")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(projectPath, "svg_final")); err != nil {
+		t.Fatal(err)
+	}
+	task.FailurePhase = "finalize_export.contract"
+	if err := repo.SaveTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RetryTask(context.Background(), task.ID, string(PhaseFinalizeExport)); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("RetryTask() error = %v, want symlink rejection", err)
+	}
+	assertPathExists(t, outsideFile)
 }
 
 func TestProcessTaskContinuesFromQualityCheckRetry(t *testing.T) {
@@ -910,6 +941,7 @@ func retryTestService(t *testing.T) (*TaskService, *repository.Repository, *mode
 		ErrorMessage:    "quality failed",
 		FailureMetadata: `{"phase":"quality_check.command"}`,
 	}
+	lockRunnerProfileForTest(task, model.RunnerProfileFullPPTMaster)
 	if err := repo.CreateTask(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
@@ -919,11 +951,13 @@ func retryTestService(t *testing.T) (*TaskService, *repository.Repository, *mode
 		splitGenerateFakeAgent{projectPath: projectPath},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
-			Enabled:       true,
-			RunnerProfile: "full-ppt-master",
-			WorkspaceRoot: workspaceRoot,
+			Enabled:               true,
+			RunnerProfile:         "full-ppt-master",
+			FullPPTDefaultEnabled: true,
+			WorkspaceRoot:         workspaceRoot,
 		},
 	)
+	writeRuntimeProfileManifestForTest(t, workspaceRoot, task)
 	return service, repo, task, projectPath
 }
 
@@ -939,6 +973,36 @@ func mustWriteRetryProjectFiles(projectPath string) {
 	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "quality_report.json"), `{"errors":1}`+"\n")
 	mustWriteFileNoTest(projectPath, filepath.Join("svg_final", "01.svg"), `<svg></svg>`+"\n")
 	mustWritePPTXNoTest(projectPath, filepath.Join("exports", "stale.pptx"), 3)
+	svgSHA, err := sha256RegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
+	if err != nil {
+		panic(err)
+	}
+	for _, phase := range []PipelinePhase{PhaseSVGExecute, PhaseQualityCheck} {
+		if err := writeJSONPretty(filepath.Join(projectPath, ".slidesmith", "contracts", string(phase)+".json"), map[string]any{
+			"phase":             string(phase),
+			"runner_profile":    model.RunnerProfileFullPPTMaster,
+			"svg_output_sha256": svgSHA,
+		}); err != nil {
+			panic(err)
+		}
+	}
+	workspaceRoot := filepath.Dir(filepath.Dir(projectPath))
+	manifestPath := filepath.Join(workspaceRoot, ".slidesmith", "runtime_manifest.json")
+	if manifestSHA, err := sha256File(manifestPath); err == nil {
+		designSHA, designErr := sha256File(filepath.Join(projectPath, "design_spec.md"))
+		lockSHA, lockErr := sha256File(filepath.Join(projectPath, "spec_lock.md"))
+		if designErr != nil || lockErr != nil {
+			panic("hash retry spec fixture")
+		}
+		if err := writeJSONPretty(filepath.Join(projectPath, ".slidesmith", "spec_contract.json"), map[string]any{
+			"runner_profile":          model.RunnerProfileFullPPTMaster,
+			"runtime_manifest_sha256": manifestSHA,
+			"design_spec_sha256":      designSHA,
+			"spec_lock_sha256":        lockSHA,
+		}); err != nil {
+			panic(err)
+		}
+	}
 }
 
 func writeTemplateFillRetryEvidence(projectPath string) []string {

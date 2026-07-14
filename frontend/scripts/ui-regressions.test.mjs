@@ -229,6 +229,21 @@ test("Template Fill labels and status classifications are exact", async () => {
   assert.equal(helpers.isConfirmationStatus("awaiting_template_fill_confirm"), false);
 });
 
+test("runner profiles expose locked engine labels and compatibility skip copy", async () => {
+  const { runnerProfileLabel, runnerProfileSourceLabel, taskRunnerProfileLabel } = await loadSourceModule(formatSource, "format.ts");
+  assert.equal(runnerProfileLabel["full-ppt-master"], "Full PPT Master");
+  assert.match(runnerProfileLabel["real-lite"], /测试\/降级/);
+  assert.equal(runnerProfileLabel.smoke, "Smoke（测试 fixture）");
+  assert.equal(taskRunnerProfileLabel("full-ppt-master", "template-fill"), "Native Template Fill");
+  assert.equal(taskRunnerProfileLabel("", "main"), "未锁定");
+  assert.equal(runnerProfileSourceLabel.deployment_default, "部署默认");
+  for (const field of ["runner_profile", "runner_profile_source", "runner_profile_locked_at"]) {
+    assert.match(apiSource, new RegExp(`\\b${field}`), `missing Task.${field}`);
+  }
+  assert.match(appSource, /资源阶段尚未启用（兼容跳过）/);
+  assert.match(appSource, /任务已进入运行阶段但引擎尚未锁定/);
+});
+
 test("slide rows preserve rationale, notes presence, and edit counts while tolerating malformed values", async () => {
   const { templateFillSlideRows } = await loadAppHelpersModule();
   const rows = templateFillSlideRows({

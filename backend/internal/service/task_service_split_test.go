@@ -82,6 +82,7 @@ func TestProcessFullPPTMasterSplitCompletesWithSeparatePhaseRuns(t *testing.T) {
 		Status:         model.TaskStatusSpecGenerating,
 		RuntimeProject: runtimeProject,
 	}
+	lockRunnerProfileForTest(task, model.RunnerProfileFullPPTMaster)
 	ctx := context.Background()
 	if err := repo.CreateTask(ctx, task); err != nil {
 		t.Fatal(err)
@@ -93,11 +94,13 @@ func TestProcessFullPPTMasterSplitCompletesWithSeparatePhaseRuns(t *testing.T) {
 		splitGenerateFakeAgent{projectPath: projectPath},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
-			Enabled:       true,
-			RunnerProfile: "full-ppt-master",
-			WorkspaceRoot: workspaceRoot,
+			Enabled:               true,
+			RunnerProfile:         "full-ppt-master",
+			FullPPTDefaultEnabled: true,
+			WorkspaceRoot:         workspaceRoot,
 		},
 	)
+	writeRuntimeProfileManifestForTest(t, workspaceRoot, task)
 	if err := service.processGenerate(ctx, task); err != nil {
 		t.Fatalf("processGenerate() error = %v", err)
 	}
@@ -280,6 +283,36 @@ func TestSpecPreviewCanQueueSpecRegenerate(t *testing.T) {
 	assertPathMissing(t, filepath.Join(projectPath, "spec_lock.md"))
 }
 
+func TestSpecPreviewRejectsExternallyModifiedSpec(t *testing.T) {
+	service, repo, task := splitPreviewTestService(t)
+	ctx := context.Background()
+	if err := repo.SubmitConfirmations(ctx, task.ID, map[string]any{"refine_spec": "true", "page_count": "3"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.processGenerate(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectPath, err := service.findPersistentProjectPath(waiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFile(t, filepath.Join(projectPath, "design_spec.md"), "# externally changed\n")
+	if _, err := service.ContinueTask(ctx, task.ID, string(PhaseSVGExecute)); err == nil || !strings.Contains(err.Error(), "stale") {
+		t.Fatalf("ContinueTask() error = %v, want stale spec rejection", err)
+	}
+	persisted, err := repo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != model.TaskStatusAwaitingSpecConfirm {
+		t.Fatalf("stale spec continue changed status: %#v", persisted)
+	}
+}
+
 func splitPreviewTestService(t *testing.T) (*TaskService, *repository.Repository, *model.Task) {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
@@ -311,6 +344,7 @@ func splitPreviewTestService(t *testing.T) (*TaskService, *repository.Repository
 		Status:         model.TaskStatusSpecGenerating,
 		RuntimeProject: runtimeProject,
 	}
+	lockRunnerProfileForTest(task, model.RunnerProfileFullPPTMaster)
 	if err := repo.CreateTask(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
@@ -320,11 +354,13 @@ func splitPreviewTestService(t *testing.T) (*TaskService, *repository.Repository
 		splitGenerateFakeAgent{projectPath: projectPath},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
-			Enabled:       true,
-			RunnerProfile: "full-ppt-master",
-			WorkspaceRoot: workspaceRoot,
+			Enabled:               true,
+			RunnerProfile:         "full-ppt-master",
+			FullPPTDefaultEnabled: true,
+			WorkspaceRoot:         workspaceRoot,
 		},
 	)
+	writeRuntimeProfileManifestForTest(t, workspaceRoot, task)
 	return service, repo, task
 }
 

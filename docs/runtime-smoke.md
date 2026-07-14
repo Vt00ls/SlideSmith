@@ -136,18 +136,18 @@ agent-compose run ppt_master --command "node workflows/ppt_workflow.js prepare -
 agent-compose run ppt_master --command "node workflows/ppt_workflow.js generate --profile real-lite --project real_lite_deck --confirmation mock" --json
 ```
 
-For the full PPT Master path, the backend keeps the command runner for prepare
-and switches the generate phase to prompt mode:
+For the full PPT Master path, enable the requested profile and rollout gate:
 
 ```bash
 export SLIDESMITH_PPT_RUNNER_PROFILE=full-ppt-master
+export SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=true
+export SLIDESMITH_FULL_PPT_PREFLIGHT_STRICT=true
 ```
 
-That profile calls:
-
-```bash
-agent-compose run ppt_master --prompt "<SlideSmith full PPT Master prompt>" --json
-```
+Prepare uses `--profile full-ppt-master`. Generation is never one monolithic
+prompt: the backend creates independent `spec_generate`, `svg_execute`,
+`quality_check`, `finalize_export`, and platform `publish` runs. Export does not
+invoke `ppt_runner.py publish`.
 
 Before running an end-to-end task in that mode, validate that the daemon-side
 Codex/LLM provider is configured:
@@ -214,13 +214,17 @@ projects/smoke_deck/exports/*.pptx
 The `smoke` generation mode validates the runtime and PPT Master export chain
 with fixed pages. The `real-lite` generation mode validates source-driven
 content flow without using a long-running Codex prompt. The `full-ppt-master`
-mode validates the real agent path: prepare stays command-based, while generate
-uses `agent-compose run --prompt` and asks the agent to follow
-the task workspace contract: read `.slidesmith/runtime_manifest.json`, load
-`skills/ppt-master/SKILL.md`, use `skills/ppt-master/scripts/`, produce
-`design_spec.md`, `spec_lock.md`, SVG, and PPTX, then publish
-`.slidesmith/artifacts.json`. `/opt/ppt-master` remains a runtime fallback, not
-the primary skill source.
+mode validates the task-locked, split agent path. Each phase reads
+`.slidesmith/runtime_manifest.json`, loads `skills/ppt-master/SKILL.md`, and
+obeys its own output contract. The platform publisher is the only publish
+entrypoint. `/opt/ppt-master` remains a runtime fallback, not the primary skill
+source.
+
+Run the deterministic three-fixture SPEC-04 contract smoke locally with:
+
+```bash
+python3 runtime/ppt-master-agent/scripts/full_main_smoke.py
+```
 
 The test server has limited free disk under `/`; keep using
 `Dockerfile.smoke`, `INSTALL_OFFICE_DEPS=false`, and `PY_DEPS_PROFILE=mock`

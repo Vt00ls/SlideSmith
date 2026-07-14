@@ -774,6 +774,10 @@ select:focus {
   white-space: nowrap;
 }
 
+.kv-grid strong.bad {
+  color: #9b3d2f;
+}
+
 .artifact-list {
   display: flex;
   flex-wrap: wrap;

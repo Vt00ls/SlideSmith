@@ -59,6 +59,99 @@ class IsolatedRunnerStateTestCase(unittest.TestCase):
         self.addCleanup(self.runner_globals.stop)
 
 
+class FullPrepareProfileTests(IsolatedRunnerStateTestCase):
+    def write_runtime_manifest(self, effective_profile: str = "full-ppt-master") -> None:
+        state_dir = self.workspace / ".slidesmith"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "runtime_manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema": "slidesmith.runtime_manifest.v2",
+                    "runner": {"effective_profile": effective_profile},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_parser_accepts_full_prepare_profile_but_not_full_generate(self) -> None:
+        parser = ppt_runner.build_parser()
+        args = parser.parse_args(["prepare", "--project", "deck", "--profile", "full-ppt-master"])
+        self.assertEqual(args.profile, "full-ppt-master")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["generate", "--project", "deck", "--profile", "full-ppt-master"])
+
+    def test_full_prepare_requires_matching_locked_manifest(self) -> None:
+        self.write_runtime_manifest("real-lite")
+        with self.assertRaisesRegex(ValueError, "expected 'full-ppt-master'"):
+            ppt_runner.validate_prepare_profile_contract("full-ppt-master")
+
+    def test_full_prepare_initializes_sources_without_generating_lite_outputs(self) -> None:
+        self.write_runtime_manifest()
+        project = self.workspace / "projects" / "deck"
+        project.mkdir(parents=True)
+        source = self.workspace / "input.md"
+        source.write_text("# Full fixture\n", encoding="utf-8")
+        args = argparse.Namespace(
+            project="deck",
+            project_path="",
+            format="ppt169",
+            profile="full-ppt-master",
+            input="input.md",
+            sources_manifest="",
+        )
+
+        def fake_run(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            if "import-sources" in command:
+                source_dir = project / "sources"
+                source_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, source_dir / source.name)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(ppt_runner, "run_command", side_effect=fake_run), mock.patch.object(
+            ppt_runner, "run_full_runtime_preflight", return_value={}
+        ):
+            ppt_runner.prepare(args)
+
+        self.assertTrue((project / "sources" / "input.md").is_file())
+        self.assertTrue((project / "confirm_ui" / "recommendations.json").is_file())
+        for path in (
+            project / "design_spec.md",
+            project / "spec_lock.md",
+            project / "svg_output",
+            project / "svg_final",
+            project / "exports",
+        ):
+            self.assertFalse(path.exists(), f"full prepare created downstream output {path}")
+
+    def test_runtime_preflight_checks_actual_guest_files_and_imports(self) -> None:
+        self.write_runtime_manifest()
+        (self.workspace / "agent-compose.yml").write_text("agents: {}\n", encoding="utf-8")
+        skill = self.workspace / "skills" / "ppt-master"
+        for relative in (
+            "SKILL.md",
+            "references/strategist.md",
+            "references/executor-base.md",
+            "templates/design_spec_reference.md",
+            "templates/spec_lock_reference.md",
+            "scripts/project_manager.py",
+            "scripts/svg_quality_checker.py",
+            "scripts/finalize_svg.py",
+            "scripts/svg_to_pptx.py",
+        ):
+            path = skill / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("fixture\n", encoding="utf-8")
+        project = self.workspace / "projects" / "deck"
+        report = ppt_runner.run_full_runtime_preflight(project)
+        self.assertEqual(report["summary"]["error"], 0)
+        self.assertTrue((project / ".slidesmith" / "contracts" / "full_runtime_preflight.json").is_file())
+
+        (skill / "scripts" / "svg_to_pptx.py").unlink()
+        with self.assertRaisesRegex(RuntimeError, "full runtime preflight failed"):
+            ppt_runner.run_full_runtime_preflight(project)
+
+
 class PPTSourceStagingTests(IsolatedRunnerStateTestCase):
     def test_stage_normalizes_slideshow_and_template_main_content_types(self) -> None:
         expected = {

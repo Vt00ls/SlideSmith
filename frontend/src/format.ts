@@ -99,6 +99,30 @@ export const routeLabel: Record<string, string> = {
   beautify: "PPTX 美化",
 };
 
+export const runnerProfileLabel: Record<string, string> = {
+  "full-ppt-master": "Full PPT Master",
+  "real-lite": "Real Lite（测试/降级）",
+  smoke: "Smoke（测试 fixture）",
+  "native-template-fill": "Native Template Fill",
+};
+
+export const runnerProfileSourceLabel: Record<string, string> = {
+  deployment_default: "部署默认",
+  explicit_config: "显式配置",
+  legacy_manifest: "旧任务 Manifest",
+  legacy_evidence: "旧任务执行证据",
+};
+
+export function taskRunnerProfileLabel(profile: string, route: string) {
+  if (route === "template-fill") {
+    return runnerProfileLabel["native-template-fill"];
+  }
+  if (!profile) {
+    return "未锁定";
+  }
+  return runnerProfileLabel[profile] || profile;
+}
+
 export function formatTime(value?: string) {
   if (!value) {
     return "-";

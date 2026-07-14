@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	runtimeManifestVersion = 1
+	runtimeManifestVersion = 2
 	skillLockVersion       = 1
 )
 
@@ -36,18 +36,34 @@ type RuntimeWorkspaceBuilder struct {
 }
 
 type runtimeManifest struct {
-	SchemaVersion    int      `json:"schema_version"`
-	TaskID           string   `json:"task_id"`
-	ProjectPath      string   `json:"project_path"`
-	CoreSkill        string   `json:"core_skill"`
-	CoreScripts      string   `json:"core_scripts"`
-	PublisherScript  string   `json:"publisher_script"`
-	TemplateRoots    []string `json:"template_roots"`
-	SelectedTemplate string   `json:"selected_template_id,omitempty"`
-	TemplateLock     string   `json:"template_lock,omitempty"`
-	AssetRoots       []string `json:"asset_roots"`
-	ExtensionSkills  []string `json:"extension_skills"`
-	CreatedAt        string   `json:"created_at"`
+	Schema           string                `json:"schema"`
+	SchemaVersion    int                   `json:"schema_version"`
+	TaskID           string                `json:"task_id"`
+	Route            string                `json:"route"`
+	ProjectPath      string                `json:"project_path"`
+	Runner           runtimeManifestRunner `json:"runner"`
+	Skill            runtimeManifestSkill  `json:"skill"`
+	CoreSkill        string                `json:"core_skill"`
+	CoreScripts      string                `json:"core_scripts"`
+	PublisherScript  string                `json:"publisher_script"`
+	TemplateRoots    []string              `json:"template_roots"`
+	SelectedTemplate string                `json:"selected_template_id,omitempty"`
+	TemplateLock     string                `json:"template_lock,omitempty"`
+	AssetRoots       []string              `json:"asset_roots"`
+	ExtensionSkills  []string              `json:"extension_skills"`
+	CreatedAt        string                `json:"created_at"`
+}
+
+type runtimeManifestRunner struct {
+	RequestedProfile string `json:"requested_profile"`
+	EffectiveProfile string `json:"effective_profile"`
+	Source           string `json:"source"`
+	LockedAt         string `json:"locked_at"`
+}
+
+type runtimeManifestSkill struct {
+	Root     string `json:"root"`
+	LockPath string `json:"lock_path"`
 }
 
 type sourceInputsManifest struct {
@@ -276,6 +292,13 @@ agents:
 }
 
 func (b *RuntimeWorkspaceBuilder) WriteRuntimeManifest(workspace *TaskWorkspace, task *model.Task, projectPath string) error {
+	if strings.TrimSpace(task.RunnerProfile) == "" || strings.TrimSpace(task.RunnerProfileSource) == "" || task.RunnerProfileLockedAt == nil {
+		return fmt.Errorf("task runner profile must be locked before writing runtime manifest")
+	}
+	requestedProfile := task.RunnerProfile
+	if configured, err := config.NormalizeRunnerProfile(b.cfg.RunnerProfile); err == nil {
+		requestedProfile = configured
+	}
 	runtimeProject := strings.TrimSpace(task.RuntimeProject)
 	if runtimeProject == "" {
 		runtimeProject = runtimeProjectName(task.ID)
@@ -297,9 +320,21 @@ func (b *RuntimeWorkspaceBuilder) WriteRuntimeManifest(workspace *TaskWorkspace,
 		templateLockPath = ".slidesmith/template_lock.json"
 	}
 	manifest := runtimeManifest{
-		SchemaVersion:    runtimeManifestVersion,
-		TaskID:           task.ID,
-		ProjectPath:      projectRel,
+		Schema:        "slidesmith.runtime_manifest.v2",
+		SchemaVersion: runtimeManifestVersion,
+		TaskID:        task.ID,
+		Route:         task.Route,
+		ProjectPath:   projectRel,
+		Runner: runtimeManifestRunner{
+			RequestedProfile: requestedProfile,
+			EffectiveProfile: task.RunnerProfile,
+			Source:           task.RunnerProfileSource,
+			LockedAt:         task.RunnerProfileLockedAt.UTC().Format(time.RFC3339Nano),
+		},
+		Skill: runtimeManifestSkill{
+			Root:     "skills/ppt-master",
+			LockPath: ".slidesmith/skill_lock.json",
+		},
 		CoreSkill:        "skills/ppt-master/SKILL.md",
 		CoreScripts:      "skills/ppt-master/scripts",
 		PublisherScript:  "scripts/ppt_runner.py",

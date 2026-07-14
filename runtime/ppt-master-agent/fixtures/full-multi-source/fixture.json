@@ -1,0 +1,6 @@
+{
+  "name": "full-multi-source",
+  "page_count": 5,
+  "refine_spec": false,
+  "sources": ["strategy.docx", "metrics.xlsx"]
+}

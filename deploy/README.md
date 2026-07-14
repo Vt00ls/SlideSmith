@@ -56,8 +56,9 @@ LLM_MODEL=<model>
 LLM_TIMEOUT=5m
 ```
 
-Keep `SLIDESMITH_PPT_RUNNER_PROFILE=real-lite` for the first smoke validation.
-Switch it to `full-ppt-master` only after the agent-compose prompt probe works.
+Use `SLIDESMITH_PPT_RUNNER_PROFILE=real-lite` explicitly for the first smoke
+validation. The standard configuration requests `full-ppt-master` while
+`SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=false` keeps the rollout gate closed.
 
 ## Build Runtime Image
 
@@ -145,8 +146,14 @@ After the probe succeeds:
 
 ```bash
 sed -i 's/^SLIDESMITH_PPT_RUNNER_PROFILE=.*/SLIDESMITH_PPT_RUNNER_PROFILE=full-ppt-master/' deploy/.env
+sed -i 's/^SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=.*/SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=true/' deploy/.env
 docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d worker api
 ```
+
+Run the repository full-main fixture command before production rollout. To
+roll back new tasks, set `SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=false` and restart
+API/worker. Already locked full tasks remain full and must never be silently
+rerouted to `real-lite`.
 
 ## Current MVP Limits
 

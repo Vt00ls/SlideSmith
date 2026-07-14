@@ -38,7 +38,17 @@ import {
   TemplateCatalogItem,
   TemplateFillPlanPreview,
 } from "./api";
-import { artifactKindLabel, formatBytes, formatTime, phaseLabel, routeLabel, statusLabel, statusTone } from "./format";
+import {
+  artifactKindLabel,
+  formatBytes,
+  formatTime,
+  phaseLabel,
+  routeLabel,
+  runnerProfileSourceLabel,
+  statusLabel,
+  statusTone,
+  taskRunnerProfileLabel,
+} from "./format";
 import { go, parseRoute, replaceRoute, Route } from "./router";
 
 const activeStatuses: TaskStatus[] = [
@@ -1084,6 +1094,13 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
   const svgFinalCount = artifacts.filter((artifact) => artifact.kind === "svg_final").length;
   const latestRun = runtimeRuns[0];
   const failureMetadata = task ? parseJSON<Record<string, unknown>>(task.failure_metadata || "{}", {}) : {};
+  const preflightReport = failureMetadata.preflight && typeof failureMetadata.preflight === "object"
+    ? failureMetadata.preflight as Record<string, unknown>
+    : {};
+  const preflightChecks = Array.isArray(preflightReport.checks)
+    ? preflightReport.checks.filter((check): check is Record<string, unknown> => !!check && typeof check === "object")
+    : [];
+  const failedPreflightChecks = preflightChecks.filter((check) => check.status === "error");
   const routeSelection = task ? parseJSON<Record<string, unknown>>(task.route_selection_json || "{}", {}) : {};
   const sourcePrepareRun = [...phaseRuns].reverse().find((run) => run.phase === "source_prepare");
   const sourcePrepareOutput = sourcePrepareRun
@@ -1176,6 +1193,18 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                 <strong className="mono">{task.selected_template_id || "-"}</strong>
                 <span>生成路线</span>
                 <strong>{routeLabel[taskRoute] || taskRoute}</strong>
+                <span>生成引擎</span>
+                <strong>{taskRunnerProfileLabel(task.runner_profile || "", taskRoute)}</strong>
+                <span>引擎来源</span>
+                <strong>{runnerProfileSourceLabel[task.runner_profile_source || ""] || task.runner_profile_source || "-"}</strong>
+                <span>锁定状态</span>
+                <strong>{task.runner_profile_locked_at ? `已锁定 · ${formatTime(task.runner_profile_locked_at)}` : "未锁定"}</strong>
+                {!task.runner_profile_locked_at && !["created", "uploaded"].includes(task.status) && (
+                  <>
+                    <span>引擎异常</span>
+                    <strong className="bad">任务已进入运行阶段但引擎尚未锁定</strong>
+                  </>
+                )}
                 <span>路线原因</span>
                 <strong>{task.route_reason || "-"}</strong>
                 <span>独立工作流</span>
@@ -1348,6 +1377,15 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                   {task.failure_phase === "route_select.unsupported_workflow" && (
                     <span className="muted">该路线已识别，执行工作流将在后续阶段开放。</span>
                   )}
+                  {failedPreflightChecks.length > 0 && (
+                    <ul>
+                      {failedPreflightChecks.map((check, index) => (
+                        <li key={`${String(check.name || "check")}-${index}`}>
+                          {String(check.name || "未命名检查")}: {String(check.message || "缺少必需能力")}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                   {retryGuidance && <span className="template-fill-recovery-note">{retryGuidance}</span>}
                 </div>
                 <div className="button-row left">
@@ -1375,7 +1413,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
             <div className="phase-run-list">
               {phaseRuns.map((run) => (
                 <div className="phase-run-row" key={run.id}>
-                  <span>{phaseLabel[run.phase] || run.phase}</span>
+                  <span>{run.phase === "image_acquire" && run.status === "skipped" ? "资源阶段尚未启用（兼容跳过）" : phaseLabel[run.phase] || run.phase}</span>
                   <span className="mono">{run.phase}</span>
                   <span className={`run-status ${run.status === "failed" ? "bad" : ""}`}>{run.status}</span>
                   <span className="mono">#{run.attempt}</span>

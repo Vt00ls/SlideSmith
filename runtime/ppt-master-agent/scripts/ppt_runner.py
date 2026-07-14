@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import posixpath
@@ -667,7 +668,123 @@ def normalize_staged_presentation_package(staged_path: Path) -> None:
             temp_path.unlink(missing_ok=True)
 
 
+def validate_prepare_profile_contract(profile: str) -> None:
+    if profile not in {"full-ppt-master", "prepare-only"}:
+        return
+    manifest_path = WORKSPACE / ".slidesmith" / "runtime_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"runtime manifest not found: {manifest_path}")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"parse runtime manifest: {exc}") from exc
+    if manifest.get("schema") != "slidesmith.runtime_manifest.v2":
+        raise ValueError(f"runtime manifest schema = {manifest.get('schema')!r}, expected 'slidesmith.runtime_manifest.v2'")
+    runner = manifest.get("runner")
+    effective = runner.get("effective_profile") if isinstance(runner, dict) else None
+    if profile == "full-ppt-master" and effective != "full-ppt-master":
+        raise ValueError(f"runtime manifest effective profile = {effective!r}, expected 'full-ppt-master'")
+    if profile == "prepare-only" and manifest.get("route") != "template-fill":
+        raise ValueError(f"prepare-only requires template-fill route, got {manifest.get('route')!r}")
+
+
+def run_full_runtime_preflight(project_path: Path) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, path: Path | str, error: str = "", required: bool = True) -> None:
+        checks.append(
+            {
+                "name": name,
+                "status": "error" if error and required else "warning" if error else "pass",
+                "required": required,
+                "path": str(path),
+                "message": error,
+            }
+        )
+
+    required_files = {
+        "compose_file": WORKSPACE / "agent-compose.yml",
+        "ppt_master_skill": WORKSPACE / "skills" / "ppt-master" / "SKILL.md",
+        "strategist_reference": WORKSPACE / "skills" / "ppt-master" / "references" / "strategist.md",
+        "executor_reference": WORKSPACE / "skills" / "ppt-master" / "references" / "executor-base.md",
+        "design_spec_reference": WORKSPACE / "skills" / "ppt-master" / "templates" / "design_spec_reference.md",
+        "spec_lock_reference": WORKSPACE / "skills" / "ppt-master" / "templates" / "spec_lock_reference.md",
+        "project_manager": WORKSPACE / "skills" / "ppt-master" / "scripts" / "project_manager.py",
+        "svg_quality_checker": WORKSPACE / "skills" / "ppt-master" / "scripts" / "svg_quality_checker.py",
+        "finalize_svg": WORKSPACE / "skills" / "ppt-master" / "scripts" / "finalize_svg.py",
+        "svg_to_pptx": WORKSPACE / "skills" / "ppt-master" / "scripts" / "svg_to_pptx.py",
+    }
+    for name, path in required_files.items():
+        error = ""
+        if not path.is_file() or path.stat().st_size == 0:
+            error = "missing or empty regular file"
+        add(name, path.relative_to(WORKSPACE), error)
+
+    add("python3", sys.executable, "" if Path(sys.executable).is_file() else "python executable is unavailable")
+    required_imports = ["pptx", "PIL"]
+    source_manifest = WORKSPACE / ".slidesmith" / "source_inputs.json"
+    if source_manifest.is_file():
+        source_payload = json.loads(source_manifest.read_text(encoding="utf-8"))
+        source_extensions = {
+            str(item.get("extension", "")).lower()
+            for item in source_payload.get("files", [])
+            if isinstance(item, dict)
+        }
+        import_by_extension = {
+            "docx": "mammoth",
+            "xlsx": "openpyxl",
+            "xlsm": "openpyxl",
+            "pdf": "fitz",
+        }
+        required_imports.extend(
+            module for extension, module in import_by_extension.items() if extension in source_extensions
+        )
+    required_imports = list(dict.fromkeys(required_imports))
+    missing_imports = [name for name in required_imports if importlib.util.find_spec(name) is None]
+    add("python_imports", ",".join(required_imports), f"missing imports: {','.join(missing_imports)}" if missing_imports else "")
+
+    try:
+        project_path.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=".preflight-", dir=project_path, delete=True):
+            pass
+        add("workspace_project_root", project_path.relative_to(WORKSPACE))
+    except (OSError, ValueError) as exc:
+        add("workspace_project_root", project_path, str(exc))
+
+    manifest_path = WORKSPACE / ".slidesmith" / "runtime_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    skill_root = (WORKSPACE / "skills" / "ppt-master").resolve()
+    for raw_root in manifest.get("template_roots", []):
+        try:
+            template_root = (WORKSPACE / str(raw_root)).resolve(strict=True)
+            template_root.relative_to(skill_root)
+            if not template_root.is_dir():
+                raise ValueError("not a directory")
+            add("template_root", raw_root)
+        except (OSError, ValueError) as exc:
+            add("template_root", raw_root, str(exc))
+
+    summary = {
+        "pass": sum(check["status"] == "pass" for check in checks),
+        "warning": sum(check["status"] == "warning" for check in checks),
+        "error": sum(check["status"] == "error" for check in checks),
+    }
+    report = {
+        "schema": "slidesmith.full_runtime_preflight.v1",
+        "effective_profile": "full-ppt-master",
+        "checks": checks,
+        "summary": summary,
+        "checked_at": utc_now(),
+    }
+    write_json(WORKSPACE / ".slidesmith" / "full_runtime_preflight.json", report)
+    write_json(project_path / ".slidesmith" / "contracts" / "full_runtime_preflight.json", report)
+    if summary["error"]:
+        raise RuntimeError(f"full runtime preflight failed with {summary['error']} required error(s)")
+    return report
+
+
 def prepare(args: argparse.Namespace) -> None:
+    validate_prepare_profile_contract(args.profile)
     set_status("source_converting", project=args.project)
     projects_dir = WORKSPACE / "projects"
     projects_dir.mkdir(parents=True, exist_ok=True)
@@ -677,6 +794,9 @@ def prepare(args: argparse.Namespace) -> None:
         project_path = parse_created_project_path(completed.stdout) or project_path_from_args(args)
     else:
         emit_event("project_exists", "Project already exists", str(project_path), "warning")
+
+    if args.profile == "full-ppt-master":
+        run_full_runtime_preflight(project_path)
 
     scratch_input_dir = STATE_DIR / "input" / args.project
     if scratch_input_dir.exists():
@@ -1853,7 +1973,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("--sources-manifest", default=".slidesmith/source_inputs.json")
     prepare_parser.add_argument("--project", required=True)
     prepare_parser.add_argument("--format", default="ppt169")
-    prepare_parser.add_argument("--profile", choices=["smoke", "real-lite"], default="smoke")
+    prepare_parser.add_argument("--profile", choices=["smoke", "real-lite", "full-ppt-master", "prepare-only"], default="smoke")
 
     generate_parser = sub.add_parser("generate")
     generate_parser.add_argument("--project", default="")

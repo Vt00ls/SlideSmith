@@ -2239,6 +2239,7 @@ func newTemplateFillWorkflowService(t *testing.T, status string, agent AgentComp
 		RuntimeProject:       runtimeProject,
 		RuntimeWorkspacePath: workspacePath,
 	}
+	lockRunnerProfileForTest(task, model.RunnerProfileNativeTemplateFill)
 	if err := repo.CreateTask(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
@@ -2259,6 +2260,7 @@ func newTemplateFillWorkflowService(t *testing.T, status string, agent AgentComp
 			Agent:         "ppt_master",
 		},
 	)
+	writeRuntimeProfileManifestForTest(t, workspaceRoot, task)
 	return service, repo, task, projectPath, workspacePath
 }
 

@@ -38,6 +38,9 @@ export type Task = {
   route_standalone_workflow: string;
   route_selection_json: string;
   route_selected_at?: string;
+  runner_profile: "full-ppt-master" | "real-lite" | "smoke" | "native-template-fill" | string;
+  runner_profile_source: "deployment_default" | "explicit_config" | "legacy_manifest" | "legacy_evidence" | string;
+  runner_profile_locked_at?: string;
   error_message: string;
   failure_phase: string;
   failure_metadata: string;
