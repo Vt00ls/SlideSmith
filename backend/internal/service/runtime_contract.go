@@ -59,17 +59,9 @@ func validateSpecGenerateContract(projectPath string, expectedTaskID ...string) 
 	return contract, nil
 }
 
-func validateSVGExecuteContract(projectPath string) (map[string]any, error) {
-	expectedPageCount := confirmedPageCount(projectPath)
-	svgCount, err := countRegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
+func validateSVGExecuteContract(projectPath string, expectedTaskID ...string) (map[string]any, error) {
+	contract, err := validateSVGBundleContract(projectPath, expectedTaskID...)
 	if err != nil {
-		return nil, err
-	}
-	if svgCount != expectedPageCount {
-		return nil, fmt.Errorf("svg_execute produced %d svg files, expected %d", svgCount, expectedPageCount)
-	}
-	notesPath := filepath.Join(projectPath, "notes", "total.md")
-	if err := requireNonEmptyFile(notesPath); err != nil {
 		return nil, err
 	}
 	pptxCount, err := countRegularFiles(filepath.Join(projectPath, "exports"), "*.pptx")
@@ -79,19 +71,7 @@ func validateSVGExecuteContract(projectPath string) (map[string]any, error) {
 	if pptxCount > 0 {
 		return nil, fmt.Errorf("svg_execute must not create pptx exports, found %d", pptxCount)
 	}
-	resourceBindings, err := validateSVGResourceBindings(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	contract := map[string]any{
-		"phase":             string(PhaseSVGExecute),
-		"project_path":      projectPath,
-		"expected_pages":    expectedPageCount,
-		"svg_count":         svgCount,
-		"notes":             notesPath,
-		"checked_at":        time.Now().UTC().Format(time.RFC3339Nano),
-		"resource_bindings": resourceBindings,
-	}
+	contract["checked_at"] = time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := writeContractReport(projectPath, string(PhaseSVGExecute), contract); err != nil {
 		return nil, err
 	}
@@ -223,16 +203,13 @@ func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map
 		contract["resources_manifest_sha256"] = manifestSHA
 		contract["resource_plan_sha256"] = planSHA
 	case PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport:
-		svgSHA, err := sha256RegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
+		hashes, err := svgBundleContractHashes(projectPath)
 		if err != nil {
 			return nil, err
 		}
-		contract["svg_output_sha256"] = svgSHA
-		manifestSHA, err := sha256File(filepath.Join(projectPath, ".slidesmith", "resources_manifest.json"))
-		if err != nil {
-			return nil, err
+		for field, sha := range hashes {
+			contract[field] = sha
 		}
-		contract["resources_manifest_sha256"] = manifestSHA
 	}
 	if phase == PhaseFinalizeExport {
 		pptxSHA, err := sha256RegularFiles(filepath.Join(projectPath, "exports"), "*.pptx")
@@ -326,6 +303,9 @@ func sha256RegularFiles(root, pattern string) (string, error) {
 }
 
 func validateFullSVGUpstreamContract(projectPath string, upstream PipelinePhase, task *model.Task) (map[string]any, error) {
+	if task == nil {
+		return nil, fmt.Errorf("%s upstream contract requires task binding", upstream)
+	}
 	path := filepath.Join(projectPath, ".slidesmith", "contracts", string(upstream)+".json")
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -335,19 +315,24 @@ func validateFullSVGUpstreamContract(projectPath string, upstream PipelinePhase,
 	if err := json.Unmarshal(raw, &contract); err != nil {
 		return nil, err
 	}
-	if profile, _ := contract["runner_profile"].(string); task == nil || profile != task.RunnerProfile {
+	if profile, _ := contract["runner_profile"].(string); profile != task.RunnerProfile {
 		return nil, fmt.Errorf("%s upstream contract runner profile %q does not match task lock", upstream, profile)
 	}
-	expected, _ := contract["svg_output_sha256"].(string)
-	if expected == "" {
-		return nil, fmt.Errorf("%s upstream contract missing svg_output_sha256", upstream)
-	}
-	actual, err := sha256RegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
+	actualHashes, err := svgBundleContractHashes(projectPath)
 	if err != nil {
 		return nil, err
 	}
-	if actual != expected {
-		return nil, fmt.Errorf("%s upstream contract is stale: SVG input changed", upstream)
+	for field, actual := range actualHashes {
+		expected, _ := contract[field].(string)
+		if expected == "" {
+			return nil, fmt.Errorf("%s upstream contract missing %s", upstream, field)
+		}
+		if actual != expected {
+			return nil, fmt.Errorf("%s upstream contract is stale: %s changed", upstream, field)
+		}
+	}
+	if _, err := validateSVGBundleContract(projectPath, task.ID); err != nil {
+		return nil, fmt.Errorf("%s upstream SVG bundle is stale: %w", upstream, err)
 	}
 	return contract, nil
 }

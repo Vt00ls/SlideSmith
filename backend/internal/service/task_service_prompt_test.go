@@ -92,6 +92,17 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"Do not run svg_quality_checker.py, finalize_svg.py, svg_to_pptx.py",
 		"never write null or placeholders",
 		"flat canonical fields prompt_or_query, source_reference",
+		"stable canonical ID P01, P02",
+		"must declare one required chart_template requirement and one required chart_data requirement",
+		"Every chart_template requirement must have a matching chart_data requirement",
+		"Never declare a chart_template for a non-data-driven timeline, roadmap, process, or decorative diagram",
+		"complete purpose string verbatim from resource_plan.json",
+		"do not translate, abbreviate, paraphrase, or omit the purpose",
+		`use "page": 2; never use "page": "P02" or "page": "2"`,
+		`fallback must be exactly one of "", "diagram", "shape", "text", "placeholder", or "omit_optional"`,
+		`source_reference must be exactly the confirmed icons value followed by "/" and a safe icon name`,
+		`"tabler-outline/chart-bar"`,
+		`"type":"chart_data"`,
 	}
 	for _, want := range specRequired {
 		if !strings.Contains(specPrompt, want) {
@@ -108,6 +119,14 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		"Read projects/task_1_ppt169_20260707/design_spec.md",
 		"Create exactly the confirmed page_count SVG pages",
 		"Create projects/task_1_ppt169_20260707/notes/total.md",
+		`"svg": "svg_output/01_safe_slug.svg"`,
+		`"resources": []`,
+		`"source_citation": {"file": "sources/input.md", "section": "Section heading"}`,
+		`"plot_area": [120, 160, 1160, 620]`,
+		"Never use svg_path, resource_bindings, fallback_bindings, data_hash_sha256",
+		`<g id="p01-icon" data-resource-id="icon.p01.chart-bar"><image id="p01-icon-image" href="../icons/tabler-outline/chart-bar.svg"`,
+		"Do not inline or copy ready image/icon SVG paths into the page",
+		"an inlined icon with no href is not a valid ready-resource use",
 		"Do not run svg_quality_checker.py, finalize_svg.py, svg_to_pptx.py",
 		"Do not create or modify projects/task_1_ppt169_20260707/exports/",
 	}

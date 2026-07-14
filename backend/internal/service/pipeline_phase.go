@@ -217,7 +217,11 @@ var pipelinePhaseRegistry = map[PipelinePhase]PipelinePhaseDefinition{
 		Runner:            PhaseRunnerAgent,
 		Retryable:         true,
 		RequiredArtifacts: []string{"design_spec.md", "spec_lock.md", ".slidesmith/resources_manifest.json", ".slidesmith/contracts/image_acquire.json"},
-		OutputArtifacts:   []string{"svg_output/*.svg", "notes/total.md"},
+		OutputArtifacts: []string{
+			"svg_output/*.svg", "notes/total.md", "analysis/svg_inventory.json",
+			"analysis/svg_resource_usage.json", "analysis/chart_usage.json", "analysis/notes_inventory.json",
+			".slidesmith/contracts/svg_execute.json",
+		},
 	},
 	PhaseQualityCheck: {
 		Phase:             PhaseQualityCheck,

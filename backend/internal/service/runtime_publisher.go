@@ -424,6 +424,7 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 		{"validation", "validation"},
 		{"design_spec.md", "design_spec.md"},
 		{"spec_lock.md", "spec_lock.md"},
+		{"notes", "notes"},
 		{"svg_output", "svg_output"},
 		{"svg_final", "svg_final"},
 		{"exports", "exports"},
@@ -586,6 +587,16 @@ func artifactKindFromRuntimePath(path string) string {
 		return model.ArtifactKindDesignSpec
 	case path == "spec_lock.md":
 		return model.ArtifactKindSpecLock
+	case path == "analysis/svg_inventory.json":
+		return model.ArtifactKindSVGInventory
+	case path == "analysis/svg_resource_usage.json":
+		return model.ArtifactKindSVGResourceUsage
+	case path == "analysis/chart_usage.json":
+		return model.ArtifactKindChartUsage
+	case path == "analysis/notes_inventory.json":
+		return model.ArtifactKindNotesInventory
+	case path == "notes/total.md":
+		return model.ArtifactKindSpeakerNotes
 	case strings.HasPrefix(path, "svg_output/"):
 		return model.ArtifactKindSVGOutput
 	case strings.HasPrefix(path, "svg_final/"):

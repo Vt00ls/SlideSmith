@@ -231,10 +231,15 @@ func hasPublishedArtifactObjectRel(artifacts []model.Artifact, objectRel string)
 
 func TestArtifactKindFromRuntimePathTemplateFill(t *testing.T) {
 	tests := map[string]string{
-		"analysis/fill_plan.json":         model.ArtifactKindTemplateFillPlan,
-		"analysis/check_report.json":      model.ArtifactKindTemplateFillCheckReport,
-		"validation/validate_report.json": model.ArtifactKindTemplateFillValidateReport,
-		"validation/readback.md":          model.ArtifactKindTemplateFillReadback,
+		"analysis/fill_plan.json":          model.ArtifactKindTemplateFillPlan,
+		"analysis/check_report.json":       model.ArtifactKindTemplateFillCheckReport,
+		"validation/validate_report.json":  model.ArtifactKindTemplateFillValidateReport,
+		"validation/readback.md":           model.ArtifactKindTemplateFillReadback,
+		"analysis/svg_inventory.json":      model.ArtifactKindSVGInventory,
+		"analysis/svg_resource_usage.json": model.ArtifactKindSVGResourceUsage,
+		"analysis/chart_usage.json":        model.ArtifactKindChartUsage,
+		"analysis/notes_inventory.json":    model.ArtifactKindNotesInventory,
+		"notes/total.md":                   model.ArtifactKindSpeakerNotes,
 	}
 	for path, want := range tests {
 		if got := artifactKindFromRuntimePath(path); got != want {

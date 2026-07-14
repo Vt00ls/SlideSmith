@@ -87,6 +87,11 @@ const (
 	ArtifactKindFormulaManifest         = "formula_manifest"
 	ArtifactKindChartData               = "chart_data"
 	ArtifactKindChartTemplate           = "chart_template"
+	ArtifactKindSVGInventory            = "svg_inventory"
+	ArtifactKindSVGResourceUsage        = "svg_resource_usage"
+	ArtifactKindChartUsage              = "chart_usage"
+	ArtifactKindNotesInventory          = "notes_inventory"
+	ArtifactKindSpeakerNotes            = "speaker_notes"
 	ArtifactKindOther                   = "other"
 )
 

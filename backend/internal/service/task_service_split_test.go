@@ -19,6 +19,7 @@ import (
 type splitGenerateFakeAgent struct {
 	projectPath string
 	taskID      string
+	t           *testing.T
 }
 
 func (a splitGenerateFakeAgent) Up(context.Context, AgentRunRequest) error {
@@ -28,7 +29,7 @@ func (a splitGenerateFakeAgent) Up(context.Context, AgentRunRequest) error {
 func (a splitGenerateFakeAgent) Run(_ context.Context, req AgentRunRequest) (*AgentRunResult, error) {
 	switch req.Phase {
 	case string(PhaseSpecGenerate):
-		mustWriteFileNoTest(a.projectPath, "design_spec.md", "# Design Spec\n\nSlides: 3\n")
+		mustWriteFileNoTest(a.projectPath, "design_spec.md", "# Design Spec\n\nP01 Cover\nP02 Content\nP03 Close\n")
 		mustWriteFileNoTest(a.projectPath, "spec_lock.md", "# Spec Lock\n\npage_count: 3\n")
 		mustWriteEmptyResourcePlanNoTest(a.projectPath, a.taskID, 3)
 	case string(PhaseImageAcquire):
@@ -38,10 +39,7 @@ func (a splitGenerateFakeAgent) Run(_ context.Context, req AgentRunRequest) (*Ag
 		}
 		mustWriteEmptyResourceManifestNoTest(a.projectPath, a.taskID, policy.PhaseRunID)
 	case string(PhaseSVGExecute):
-		for _, name := range []string{"01.svg", "02.svg", "03.svg"} {
-			mustWriteFileNoTest(a.projectPath, filepath.Join("svg_output", name), `<svg viewBox="0 0 1280 720"></svg>`+"\n")
-		}
-		mustWriteFileNoTest(a.projectPath, filepath.Join("notes", "total.md"), "# Notes\n")
+		writeValidSVGBundleNoTest(a.projectPath, a.taskID, 3)
 	case string(PhaseQualityCheck):
 		mustWriteFileNoTest(a.projectPath, filepath.Join("logs", "quality.log"), "ok\n")
 	case string(PhaseFinalizeExport):
@@ -99,7 +97,7 @@ func TestProcessFullPPTMasterSplitCompletesWithSeparatePhaseRuns(t *testing.T) {
 	service := NewTaskService(
 		repo,
 		storage,
-		splitGenerateFakeAgent{projectPath: projectPath, taskID: task.ID},
+		splitGenerateFakeAgent{projectPath: projectPath, taskID: task.ID, t: t},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
 			Enabled:               true,
@@ -381,7 +379,7 @@ func splitPreviewTestService(t *testing.T) (*TaskService, *repository.Repository
 	service := NewTaskService(
 		repo,
 		storage,
-		splitGenerateFakeAgent{projectPath: projectPath, taskID: task.ID},
+		splitGenerateFakeAgent{projectPath: projectPath, taskID: task.ID, t: t},
 		NewRuntimeWorkspacePublisher(storage),
 		config.AgentComposeConfig{
 			Enabled:               true,

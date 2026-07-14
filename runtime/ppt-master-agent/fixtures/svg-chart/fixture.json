@@ -1,0 +1,15 @@
+{
+  "schema": "slidesmith.svg_fixture.v1",
+  "name": "svg-chart",
+  "expected": "pass",
+  "canvas": "ppt169",
+  "page_count": 3,
+  "resources": [
+    {"id": "res-chart-template", "type": "chart_template", "status": "ready"},
+    {"id": "res-chart-data", "type": "chart_data", "status": "ready"}
+  ],
+  "charts": [
+    {"id": "chart-revenue", "type": "bar", "verification_mode": "direct-calc", "source_citation": true}
+  ],
+  "notes": "per-page"
+}
