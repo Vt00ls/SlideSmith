@@ -163,6 +163,12 @@ func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspa
 	}()
 
 	var artifacts []model.Artifact
+	validateContract := readJSONMap(filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePPTXValidate)+".json"))
+	validateRunID := valueString(validateContract, "phase_run_id", "")
+	pptxSHA := ""
+	if canonical, ok := validateContract["canonical_pptx"].(map[string]any); ok {
+		pptxSHA = valueString(canonical, "sha256", "")
+	}
 	for _, item := range items {
 		objectKey := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts", publishVersion, item.ObjectRel))
 		attemptedObjectKeys = append(attemptedObjectKeys, objectKey)
@@ -190,6 +196,17 @@ func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspa
 			Size:           stored.Size,
 			SHA256:         stored.SHA256,
 			PublishVersion: publishVersion,
+		}
+		if item.Kind == model.ArtifactKindRenderedSlide {
+			page := 0
+			_, _ = fmt.Sscanf(filepath.Base(item.ObjectRel), "slide-%02d.png", &page)
+			metadata, _ := json.Marshal(map[string]any{
+				"page_id":         fmt.Sprintf("P%02d", page),
+				"page":            page,
+				"pptx_sha256":     pptxSHA,
+				"validate_run_id": validateRunID,
+			})
+			artifact.MetadataJSON = string(metadata)
 		}
 		artifacts = append(artifacts, artifact)
 	}
@@ -430,6 +447,7 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 		{"exports", "exports"},
 		{"logs", "logs"},
 		{filepath.Join(".slidesmith", "contracts"), "contracts"},
+		{filepath.Join(".slidesmith", "quality_report.json"), filepath.Join("manifest", "quality_report.json")},
 		{filepath.Join(".slidesmith", "artifacts.json"), filepath.Join("manifest", "runtime_artifacts.json")},
 		{".slidesmith-artifacts.json", filepath.Join("manifest", "runtime_artifacts.json")},
 	}
@@ -595,6 +613,26 @@ func artifactKindFromRuntimePath(path string) string {
 		return model.ArtifactKindChartUsage
 	case path == "analysis/notes_inventory.json":
 		return model.ArtifactKindNotesInventory
+	case path == "validation/svg_quality_report.json":
+		return model.ArtifactKindSVGQualityReport
+	case path == "validation/chart_verify_report.json":
+		return model.ArtifactKindChartVerifyReport
+	case path == "validation/quality_summary.json":
+		return model.ArtifactKindQualitySummary
+	case path == "validation/pptx_readback.md":
+		return model.ArtifactKindPPTXReadback
+	case path == "validation/pptx_text_inventory.json":
+		return model.ArtifactKindPPTXTextInventory
+	case path == "validation/pptx_validate_report.json":
+		return model.ArtifactKindPPTXValidateReport
+	case path == "validation/visual_review_report.json":
+		return model.ArtifactKindVisualReviewReport
+	case path == "validation/render/output.pdf":
+		return model.ArtifactKindRenderedPDF
+	case path == "validation/render/contact_sheet.png":
+		return model.ArtifactKindContactSheet
+	case strings.HasPrefix(path, "validation/render/slide-") && strings.HasSuffix(lowerPath, ".png"):
+		return model.ArtifactKindRenderedSlide
 	case path == "notes/total.md":
 		return model.ArtifactKindSpeakerNotes
 	case strings.HasPrefix(path, "svg_output/"):

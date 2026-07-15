@@ -18,6 +18,7 @@ export type TaskStatus =
   | "svg_generating"
   | "quality_checking"
   | "exporting"
+  | "pptx_validating"
   | "publishing"
   | "completed"
   | "failed"
@@ -119,6 +120,7 @@ export type PipelinePhase =
   | "svg_execute"
   | "quality_check"
   | "finalize_export"
+  | "pptx_validate"
   | "publish";
 
 export type TaskPhaseRun = {
@@ -152,6 +154,7 @@ export type RetryPhase =
   | "svg_execute"
   | "quality_check"
   | "finalize_export"
+  | "pptx_validate"
   | "publish";
 
 export type ContinuePhase = "spec_generate" | "svg_execute";
@@ -252,6 +255,50 @@ export type SVGBundleSummary = {
   artifact_ids: Record<string, string>;
   inventory_sha256: string;
   phase_run_id: string;
+};
+
+export type QualityGateSummary = {
+  blocking: number;
+  error: number;
+  warning: number;
+  info: number;
+  decision: string;
+};
+
+export type QualityFinding = {
+  id: string;
+  rule: string;
+  severity: "blocking" | "error" | "warning" | "info" | string;
+  status: string;
+  stage: string;
+  page_id: string;
+  artifact: string;
+  message: string;
+  owner_phase: string;
+  retry_phase: string;
+};
+
+export type TaskQuality = {
+  task_id: string;
+  current_gate: string;
+  decision: string;
+  warning_badge: number;
+  svg_summary: QualityGateSummary;
+  pptx_summary: QualityGateSummary;
+  findings: QualityFinding[];
+  chart_receipts: Array<{
+    chart_id: string;
+    page_id: string;
+    mode: string;
+    decision: string;
+    checks: number;
+    failures: number;
+  }>;
+  text_coverage: number;
+  render_artifact_ids: string[];
+  contact_sheet_artifact_id: string;
+  readback_artifact_id: string;
+  allowed_retry_phases: RetryPhase[];
 };
 
 export type TemplateFillInputs = {
@@ -429,6 +476,7 @@ export const api = {
   listArtifacts: (id: string) => request<Artifact[]>(`/tasks/${encodeURIComponent(id)}/artifacts`),
   getResources: (id: string) => request<TaskResources>(`/tasks/${encodeURIComponent(id)}/resources`),
   getSVGBundle: (id: string) => request<SVGBundleSummary>(`/tasks/${encodeURIComponent(id)}/svg-bundle`),
+  getQuality: (id: string) => request<TaskQuality>(`/tasks/${encodeURIComponent(id)}/quality`),
   artifactContentUrl: (taskId: string, artifactId: string) =>
     `${API_BASE}/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
   pptxDownloadUrl: (taskId: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/download/pptx`,

@@ -22,6 +22,7 @@ func TestStateMachineAllowsMVPPath(t *testing.T) {
 		model.TaskStatusSVGGenerating,
 		model.TaskStatusQualityChecking,
 		model.TaskStatusExporting,
+		model.TaskStatusPPTXValidating,
 		model.TaskStatusPublishing,
 		model.TaskStatusCompleted,
 	}
@@ -78,11 +79,19 @@ func TestStateMachineAllowsFailedPhaseRetries(t *testing.T) {
 	for _, status := range []string{
 		model.TaskStatusRuntimePreparing,
 		model.TaskStatusSpecGenerating,
+		model.TaskStatusPPTXValidating,
 		model.TaskStatusPublishing,
 	} {
 		if err := machine.Validate(model.TaskStatusFailed, status); err != nil {
 			t.Fatalf("failed -> %s should be allowed: %v", status, err)
 		}
+	}
+}
+
+func TestStateMachineRejectsPublishBeforePPTXValidate(t *testing.T) {
+	machine := NewStateMachine()
+	if machine.CanTransition(model.TaskStatusExporting, model.TaskStatusPublishing) {
+		t.Fatal("exporting must not skip pptx_validating")
 	}
 }
 

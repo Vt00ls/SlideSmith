@@ -78,45 +78,17 @@ func validateSVGExecuteContract(projectPath string, expectedTaskID ...string) (m
 	return contract, nil
 }
 
-func validateQualityCheckContract(projectPath string) (map[string]any, error) {
-	expectedPageCount := confirmedPageCount(projectPath)
-	svgCount, err := countRegularFiles(filepath.Join(projectPath, "svg_output"), "*.svg")
-	if err != nil {
-		return nil, err
-	}
-	if svgCount != expectedPageCount {
-		return nil, fmt.Errorf("quality_check saw %d svg files, expected %d", svgCount, expectedPageCount)
-	}
-	pptxCount, err := countRegularFiles(filepath.Join(projectPath, "exports"), "*.pptx")
-	if err != nil {
-		return nil, err
-	}
-	if pptxCount > 0 {
-		return nil, fmt.Errorf("quality_check must not create pptx exports, found %d", pptxCount)
-	}
-	contract := map[string]any{
-		"phase":          string(PhaseQualityCheck),
-		"project_path":   projectPath,
-		"expected_pages": expectedPageCount,
-		"svg_count":      svgCount,
-		"checked_at":     time.Now().UTC().Format(time.RFC3339Nano),
-	}
-	if _, err := writeContractReport(projectPath, string(PhaseQualityCheck), contract); err != nil {
-		return nil, err
-	}
-	return contract, nil
-}
-
 func validatePPTXExportContract(projectPath string) (map[string]any, error) {
 	pptxFiles, err := listRegularFiles(filepath.Join(projectPath, "exports"), "*.pptx")
 	if err != nil {
 		return nil, err
 	}
-	if len(pptxFiles) == 0 {
-		return nil, fmt.Errorf("finalize_export did not produce exports/*.pptx in %s", projectPath)
+	if len(pptxFiles) != 1 {
+		return nil, fmt.Errorf("finalize_export must produce exactly one canonical PPTX, found %d", len(pptxFiles))
 	}
 	expectedPageCount := confirmedPageCount(projectPath)
 	pptxReports := make([]map[string]any, 0, len(pptxFiles))
+	var canonical map[string]any
 	for _, pptxPath := range pptxFiles {
 		slideCount, err := countPPTXSlides(pptxPath)
 		if err != nil {
@@ -125,23 +97,123 @@ func validatePPTXExportContract(projectPath string) (map[string]any, error) {
 		if slideCount != expectedPageCount {
 			return nil, fmt.Errorf("finalize_export pptx %s has %d slides, expected %d", pptxPath, slideCount, expectedPageCount)
 		}
-		pptxReports = append(pptxReports, map[string]any{
-			"path":        pptxPath,
+		info, err := os.Stat(pptxPath)
+		if err != nil {
+			return nil, err
+		}
+		sha, err := sha256File(pptxPath)
+		if err != nil {
+			return nil, err
+		}
+		relative := filepath.ToSlash(filepath.Join("exports", filepath.Base(pptxPath)))
+		canonical = map[string]any{
+			"path":        relative,
+			"sha256":      sha,
+			"size":        info.Size(),
 			"slide_count": slideCount,
-		})
+		}
+		pptxReports = append(pptxReports, canonical)
+	}
+	exportManifest := map[string]any{
+		"schema":         "slidesmith.export_manifest.v1",
+		"canonical_pptx": canonical,
+		"notes_policy":   "no-notes",
+		"created_at":     time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if err := writeJSONPretty(filepath.Join(projectPath, "exports", "export_manifest.json"), exportManifest); err != nil {
+		return nil, err
+	}
+	manifestSHA, err := sha256File(filepath.Join(projectPath, "exports", "export_manifest.json"))
+	if err != nil {
+		return nil, err
 	}
 	contract := map[string]any{
-		"phase":          string(PhaseFinalizeExport),
-		"project_path":   projectPath,
-		"expected_pages": expectedPageCount,
-		"pptx_count":     len(pptxFiles),
-		"pptx":           pptxReports,
-		"checked_at":     time.Now().UTC().Format(time.RFC3339Nano),
+		"schema":                 "slidesmith.finalize_export_contract.v1",
+		"phase":                  string(PhaseFinalizeExport),
+		"project_path":           projectPath,
+		"expected_pages":         expectedPageCount,
+		"pptx_count":             len(pptxFiles),
+		"pptx":                   pptxReports,
+		"canonical_pptx":         canonical,
+		"export_manifest":        "exports/export_manifest.json",
+		"export_manifest_sha256": manifestSHA,
+		"notes_policy":           "no-notes",
+		"converter": map[string]any{
+			"tool": "svg_to_pptx.py", "options": []string{"--no-notes", "-t", "none"},
+		},
+		"checked_at": time.Now().UTC().Format(time.RFC3339Nano),
 	}
 	if _, err := writeContractReport(projectPath, string(PhaseFinalizeExport), contract); err != nil {
 		return nil, err
 	}
 	return contract, nil
+}
+
+func validateExistingPPTXExportContract(projectPath string, task *model.Task) (map[string]any, error) {
+	contractPath := filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseFinalizeExport)+".json")
+	if err := requireContainedContractFile(projectPath, contractPath); err != nil {
+		return nil, err
+	}
+	var contract map[string]any
+	if err := readJSONContract(contractPath, &contract); err != nil {
+		return nil, err
+	}
+	if valueString(contract, "schema", "") != "slidesmith.finalize_export_contract.v1" || task == nil || valueString(contract, "task_id", "") != task.ID || valueString(contract, "runner_profile", "") != task.RunnerProfile {
+		return nil, fmt.Errorf("finalize export contract task/profile binding mismatch")
+	}
+	for field, path := range map[string]string{
+		"quality_summary_sha256":  filepath.Join(projectPath, "validation", "quality_summary.json"),
+		"quality_contract_sha256": filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseQualityCheck)+".json"),
+		"export_manifest_sha256":  filepath.Join(projectPath, "exports", "export_manifest.json"),
+	} {
+		sha, err := sha256File(path)
+		if err != nil || valueString(contract, field, "") != sha {
+			return nil, fmt.Errorf("finalize export contract %s is stale", field)
+		}
+	}
+	canonical, _ := contract["canonical_pptx"].(map[string]any)
+	if canonical == nil {
+		return nil, fmt.Errorf("finalize export contract missing canonical PPTX")
+	}
+	pptxPath, err := containedProjectContractPath(projectPath, valueString(canonical, "path", ""))
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Stat(pptxPath)
+	if err != nil || !info.Mode().IsRegular() || info.Size() != int64(valueNumber(canonical["size"])) {
+		return nil, fmt.Errorf("finalize export canonical PPTX size is stale")
+	}
+	sha, err := sha256File(pptxPath)
+	if err != nil || sha != valueString(canonical, "sha256", "") {
+		return nil, fmt.Errorf("finalize export canonical PPTX hash is stale")
+	}
+	slides, err := countPPTXSlides(pptxPath)
+	if err != nil || slides != int(valueNumber(canonical["slide_count"])) || slides != confirmedPageCount(projectPath) {
+		return nil, fmt.Errorf("finalize export canonical PPTX slide count is stale")
+	}
+	files, err := listRegularFiles(filepath.Join(projectPath, "exports"), "*.pptx")
+	if err != nil || len(files) != 1 || !sameFilesystemPath(files[0], pptxPath) {
+		return nil, fmt.Errorf("finalize export canonical PPTX selection is ambiguous")
+	}
+	return contract, nil
+}
+
+func valueNumber(value any) float64 {
+	switch typed := value.(type) {
+	case float64:
+		return typed
+	case float32:
+		return float64(typed)
+	case int:
+		return float64(typed)
+	case int64:
+		return float64(typed)
+	case json.Number:
+		parsed, _ := typed.Float64()
+		return parsed
+	default:
+		return 0
+	}
 }
 
 func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map[string]any, task *model.Task, workspace *TaskWorkspace, runtimeRunID string) (map[string]any, error) {
@@ -152,6 +224,7 @@ func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map
 		return nil, fmt.Errorf("full phase %s requires a locked full-ppt-master task profile", phase)
 	}
 	contract["runner_profile"] = task.RunnerProfile
+	contract["task_id"] = task.ID
 	contract["runner_profile_locked_at"] = task.RunnerProfileLockedAt.UTC().Format(time.RFC3339Nano)
 	contract["runtime_run_id"] = runtimeRunID
 	if workspace != nil {
@@ -202,7 +275,7 @@ func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map
 		}
 		contract["resources_manifest_sha256"] = manifestSHA
 		contract["resource_plan_sha256"] = planSHA
-	case PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport:
+	case PhaseSVGExecute, PhaseQualityCheck, PhaseFinalizeExport, PhasePPTXValidate:
 		hashes, err := svgBundleContractHashes(projectPath)
 		if err != nil {
 			return nil, err
@@ -212,11 +285,34 @@ func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map
 		}
 	}
 	if phase == PhaseFinalizeExport {
+		qualitySummarySHA, err := sha256File(filepath.Join(projectPath, "validation", "quality_summary.json"))
+		if err != nil {
+			return nil, err
+		}
+		qualityContractSHA, err := sha256File(filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseQualityCheck)+".json"))
+		if err != nil {
+			return nil, err
+		}
+		contract["quality_summary_sha256"] = qualitySummarySHA
+		contract["quality_contract_sha256"] = qualityContractSHA
 		pptxSHA, err := sha256RegularFiles(filepath.Join(projectPath, "exports"), "*.pptx")
 		if err != nil {
 			return nil, err
 		}
 		contract["pptx_output_sha256"] = pptxSHA
+		manifestPath := filepath.Join(projectPath, "exports", "export_manifest.json")
+		manifest := readJSONMap(manifestPath)
+		manifest["phase_run_id"] = valueString(contract, "phase_run_id", "")
+		manifest["task_id"] = task.ID
+		manifest["quality_summary_sha256"] = qualitySummarySHA
+		if err := writeJSONPretty(manifestPath, manifest); err != nil {
+			return nil, err
+		}
+		manifestSHA, err := sha256File(manifestPath)
+		if err != nil {
+			return nil, err
+		}
+		contract["export_manifest_sha256"] = manifestSHA
 	}
 	if _, err := writeContractReport(projectPath, string(phase), contract); err != nil {
 		return nil, err

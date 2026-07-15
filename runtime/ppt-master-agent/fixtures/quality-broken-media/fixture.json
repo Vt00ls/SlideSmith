@@ -1,0 +1,1 @@
+{"name":"quality-broken-media","stage":"pptx_validate","expected_decision":"fail","expected_rule":"pptx.relationship_missing"}

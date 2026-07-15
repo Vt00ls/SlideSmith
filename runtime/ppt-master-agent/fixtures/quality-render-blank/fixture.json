@@ -1,0 +1,1 @@
+{"name":"quality-render-blank","stage":"pptx_validate","expected_decision":"fail","expected_rule":"pptx.render_blank"}

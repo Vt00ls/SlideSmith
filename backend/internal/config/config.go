@@ -45,6 +45,11 @@ type AgentComposeConfig struct {
 	RunnerProfileExplicit  bool
 	FullPPTDefaultEnabled  bool
 	FullPPTPreflightStrict bool
+	QualityGateEnabled     bool
+	QualityGateStrict      bool
+	PPTXValidateEnabled    bool
+	VisualReviewEnabled    bool
+	VisualReviewDefault    bool
 	ResourcePhaseEnabled   bool
 	ResourceNetworkEnabled bool
 	ResourceWebEnabled     bool
@@ -99,6 +104,11 @@ func Load() Config {
 			RunnerProfileExplicit:  runnerProfileExplicit,
 			FullPPTDefaultEnabled:  envBool("SLIDESMITH_FULL_PPT_DEFAULT_ENABLED", false),
 			FullPPTPreflightStrict: envBool("SLIDESMITH_FULL_PPT_PREFLIGHT_STRICT", true),
+			QualityGateEnabled:     envBool("SLIDESMITH_QUALITY_GATE_ENABLED", false),
+			QualityGateStrict:      envBool("SLIDESMITH_QUALITY_GATE_STRICT", true),
+			PPTXValidateEnabled:    envBool("SLIDESMITH_PPTX_VALIDATE_ENABLED", false),
+			VisualReviewEnabled:    envBool("SLIDESMITH_VISUAL_REVIEW_ENABLED", false),
+			VisualReviewDefault:    envBool("SLIDESMITH_VISUAL_REVIEW_DEFAULT", false),
 			ResourcePhaseEnabled:   envBool("SLIDESMITH_RESOURCE_PHASE_ENABLED", false),
 			ResourceNetworkEnabled: envBool("SLIDESMITH_RESOURCE_NETWORK_ENABLED", false),
 			ResourceWebEnabled:     envBool("SLIDESMITH_RESOURCE_WEB_IMAGE_ENABLED", false),

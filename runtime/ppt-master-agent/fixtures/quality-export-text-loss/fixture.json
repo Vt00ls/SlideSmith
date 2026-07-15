@@ -1,0 +1,1 @@
+{"name":"quality-export-text-loss","stage":"pptx_validate","expected_decision":"fail","expected_rule":"pptx.text_missing"}

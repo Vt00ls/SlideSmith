@@ -78,6 +78,7 @@ func (s *TaskService) tryRecoverGeneratedRuntimeArtifacts(
 		model.TaskStatusSVGGenerating,
 		model.TaskStatusQualityChecking,
 		model.TaskStatusExporting,
+		model.TaskStatusPPTXValidating,
 		model.TaskStatusPublishing,
 	} {
 		if err := s.transition(ctx, task, status, status, map[string]any{

@@ -1,0 +1,1 @@
+{"name":"quality-warning","stage":"quality_check","expected_decision":"pass_with_warnings","expected_rule":"chart.manual_review_required"}

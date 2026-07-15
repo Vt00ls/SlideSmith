@@ -116,6 +116,11 @@ func NewStateMachine() *StateMachine {
 			model.TaskStatusFailed,
 		),
 		model.TaskStatusExporting: allow(
+			model.TaskStatusPPTXValidating,
+			model.TaskStatusCancelled,
+			model.TaskStatusFailed,
+		),
+		model.TaskStatusPPTXValidating: allow(
 			model.TaskStatusPublishing,
 			model.TaskStatusCancelled,
 			model.TaskStatusFailed,
@@ -136,6 +141,7 @@ func NewStateMachine() *StateMachine {
 			model.TaskStatusSVGGenerating,
 			model.TaskStatusQualityChecking,
 			model.TaskStatusExporting,
+			model.TaskStatusPPTXValidating,
 			model.TaskStatusPublishing,
 			model.TaskStatusCancelled,
 		),
