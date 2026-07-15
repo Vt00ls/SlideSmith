@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/slidesmith/slidesmith/backend/internal/model"
@@ -26,6 +27,22 @@ type TaskQuality struct {
 	ContactSheetArtifactID string                    `json:"contact_sheet_artifact_id"`
 	ReadbackArtifactID     string                    `json:"readback_artifact_id"`
 	AllowedRetryPhases     []string                  `json:"allowed_retry_phases"`
+	BeautifyFidelity       *TaskBeautifyFidelity     `json:"beautify_fidelity,omitempty"`
+}
+
+type TaskBeautifyFidelity struct {
+	Present          bool                     `json:"present"`
+	Decision         string                   `json:"decision"`
+	SourceSlideCount int                      `json:"source_slide_count"`
+	OutputSlideCount int                      `json:"output_slide_count"`
+	Pages            []BeautifyFidelityPage   `json:"pages"`
+	Identity         BeautifyFidelityIdentity `json:"identity"`
+	Ignored          []string                 `json:"ignored"`
+	Unsupported      []string                 `json:"unsupported"`
+	Warning          int                      `json:"warning"`
+	Error            int                      `json:"error"`
+	Blocking         int                      `json:"blocking"`
+	ReportArtifactID string                   `json:"report_artifact_id"`
 }
 
 type TaskQualityFinding struct {
@@ -56,9 +73,13 @@ func (s *TaskService) GetQuality(ctx context.Context, taskID string) (*TaskQuali
 		return nil, err
 	}
 	result := &TaskQuality{
-		TaskID:      task.ID,
-		CurrentGate: qualityCurrentGate(task),
-		Decision:    "pending",
+		TaskID:             task.ID,
+		CurrentGate:        qualityCurrentGate(task),
+		Decision:           "pending",
+		Findings:           make([]TaskQualityFinding, 0),
+		ChartReceipts:      make([]TaskChartReceiptSummary, 0),
+		RenderArtifactIDs:  make([]string, 0),
+		AllowedRetryPhases: make([]string, 0),
 	}
 	projectPath, err := s.findPersistentProjectPath(task)
 	if err == nil {
@@ -80,6 +101,10 @@ func (s *TaskService) GetQuality(ctx context.Context, taskID string) (*TaskQuali
 			if result.ReadbackArtifactID == "" {
 				result.ReadbackArtifactID = artifact.ID
 			}
+		case model.ArtifactKindBeautifyFidelityReport:
+			if result.BeautifyFidelity != nil && result.BeautifyFidelity.ReportArtifactID == "" {
+				result.BeautifyFidelity.ReportArtifactID = artifact.ID
+			}
 		}
 	}
 	result.AllowedRetryPhases = qualityRetryPhases(task, result.Findings)
@@ -88,13 +113,14 @@ func (s *TaskService) GetQuality(ctx context.Context, taskID string) (*TaskQuali
 
 func (s *TaskService) loadTaskQualityReports(projectPath string, result *TaskQuality) {
 	var svg detailedQualityReport
-	if err := readOptionalQualityJSON(projectPath, "validation/svg_quality_report.json", &svg); err == nil && svg.Schema == svgQualityReportSchema {
+	if err := readOptionalQualityJSON(projectPath, "validation/svg_quality_report.json", &svg); err == nil && svg.Schema == svgQualityReportSchema && svg.TaskID == result.TaskID {
 		result.SVGSummary = svg.Summary
 		appendSafeQualityFindings(result, svg.Findings)
 		result.Decision = svg.Summary.Decision
 	}
 	var chart struct {
 		Schema   string `json:"schema"`
+		TaskID   string `json:"task_id"`
 		Receipts []struct {
 			ChartID     string `json:"chart_id"`
 			PageID      string `json:"page_id"`
@@ -105,7 +131,7 @@ func (s *TaskService) loadTaskQualityReports(projectPath string, result *TaskQua
 			} `json:"comparisons"`
 		} `json:"receipts"`
 	}
-	if err := readOptionalQualityJSON(projectPath, "validation/chart_verify_report.json", &chart); err == nil && chart.Schema == chartVerifyReportSchema {
+	if err := readOptionalQualityJSON(projectPath, "validation/chart_verify_report.json", &chart); err == nil && chart.Schema == chartVerifyReportSchema && chart.TaskID == result.TaskID {
 		for _, receipt := range chart.Receipts {
 			failures := 0
 			for _, comparison := range receipt.Comparisons {
@@ -121,19 +147,47 @@ func (s *TaskService) loadTaskQualityReports(projectPath string, result *TaskQua
 	}
 	var pptx struct {
 		Schema       string             `json:"schema"`
+		TaskID       string             `json:"task_id"`
 		Summary      qualityGateSummary `json:"summary"`
 		Findings     []qualityFinding   `json:"findings"`
 		TextFidelity struct {
 			DeckCoverage float64 `json:"deck_coverage"`
 		} `json:"text_fidelity"`
 	}
-	if err := readOptionalQualityJSON(projectPath, "validation/pptx_validate_report.json", &pptx); err == nil && pptx.Schema == pptxValidateReportSchema {
+	if err := readOptionalQualityJSON(projectPath, "validation/pptx_validate_report.json", &pptx); err == nil && pptx.Schema == pptxValidateReportSchema && pptx.TaskID == result.TaskID {
 		result.PPTXSummary = pptx.Summary
 		result.TextCoverage = pptx.TextFidelity.DeckCoverage
 		appendSafeQualityFindings(result, pptx.Findings)
 		result.Decision = pptx.Summary.Decision
 	}
+	var fidelity BeautifyFidelityReport
+	if err := readOptionalQualityJSON(projectPath, "validation/beautify_fidelity_report.json", &fidelity); err == nil && fidelity.Schema == beautifyFidelityReportSchema && fidelity.TaskID == result.TaskID {
+		identity := fidelity.Identity
+		identity.Overrides = append(make([]string, 0, len(fidelity.Identity.Overrides)), fidelity.Identity.Overrides...)
+		identity.FontSubstitutions = append(make([]string, 0, len(fidelity.Identity.FontSubstitutions)), fidelity.Identity.FontSubstitutions...)
+		view := &TaskBeautifyFidelity{
+			Present: true, Decision: fidelity.Decision, SourceSlideCount: fidelity.SourceSlideCount,
+			OutputSlideCount: fidelity.OutputSlideCount,
+			Pages:            append(make([]BeautifyFidelityPage, 0, len(fidelity.Pages)), fidelity.Pages...),
+			Identity:         identity,
+			Ignored:          make([]string, 0, len(fidelity.Ignored)),
+			Unsupported:      make([]string, 0, len(fidelity.Unsupported)),
+			Warning:          fidelity.Summary.Warning, Error: fidelity.Summary.Error, Blocking: fidelity.Summary.Blocking,
+		}
+		for _, item := range fidelity.Ignored {
+			view.Ignored = append(view.Ignored, beautifyDecisionLabel(item))
+		}
+		for _, item := range fidelity.Unsupported {
+			view.Unsupported = append(view.Unsupported, beautifyDecisionLabel(item))
+		}
+		result.BeautifyFidelity = view
+		appendSafeQualityFindings(result, fidelity.Findings)
+		result.Decision = fidelity.Decision
+	}
 	result.WarningBadge = result.SVGSummary.Warning + result.PPTXSummary.Warning
+	if result.BeautifyFidelity != nil {
+		result.WarningBadge += result.BeautifyFidelity.Warning
+	}
 	if result.Decision == "" {
 		result.Decision = "pending"
 	}
@@ -147,6 +201,18 @@ func (s *TaskService) loadTaskQualityReports(projectPath string, result *TaskQua
 		}
 		return result.Findings[i].Rule < result.Findings[j].Rule
 	})
+}
+
+func beautifyDecisionLabel(item BeautifyLockDecision) string {
+	return "P" + leftPadInt(item.SlideIndex, 2) + ":" + item.ID
+}
+
+func leftPadInt(value, width int) string {
+	text := strconv.Itoa(value)
+	for len(text) < width {
+		text = "0" + text
+	}
+	return text
 }
 
 func readOptionalQualityJSON(projectPath, relative string, target any) error {

@@ -8,7 +8,7 @@ import (
 )
 
 func TestRouteExecutionPolicyAllowsMain(t *testing.T) {
-	policy := routeExecutionPolicyFor(&routeSelection{Route: model.TaskRouteMain})
+	policy := routeExecutionPolicyFor(&routeSelection{Route: model.TaskRouteMain}, false)
 	if !policy.Executable {
 		t.Fatalf("main policy should be executable: %#v", policy)
 	}
@@ -28,7 +28,7 @@ func TestRouteExecutionPolicyAllowsMain(t *testing.T) {
 }
 
 func TestRouteExecutionPolicyAllowsTemplateFillWorkflow(t *testing.T) {
-	policy := routeExecutionPolicyFor(&routeSelection{Route: model.TaskRouteTemplateFill})
+	policy := routeExecutionPolicyFor(&routeSelection{Route: model.TaskRouteTemplateFill}, false)
 	if !policy.Executable {
 		t.Fatalf("template-fill should be executable: %#v", policy)
 	}
@@ -42,7 +42,7 @@ func TestRouteExecutionPolicyAllowsTemplateFillWorkflow(t *testing.T) {
 	if policy.NextStatus != model.TaskStatusSourceConverting || policy.NextPhase != PhaseSourcePrepare {
 		t.Fatalf("unexpected intake transition: %#v", policy)
 	}
-	wantSupported := []string{model.TaskRouteMain, model.TaskRouteTemplateFill}
+	wantSupported := []string{model.TaskRouteMain, model.TaskRouteTemplateFill, model.TaskRouteBeautify}
 	if len(policy.SupportedRoutes) != len(wantSupported) {
 		t.Fatalf("supported routes = %#v, want %#v", policy.SupportedRoutes, wantSupported)
 	}
@@ -53,14 +53,14 @@ func TestRouteExecutionPolicyAllowsTemplateFillWorkflow(t *testing.T) {
 	}
 }
 
-func TestRouteExecutionPolicyAllowsBeautifyIntakeButBlocksWorkflow(t *testing.T) {
-	policy := routeExecutionPolicyFor(&routeSelection{Route: model.TaskRouteBeautify})
+func TestRouteExecutionPolicyAllowsBeautifyIntakeButBlocksWorkflowWhenDisabled(t *testing.T) {
+	policy := routeExecutionPolicyFor(&routeSelection{Route: model.TaskRouteBeautify}, false)
 	if !policy.Executable {
 		t.Fatalf("beautify should be allowed to run source intake: %#v", policy)
 	}
 	policyJSON := routeExecutionPolicyJSON(t, policy)
 	if policyJSON["workflow_executable"] != false {
-		t.Fatalf("beautify workflow should still be blocked in SPEC2: %#v", policy)
+		t.Fatalf("disabled beautify workflow should be blocked: %#v", policy)
 	}
 	if policy.FailurePhase != "source_prepare.workflow_not_enabled" {
 		t.Fatalf("failure phase = %q, want source_prepare.workflow_not_enabled", policy.FailurePhase)
@@ -68,8 +68,8 @@ func TestRouteExecutionPolicyAllowsBeautifyIntakeButBlocksWorkflow(t *testing.T)
 	if policyJSON["unsupported_after"] != string(PhaseSourcePrepare) {
 		t.Fatalf("unsupported after = %#v, want %q", policyJSON["unsupported_after"], PhaseSourcePrepare)
 	}
-	if policy.NextSpec != "SPEC-04-Beautify-PPTX.md" {
-		t.Fatalf("next spec = %q", policy.NextSpec)
+	if policy.NextSpec != "" {
+		t.Fatalf("disabled workflow must not expose stale next spec = %q", policy.NextSpec)
 	}
 	if policy.NextStatus != model.TaskStatusSourceConverting || policy.NextPhase != PhaseSourcePrepare {
 		t.Fatalf("unexpected intake transition: %#v", policy)
@@ -77,13 +77,26 @@ func TestRouteExecutionPolicyAllowsBeautifyIntakeButBlocksWorkflow(t *testing.T)
 	if policy.FailureMessage == "" {
 		t.Fatalf("beautify policy should explain the workflow block: %#v", policy)
 	}
-	if policy.FailureMessage != "route beautify source intake is complete, but the full workflow is deferred to SPEC-04" {
-		t.Fatalf("beautify failure message = %q, want visible SPEC-04 handoff", policy.FailureMessage)
+	if policy.FailureMessage != "route beautify is disabled by SLIDESMITH_BEAUTIFY_ENABLED" {
+		t.Fatalf("beautify failure message = %q", policy.FailureMessage)
+	}
+}
+
+func TestRouteExecutionPolicyAllowsEnabledBeautifyWorkflow(t *testing.T) {
+	policy := routeExecutionPolicyFor(&routeSelection{Route: model.TaskRouteBeautify}, true)
+	if !policy.Executable || !policy.WorkflowExecutable {
+		t.Fatalf("enabled beautify workflow should be executable: %#v", policy)
+	}
+	if policy.FailurePhase != "" || policy.FailureMessage != "" || policy.UnsupportedAfter != "" || policy.NextSpec != "" {
+		t.Fatalf("enabled beautify should not carry workflow-block metadata: %#v", policy)
+	}
+	if policy.NextStatus != model.TaskStatusSourceConverting || policy.NextPhase != PhaseSourcePrepare {
+		t.Fatalf("unexpected intake transition: %#v", policy)
 	}
 }
 
 func TestRouteExecutionPolicyRejectsMissingSelection(t *testing.T) {
-	policy := routeExecutionPolicyFor(nil)
+	policy := routeExecutionPolicyFor(nil, false)
 	policyJSON := routeExecutionPolicyJSON(t, policy)
 	if policy.Executable || policyJSON["workflow_executable"] != false {
 		t.Fatalf("missing selection should not be executable: %#v", policy)
@@ -97,7 +110,7 @@ func TestRouteExecutionPolicyRejectsMissingSelection(t *testing.T) {
 }
 
 func TestRouteExecutionPolicyRejectsUnknownRoute(t *testing.T) {
-	policy := routeExecutionPolicyFor(&routeSelection{Route: "unknown"})
+	policy := routeExecutionPolicyFor(&routeSelection{Route: "unknown"}, true)
 	policyJSON := routeExecutionPolicyJSON(t, policy)
 	if policy.Executable || policyJSON["workflow_executable"] != false {
 		t.Fatalf("unknown route should not be executable: %#v", policy)
@@ -108,7 +121,7 @@ func TestRouteExecutionPolicyRejectsUnknownRoute(t *testing.T) {
 	if _, ok := policyJSON["unsupported_after"]; ok || policy.NextSpec != "" || policy.NextStatus != "" || policy.NextPhase != "" {
 		t.Fatalf("unknown route should not have a next workflow phase: %#v", policy)
 	}
-	wantSupported := []string{model.TaskRouteMain, model.TaskRouteTemplateFill}
+	wantSupported := []string{model.TaskRouteMain, model.TaskRouteTemplateFill, model.TaskRouteBeautify}
 	if len(policy.SupportedRoutes) != len(wantSupported) {
 		t.Fatalf("supported routes = %#v, want %#v", policy.SupportedRoutes, wantSupported)
 	}

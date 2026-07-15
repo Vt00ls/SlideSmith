@@ -207,6 +207,63 @@ for name in names:
         self.assertEqual(manifest["resources"][0]["status"], "degraded")
         self.assertEqual(manifest["resources"][0]["fallback"]["type"], "text")
 
+    def test_template_asset_copies_only_contained_concrete_file(self) -> None:
+        template_root = self.workspace / "templates" / "brand"
+        (template_root / "assets").mkdir(parents=True)
+        (template_root / "assets" / "brand_mark.svg").write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h1v1z"/></svg>', encoding="utf-8"
+        )
+        (self.workspace / ".slidesmith").mkdir(exist_ok=True)
+        (self.workspace / ".slidesmith" / "template_resolution.json").write_text(
+            json.dumps({"template_root": "templates/brand"}), encoding="utf-8"
+        )
+        requirement = {
+            "id": "template_asset.p02.brand_mark", "page": 2, "type": "template_asset",
+            "purpose": "Brand mark used on P02", "required": True, "acquire_via": "template",
+            "fallback": "shape", "output_name": "p02_brand_mark.svg",
+            "source_reference": "assets/brand_mark.svg", "publishable": True,
+        }
+        self._write_contract_inputs([requirement], ["provided"])
+        manifest = self._run()
+        item = manifest["resources"][0]
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["output"]["path"], "images/p02_brand_mark.svg")
+        self.assertEqual(item["output"]["sha256"], resource_runner.sha256_file(template_root / "assets" / "brand_mark.svg"))
+
+    def test_beautify_source_image_copies_to_acquired_namespace(self) -> None:
+        (self.project / "images").mkdir(exist_ok=True)
+        (self.project / "images" / "source_logo.png").write_bytes(PNG_1X1)
+        requirement = {
+            "id": "image.p01.source_logo", "page": 1, "type": "image", "purpose": "Frozen source logo",
+            "required": True, "acquire_via": "source", "fallback": "", "output_name": "p01_source_logo.png",
+            "source_reference": "images/source_logo.png", "publishable": True,
+        }
+        self._write_contract_inputs([requirement], ["provided"])
+        manifest = self._run()
+        item = manifest["resources"][0]
+        self.assertEqual(item["status"], "ready")
+        self.assertEqual(item["output"]["path"], "images/acquired/p01_source_logo.png")
+        self.assertEqual((self.project / "images" / "source_logo.png").read_bytes(), PNG_1X1)
+
+    def test_beautify_source_image_cache_is_invalidated_by_source_mutation(self) -> None:
+        (self.project / "images").mkdir(exist_ok=True)
+        source = self.project / "images" / "source_logo.png"
+        source.write_bytes(PNG_1X1)
+        requirement = {
+            "id": "image.p01.source_logo", "page": 1, "type": "image", "purpose": "Frozen source logo",
+            "required": True, "acquire_via": "source", "fallback": "", "output_name": "p01_source_logo.png",
+            "source_reference": "images/source_logo.png", "publishable": True,
+        }
+        self._write_contract_inputs([requirement], ["provided"])
+        first = self._run()["resources"][0]
+        second = self._run()["resources"][0]
+        self.assertTrue(second["cache_reused"])
+        source.write_bytes(PNG_1X1 + b"source-revision")
+        third = self._run()["resources"][0]
+        self.assertFalse(third.get("cache_reused", False))
+        self.assertEqual(third["attempt"], first["attempt"] + 1)
+        self.assertNotEqual(third["output"]["sha256"], first["output"]["sha256"])
+
     def test_ai_uses_manifest_mode_and_slice_parent(self) -> None:
         requirements = [
             {

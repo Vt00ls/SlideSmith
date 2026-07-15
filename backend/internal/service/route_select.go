@@ -18,12 +18,20 @@ const (
 )
 
 type routeSelection struct {
-	Route              string                `json:"route"`
-	Reason             string                `json:"reason"`
-	Confidence         float64               `json:"confidence"`
-	StandaloneWorkflow string                `json:"standalone_workflow"`
-	CreatedAt          string                `json:"created_at"`
-	SourceArtifacts    []routeSourceArtifact `json:"source_artifacts"`
+	Route              string                  `json:"route"`
+	Reason             string                  `json:"reason"`
+	Confidence         float64                 `json:"confidence"`
+	StandaloneWorkflow string                  `json:"standalone_workflow"`
+	CreatedAt          string                  `json:"created_at"`
+	SourceArtifacts    []routeSourceArtifact   `json:"source_artifacts"`
+	CapabilitySnapshot routeCapabilitySnapshot `json:"capability_snapshot"`
+}
+
+type routeCapabilitySnapshot struct {
+	Captured                          bool `json:"captured"`
+	BeautifyEnabled                   bool `json:"beautify_enabled"`
+	BeautifyFidelityStrict            bool `json:"beautify_fidelity_strict"`
+	BeautifySourceSVGReferenceEnabled bool `json:"beautify_source_svg_reference_enabled"`
 }
 
 type routeSourceArtifact struct {
@@ -54,7 +62,7 @@ func (s *TaskService) runRouteSelect(ctx context.Context, task *model.Task, work
 		_ = s.finishPhaseRun(ctx, phaseRun, PhaseRunStatusFailed, nil, err)
 		return nil, err
 	}
-	policy := routeExecutionPolicyFor(selection)
+	policy := routeExecutionPolicyFor(selection, s.agentCfg.BeautifyEnabled)
 	output := map[string]any{
 		"selection":        selection,
 		"execution_policy": policy,
@@ -73,6 +81,12 @@ func (s *TaskService) runRouteSelect(ctx context.Context, task *model.Task, work
 func (s *TaskService) persistRouteSelection(ctx context.Context, task *model.Task, selection *routeSelection) error {
 	if selection == nil {
 		return fmt.Errorf("route selection is nil")
+	}
+	if task.RouteSelectedAt != nil && strings.TrimSpace(task.RouteSelectionJSON) != "" {
+		var previous routeSelection
+		if json.Unmarshal([]byte(task.RouteSelectionJSON), &previous) == nil && previous.Route == selection.Route && previous.CapabilitySnapshot.Captured {
+			selection.CapabilitySnapshot = previous.CapabilitySnapshot
+		}
 	}
 	raw, err := json.Marshal(selection)
 	if err != nil {
@@ -155,6 +169,12 @@ func (s *TaskService) selectRoute(ctx context.Context, task *model.Task) (*route
 		StandaloneWorkflow: standaloneWorkflow,
 		CreatedAt:          time.Now().UTC().Format(time.RFC3339Nano),
 		SourceArtifacts:    sources,
+		CapabilitySnapshot: routeCapabilitySnapshot{
+			Captured:                          true,
+			BeautifyEnabled:                   s.agentCfg.BeautifyEnabled,
+			BeautifyFidelityStrict:            s.agentCfg.BeautifyFidelityStrict,
+			BeautifySourceSVGReferenceEnabled: s.agentCfg.BeautifySourceSVGReferenceEnabled,
+		},
 	}, nil
 }
 

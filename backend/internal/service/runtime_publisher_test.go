@@ -372,3 +372,46 @@ func TestRuntimeWorkspacePublisherPublishesStage5Contract(t *testing.T) {
 		}
 	}
 }
+
+func TestRuntimeWorkspacePublisherBeautifyExcludesSourceAndPublishesAuditChain(t *testing.T) {
+	tmp := t.TempDir()
+	workspace := filepath.Join(tmp, "workspace")
+	project := filepath.Join(workspace, "projects", "task-beautify")
+	mustWriteFile(t, filepath.Join(project, "sources", "private-source.pptx"), "private source bytes\n")
+	mustWriteFile(t, filepath.Join(project, "analysis", "beautify_inventory.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "analysis", "beautify_risk_report.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "analysis", "beautify_plan.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "analysis", "beautify_svg_fidelity.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "validation", "beautify_fidelity_report.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, ".slidesmith", "beautify_lock.json"), "{}\n")
+	mustWriteFile(t, filepath.Join(project, "exports", "beautified.pptx"), "pptx bytes\n")
+
+	publisher := NewRuntimeWorkspacePublisher(NewLocalStorage(filepath.Join(tmp, "storage")))
+	artifacts, err := publisher.PublishProjectForRoute(context.Background(), "task-beautify", workspace, project, "v-beautify", model.TaskRouteBeautify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"analysis/beautify_inventory.json":         model.ArtifactKindBeautifyInventory,
+		"analysis/beautify_risk_report.json":       model.ArtifactKindBeautifyRiskReport,
+		"analysis/beautify_plan.json":              model.ArtifactKindBeautifyPlan,
+		"analysis/beautify_svg_fidelity.json":      model.ArtifactKindManifest,
+		"validation/beautify_fidelity_report.json": model.ArtifactKindBeautifyFidelityReport,
+		"manifest/beautify_lock.json":              model.ArtifactKindBeautifyLock,
+	}
+	for _, artifact := range artifacts {
+		relative := strings.TrimPrefix(filepath.ToSlash(artifact.ObjectKey), "tasks/task-beautify/artifacts/v-beautify/")
+		if strings.HasPrefix(relative, "source/") || strings.HasPrefix(relative, "sources/") || artifact.Kind == model.ArtifactKindSource {
+			t.Fatalf("Beautify publisher leaked source artifact: %#v", artifact)
+		}
+		if kind, ok := want[relative]; ok {
+			if artifact.Kind != kind {
+				t.Fatalf("artifact %s kind = %q, want %q", relative, artifact.Kind, kind)
+			}
+			delete(want, relative)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("Beautify audit artifacts missing: %#v", want)
+	}
+}

@@ -1,0 +1,12 @@
+{
+  "name": "beautify-charts",
+  "source_features": ["bar-chart", "line-chart", "combo-chart", "display-cache"],
+  "expected_decision": "pass_with_warnings",
+  "expected_risks": ["beautify.complex_chart"],
+  "negative_mutations": [
+    {"kind": "category-order-change", "expected_rule": "beautify.chart_fidelity"},
+    {"kind": "series-name-change", "expected_rule": "beautify.chart_fidelity"},
+    {"kind": "series-value-change", "expected_rule": "beautify.chart_fidelity"}
+  ],
+  "fix_verify": ["fail-fidelity", "retry-svg", "clean-stale-validation", "pass-fidelity"]
+}

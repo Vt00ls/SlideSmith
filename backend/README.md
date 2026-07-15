@@ -37,6 +37,9 @@ export SLIDESMITH_AGENT_COMPOSE_SESSION_ROOT=/root/slidesmith-agent-compose-data
 export SLIDESMITH_PPT_RUNNER_PROFILE=full-ppt-master
 export SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=false
 export SLIDESMITH_FULL_PPT_PREFLIGHT_STRICT=true
+export SLIDESMITH_BEAUTIFY_ENABLED=false
+export SLIDESMITH_BEAUTIFY_FIDELITY_STRICT=true
+export SLIDESMITH_BEAUTIFY_SOURCE_SVG_REFERENCE_ENABLED=false
 export SLIDESMITH_RESOURCE_PHASE_ENABLED=true
 export SLIDESMITH_RESOURCE_NETWORK_ENABLED=false
 export SLIDESMITH_RESOURCE_WEB_IMAGE_ENABLED=false
@@ -86,6 +89,13 @@ fallbacks, and resource-use bindings pass validation. Disabling the resource
 phase fails a locked full task instead of silently skipping it. Web, AI, and
 network-backed formula paths additionally require confirmation, deployment
 switches, and an allowlisted provider; all are offline by default.
+
+Beautify tasks use the same locked `full-ppt-master` public pipeline after a
+route-specific inventory, source-seeded confirmation, plan, and immutable
+lock. `SLIDESMITH_BEAUTIFY_ENABLED` defaults to false, strict source-to-output
+fidelity defaults to true, and optional source-SVG references default to false.
+The route-selection capability snapshot keeps already-started tasks stable
+when deployment switches change.
 
 ## Core API
 

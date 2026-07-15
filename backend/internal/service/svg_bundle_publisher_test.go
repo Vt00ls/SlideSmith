@@ -126,3 +126,26 @@ func TestGetSVGBundleReturnsSafePassedSummaryAndRejectsStalePreview(t *testing.T
 		t.Fatalf("stale SVG bundle view = %#v", stale)
 	}
 }
+
+func TestSVGBundlePublisherIncludesHashBoundBeautifyFidelityReceipt(t *testing.T) {
+	projectPath := t.TempDir()
+	mustWriteFileNoTest(projectPath, filepath.Join("analysis", "beautify_svg_fidelity.json"), `{"schema":"slidesmith.beautify_svg_fidelity.v1"}`+"\n")
+	sha, _ := sha256File(filepath.Join(projectPath, "analysis", "beautify_svg_fidelity.json"))
+	task := &model.Task{ID: "task-beautify-svg-publish", Route: model.TaskRouteBeautify}
+	candidates, err := svgBundlePublishCandidates(task, projectPath, map[string]any{"beautify_svg_fidelity_sha256": sha}, &svgInventoryDocument{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, candidate := range candidates {
+		if candidate.RelativePath == "analysis/beautify_svg_fidelity.json" && candidate.Kind == model.ArtifactKindManifest {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Beautify SVG fidelity candidate missing: %#v", candidates)
+	}
+	if _, err := svgBundlePublishCandidates(task, projectPath, map[string]any{"beautify_svg_fidelity_sha256": strings.Repeat("0", 64)}, &svgInventoryDocument{}); err == nil {
+		t.Fatal("stale Beautify SVG fidelity receipt was accepted")
+	}
+}

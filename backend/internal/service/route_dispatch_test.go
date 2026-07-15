@@ -60,7 +60,6 @@ func TestProcessPrepareDispatchesRouteAfterSourcePrepare(t *testing.T) {
 		wantRoute        string
 		wantStatus       string
 		wantFailurePhase string
-		wantSpec         string
 	}{
 		{
 			name:  "template-fill",
@@ -81,7 +80,6 @@ func TestProcessPrepareDispatchesRouteAfterSourcePrepare(t *testing.T) {
 			wantRoute:        model.TaskRouteBeautify,
 			wantStatus:       model.TaskStatusFailed,
 			wantFailurePhase: "source_prepare.workflow_not_enabled",
-			wantSpec:         "SPEC-04-Beautify-PPTX.md",
 		},
 	}
 	for _, test := range tests {
@@ -150,11 +148,13 @@ func TestProcessPrepareDispatchesRouteAfterSourcePrepare(t *testing.T) {
 					"workspace_path": wantWorkspace,
 					"project_path":   wantProject,
 					"route":          test.wantRoute,
-					"next_spec":      test.wantSpec,
 				} {
 					if metadata[key] != want {
 						t.Fatalf("metadata[%q] = %#v, want %q; metadata=%#v", key, metadata[key], want, metadata)
 					}
+				}
+				if metadata["next_spec"] != "" {
+					t.Fatalf("metadata next_spec must not expose stale SPEC handoff: %#v", metadata)
 				}
 				if metadata["route_reason"] == "" {
 					t.Fatalf("failure metadata missing route_reason: %#v", metadata)
@@ -191,6 +191,32 @@ func TestProcessPrepareDispatchesRouteAfterSourcePrepare(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestProcessPrepareQueuesEnabledBeautifyInventoryWithoutTemplateResolve(t *testing.T) {
+	service, repo, task, _ := routeDispatchPrepareService(t, "请美化 PPTX，保留页数和文字", []model.Artifact{
+		{Name: "original.pptx", Kind: model.ArtifactKindSource, ObjectKey: "tasks/task-route/source/original.pptx"},
+	})
+	service.agentCfg.BeautifyEnabled = true
+	if err := service.processPrepare(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := repo.GetTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Route != model.TaskRouteBeautify || updated.Status != model.TaskStatusBeautifyInventoryBuilding {
+		t.Fatalf("enabled Beautify dispatch = route %q status %q", updated.Route, updated.Status)
+	}
+	runs, err := repo.ListPhaseRuns(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range runs {
+		if run.Phase == string(PhaseTemplateResolve) {
+			t.Fatalf("Beautify must not run platform template resolve: %#v", runs)
+		}
 	}
 }
 

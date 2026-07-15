@@ -1,0 +1,10 @@
+{
+  "name": "beautify-text",
+  "source_features": ["three-pages", "paragraphs", "lists", "duplicate-text", "split-runs"],
+  "expected_decision": "pass",
+  "negative_mutations": [
+    {"kind": "missing-text", "expected_rule": "beautify.text_missing_or_reordered"},
+    {"kind": "reordered-text", "expected_rule": "beautify.text_missing_or_reordered"},
+    {"kind": "duplicate-consumed-once", "expected_rule": "beautify.text_missing_or_reordered"}
+  ]
+}

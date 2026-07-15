@@ -1007,7 +1007,8 @@ func mustWriteRetryProjectFiles(projectPath string) {
 	if manifestSHA, err := sha256File(manifestPath); err == nil {
 		designSHA, designErr := sha256File(filepath.Join(projectPath, "design_spec.md"))
 		lockSHA, lockErr := sha256File(filepath.Join(projectPath, "spec_lock.md"))
-		if designErr != nil || lockErr != nil {
+		planSHA, planErr := sha256File(filepath.Join(projectPath, ".slidesmith", "resource_plan.json"))
+		if designErr != nil || lockErr != nil || planErr != nil {
 			panic("hash retry spec fixture")
 		}
 		if err := writeJSONPretty(filepath.Join(projectPath, ".slidesmith", "spec_contract.json"), map[string]any{
@@ -1015,6 +1016,7 @@ func mustWriteRetryProjectFiles(projectPath string) {
 			"runtime_manifest_sha256": manifestSHA,
 			"design_spec_sha256":      designSHA,
 			"spec_lock_sha256":        lockSHA,
+			"resource_plan_sha256":    planSHA,
 		}); err != nil {
 			panic(err)
 		}

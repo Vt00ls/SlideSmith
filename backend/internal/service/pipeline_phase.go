@@ -24,6 +24,8 @@ const (
 	PhaseFinalizeExport     PipelinePhase = "finalize_export"
 	PhasePPTXValidate       PipelinePhase = "pptx_validate"
 	PhasePublish            PipelinePhase = "publish"
+	PhaseBeautifyInventory  PipelinePhase = "beautify_inventory"
+	PhaseBeautifyPlan       PipelinePhase = "beautify_plan"
 )
 
 const (
@@ -72,6 +74,21 @@ var pipelinePhaseOrder = []PipelinePhase{
 
 var pipelinePhaseOrderByRoute = map[string][]PipelinePhase{
 	model.TaskRouteMain: pipelinePhaseOrder,
+	model.TaskRouteBeautify: {
+		PhaseRouteSelect,
+		PhaseSourcePrepare,
+		PhaseBeautifyInventory,
+		PhaseAnchorConfirm,
+		PhaseRealizationConfirm,
+		PhaseBeautifyPlan,
+		PhaseSpecGenerate,
+		PhaseImageAcquire,
+		PhaseSVGExecute,
+		PhaseQualityCheck,
+		PhaseFinalizeExport,
+		PhasePPTXValidate,
+		PhasePublish,
+	},
 	model.TaskRouteTemplateFill: {
 		PhaseRouteSelect,
 		PhaseSourcePrepare,
@@ -103,6 +120,26 @@ var pipelinePhaseRegistry = map[PipelinePhase]PipelinePhaseDefinition{
 		Retryable:         true,
 		RequiredArtifacts: []string{model.ArtifactKindSource},
 		OutputArtifacts:   []string{"normalized markdown", "source metadata"},
+	},
+	PhaseBeautifyInventory: {
+		Phase:             PhaseBeautifyInventory,
+		DisplayName:       "Beautify Inventory",
+		RequiredStatuses:  []string{model.TaskStatusBeautifyInventoryBuilding},
+		NextStatus:        model.TaskStatusAwaitingAnchorConfirm,
+		Runner:            PhaseRunnerWorker,
+		Retryable:         true,
+		RequiredArtifacts: []string{model.ArtifactKindSource, model.ArtifactKindPPTXIdentity, model.ArtifactKindPPTXSlideLibrary},
+		OutputArtifacts:   []string{".slidesmith/contracts/beautify_inputs.json", "analysis/beautify_inventory.json", "analysis/beautify_risk_report.json", ".slidesmith/contracts/beautify_inventory.json"},
+	},
+	PhaseBeautifyPlan: {
+		Phase:             PhaseBeautifyPlan,
+		DisplayName:       "Beautify Plan",
+		RequiredStatuses:  []string{model.TaskStatusBeautifyPlanning},
+		NextStatus:        model.TaskStatusAwaitingBeautifyConfirm,
+		Runner:            PhaseRunnerAgent,
+		Retryable:         true,
+		RequiredArtifacts: []string{model.ArtifactKindBeautifyInventory, model.ArtifactKindBeautifyRiskReport},
+		OutputArtifacts:   []string{"analysis/beautify_plan.json", ".slidesmith/contracts/beautify_plan.json"},
 	},
 	PhaseTemplateFillPlan: {
 		Phase:             PhaseTemplateFillPlan,

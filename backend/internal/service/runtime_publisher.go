@@ -42,17 +42,27 @@ func NewRuntimeWorkspacePublisher(storage StorageService) *RuntimeWorkspacePubli
 }
 
 func (p *RuntimeWorkspacePublisher) Publish(ctx context.Context, taskID, workspacePath, publishVersion string) ([]model.Artifact, error) {
-	return p.publish(ctx, taskID, workspacePath, "", publishVersion)
+	return p.publish(ctx, taskID, workspacePath, "", publishVersion, "")
 }
 
 func (p *RuntimeWorkspacePublisher) PublishProject(ctx context.Context, taskID, workspacePath, projectPath, publishVersion string) ([]model.Artifact, error) {
 	if strings.TrimSpace(projectPath) == "" {
 		return nil, fmt.Errorf("project path is empty")
 	}
-	return p.publish(ctx, taskID, workspacePath, projectPath, publishVersion)
+	return p.publish(ctx, taskID, workspacePath, projectPath, publishVersion, "")
 }
 
-func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspacePath, exactProjectPath, publishVersion string) (_ []model.Artifact, resultErr error) {
+func (p *RuntimeWorkspacePublisher) PublishProjectForRoute(ctx context.Context, taskID, workspacePath, projectPath, publishVersion, route string) ([]model.Artifact, error) {
+	if strings.TrimSpace(projectPath) == "" {
+		return nil, fmt.Errorf("project path is empty")
+	}
+	if route != model.TaskRouteBeautify {
+		return nil, fmt.Errorf("route-aware project publish does not support route %q", route)
+	}
+	return p.publish(ctx, taskID, workspacePath, projectPath, publishVersion, route)
+}
+
+func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspacePath, exactProjectPath, publishVersion, route string) (_ []model.Artifact, resultErr error) {
 	if workspacePath == "" {
 		return nil, fmt.Errorf("workspace path is empty")
 	}
@@ -128,7 +138,7 @@ func (p *RuntimeWorkspacePublisher) publish(ctx context.Context, taskID, workspa
 		}
 	}
 
-	items, err := collectRuntimeArtifacts(ctx, workspacePath, projectPath, manifest, hasManifest)
+	items, err := collectRuntimeArtifacts(ctx, workspacePath, projectPath, manifest, hasManifest, route)
 	if err != nil {
 		return nil, err
 	}
@@ -389,7 +399,11 @@ func discoverRuntimeProjectPath(workspacePath string) (string, error) {
 	return newestPath(candidates), nil
 }
 
-func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath string, manifest runtimeArtifactManifest, hasManifest bool) ([]publishedRuntimeArtifact, error) {
+func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath string, manifest runtimeArtifactManifest, hasManifest bool, routes ...string) ([]publishedRuntimeArtifact, error) {
+	route := ""
+	if len(routes) > 0 {
+		route = routes[0]
+	}
 	byObjectRel := map[string]publishedRuntimeArtifact{}
 	addFile := func(permittedRoot, sourcePath, objectRel string) error {
 		if err := ctx.Err(); err != nil {
@@ -426,6 +440,9 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 			if err != nil {
 				return nil, err
 			}
+			if route == model.TaskRouteBeautify && (strings.HasPrefix(cleanRel, "sources/") || strings.HasPrefix(cleanRel, "source/")) {
+				continue
+			}
 			if err := addFile(projectPath, filepath.Join(projectPath, filepath.FromSlash(cleanRel)), cleanRel); err != nil {
 				return nil, err
 			}
@@ -436,7 +453,6 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 		ProjectRel string
 		ObjectRel  string
 	}{
-		{"sources", "source"},
 		{"analysis", "analysis"},
 		{"validation", "validation"},
 		{"design_spec.md", "design_spec.md"},
@@ -450,6 +466,17 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 		{filepath.Join(".slidesmith", "quality_report.json"), filepath.Join("manifest", "quality_report.json")},
 		{filepath.Join(".slidesmith", "artifacts.json"), filepath.Join("manifest", "runtime_artifacts.json")},
 		{".slidesmith-artifacts.json", filepath.Join("manifest", "runtime_artifacts.json")},
+	}
+	if route != model.TaskRouteBeautify {
+		contractRoots = append(contractRoots, struct {
+			ProjectRel string
+			ObjectRel  string
+		}{"sources", "source"})
+	} else {
+		contractRoots = append(contractRoots, struct {
+			ProjectRel string
+			ObjectRel  string
+		}{filepath.Join(".slidesmith", "beautify_lock.json"), filepath.Join("manifest", "beautify_lock.json")})
 	}
 	for _, root := range contractRoots {
 		if err := addArtifactRoot(ctx, projectPath, root.ProjectRel, root.ObjectRel, func(sourcePath, objectRel string) error {
@@ -625,6 +652,20 @@ func artifactKindFromRuntimePath(path string) string {
 		return model.ArtifactKindPPTXTextInventory
 	case path == "validation/pptx_validate_report.json":
 		return model.ArtifactKindPPTXValidateReport
+	case path == "validation/beautify_fidelity_report.json":
+		return model.ArtifactKindBeautifyFidelityReport
+	case path == "analysis/beautify_inventory.json":
+		return model.ArtifactKindBeautifyInventory
+	case path == "analysis/beautify_risk_report.json":
+		return model.ArtifactKindBeautifyRiskReport
+	case path == "analysis/beautify_plan.json":
+		return model.ArtifactKindBeautifyPlan
+	case path == "analysis/beautify_svg_fidelity.json":
+		return model.ArtifactKindManifest
+	case path == "manifest/beautify_lock.json":
+		return model.ArtifactKindBeautifyLock
+	case strings.HasPrefix(path, "analysis/source_svg_import/"):
+		return model.ArtifactKindSourceSVGReference
 	case path == "validation/visual_review_report.json":
 		return model.ArtifactKindVisualReviewReport
 	case path == "validation/render/output.pdf":

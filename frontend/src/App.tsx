@@ -26,6 +26,9 @@ import {
 import {
   api,
   Artifact,
+  BeautifyFidelityMetric,
+  BeautifyPlan,
+  BeautifyPlanPreview,
   Confirmation,
   parseJSON,
   RetryPhase,
@@ -64,6 +67,8 @@ const activeStatuses: TaskStatus[] = [
   "template_fill_checking",
   "template_fill_applying",
   "template_fill_validating",
+  "beautify_inventory_building",
+  "beautify_planning",
   "image_acquiring",
   "svg_generating",
   "quality_checking",
@@ -79,7 +84,10 @@ function isConfirmationStatus(status?: TaskStatus) {
 }
 
 function isWaitingStatus(status?: TaskStatus) {
-  return isConfirmationStatus(status) || status === "awaiting_spec_confirm" || status === "awaiting_template_fill_confirm";
+  return isConfirmationStatus(status)
+    || status === "awaiting_spec_confirm"
+    || status === "awaiting_template_fill_confirm"
+    || status === "awaiting_beautify_confirm";
 }
 
 const splitRetryOptions: Array<{ phase: RetryPhase; label: string }> = [
@@ -108,6 +116,20 @@ const templateFillPlanReadableStatuses: TaskStatus[] = [
   "template_fill_checking",
   "template_fill_applying",
   "template_fill_validating",
+  "publishing",
+  "completed",
+  "failed",
+];
+
+const beautifyPlanStatuses: TaskStatus[] = [
+  "awaiting_beautify_confirm",
+  "spec_generating",
+  "awaiting_spec_confirm",
+  "image_acquiring",
+  "svg_generating",
+  "quality_checking",
+  "exporting",
+  "pptx_validating",
   "publishing",
   "completed",
   "failed",
@@ -189,6 +211,30 @@ function qualityDecisionText(decision: string) {
   }
 }
 
+function fidelityMetricCount(value: number | string[] | undefined) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  return Array.isArray(value) ? value.length : 0;
+}
+
+function beautifyFidelityMetricText(metric?: BeautifyFidelityMetric) {
+  if (!metric) {
+    return "-";
+  }
+  const expected = typeof metric.required === "number" ? metric.required : metric.expected || 0;
+  const matched = typeof metric.used === "number" ? metric.used : metric.matched || 0;
+  const mismatches = fidelityMetricCount(metric.missing)
+    + fidelityMetricCount(metric.changed)
+    + fidelityMetricCount(metric.reordered)
+    + fidelityMetricCount(metric.mismatches);
+  return `${matched}/${expected}${mismatches > 0 ? ` · ${mismatches} 异常` : ""}`;
+}
+
+function isFullSVGRouteUI(route: string) {
+  return route === "main" || route === "beautify";
+}
+
 function resourceItemsByStatus(items: TaskResourceItem[]) {
   return {
     ready: items.filter((item) => item.status === "ready"),
@@ -254,6 +300,51 @@ function templateFillCheckRows(report: Record<string, unknown>) {
   ];
 }
 
+function beautifyPlanSlideRows(preview: BeautifyPlanPreview | null) {
+  if (!preview) {
+    return [];
+  }
+  const inventoryByPage = new Map(
+    (preview.inventory?.pages || []).map((page) => [page.source_slide, page]),
+  );
+  return (preview.plan?.slides || []).map((slide) => ({
+    ...slide,
+    inventory: inventoryByPage.get(slide.source_slide),
+  }));
+}
+
+function beautifyPlanErrorCount(preview: BeautifyPlanPreview | null) {
+  return (preview?.findings || []).filter((finding) => ["blocking", "error"].includes(finding.severity)).length;
+}
+
+function beautifyPlanActionState({
+  canEdit,
+  canConfirm,
+  taskStatus,
+  busy,
+  dirty,
+  errorCount,
+}: {
+  canEdit: boolean;
+  canConfirm: boolean;
+  taskStatus?: TaskStatus;
+  busy: boolean;
+  dirty: boolean;
+  errorCount: number;
+}) {
+  const hint = dirty
+    ? "美化计划已修改，请先保存；页数、顺序、文字和数据始终保持冻结。"
+    : errorCount > 0
+      ? `存在 ${errorCount} 个阻断问题，请调整布局或风险决策后重新检查。`
+      : "";
+  return {
+    saveDisabled: !canEdit || busy || !dirty,
+    checkDisabled: taskStatus !== "awaiting_beautify_confirm" || busy || dirty,
+    confirmDisabled: !canConfirm || busy || dirty || errorCount > 0,
+    hint,
+  };
+}
+
 function templateFillActionState({
   canEdit,
   canConfirm,
@@ -295,12 +386,29 @@ function templateFillPageKey(taskId: string) {
   return `template-fill:${taskId}`;
 }
 
+function beautifyPlanPageKey(taskId: string) {
+  return `beautify-plan:${taskId}`;
+}
+
 function taskDetailPageKey(taskId: string) {
   return `task-detail:${taskId}`;
 }
 
-function taskRouteMatches(route: Route, routeName: "task" | "templateFill" | "preview", taskId: string) {
+function taskRouteMatches(route: Route, routeName: "task" | "templateFill" | "beautifyPlan" | "preview", taskId: string) {
   return route.name === routeName && "id" in route && route.id === taskId;
+}
+
+function createBeautifyPlanRequestScope(taskId: string, isRouteCurrent: () => boolean = () => true) {
+  return createTemplateFillRequestScope(taskId, isRouteCurrent);
+}
+
+async function scopedBeautifyPlanRequest<T>(
+  scope: ReturnType<typeof createBeautifyPlanRequestScope>,
+  currentTaskId: string,
+  request: (scopedTaskId: string) => Promise<T>,
+  generation = scope.currentGeneration(),
+) {
+  return scopedTemplateFillRequest(scope, currentTaskId, request, generation);
 }
 
 function createTemplateFillRequestScope(taskId: string, isRouteCurrent: () => boolean = () => true) {
@@ -403,6 +511,10 @@ function templateFillPlanReadableStatus(task?: Pick<Task, "route" | "status">) {
     && templateFillPlanReadableStatuses.includes(task.status);
 }
 
+function beautifyPlanReadableStatus(task?: Pick<Task, "route" | "status">) {
+  return !!task && task.route === "beautify" && beautifyPlanStatuses.includes(task.status);
+}
+
 async function loadTaskDetailData<
   TTask extends Pick<Task, "id" | "route" | "status">,
   TEvent,
@@ -413,6 +525,7 @@ async function loadTaskDetailData<
   TRuntimeRun,
   TPhaseRun,
   TPreview,
+  TBeautifyPreview,
 >(
   scope: ReturnType<typeof createTaskDetailRequestScope>,
   currentTaskId: string,
@@ -426,6 +539,7 @@ async function loadTaskDetailData<
     listRuntimeRuns: (id: string) => Promise<TRuntimeRun[]>;
     listPhaseRuns: (id: string) => Promise<TPhaseRun[]>;
     getTemplateFillPlan: (id: string) => Promise<TPreview>;
+    getBeautifyPlan?: (id: string) => Promise<TBeautifyPreview>;
   },
 ) {
   const generation = scope.activate();
@@ -469,10 +583,40 @@ async function loadTaskDetailData<
       templateFillPreview = null;
     }
   }
+  if (
+    templateFillPreview
+    && typeof templateFillPreview === "object"
+    && "task_id" in templateFillPreview
+    && templateFillPreview.task_id !== scope.taskId
+  ) {
+    return undefined;
+  }
+  let beautifyPlanPreview: TBeautifyPreview | null = null;
+  if (beautifyPlanReadableStatus(task) && requests.getBeautifyPlan) {
+    try {
+      beautifyPlanPreview = await requests.getBeautifyPlan(scope.taskId);
+    } catch (err) {
+      if (!scope.isGenerationCurrent(generation, currentTaskId)) {
+        return undefined;
+      }
+      beautifyPlanPreview = null;
+    }
+  }
+  if (
+    beautifyPlanPreview
+    && typeof beautifyPlanPreview === "object"
+    && "task_id" in beautifyPlanPreview
+    && beautifyPlanPreview.task_id !== scope.taskId
+  ) {
+    return undefined;
+  }
   if (!scope.isGenerationCurrent(generation, currentTaskId)) {
     return undefined;
   }
-  return { task, events, artifacts, resources, svgBundle, quality, runtimeRuns, phaseRuns, templateFillPreview };
+  return {
+    task, events, artifacts, resources, svgBundle, quality, runtimeRuns, phaseRuns,
+    templateFillPreview, beautifyPlanPreview,
+  };
 }
 
 function taskDetailRetryTaskID(
@@ -485,6 +629,20 @@ function taskDetailRetryTaskID(
 
 function retryOptionsForFailure(failurePhase: string, taskRoute = "main"): Array<{ phase: RetryPhase; label: string }> {
   const value = failurePhase.toLowerCase();
+  if (taskRoute === "beautify") {
+    if (value.startsWith("beautify_inventory.inputs")) {
+      return [
+        { phase: "prepare", label: "重新准备" },
+        { phase: "beautify_inventory", label: "重建美化清单" },
+      ];
+    }
+    if (value.startsWith("beautify_inventory")) {
+      return [{ phase: "beautify_inventory", label: "重建美化清单" }];
+    }
+    if (value.startsWith("beautify_plan") || value.startsWith("beautify_lock")) {
+      return [{ phase: "beautify_plan", label: "重建美化计划" }];
+    }
+  }
   if (taskRoute === "template-fill") {
     if (value.startsWith("template_fill_plan.inputs")) {
       return [
@@ -530,6 +688,10 @@ function canOpenTemplateFillPlan(task?: Pick<Task, "route" | "status">) {
   return !!task && task.route === "template-fill" && templateFillPlanStatuses.includes(task.status);
 }
 
+function canOpenBeautifyPlan(task?: Pick<Task, "route" | "status">) {
+  return !!task && task.route === "beautify" && beautifyPlanStatuses.includes(task.status);
+}
+
 function completedTaskRoute(taskId: string, taskRoute: string): Route {
   return taskRoute === "template-fill"
     ? { name: "templateFill", id: taskId }
@@ -537,7 +699,7 @@ function completedTaskRoute(taskId: string, taskRoute: string): Route {
 }
 
 function visibleTaskArtifacts<T>(artifacts: T[], taskRoute: string) {
-  return taskRoute === "template-fill" ? artifacts : artifacts.slice(0, 8);
+  return taskRoute === "template-fill" || taskRoute === "beautify" ? artifacts : artifacts.slice(0, 8);
 }
 
 async function loadPreviewPageData<TTask extends Pick<Task, "id" | "route">, TArtifact>(
@@ -622,6 +784,10 @@ function retryPhaseIcon(phase: RetryPhase, active: boolean) {
       return <Presentation size={16} />;
     case "template_fill_validate":
       return <CheckCircle2 size={16} />;
+    case "beautify_inventory":
+      return <LayoutList size={16} />;
+    case "beautify_plan":
+      return <Palette size={16} />;
     case "svg_execute":
       return <Play size={16} />;
     case "quality_check":
@@ -677,6 +843,9 @@ export function App() {
         {route.name === "spec" && <SpecPreviewPage taskId={route.id} />}
         {route.name === "templateFill" && (
           <TemplateFillPlanPage key={templateFillPageKey(route.id)} taskId={route.id} />
+        )}
+        {route.name === "beautifyPlan" && (
+          <BeautifyPlanPage key={beautifyPlanPageKey(route.id)} taskId={route.id} />
         )}
         {route.name === "preview" && (
           <PreviewPage key={previewPageKey(route.id)} taskId={route.id} />
@@ -1144,10 +1313,14 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
     runtimeRuns: [] as RuntimeRun[],
     phaseRuns: [] as TaskPhaseRun[],
     templateFillPreview: null as TemplateFillPlanPreview | null,
+    beautifyPlanPreview: null as BeautifyPlanPreview | null,
   }));
   const [retrying, setRetrying] = useState<RetryPhase | "">("");
   const [error, setError] = useState("");
-  const { task, events, artifacts, resources, svgBundle, quality, runtimeRuns, phaseRuns, templateFillPreview } = detail;
+  const {
+    task, events, artifacts, resources, svgBundle, quality, runtimeRuns, phaseRuns,
+    templateFillPreview, beautifyPlanPreview,
+  } = detail;
 
   const load = useCallback(async () => {
     try {
@@ -1161,6 +1334,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
         listRuntimeRuns: api.listRuntimeRuns,
         listPhaseRuns: api.listPhaseRuns,
         getTemplateFillPlan: api.getTemplateFillPlan,
+        getBeautifyPlan: api.getBeautifyPlan,
       });
       if (next) {
         setDetail(next);
@@ -1200,11 +1374,18 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
     : {};
   const sourceContract = sourcePrepareOutput.source_contract as Record<string, unknown> | undefined;
   const taskRoute = task?.route || "main";
+  const fullSVGRoute = isFullSVGRouteUI(taskRoute);
   const routeConfidence = typeof routeSelection.confidence === "number" ? Math.round(routeSelection.confidence * 100) : null;
   const retryOptions = task?.status === "failed" ? retryOptionsForFailure(task.failure_phase || "", taskRoute) : [];
   const retryGuidance = task?.status === "failed" ? retryGuidanceForFailure(task.failure_phase || "") : "";
   const displayedArtifacts = visibleTaskArtifacts(artifacts, taskRoute);
   const resourceGroups = resourceItemsByStatus(resources.resources);
+  const qualityBlocking = quality.svg_summary.blocking
+    + quality.pptx_summary.blocking
+    + (quality.beautify_fidelity?.blocking || 0);
+  const qualityErrors = quality.svg_summary.error
+    + quality.pptx_summary.error
+    + (quality.beautify_fidelity?.error || 0);
 
   async function retry(phase: RetryPhase) {
     const loadedTaskId = task?.id || "";
@@ -1263,6 +1444,12 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
               <button className="primary-button" onClick={() => go({ name: "templateFill", id: task.id })}>
                 <ListChecks size={17} />
                 <span>打开填充计划</span>
+              </button>
+            )}
+            {task && canOpenBeautifyPlan(task) && (
+              <button className="primary-button" onClick={() => go({ name: "beautifyPlan", id: task.id })}>
+                <Palette size={17} />
+                <span>打开美化计划</span>
               </button>
             )}
           </>
@@ -1329,7 +1516,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
               </div>
             </div>
 
-            {taskRoute === "main" && (
+            {fullSVGRoute && (
               <div className="status-panel resource-panel">
                 <div className="section-title">
                   <ImageIcon size={17} />
@@ -1397,7 +1584,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
               </div>
             )}
 
-            {taskRoute === "main" && (
+            {fullSVGRoute && (
               <div className="status-panel executor-panel">
                 <div className="section-title">
                   <Layers size={17} />
@@ -1447,7 +1634,7 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
               </div>
             )}
 
-            {taskRoute === "main" && (
+            {fullSVGRoute && (
               <div className={`status-panel quality-panel quality-${quality.decision}`}>
                 <div className="section-title">
                   <CheckCircle2 size={17} />
@@ -1460,13 +1647,16 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                   <span>图表<strong>{quality.chart_receipts.length}</strong></span>
                   <span>PPTX<strong>{qualityDecisionText(quality.pptx_summary.decision)}</strong></span>
                   <span>文本覆盖<strong>{quality.text_coverage > 0 ? `${Math.round(quality.text_coverage * 100)}%` : "-"}</strong></span>
+                  {taskRoute === "beautify" && (
+                    <span>源内容保真<strong>{qualityDecisionText(quality.beautify_fidelity?.decision || "pending")}</strong></span>
+                  )}
                 </div>
                 <div className="kv-grid compact">
                   <span>当前门禁</span>
                   <strong className="mono">{phaseLabel[quality.current_gate] || quality.current_gate}</strong>
                   <span>阻断 / 错误</span>
-                  <strong className={(quality.svg_summary.blocking + quality.svg_summary.error + quality.pptx_summary.blocking + quality.pptx_summary.error) > 0 ? "bad" : ""}>
-                    {quality.svg_summary.blocking + quality.pptx_summary.blocking} / {quality.svg_summary.error + quality.pptx_summary.error}
+                  <strong className={(qualityBlocking + qualityErrors) > 0 ? "bad" : ""}>
+                    {qualityBlocking} / {qualityErrors}
                   </strong>
                   <span>警告</span>
                   <strong>{quality.warning_badge}</strong>
@@ -1508,6 +1698,54 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                     </a>
                   ))}
                 </div>
+                {taskRoute === "beautify" && quality.beautify_fidelity && (
+                  <section className="beautify-fidelity" aria-labelledby="beautify-fidelity-title">
+                    <div className="section-title" id="beautify-fidelity-title">
+                      <Layers size={16} />
+                      <span>源 PPTX → 输出 PPTX 保真</span>
+                    </div>
+                    <div className="resource-summary-grid quality-summary-grid">
+                      <span>源页数<strong>{quality.beautify_fidelity.source_slide_count}</strong></span>
+                      <span>输出页数<strong>{quality.beautify_fidelity.output_slide_count}</strong></span>
+                      <span>结果<strong>{qualityDecisionText(quality.beautify_fidelity.decision)}</strong></span>
+                      <span>覆盖页面<strong>{quality.beautify_fidelity.pages.length}</strong></span>
+                      <span>视觉覆盖<strong>{quality.beautify_fidelity.identity.overrides.length}</strong></span>
+                    </div>
+                    <div className="beautify-fidelity-pages">
+                      {quality.beautify_fidelity.pages.map((page) => (
+                        <div className={`beautify-fidelity-row fidelity-${page.decision}`} key={`${page.source_slide}:${page.output_page}`}>
+                          <strong>P{String(page.source_slide).padStart(2, "0")} → P{String(page.output_page).padStart(2, "0")}</strong>
+                          <span>文字 {beautifyFidelityMetricText(page.text)}</span>
+                          <span>表格 {beautifyFidelityMetricText(page.tables)}</span>
+                          <span>图表 {beautifyFidelityMetricText(page.charts)}</span>
+                          <span>图片 {beautifyFidelityMetricText(page.images)}</span>
+                          <span>{qualityDecisionText(page.decision)}</span>
+                        </div>
+                      ))}
+                      {quality.beautify_fidelity.pages.length === 0 && <span className="muted">尚无逐页保真结果</span>}
+                    </div>
+                    <div className="kv-grid compact">
+                      <span>身份来源</span>
+                      <strong>{quality.beautify_fidelity.identity.selected_source || "-"}</strong>
+                      <span>字体替换</span>
+                      <strong>{quality.beautify_fidelity.identity.font_substitutions.join(" · ") || "0"}</strong>
+                      <span>忽略 / 不支持</span>
+                      <strong>{quality.beautify_fidelity.ignored.length} / {quality.beautify_fidelity.unsupported.length}</strong>
+                    </div>
+                    {quality.beautify_fidelity.report_artifact_id && (
+                      <div className="button-row left">
+                        <a
+                          className="secondary-button"
+                          href={api.artifactContentUrl(task.id, quality.beautify_fidelity.report_artifact_id)}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          <FileText size={16} /><span>美化保真报告</span>
+                        </a>
+                      </div>
+                    )}
+                  </section>
+                )}
               </div>
             )}
 
@@ -1616,6 +1854,39 @@ function TaskDetailPage({ taskId }: { taskId: string }) {
                     <button className="primary-button" onClick={() => go({ name: "templateFill", id: task.id })}>
                       <FileText size={16} />
                       <span>打开填充计划</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {taskRoute === "beautify" && (
+              <div className="status-panel beautify-gate-panel">
+                <div className="section-title">
+                  <Palette size={17} />
+                  <span>PPTX 美化</span>
+                </div>
+                <div className="kv-grid">
+                  <span>源文件</span>
+                  <strong>{beautifyPlanPreview?.source?.name || "-"}</strong>
+                  <span>页数锁定</span>
+                  <strong>{beautifyPlanPreview?.source?.slide_count || "-"}</strong>
+                  <span>源画布</span>
+                  <strong>{beautifyPlanPreview?.source?.canvas || "-"}</strong>
+                  <span>身份来源</span>
+                  <strong>{beautifyPlanPreview?.identity?.selected_source || "-"}</strong>
+                  <span>清单 / 计划</span>
+                  <strong>{beautifyPlanPreview ? `${beautifyPlanPreview.inventory?.slide_count || 0} 页 / 已生成` : "-"}</strong>
+                  <span>风险</span>
+                  <strong>{beautifyPlanPreview?.risks?.length ?? "-"}</strong>
+                  <span>锁定说明</span>
+                  <strong>页数、顺序、文字与数据不可更改</strong>
+                </div>
+                {canOpenBeautifyPlan(task) && (
+                  <div className="button-row left">
+                    <button className="primary-button" onClick={() => go({ name: "beautifyPlan", id: task.id })}>
+                      <Palette size={16} />
+                      <span>打开美化计划</span>
                     </button>
                   </div>
                 )}
@@ -2132,6 +2403,403 @@ function TemplateFillPlanPage({ taskId }: { taskId: string }) {
   );
 }
 
+function BeautifyPlanPage({ taskId }: { taskId: string }) {
+  const [requestScope] = useState(() => createBeautifyPlanRequestScope(
+    taskId,
+    () => taskRouteMatches(parseRoute(), "beautifyPlan", taskId),
+  ));
+  const [task, setTask] = useState<Task | null>(null);
+  const [preview, setPreview] = useState<BeautifyPlanPreview | null>(null);
+  const [plan, setPlan] = useState<BeautifyPlan | null>(null);
+  const [savedPlan, setSavedPlan] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<"regenerate" | "save" | "check" | "confirm" | "">("");
+  const [error, setError] = useState("");
+
+  function adoptPreview(next: BeautifyPlanPreview) {
+    const canonical = JSON.parse(JSON.stringify(next.plan)) as BeautifyPlan;
+    setPreview(next);
+    setPlan(canonical);
+    setSavedPlan(JSON.stringify(canonical));
+  }
+
+  const load = useCallback(async (generation: number) => {
+    setLoading(true);
+    setError("");
+    try {
+      const nextTask = await scopedBeautifyPlanRequest(requestScope, taskId, api.getTask, generation);
+      if (!nextTask) {
+        return;
+      }
+      if (nextTask.route !== "beautify") {
+        replaceRoute({ name: "task", id: nextTask.id });
+        return;
+      }
+      setTask(nextTask);
+      const nextPreview = await scopedBeautifyPlanRequest(requestScope, taskId, api.getBeautifyPlan, generation);
+      if (!nextPreview || nextPreview.task_id !== taskId) {
+        return;
+      }
+      adoptPreview(nextPreview);
+    } catch (err) {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setLoading(false);
+      }
+    }
+  }, [requestScope, taskId]);
+
+  useEffect(() => startTemplateFillRequestGeneration(requestScope, (generation) => void load(generation)), [load, requestScope]);
+
+  const dirty = !!plan && JSON.stringify(plan) !== savedPlan;
+  const errorCount = beautifyPlanErrorCount(preview);
+  const actionState = beautifyPlanActionState({
+    canEdit: !!preview?.can_edit,
+    canConfirm: !!preview?.can_confirm,
+    taskStatus: task?.status,
+    busy: !!busy,
+    dirty,
+    errorCount,
+  });
+  const slideRows = beautifyPlanSlideRows(preview && plan ? { ...preview, plan } : preview);
+  const canRegenerate = task?.route === "beautify"
+    && (task.status === "awaiting_beautify_confirm" || task.status === "failed");
+
+  function updateSlide(index: number, field: "layout_strategy" | "page_rhythm", value: string) {
+    if (!preview?.can_edit || busy) {
+      return;
+    }
+    setPlan((current) => current ? {
+      ...current,
+      slides: current.slides.map((slide, slideIndex) => slideIndex === index ? { ...slide, [field]: value } : slide),
+    } : current);
+  }
+
+  function updateIdentitySource(value: string) {
+    if (!preview?.can_edit || busy) {
+      return;
+    }
+    setPlan((current) => current ? { ...current, identity: { ...current.identity, source: value } } : current);
+  }
+
+  function toggleRisk(riskID: string, accepted: boolean) {
+    if (!preview?.can_edit || busy) {
+      return;
+    }
+    setPlan((current) => {
+      if (!current) {
+        return current;
+      }
+      const acceptedRisks = new Set(current.accepted_risks || []);
+      if (accepted) {
+        acceptedRisks.add(riskID);
+      } else {
+        acceptedRisks.delete(riskID);
+      }
+      return { ...current, accepted_risks: [...acceptedRisks] };
+    });
+  }
+
+  async function regeneratePlan() {
+    const generation = requestScope.currentGeneration();
+    if (!canRegenerate || busy || !requestScope.isGenerationCurrent(generation, taskId)) {
+      return;
+    }
+    setBusy("regenerate");
+    setError("");
+    try {
+      const next = await scopedBeautifyPlanRequest(requestScope, taskId, api.regenerateBeautifyPlan, generation);
+      if (next) {
+        go({ name: "task", id: taskId });
+      }
+    } catch (err) {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setBusy("");
+      }
+    }
+  }
+
+  async function savePlan() {
+    const generation = requestScope.currentGeneration();
+    if (!plan || !preview || actionState.saveDisabled || !requestScope.isGenerationCurrent(generation, taskId)) {
+      return;
+    }
+    setBusy("save");
+    setError("");
+    try {
+      const saved = await scopedBeautifyPlanRequest(
+        requestScope,
+        taskId,
+        (id) => api.saveBeautifyPlan(id, plan, preview.plan_sha256),
+        generation,
+      );
+      if (!saved || saved.task_id !== taskId) {
+        return;
+      }
+      adoptPreview(saved);
+      const canonical = await scopedBeautifyPlanRequest(requestScope, taskId, api.getBeautifyPlan, generation);
+      if (canonical && canonical.task_id === taskId) {
+        adoptPreview(canonical);
+      }
+    } catch (err) {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setBusy("");
+      }
+    }
+  }
+
+  async function checkPlan() {
+    const generation = requestScope.currentGeneration();
+    if (actionState.checkDisabled || !requestScope.isGenerationCurrent(generation, taskId)) {
+      return;
+    }
+    setBusy("check");
+    setError("");
+    try {
+      const checked = await scopedBeautifyPlanRequest(requestScope, taskId, api.checkBeautifyPlan, generation);
+      if (!checked) {
+        return;
+      }
+      setTask(checked);
+      const canonical = await scopedBeautifyPlanRequest(requestScope, taskId, api.getBeautifyPlan, generation);
+      if (canonical && canonical.task_id === taskId) {
+        adoptPreview(canonical);
+      }
+    } catch (err) {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setBusy("");
+      }
+    }
+  }
+
+  async function confirmPlan() {
+    const generation = requestScope.currentGeneration();
+    if (actionState.confirmDisabled || !requestScope.isGenerationCurrent(generation, taskId)) {
+      return;
+    }
+    setBusy("confirm");
+    setError("");
+    try {
+      const confirmed = await scopedBeautifyPlanRequest(requestScope, taskId, api.confirmBeautifyPlan, generation);
+      if (confirmed) {
+        go({ name: "task", id: taskId });
+      }
+    } catch (err) {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setError(err instanceof Error ? err.message : String(err));
+      }
+    } finally {
+      if (requestScope.isGenerationCurrent(generation, taskId)) {
+        setBusy("");
+      }
+    }
+  }
+
+  return (
+    <section className="page beautify-plan-page">
+      <PageHeader
+        title="PPTX 美化计划"
+        subtitle={task?.title || taskId}
+        actions={
+          <>
+            <button className="secondary-button" onClick={() => go({ name: "task", id: taskId })}>
+              <ArrowLeft size={16} /><span>返回</span>
+            </button>
+            <button className="secondary-button" disabled={!canRegenerate || !!busy} onClick={() => void regeneratePlan()}>
+              {busy === "regenerate" ? <Loader2 className="spin" size={16} /> : <RefreshCw size={16} />}
+              <span>重新生成计划</span>
+            </button>
+            <button className="secondary-button" disabled={actionState.saveDisabled} onClick={() => void savePlan()}>
+              {busy === "save" ? <Loader2 className="spin" size={16} /> : <FileText size={16} />}
+              <span>保存布局选择</span>
+            </button>
+            <button className="secondary-button" disabled={actionState.checkDisabled} onClick={() => void checkPlan()}>
+              {busy === "check" ? <Loader2 className="spin" size={16} /> : <ListChecks size={16} />}
+              <span>检查计划</span>
+            </button>
+            <button className="primary-button" disabled={actionState.confirmDisabled} onClick={() => void confirmPlan()}>
+              {busy === "confirm" ? <Loader2 className="spin" size={17} /> : <Play size={17} />}
+              <span>确认美化计划</span>
+            </button>
+          </>
+        }
+      />
+
+      <div className="beautify-lock-notice" role="note">
+        <strong>内容与数据已冻结</strong>
+        <span>页数、页面顺序、可见文字、表格单元格和图表数据不可编辑。需要删页、合并、拆页或改写内容时，请转为主生成任务。</span>
+      </div>
+      {actionState.hint && <div className={`template-fill-action-hint${errorCount > 0 && !dirty ? " bad" : ""}`}>{actionState.hint}</div>}
+      {error && <InlineState icon={<XCircle size={18} />} text={error} bad />}
+      {loading && !preview && <InlineState icon={<Loader2 className="spin" size={18} />} text="加载美化计划" />}
+
+      {preview && plan && (
+        <>
+          <div className="template-fill-summary beautify-plan-summary">
+            <StatusPill status={task?.status || "awaiting_beautify_confirm"} />
+            <span className="summary-chip"><span>源 PPTX</span><strong>{preview.source?.name || "-"}</strong></span>
+            <span className="summary-chip"><span>页数锁定</span><strong>{preview.source?.slide_count || plan.slide_count}</strong></span>
+            <span className="summary-chip"><span>画布</span><strong>{preview.source?.canvas || preview.identity?.canvas || "-"}</strong></span>
+            <span className="summary-chip"><span>风险</span><strong>{preview.risks?.length || 0}</strong></span>
+            <span className="summary-chip"><span>阻断</span><strong>{errorCount}</strong></span>
+            <span className="summary-chip"><span>版本</span><strong>r{preview.revision || 1}</strong></span>
+          </div>
+
+          <div className="beautify-plan-layout">
+            <section className="plan-preview-surface" aria-labelledby="beautify-plan-pages-title">
+              <div className="section-title" id="beautify-plan-pages-title">
+                <LayoutList size={17} /><span>1:1 逐页美化计划</span>
+              </div>
+              <div className="beautify-identity-control">
+                <label htmlFor="beautify-identity-source">视觉身份来源</label>
+                <select
+                  id="beautify-identity-source"
+                  disabled={!preview.can_edit || !!busy}
+                  value={plan.identity.source}
+                  onChange={(event) => updateIdentitySource(event.target.value)}
+                >
+                  {[plan.identity.source, "theme", "observed"].filter((value, index, values) => value && values.indexOf(value) === index).map((value) => (
+                    <option value={value} key={value}>{value === "theme" ? "源主题（推荐）" : value === "observed" ? "观察到的颜色与字体" : value}</option>
+                  ))}
+                </select>
+                <small>视觉覆盖会被审计并降低 paste-back guarantee，不影响冻结内容。</small>
+              </div>
+              <div className="plan-slide-list">
+                {slideRows.map((slide, index) => (
+                  <article className="plan-slide-row beautify-plan-slide" key={`${slide.source_slide}:${slide.output_page}`}>
+                    <div className="plan-slide-heading">
+                      <span>P{String(slide.source_slide).padStart(2, "0")} → P{String(slide.output_page).padStart(2, "0")}</span>
+                      <strong>{slide.page_role || "内容页"}</strong>
+                    </div>
+                    <div className="beautify-plan-controls">
+                      <label>
+                        <span>布局策略</span>
+                        <select
+                          aria-label={`第 ${slide.source_slide} 页布局策略`}
+                          disabled={!preview.can_edit || !!busy}
+                          value={slide.layout_strategy}
+                          onChange={(event) => updateSlide(index, "layout_strategy", event.target.value)}
+                        >
+                          {[
+                            [slide.layout_strategy, slide.layout_strategy],
+                            ["preserve_identity", "保留源身份，重排层级"],
+                            ["clarify_hierarchy", "强化信息层级"],
+                            ["increase_whitespace", "增加留白"],
+                            ["rebalance_visuals", "平衡图文节奏"],
+                          ].filter(([value], optionIndex, options) => value && options.findIndex(([candidate]) => candidate === value) === optionIndex).map(([value, label]) => (
+                            <option value={value} key={value}>{label}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        <span>页面节奏</span>
+                        <select
+                          aria-label={`第 ${slide.source_slide} 页页面节奏`}
+                          disabled={!preview.can_edit || !!busy}
+                          value={slide.page_rhythm}
+                          onChange={(event) => updateSlide(index, "page_rhythm", event.target.value)}
+                        >
+                          {[
+                            [slide.page_rhythm, slide.page_rhythm],
+                            ["anchor", "锚点页"],
+                            ["flow", "叙事流"],
+                            ["breathing", "留白节奏"],
+                            ["dense", "高密度"],
+                          ].filter(([value], optionIndex, options) => value && options.findIndex(([candidate]) => candidate === value) === optionIndex).map(([value, label]) => (
+                            <option value={value} key={value}>{label}</option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <dl className="plan-slide-details beautify-frozen-details">
+                      <div><dt>文字块</dt><dd>{slide.inventory?.text_count ?? slide.text_block_ids.length}</dd></div>
+                      <div><dt>图片</dt><dd>{slide.inventory?.image_count ?? slide.image_ids.length}</dd></div>
+                      <div><dt>表格</dt><dd>{slide.inventory?.table_count ?? slide.table_ids.length}</dd></div>
+                      <div><dt>图表</dt><dd>{slide.inventory?.chart_count ?? slide.chart_ids.length}</dd></div>
+                      <div><dt>忽略</dt><dd>{slide.ignored.length}</dd></div>
+                      <div><dt>不支持</dt><dd>{slide.unsupported.length}</dd></div>
+                      <div className="wide"><dt>冻结项</dt><dd>文字/图片/表格/图表 ID 只读绑定，不可跨页、删除或改写</dd></div>
+                    </dl>
+                  </article>
+                ))}
+                {slideRows.length === 0 && <InlineState icon={<Clock3 size={18} />} text="暂无美化计划页" />}
+              </div>
+            </section>
+
+            <section className="plan-editor-surface beautify-risk-surface" aria-labelledby="beautify-risk-title">
+              <div className="section-title" id="beautify-risk-title">
+                <ListChecks size={17} /><span>复杂对象与风险决策</span>
+              </div>
+              <div className="beautify-risk-list">
+                {(preview.risks || []).map((risk) => {
+                  const accepted = plan.accepted_risks.includes(risk.id);
+                  return (
+                    <label className={`beautify-risk-row severity-${risk.severity}`} key={risk.id}>
+                      <input
+                        type="checkbox"
+                        disabled={!preview.can_edit || !!busy}
+                        checked={accepted}
+                        onChange={(event) => toggleRisk(risk.id, event.target.checked)}
+                      />
+                      <span>
+                        <strong>P{String(risk.source_slide).padStart(2, "0")} · {risk.code || risk.object_type}</strong>
+                        <small>{risk.message}</small>
+                      </span>
+                    </label>
+                  );
+                })}
+                {(preview.risks || []).length === 0 && <InlineState icon={<CheckCircle2 size={18} />} text="没有待确认风险" />}
+              </div>
+              <div className="beautify-readonly-summary">
+                <strong>只读决策摘要</strong>
+                <span>全局忽略 {plan.global_ignored.length}</span>
+                <span>已接受风险 {plan.accepted_risks.length}</span>
+                <span className="mono">Plan {preview.plan_sha256 ? preview.plan_sha256.slice(0, 12) : "-"}</span>
+              </div>
+            </section>
+          </div>
+
+          <section className="check-report-surface" aria-labelledby="beautify-plan-findings-title">
+            <div className="section-title" id="beautify-plan-findings-title">
+              <ListChecks size={17} /><span>计划检查结果</span>
+            </div>
+            <div className="check-report-list">
+              {(preview.findings || []).map((finding) => (
+                <div
+                  className={`check-report-row ${["blocking", "error"].includes(finding.severity) ? "bad" : "warn"}`}
+                  key={finding.id}
+                >
+                  <strong>{finding.severity.toUpperCase()}</strong>
+                  <span className="mono">{finding.code}</span>
+                  <span>源页 {finding.source_slide || "-"}</span>
+                  <span>计划</span>
+                  <span>{finding.message}</span>
+                </div>
+              ))}
+              {(preview.findings || []).length === 0 && <InlineState icon={<CheckCircle2 size={18} />} text="暂无阻断或警告" />}
+            </div>
+          </section>
+        </>
+      )}
+    </section>
+  );
+}
+
 function ConfirmPage({ taskId }: { taskId: string }) {
   const [task, setTask] = useState<Task | null>(null);
   const [confirmations, setConfirmations] = useState<Confirmation[]>([]);
@@ -2159,7 +2827,7 @@ function ConfirmPage({ taskId }: { taskId: string }) {
     setBusy(true);
     setError("");
     try {
-      const nextTask = await api.submitConfirmations(taskId, values);
+      const nextTask = await api.submitConfirmations(taskId, confirmationSubmissionValues(task, values));
       setTask(nextTask);
       if (nextTask.status === "awaiting_realization_confirm") {
         const nextConfirmations = await api.listConfirmations(taskId);
@@ -2182,7 +2850,9 @@ function ConfirmPage({ taskId }: { taskId: string }) {
   const tierTitle = task?.status === "awaiting_realization_confirm" ? "确认表现方式" : "确认生成目标";
   const tierNote =
     task?.status === "awaiting_realization_confirm"
-      ? "根据你已确认的目标锚点，确认页数、色彩、字体、图片和生成模式。"
+      ? task.route === "beautify"
+        ? "源页数与顺序已锁定；确认配色、字体、源图片策略和生成模式。"
+        : "根据你已确认的目标锚点，确认页数、色彩、字体、图片和生成模式。"
       : "先确认画布、受众、叙事模式和视觉方向；下一步会据此重新推导表现层推荐。";
   const submitLabel = task?.status === "awaiting_realization_confirm" ? "确认并生成" : "下一步";
 
@@ -2210,6 +2880,7 @@ function ConfirmPage({ taskId }: { taskId: string }) {
             key={confirmation.id}
             confirmation={confirmation}
             value={values[confirmation.key]}
+            locked={task?.route === "beautify" && confirmation.key === "page_count"}
             onChange={(value) => setValues((current) => ({ ...current, [confirmation.key]: value }))}
           />
         ))}
@@ -2447,10 +3118,12 @@ function PreviewPage({ taskId }: { taskId: string }) {
 function ConfirmationField({
   confirmation,
   value,
+  locked = false,
   onChange,
 }: {
   confirmation: Confirmation;
   value: unknown;
+  locked?: boolean;
   onChange: (value: unknown) => void;
 }) {
   const options = parseJSON<string[]>(confirmation.options_json, []);
@@ -2460,9 +3133,11 @@ function ConfirmationField({
     <div className="confirm-field">
       <div className="confirm-heading">
         <span>{confirmation.label}</span>
-        {confirmation.required && <small>必填</small>}
+        {locked ? <small>已锁定</small> : confirmation.required && <small>必填</small>}
       </div>
-      {options.length > 0 ? (
+      {locked ? (
+        <input value={stringValue} readOnly aria-readonly="true" />
+      ) : options.length > 0 ? (
         <div className="segmented">
           {options.map((option) => (
             <button
@@ -2495,6 +3170,15 @@ function defaultConfirmationValues(confirmations: Confirmation[]) {
     values[confirmation.key] = confirmation.recommendation || options[0] || "";
   }
   return values;
+}
+
+function confirmationSubmissionValues(task: Task | null, values: Record<string, unknown>) {
+  const payload = { ...values };
+  if (task?.route === "beautify" && task.status === "awaiting_realization_confirm") {
+    delete payload.page_count;
+    delete payload.slide_count;
+  }
+  return payload;
 }
 
 function specSummaryRows(summary: Record<string, unknown>) {

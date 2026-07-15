@@ -191,7 +191,7 @@ func validateResourcePlanContract(projectPath, expectedTaskID string) (*resource
 			return nil, nil, fmt.Errorf("resource %s purpose is empty", item.ID)
 		}
 		if !allowedResourceTypes[item.Type] {
-			return nil, nil, fmt.Errorf("resource %s has unsupported type %q", item.ID, item.Type)
+			return nil, nil, fmt.Errorf("resource %s has unsupported type %q in spec_generate; read locked layout shells from template_lock/template_resolution, or use type %q with acquire_via %q for a concrete template file", item.ID, item.Type, "template_asset", "template")
 		}
 		if !allowedAcquireVia[item.AcquireVia] {
 			return nil, nil, fmt.Errorf("resource %s has unsupported acquire_via %q", item.ID, item.AcquireVia)
@@ -345,7 +345,7 @@ func resourceAcquireMatchesType(resourceType, acquireVia string) bool {
 	case "illustration_sheet":
 		return acquireVia == "ai"
 	case "image":
-		return map[string]bool{"user": true, "template": true, "web": true, "ai": true, "placeholder": true}[acquireVia]
+		return map[string]bool{"user": true, "source": true, "template": true, "web": true, "ai": true, "placeholder": true}[acquireVia]
 	default:
 		return false
 	}
@@ -391,6 +391,8 @@ func confirmationAllowsAcquireVia(allowed map[string]bool, acquireVia string) bo
 		return allowed["ai"]
 	case "user":
 		return allowed["provided"] || allowed["user"] || allowed["source"]
+	case "source":
+		return true
 	default:
 		return true
 	}

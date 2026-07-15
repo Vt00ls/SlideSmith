@@ -98,6 +98,19 @@ func (s *TaskService) runFullRuntimePreflight(ctx context.Context, task *model.T
 	add("quality_runner", filepath.Join(workspace.HostDir, "scripts", "quality_runner.py"), true, requireReadableRegularFile(filepath.Join(workspace.HostDir, "scripts", "quality_runner.py")))
 	add("quality_schema", filepath.Join(workspace.HostDir, "scripts", "quality_schema.py"), true, requireReadableRegularFile(filepath.Join(workspace.HostDir, "scripts", "quality_schema.py")))
 	add("pptx_validate_runner", filepath.Join(workspace.HostDir, "scripts", "pptx_validate_runner.py"), true, requireReadableRegularFile(filepath.Join(workspace.HostDir, "scripts", "pptx_validate_runner.py")))
+	if task != nil && task.Route == model.TaskRouteBeautify {
+		for _, item := range []struct {
+			name string
+			path string
+		}{
+			{"beautify_runner", filepath.Join(workspace.HostDir, "scripts", "beautify_runner.py")},
+			{"beautify_inventory", filepath.Join(workspace.SkillDir, "scripts", "beautify_inventory.py")},
+			{"beautify_identity", filepath.Join(workspace.SkillDir, "scripts", "beautify_identity.py")},
+			{"pptx_intake", filepath.Join(workspace.SkillDir, "scripts", "pptx_intake.py")},
+		} {
+			add(item.name, item.path, true, requireReadableRegularFile(item.path))
+		}
+	}
 
 	add("runtime_python3", "python3", false, fmt.Errorf("validated inside the agent runtime during full prepare"))
 	add("runtime_python_imports", "pptx,PIL", false, fmt.Errorf("validated inside the agent runtime during full prepare"))

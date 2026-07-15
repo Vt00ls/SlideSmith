@@ -154,7 +154,7 @@ func validateSVGBundleContract(projectPath string, expectedTaskID ...string) (ma
 	if err := readJSONContract(manifestPath, &manifest); err != nil {
 		return nil, fmt.Errorf("decode resources manifest: %w", err)
 	}
-	if manifest.Schema != resourcesManifestSchema || manifest.Route != "main" || manifest.RunnerProfile != "full-ppt-master" || manifest.TaskID != inventory.TaskID {
+	if manifest.Schema != resourcesManifestSchema || !isFullSVGRoute(manifest.Route) || manifest.RunnerProfile != "full-ppt-master" || manifest.TaskID != inventory.TaskID {
 		return nil, fmt.Errorf("SVG inventory resources manifest binding mismatch")
 	}
 	if inventory.ResourcesManifestSHA256 != manifestSHA {

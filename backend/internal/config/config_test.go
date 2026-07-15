@@ -72,6 +72,27 @@ func TestLoadQualityGateDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadBeautifyDefaultsAndOverrides(t *testing.T) {
+	for _, key := range []string{
+		"SLIDESMITH_BEAUTIFY_ENABLED",
+		"SLIDESMITH_BEAUTIFY_FIDELITY_STRICT",
+		"SLIDESMITH_BEAUTIFY_SOURCE_SVG_REFERENCE_ENABLED",
+	} {
+		t.Setenv(key, "")
+	}
+	defaults := Load().AgentCompose
+	if defaults.BeautifyEnabled || !defaults.BeautifyFidelityStrict || defaults.BeautifySourceSVGReferenceEnabled {
+		t.Fatalf("beautify defaults = %#v", defaults)
+	}
+	t.Setenv("SLIDESMITH_BEAUTIFY_ENABLED", "true")
+	t.Setenv("SLIDESMITH_BEAUTIFY_FIDELITY_STRICT", "false")
+	t.Setenv("SLIDESMITH_BEAUTIFY_SOURCE_SVG_REFERENCE_ENABLED", "true")
+	overrides := Load().AgentCompose
+	if !overrides.BeautifyEnabled || overrides.BeautifyFidelityStrict || !overrides.BeautifySourceSVGReferenceEnabled {
+		t.Fatalf("beautify overrides = %#v", overrides)
+	}
+}
+
 func TestLoadResourcePolicyDefaultsOfflineAndFailClosed(t *testing.T) {
 	for _, key := range []string{
 		"SLIDESMITH_RESOURCE_PHASE_ENABLED", "SLIDESMITH_RESOURCE_NETWORK_ENABLED",

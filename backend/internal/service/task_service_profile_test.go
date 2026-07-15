@@ -18,12 +18,34 @@ func profileTestService(t *testing.T, cfg config.AgentComposeConfig) (*TaskServi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.TaskPhaseRun{}, &model.TaskRuntimeRun{}, &model.TaskConfirmation{}); err != nil {
+	if err := db.AutoMigrate(&model.Task{}, &model.TaskEvent{}, &model.TaskPhaseRun{}, &model.TaskRuntimeRun{}, &model.TaskConfirmation{}, &model.Artifact{}); err != nil {
 		t.Fatal(err)
 	}
 	repo := repository.New(db)
 	storage := NewLocalStorage(t.TempDir())
 	return NewTaskService(repo, storage, nil, NewRuntimeWorkspacePublisher(storage), cfg), repo
+}
+
+func TestStartEnabledBeautifyLocksFullProfileBeforeFormalRouteSelect(t *testing.T) {
+	service, repo := profileTestService(t, config.AgentComposeConfig{
+		RunnerProfile:         model.RunnerProfileFullPPTMaster,
+		FullPPTDefaultEnabled: false,
+		BeautifyEnabled:       true,
+	})
+	task := &model.Task{ID: "profile-beautify", Title: "请美化 PPTX，保留页数和文字", Status: model.TaskStatusUploaded, Route: model.TaskRouteMain}
+	if err := repo.CreateTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.CreateArtifact(context.Background(), &model.Artifact{TaskID: task.ID, Kind: model.ArtifactKindSource, Name: "source.pptx", ObjectKey: "tasks/profile-beautify/source/source.pptx", Storage: "local"}); err != nil {
+		t.Fatal(err)
+	}
+	started, err := service.StartTask(context.Background(), task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.RunnerProfile != model.RunnerProfileFullPPTMaster {
+		t.Fatalf("Beautify runner profile = %q", started.RunnerProfile)
+	}
 }
 
 func TestStartTaskLocksFullProfileAndConfigurationChangesDoNotOverwriteIt(t *testing.T) {
