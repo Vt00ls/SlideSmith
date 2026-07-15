@@ -1,0 +1,11 @@
+{
+  "name": "beautify-cjk",
+  "source_features": ["cjk", "latin", "fullwidth-compatibility", "numbers", "units", "punctuation"],
+  "expected_decision": "pass",
+  "negative_mutations": [
+    {"kind": "case-change", "expected_rule": "beautify.text_missing_or_reordered"},
+    {"kind": "number-change", "expected_rule": "beautify.text_missing_or_reordered"},
+    {"kind": "unit-change", "expected_rule": "beautify.text_missing_or_reordered"},
+    {"kind": "punctuation-change", "expected_rule": "beautify.text_missing_or_reordered"}
+  ]
+}

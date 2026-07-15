@@ -1,0 +1,9 @@
+{
+  "name": "beautify-overcrowded",
+  "source_features": ["sixteen-text-blocks", "high-character-density", "near-empty-divider"],
+  "expected_decision": "pass_with_warnings",
+  "expected_risks": ["beautify.overcrowded", "beautify.near_empty"],
+  "negative_mutations": [
+    {"kind": "automatic-page-split", "expected_rule": "beautify.page_count"}
+  ]
+}

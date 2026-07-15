@@ -14,6 +14,9 @@ export type TaskStatus =
   | "template_fill_checking"
   | "template_fill_applying"
   | "template_fill_validating"
+  | "beautify_inventory_building"
+  | "beautify_planning"
+  | "awaiting_beautify_confirm"
   | "image_acquiring"
   | "svg_generating"
   | "quality_checking"
@@ -116,6 +119,8 @@ export type PipelinePhase =
   | "template_fill_check"
   | "template_fill_apply"
   | "template_fill_validate"
+  | "beautify_inventory"
+  | "beautify_plan"
   | "image_acquire"
   | "svg_execute"
   | "quality_check"
@@ -151,6 +156,8 @@ export type RetryPhase =
   | "template_fill_check"
   | "template_fill_apply"
   | "template_fill_validate"
+  | "beautify_inventory"
+  | "beautify_plan"
   | "svg_execute"
   | "quality_check"
   | "finalize_export"
@@ -299,6 +306,47 @@ export type TaskQuality = {
   contact_sheet_artifact_id: string;
   readback_artifact_id: string;
   allowed_retry_phases: RetryPhase[];
+  beautify_fidelity?: BeautifyFidelitySummary;
+};
+
+export type BeautifyFidelityMetric = {
+  expected?: number;
+  matched?: number;
+  missing?: number | string[];
+  changed?: number | string[];
+  reordered?: number | string[];
+  mismatches?: number | string[];
+  required?: number;
+  used?: number;
+};
+
+export type BeautifyFidelityPage = {
+  source_slide: number;
+  output_page: number;
+  decision: string;
+  text: BeautifyFidelityMetric;
+  tables: BeautifyFidelityMetric;
+  charts: BeautifyFidelityMetric;
+  images: BeautifyFidelityMetric;
+};
+
+export type BeautifyFidelitySummary = {
+  present?: boolean;
+  decision: string;
+  source_slide_count: number;
+  output_slide_count: number;
+  pages: BeautifyFidelityPage[];
+  identity: {
+    selected_source: string;
+    overrides: string[];
+    font_substitutions: string[];
+  };
+  ignored: string[];
+  unsupported: string[];
+  warning: number;
+  error: number;
+  blocking: number;
+  report_artifact_id: string;
 };
 
 export type TemplateFillInputs = {
@@ -329,6 +377,110 @@ export type TemplateFillPlanPreview = {
   check_report: Record<string, unknown>;
   summary: Record<string, unknown>;
   plan_file: TemplateFillPlanFile;
+  can_edit: boolean;
+  can_confirm: boolean;
+};
+
+export type BeautifySourceSummary = {
+  name: string;
+  sha256: string;
+  slide_count: number;
+  canvas: string;
+};
+
+export type BeautifyIdentitySummary = {
+  selected_source: string;
+  canvas: string;
+  palette: string[];
+  fonts: string[];
+  overrides: string[];
+};
+
+export type BeautifyInventoryPageSummary = {
+  source_slide: number;
+  text_count: number;
+  image_count: number;
+  table_count: number;
+  chart_count: number;
+  ignored_count: number;
+  unsupported_count: number;
+  needs_confirmation_count: number;
+};
+
+export type BeautifyRiskSummary = {
+  id: string;
+  source_slide: number;
+  code: string;
+  severity: string;
+  object_type: string;
+  message: string;
+  decision: string;
+};
+
+export type BeautifyPlanItemDecision = {
+  id: string;
+  type?: string;
+  reason: string;
+};
+
+export type BeautifyPlanSlide = {
+  source_slide: number;
+  output_page: number;
+  page_role: string;
+  page_rhythm: string;
+  layout_strategy: string;
+  text_block_ids: string[];
+  image_ids: string[];
+  table_ids: string[];
+  chart_ids: string[];
+  ignored: BeautifyPlanItemDecision[];
+  unsupported: BeautifyPlanItemDecision[];
+  risks: string[];
+};
+
+export type BeautifyPlan = {
+  schema: string;
+  task_id: string;
+  status: string;
+  revision: number;
+  source_pptx_sha256: string;
+  inventory_sha256: string;
+  confirmation_sha256: string;
+  slide_count: number;
+  identity: {
+    source: string;
+    canvas_override: boolean;
+    palette_override: boolean;
+    typography_override: boolean;
+  };
+  slides: BeautifyPlanSlide[];
+  global_ignored: BeautifyPlanItemDecision[];
+  accepted_risks: string[];
+  created_at: string;
+};
+
+export type BeautifyPlanFinding = {
+  id: string;
+  severity: string;
+  code: string;
+  source_slide: number;
+  message: string;
+};
+
+export type BeautifyPlanPreview = {
+  task_id: string;
+  source: BeautifySourceSummary;
+  identity: BeautifyIdentitySummary;
+  inventory: {
+    slide_count: number;
+    pages: BeautifyInventoryPageSummary[];
+  };
+  risks: BeautifyRiskSummary[];
+  plan: BeautifyPlan;
+  findings: BeautifyPlanFinding[];
+  summary: Record<string, unknown>;
+  plan_sha256: string;
+  revision: number;
   can_edit: boolean;
   can_confirm: boolean;
 };
@@ -466,6 +618,19 @@ export const api = {
     request<Task>(`/tasks/${encodeURIComponent(id)}/template-fill/confirm`, { method: "POST" }),
   regenerateTemplateFillPlan: (id: string) =>
     request<Task>(`/tasks/${encodeURIComponent(id)}/template-fill/regenerate`, { method: "POST" }),
+  getBeautifyPlan: (id: string) =>
+    request<BeautifyPlanPreview>(`/tasks/${encodeURIComponent(id)}/beautify-plan`),
+  saveBeautifyPlan: (id: string, plan: BeautifyPlan, expectedPlanSHA256: string) =>
+    request<BeautifyPlanPreview>(`/tasks/${encodeURIComponent(id)}/beautify-plan`, {
+      method: "PUT",
+      body: JSON.stringify({ plan, expected_plan_sha256: expectedPlanSHA256 }),
+    }),
+  checkBeautifyPlan: (id: string) =>
+    request<Task>(`/tasks/${encodeURIComponent(id)}/beautify-plan/check`, { method: "POST" }),
+  confirmBeautifyPlan: (id: string) =>
+    request<Task>(`/tasks/${encodeURIComponent(id)}/beautify-plan/confirm`, { method: "POST" }),
+  regenerateBeautifyPlan: (id: string) =>
+    request<Task>(`/tasks/${encodeURIComponent(id)}/beautify-plan/regenerate`, { method: "POST" }),
   listConfirmations: (id: string) =>
     request<Confirmation[]>(`/tasks/${encodeURIComponent(id)}/confirmations`),
   submitConfirmations: (id: string, values: Record<string, unknown>) =>

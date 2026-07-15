@@ -33,6 +33,12 @@ const (
 )
 
 const (
+	TaskStatusBeautifyInventoryBuilding = "beautify_inventory_building"
+	TaskStatusBeautifyPlanning          = "beautify_planning"
+	TaskStatusAwaitingBeautifyConfirm   = "awaiting_beautify_confirm"
+)
+
+const (
 	TaskRouteMain         = "main"
 	TaskRouteBeautify     = "beautify"
 	TaskRouteTemplateFill = "template-fill"
@@ -103,6 +109,13 @@ const (
 	ArtifactKindRenderedSlide           = "rendered_slide"
 	ArtifactKindContactSheet            = "contact_sheet"
 	ArtifactKindVisualReviewReport      = "visual_review_report"
+	ArtifactKindBeautifyInputs          = "beautify_inputs"
+	ArtifactKindBeautifyInventory       = "beautify_inventory"
+	ArtifactKindBeautifyRiskReport      = "beautify_risk_report"
+	ArtifactKindBeautifyPlan            = "beautify_plan"
+	ArtifactKindBeautifyLock            = "beautify_lock"
+	ArtifactKindBeautifyFidelityReport  = "beautify_fidelity_report"
+	ArtifactKindSourceSVGReference      = "source_svg_reference"
 	ArtifactKindOther                   = "other"
 )
 

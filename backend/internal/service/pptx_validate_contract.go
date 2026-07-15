@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/slidesmith/slidesmith/backend/internal/model"
 )
 
 const (
@@ -163,6 +165,59 @@ func validatePPTXValidateContractForRun(projectPath, expectedPhaseRunID string) 
 	return contract, nil
 }
 
+func validatePPTXValidateContractForTask(projectPath string, task *model.Task, expectedPhaseRunID string) (map[string]any, error) {
+	contract, err := validatePPTXValidateContractForRun(projectPath, expectedPhaseRunID)
+	if err != nil {
+		return nil, err
+	}
+	if task == nil || task.Route != model.TaskRouteBeautify {
+		return contract, nil
+	}
+	canonical, _ := contract["canonical_pptx"].(map[string]any)
+	outputSHA := valueString(canonical, "sha256", "")
+	fidelity, err := ValidateBeautifyFidelityReport(projectPath, task.ID, outputSHA)
+	if err != nil {
+		return nil, fmt.Errorf("pptx_validate.beautify_fidelity: %w", err)
+	}
+	bindings := map[string]any{
+		"beautify_inputs_sha256":          fidelity.BeautifyInputsSHA256,
+		"beautify_inventory_sha256":       fidelity.BeautifyInventorySHA256,
+		"beautify_plan_sha256":            fidelity.BeautifyPlanSHA256,
+		"beautify_lock_sha256":            fidelity.BeautifyLockSHA256,
+		"source_pptx_sha256":              fidelity.SourcePPTXSHA256,
+		"output_pptx_sha256":              fidelity.OutputPPTXSHA256,
+		"source_slide_count":              fidelity.SourceSlideCount,
+		"output_slide_count":              fidelity.OutputSlideCount,
+		"beautify_fidelity_report_sha256": fidelity.FidelityReportSHA256,
+		"beautify_fidelity_decision":      fidelity.Decision,
+	}
+	for field, expected := range bindings {
+		actual, ok := contract[field]
+		if !ok || fmt.Sprint(actual) != fmt.Sprint(expected) {
+			return nil, fmt.Errorf("pptx_validate.beautify_fidelity: contract %s is stale", field)
+		}
+	}
+	summary, ok := contract["beautify_fidelity_summary"].(map[string]any)
+	if !ok || intFromAny(summary["blocking"]) != 0 || intFromAny(summary["error"]) != 0 {
+		return nil, fmt.Errorf("pptx_validate.beautify_fidelity: contract summary is missing or blocking")
+	}
+	contract["beautify_fidelity"] = fidelity
+	return contract, nil
+}
+
+func intFromAny(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return -1
+	}
+}
+
 func validatePublishQualityChain(projectPath string) (map[string]any, error) {
 	contract, err := validatePPTXValidateContract(projectPath)
 	if err != nil {
@@ -170,6 +225,23 @@ func validatePublishQualityChain(projectPath string) (map[string]any, error) {
 	}
 	if valueString(contract, "decision", "") != "pass" && valueString(contract, "decision", "") != "pass_with_warnings" {
 		return nil, fmt.Errorf("PPTX validate decision is not publishable")
+	}
+	return contract, nil
+}
+
+func validatePublishQualityChainForTask(projectPath string, task *model.Task) (map[string]any, error) {
+	contract, err := validatePPTXValidateContractForTask(projectPath, task, "")
+	if err != nil {
+		return nil, err
+	}
+	if valueString(contract, "decision", "") != "pass" && valueString(contract, "decision", "") != "pass_with_warnings" {
+		return nil, fmt.Errorf("PPTX validate decision is not publishable")
+	}
+	if task != nil && task.Route == model.TaskRouteBeautify {
+		fidelity, ok := contract["beautify_fidelity"].(*BeautifyFidelityContract)
+		if !ok || (fidelity.Decision != "pass" && fidelity.Decision != "pass_with_warnings") || fidelity.Summary.Blocking != 0 || fidelity.Summary.Error != 0 {
+			return nil, fmt.Errorf("publish.beautify_gate: Beautify fidelity is not publishable")
+		}
 	}
 	return contract, nil
 }

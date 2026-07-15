@@ -70,6 +70,10 @@ func (s *TaskService) ensureTaskRunnerProfile(ctx context.Context, task *model.T
 			profile = model.RunnerProfileNativeTemplateFill
 			source = model.RunnerProfileSourceLegacyEvidence
 			found = true
+		} else if task.Route == model.TaskRouteBeautify && s.agentCfg.BeautifyEnabled && canLockRunnerProfileFromConfiguration(task) {
+			profile = model.RunnerProfileFullPPTMaster
+			source = model.RunnerProfileSourceDeploymentDefault
+			found = true
 		} else if canLockRunnerProfileFromConfiguration(task) {
 			profile, source, err = configuredRunnerProfile(s.agentCfg)
 			if err != nil {

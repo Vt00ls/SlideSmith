@@ -32,38 +32,41 @@ type StorageConfig struct {
 }
 
 type AgentComposeConfig struct {
-	Enabled                bool
-	CLI                    string
-	Host                   string
-	ComposeFile            string
-	WorkDir                string
-	WorkspaceRoot          string
-	PPTMasterSkillDir      string
-	Agent                  string
-	RuntimeImage           string
-	RunnerProfile          string
-	RunnerProfileExplicit  bool
-	FullPPTDefaultEnabled  bool
-	FullPPTPreflightStrict bool
-	QualityGateEnabled     bool
-	QualityGateStrict      bool
-	PPTXValidateEnabled    bool
-	VisualReviewEnabled    bool
-	VisualReviewDefault    bool
-	ResourcePhaseEnabled   bool
-	ResourceNetworkEnabled bool
-	ResourceWebEnabled     bool
-	ResourceAIEnabled      bool
-	ResourceAIPaths        string
-	ResourceMaxFiles       int
-	ResourceMaxTotalBytes  int64
-	ResourceMaxSingleBytes int64
-	ResourceTimeout        time.Duration
-	ResourceWebProviders   string
-	ResourceAIProviders    string
-	ResourceFormulaNetwork bool
-	SessionDataRoot        string
-	Timeout                time.Duration
+	Enabled                           bool
+	CLI                               string
+	Host                              string
+	ComposeFile                       string
+	WorkDir                           string
+	WorkspaceRoot                     string
+	PPTMasterSkillDir                 string
+	Agent                             string
+	RuntimeImage                      string
+	RunnerProfile                     string
+	RunnerProfileExplicit             bool
+	FullPPTDefaultEnabled             bool
+	FullPPTPreflightStrict            bool
+	QualityGateEnabled                bool
+	QualityGateStrict                 bool
+	PPTXValidateEnabled               bool
+	VisualReviewEnabled               bool
+	VisualReviewDefault               bool
+	BeautifyEnabled                   bool
+	BeautifyFidelityStrict            bool
+	BeautifySourceSVGReferenceEnabled bool
+	ResourcePhaseEnabled              bool
+	ResourceNetworkEnabled            bool
+	ResourceWebEnabled                bool
+	ResourceAIEnabled                 bool
+	ResourceAIPaths                   string
+	ResourceMaxFiles                  int
+	ResourceMaxTotalBytes             int64
+	ResourceMaxSingleBytes            int64
+	ResourceTimeout                   time.Duration
+	ResourceWebProviders              string
+	ResourceAIProviders               string
+	ResourceFormulaNetwork            bool
+	SessionDataRoot                   string
+	Timeout                           time.Duration
 }
 
 type WorkerConfig struct {
@@ -91,38 +94,41 @@ func Load() Config {
 			Root: env("SLIDESMITH_STORAGE_ROOT", "storage"),
 		},
 		AgentCompose: AgentComposeConfig{
-			Enabled:                envBool("SLIDESMITH_AGENT_COMPOSE_ENABLED", false),
-			CLI:                    env("SLIDESMITH_AGENT_COMPOSE_CLI", "agent-compose"),
-			Host:                   env("SLIDESMITH_AGENT_COMPOSE_HOST", ""),
-			ComposeFile:            env("SLIDESMITH_AGENT_COMPOSE_FILE", "../runtime/ppt-master-agent/agent-compose.yml"),
-			WorkDir:                env("SLIDESMITH_AGENT_COMPOSE_WORKDIR", "../runtime/ppt-master-agent"),
-			WorkspaceRoot:          env("SLIDESMITH_AGENT_COMPOSE_WORKSPACE_ROOT", ""),
-			PPTMasterSkillDir:      env("SLIDESMITH_PPT_MASTER_SKILL_DIR", ""),
-			Agent:                  env("SLIDESMITH_AGENT_COMPOSE_AGENT", "ppt_master"),
-			RuntimeImage:           env("SLIDESMITH_AGENT_COMPOSE_RUNTIME_IMAGE", "slidesmith/ppt-master-runtime:dev"),
-			RunnerProfile:          runnerProfile,
-			RunnerProfileExplicit:  runnerProfileExplicit,
-			FullPPTDefaultEnabled:  envBool("SLIDESMITH_FULL_PPT_DEFAULT_ENABLED", false),
-			FullPPTPreflightStrict: envBool("SLIDESMITH_FULL_PPT_PREFLIGHT_STRICT", true),
-			QualityGateEnabled:     envBool("SLIDESMITH_QUALITY_GATE_ENABLED", false),
-			QualityGateStrict:      envBool("SLIDESMITH_QUALITY_GATE_STRICT", true),
-			PPTXValidateEnabled:    envBool("SLIDESMITH_PPTX_VALIDATE_ENABLED", false),
-			VisualReviewEnabled:    envBool("SLIDESMITH_VISUAL_REVIEW_ENABLED", false),
-			VisualReviewDefault:    envBool("SLIDESMITH_VISUAL_REVIEW_DEFAULT", false),
-			ResourcePhaseEnabled:   envBool("SLIDESMITH_RESOURCE_PHASE_ENABLED", false),
-			ResourceNetworkEnabled: envBool("SLIDESMITH_RESOURCE_NETWORK_ENABLED", false),
-			ResourceWebEnabled:     envBool("SLIDESMITH_RESOURCE_WEB_IMAGE_ENABLED", false),
-			ResourceAIEnabled:      envBool("SLIDESMITH_RESOURCE_AI_IMAGE_ENABLED", false),
-			ResourceAIPaths:        env("SLIDESMITH_RESOURCE_AI_PATHS", "api"),
-			ResourceMaxFiles:       envInt("SLIDESMITH_RESOURCE_MAX_FILES", 100),
-			ResourceMaxTotalBytes:  envInt64("SLIDESMITH_RESOURCE_MAX_TOTAL_BYTES", 524288000),
-			ResourceMaxSingleBytes: envInt64("SLIDESMITH_RESOURCE_MAX_SINGLE_BYTES", 52428800),
-			ResourceTimeout:        envDuration("SLIDESMITH_RESOURCE_TIMEOUT", 20*time.Minute),
-			ResourceWebProviders:   env("SLIDESMITH_RESOURCE_ALLOWED_WEB_PROVIDERS", "openverse,wikimedia"),
-			ResourceAIProviders:    env("SLIDESMITH_RESOURCE_ALLOWED_AI_PROVIDERS", ""),
-			ResourceFormulaNetwork: envBool("SLIDESMITH_RESOURCE_FORMULA_NETWORK_ENABLED", false),
-			SessionDataRoot:        env("SLIDESMITH_AGENT_COMPOSE_SESSION_ROOT", ""),
-			Timeout:                envDuration("SLIDESMITH_AGENT_COMPOSE_TIMEOUT", 30*time.Minute),
+			Enabled:                           envBool("SLIDESMITH_AGENT_COMPOSE_ENABLED", false),
+			CLI:                               env("SLIDESMITH_AGENT_COMPOSE_CLI", "agent-compose"),
+			Host:                              env("SLIDESMITH_AGENT_COMPOSE_HOST", ""),
+			ComposeFile:                       env("SLIDESMITH_AGENT_COMPOSE_FILE", "../runtime/ppt-master-agent/agent-compose.yml"),
+			WorkDir:                           env("SLIDESMITH_AGENT_COMPOSE_WORKDIR", "../runtime/ppt-master-agent"),
+			WorkspaceRoot:                     env("SLIDESMITH_AGENT_COMPOSE_WORKSPACE_ROOT", ""),
+			PPTMasterSkillDir:                 env("SLIDESMITH_PPT_MASTER_SKILL_DIR", ""),
+			Agent:                             env("SLIDESMITH_AGENT_COMPOSE_AGENT", "ppt_master"),
+			RuntimeImage:                      env("SLIDESMITH_AGENT_COMPOSE_RUNTIME_IMAGE", "slidesmith/ppt-master-runtime:dev"),
+			RunnerProfile:                     runnerProfile,
+			RunnerProfileExplicit:             runnerProfileExplicit,
+			FullPPTDefaultEnabled:             envBool("SLIDESMITH_FULL_PPT_DEFAULT_ENABLED", false),
+			FullPPTPreflightStrict:            envBool("SLIDESMITH_FULL_PPT_PREFLIGHT_STRICT", true),
+			QualityGateEnabled:                envBool("SLIDESMITH_QUALITY_GATE_ENABLED", false),
+			QualityGateStrict:                 envBool("SLIDESMITH_QUALITY_GATE_STRICT", true),
+			PPTXValidateEnabled:               envBool("SLIDESMITH_PPTX_VALIDATE_ENABLED", false),
+			VisualReviewEnabled:               envBool("SLIDESMITH_VISUAL_REVIEW_ENABLED", false),
+			VisualReviewDefault:               envBool("SLIDESMITH_VISUAL_REVIEW_DEFAULT", false),
+			BeautifyEnabled:                   envBool("SLIDESMITH_BEAUTIFY_ENABLED", false),
+			BeautifyFidelityStrict:            envBool("SLIDESMITH_BEAUTIFY_FIDELITY_STRICT", true),
+			BeautifySourceSVGReferenceEnabled: envBool("SLIDESMITH_BEAUTIFY_SOURCE_SVG_REFERENCE_ENABLED", false),
+			ResourcePhaseEnabled:              envBool("SLIDESMITH_RESOURCE_PHASE_ENABLED", false),
+			ResourceNetworkEnabled:            envBool("SLIDESMITH_RESOURCE_NETWORK_ENABLED", false),
+			ResourceWebEnabled:                envBool("SLIDESMITH_RESOURCE_WEB_IMAGE_ENABLED", false),
+			ResourceAIEnabled:                 envBool("SLIDESMITH_RESOURCE_AI_IMAGE_ENABLED", false),
+			ResourceAIPaths:                   env("SLIDESMITH_RESOURCE_AI_PATHS", "api"),
+			ResourceMaxFiles:                  envInt("SLIDESMITH_RESOURCE_MAX_FILES", 100),
+			ResourceMaxTotalBytes:             envInt64("SLIDESMITH_RESOURCE_MAX_TOTAL_BYTES", 524288000),
+			ResourceMaxSingleBytes:            envInt64("SLIDESMITH_RESOURCE_MAX_SINGLE_BYTES", 52428800),
+			ResourceTimeout:                   envDuration("SLIDESMITH_RESOURCE_TIMEOUT", 20*time.Minute),
+			ResourceWebProviders:              env("SLIDESMITH_RESOURCE_ALLOWED_WEB_PROVIDERS", "openverse,wikimedia"),
+			ResourceAIProviders:               env("SLIDESMITH_RESOURCE_ALLOWED_AI_PROVIDERS", ""),
+			ResourceFormulaNetwork:            envBool("SLIDESMITH_RESOURCE_FORMULA_NETWORK_ENABLED", false),
+			SessionDataRoot:                   env("SLIDESMITH_AGENT_COMPOSE_SESSION_ROOT", ""),
+			Timeout:                           envDuration("SLIDESMITH_AGENT_COMPOSE_TIMEOUT", 30*time.Minute),
 		},
 		Worker: WorkerConfig{
 			PollInterval: envDuration("SLIDESMITH_WORKER_POLL_INTERVAL", 2*time.Second),

@@ -37,7 +37,13 @@ func NewStateMachine() *StateMachine {
 		model.TaskStatusSourceConverting: allow(
 			model.TaskStatusAwaitingConfirm,
 			model.TaskStatusAwaitingAnchorConfirm,
+			model.TaskStatusBeautifyInventoryBuilding,
 			model.TaskStatusTemplateFillPlanning,
+			model.TaskStatusCancelled,
+			model.TaskStatusFailed,
+		),
+		model.TaskStatusBeautifyInventoryBuilding: allow(
+			model.TaskStatusAwaitingAnchorConfirm,
 			model.TaskStatusCancelled,
 			model.TaskStatusFailed,
 		),
@@ -84,6 +90,18 @@ func NewStateMachine() *StateMachine {
 			model.TaskStatusFailed,
 		),
 		model.TaskStatusAwaitingRealizationConfirm: allow(
+			model.TaskStatusSpecGenerating,
+			model.TaskStatusBeautifyPlanning,
+			model.TaskStatusCancelled,
+			model.TaskStatusFailed,
+		),
+		model.TaskStatusBeautifyPlanning: allow(
+			model.TaskStatusAwaitingBeautifyConfirm,
+			model.TaskStatusCancelled,
+			model.TaskStatusFailed,
+		),
+		model.TaskStatusAwaitingBeautifyConfirm: allow(
+			model.TaskStatusBeautifyPlanning,
 			model.TaskStatusSpecGenerating,
 			model.TaskStatusCancelled,
 			model.TaskStatusFailed,
@@ -132,6 +150,8 @@ func NewStateMachine() *StateMachine {
 		),
 		model.TaskStatusFailed: allow(
 			model.TaskStatusRuntimePreparing,
+			model.TaskStatusBeautifyInventoryBuilding,
+			model.TaskStatusBeautifyPlanning,
 			model.TaskStatusTemplateFillPlanning,
 			model.TaskStatusTemplateFillChecking,
 			model.TaskStatusTemplateFillApplying,

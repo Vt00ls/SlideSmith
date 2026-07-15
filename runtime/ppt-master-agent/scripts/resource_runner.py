@@ -266,7 +266,9 @@ def base_manifest_item(item: dict[str, Any], attempt: int) -> dict[str, Any]:
 
 def source_input_hash(item: dict[str, Any], project: Path) -> str:
     source_reference = str(item.get("source_reference") or "").split("#", 1)[0]
-    if not source_reference or not source_reference.startswith("sources/"):
+    is_user_source = source_reference.startswith("sources/")
+    is_beautify_source = str(item.get("acquire_via") or "") == "source" and source_reference.startswith("images/")
+    if not source_reference or not (is_user_source or is_beautify_source):
         return ""
     try:
         return sha256_file(contained_regular(project, project / source_reference))
@@ -542,6 +544,12 @@ def execute_item(
                 raise RuntimeError("user/source resource must reference project sources/")
             name = safe_output_name(item.get("output_name", ""), item["id"], source_ref.suffix or ".bin")
             base["output"] = copy_local_resource(project, project / source_ref, f"images/{name}", max_single)
+        elif via == "source" and item["type"] == "image":
+            source_ref = Path(str(item.get("source_reference") or ""))
+            if source_ref.is_absolute() or ".." in source_ref.parts or not source_ref.as_posix().startswith(("images/", "sources/")):
+                raise RuntimeError("source image must reference project images/ or sources/")
+            name = safe_output_name(item.get("output_name", ""), item["id"], source_ref.suffix or ".bin")
+            base["output"] = copy_local_resource(project, project / source_ref, f"images/acquired/{name}", max_single)
         elif via == "template":
             resolution = load_json(workspace / ".slidesmith" / "template_resolution.json")
             template_root = workspace / str(resolution.get("template_root") or "")

@@ -139,3 +139,38 @@ func TestStateMachineAllowsTemplateFillCancellation(t *testing.T) {
 		}
 	}
 }
+
+func TestStateMachineAllowsBeautifyTransitions(t *testing.T) {
+	machine := NewStateMachine()
+	path := []string{
+		model.TaskStatusSourceConverting,
+		model.TaskStatusBeautifyInventoryBuilding,
+		model.TaskStatusAwaitingAnchorConfirm,
+		model.TaskStatusRealizationDeriving,
+		model.TaskStatusAwaitingRealizationConfirm,
+		model.TaskStatusBeautifyPlanning,
+		model.TaskStatusAwaitingBeautifyConfirm,
+		model.TaskStatusSpecGenerating,
+		model.TaskStatusImageAcquiring,
+	}
+	for i := 0; i < len(path)-1; i++ {
+		if err := machine.Validate(path[i], path[i+1]); err != nil {
+			t.Fatalf("beautify transition %s -> %s: %v", path[i], path[i+1], err)
+		}
+	}
+	for _, status := range []string{model.TaskStatusBeautifyInventoryBuilding, model.TaskStatusBeautifyPlanning} {
+		if err := machine.Validate(model.TaskStatusFailed, status); err != nil {
+			t.Fatalf("failed -> %s: %v", status, err)
+		}
+	}
+}
+
+func TestStateMachineRejectsBeautifyPlanBypass(t *testing.T) {
+	machine := NewStateMachine()
+	if machine.CanTransition(model.TaskStatusBeautifyPlanning, model.TaskStatusSpecGenerating) {
+		t.Fatal("beautify planning must pause for plan confirmation")
+	}
+	if machine.CanTransition(model.TaskStatusBeautifyInventoryBuilding, model.TaskStatusBeautifyPlanning) {
+		t.Fatal("beautify inventory must not skip source-seeded confirmations")
+	}
+}

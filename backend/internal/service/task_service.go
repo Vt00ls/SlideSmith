@@ -41,6 +41,8 @@ const (
 	retryPhaseQualityCheck         = "quality_check"
 	retryPhaseFinalizeExport       = "finalize_export"
 	retryPhasePPTXValidate         = "pptx_validate"
+	retryPhaseBeautifyInventory    = "beautify_inventory"
+	retryPhaseBeautifyPlan         = "beautify_plan"
 	retryPhaseTemplateFillPlan     = "template_fill_plan"
 	retryPhaseTemplateFillCheck    = "template_fill_check"
 	retryPhaseTemplateFillApply    = "template_fill_apply"
@@ -184,6 +186,14 @@ func (s *TaskService) StartTask(ctx context.Context, taskID string) (*model.Task
 	if task.Status != model.TaskStatusUploaded && task.Status != model.TaskStatusFailed {
 		return nil, fmt.Errorf("task must be uploaded or failed before start, got %q", task.Status)
 	}
+	if task.RunnerProfile == "" {
+		if selection, selectErr := s.selectRoute(ctx, task); selectErr == nil && selection.Route == model.TaskRouteBeautify && s.agentCfg.BeautifyEnabled {
+			// Route select is formally persisted by the worker. This early read-only
+			// classification ensures an enabled Beautify task locks the required
+			// full runtime profile before the task leaves the upload gate.
+			task.Route = model.TaskRouteBeautify
+		}
+	}
 	if err := s.ensureTaskRunnerProfile(ctx, task); err != nil {
 		return nil, err
 	}
@@ -207,6 +217,11 @@ func (s *TaskService) SubmitConfirmations(ctx context.Context, taskID string, va
 	if err != nil {
 		return nil, err
 	}
+	if task.Route == model.TaskRouteBeautify {
+		if err := validateBeautifyConfirmationValues(task.Status, values); err != nil {
+			return nil, err
+		}
+	}
 	switch task.Status {
 	case model.TaskStatusAwaitingAnchorConfirm:
 		if err := s.repo.SubmitConfirmations(ctx, taskID, values); err != nil {
@@ -216,9 +231,11 @@ func (s *TaskService) SubmitConfirmations(ctx context.Context, taskID string, va
 		if err := s.transition(ctx, task, model.TaskStatusRealizationDeriving, "Deriving realization recommendations", nil); err != nil {
 			return nil, err
 		}
-		if err := s.deriveRealizationConfirmations(ctx, task); err != nil {
-			_ = s.fail(ctx, task, err)
-			return nil, err
+		if task.Route != model.TaskRouteBeautify {
+			if err := s.deriveRealizationConfirmations(ctx, task); err != nil {
+				_ = s.fail(ctx, task, err)
+				return nil, err
+			}
 		}
 		if err := s.transition(ctx, task, model.TaskStatusAwaitingRealizationConfirm, "Awaiting realization confirmation", nil); err != nil {
 			return nil, err
@@ -228,10 +245,16 @@ func (s *TaskService) SubmitConfirmations(ctx context.Context, taskID string, va
 			return nil, err
 		}
 		_ = s.event(ctx, taskID, model.EventTypeConfirmation, "tier2_submitted", "Realization confirmations submitted", map[string]any{"keys": mapKeys(values)})
-		if err := s.transition(ctx, task, model.TaskStatusSpecGenerating, "Spec generating", nil); err != nil {
+		nextStatus := model.TaskStatusSpecGenerating
+		nextMessage := "Spec generating"
+		if task.Route == model.TaskRouteBeautify {
+			nextStatus = model.TaskStatusBeautifyPlanning
+			nextMessage = "Beautify planning"
+		}
+		if err := s.transition(ctx, task, nextStatus, nextMessage, nil); err != nil {
 			return nil, err
 		}
-		_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", "Generate queued for worker", nil)
+		_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", nextMessage+" queued for worker", nil)
 	case model.TaskStatusAwaitingConfirm:
 		if err := s.repo.SubmitConfirmations(ctx, taskID, values); err != nil {
 			return nil, err
@@ -252,6 +275,8 @@ func (s *TaskService) ProcessQueuedTasks(ctx context.Context, limit int) (int, e
 	tasks, err := s.repo.ListClaimableTasksByStatuses(ctx, []string{
 		model.TaskStatusRuntimePreparing,
 		model.TaskStatusSourceConverting,
+		model.TaskStatusBeautifyInventoryBuilding,
+		model.TaskStatusBeautifyPlanning,
 		model.TaskStatusTemplateFillPlanning,
 		model.TaskStatusTemplateFillChecking,
 		model.TaskStatusTemplateFillApplying,
@@ -324,6 +349,10 @@ func (s *TaskService) processClaimedTask(ctx context.Context, task *model.Task) 
 	switch task.Status {
 	case model.TaskStatusRuntimePreparing, model.TaskStatusSourceConverting:
 		return s.processPrepare(ctx, task)
+	case model.TaskStatusBeautifyInventoryBuilding:
+		return s.processBeautifyInventory(ctx, task)
+	case model.TaskStatusBeautifyPlanning:
+		return s.processBeautifyPlan(ctx, task)
 	case model.TaskStatusTemplateFillPlanning:
 		return s.processTemplateFillPlan(ctx, task)
 	case model.TaskStatusTemplateFillChecking:
@@ -355,6 +384,8 @@ func isWorkerTaskStatus(status string) bool {
 	switch status {
 	case model.TaskStatusRuntimePreparing,
 		model.TaskStatusSourceConverting,
+		model.TaskStatusBeautifyInventoryBuilding,
+		model.TaskStatusBeautifyPlanning,
 		model.TaskStatusTemplateFillPlanning,
 		model.TaskStatusTemplateFillChecking,
 		model.TaskStatusTemplateFillApplying,
@@ -418,7 +449,7 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 		extra := map[string]any{}
 		if task.RunnerProfile == model.RunnerProfileFullPPTMaster {
 			selection, selectionErr := s.selectRoute(ctx, task)
-			if selectionErr == nil && selection.Route == model.TaskRouteMain {
+			if selectionErr == nil && isFullSVGRoute(selection.Route) {
 				failurePhase = "source_prepare.full_runtime_preflight"
 				resolved := s.resolveTaskWorkspace(task)
 				report, preflightErr := s.runFullRuntimePreflight(ctx, task, resolved)
@@ -438,7 +469,7 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 		})
 		return err
 	}
-	policy := routeExecutionPolicyFor(selection)
+	policy := routeExecutionPolicyFor(selection, s.agentCfg.BeautifyEnabled)
 	if !policy.Executable {
 		err := fmt.Errorf("%s", policy.FailureMessage)
 		_ = s.failWithMetadata(ctx, task, policy.FailurePhase, err, nil, map[string]any{
@@ -459,7 +490,7 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 		return err
 	}
 	var fullPreflight *fullRuntimePreflightReport
-	if selection.Route == model.TaskRouteMain && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+	if isFullSVGRoute(selection.Route) && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
 		preflight, err := s.runFullRuntimePreflight(ctx, task, workspace)
 		fullPreflight = preflight
 		if err != nil {
@@ -559,7 +590,7 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 			return err
 		}
 	}
-	if task.RunnerProfile == model.RunnerProfileFullPPTMaster && selection.Route == model.TaskRouteMain {
+	if task.RunnerProfile == model.RunnerProfileFullPPTMaster && isFullSVGRoute(selection.Route) {
 		runtimePreflight, err := validateRuntimeFullPreflightContract(preparedProjectPath, task.RunnerProfile)
 		if err != nil {
 			output := runtimeRunPhaseOutput(run)
@@ -667,7 +698,7 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 			},
 		)
 	}
-	policy = routeExecutionPolicyFor(selection)
+	policy = routeExecutionPolicyFor(selection, s.agentCfg.BeautifyEnabled)
 	if !policy.WorkflowExecutable {
 		err := fmt.Errorf("%s", policy.FailureMessage)
 		return s.failTaskAfterSourcePrepare(ctx, task, policy.FailurePhase, err, run, map[string]any{
@@ -697,6 +728,26 @@ func (s *TaskService) processPrepare(ctx context.Context, task *model.Task) erro
 		_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", "Template fill plan queued after source prepare", map[string]any{
 			"project_path": preparedProjectPath,
 		})
+		return nil
+	}
+	if selection.Route == model.TaskRouteBeautify {
+		if strings.TrimSpace(task.SelectedTemplateID) != "" || (strings.TrimSpace(task.TemplateLockJSON) != "" && strings.TrimSpace(task.TemplateLockJSON) != "{}") {
+			err := fmt.Errorf("Beautify v1 cannot combine source identity with a platform template; create a main-route task for template-based redesign")
+			return s.failTaskAfterSourcePrepare(ctx, task, "beautify_inventory.template_overlap", err, run, map[string]any{"project_path": s.projectRel(task, preparedProjectPath)})
+		}
+		transitioned, err := s.transitionIfCurrent(ctx, task, model.TaskStatusBeautifyInventoryBuilding, "Building Beautify inventory", map[string]any{
+			"runtime_run_id": run.ID,
+			"project_path":   preparedProjectPath,
+		})
+		if err != nil {
+			return s.failTaskAfterSourcePrepare(ctx, task, "source_prepare.beautify_inventory_queue", err, run, map[string]any{
+				"workspace_path": workspace.HostDir,
+				"project_path":   preparedProjectPath,
+			})
+		}
+		if transitioned {
+			_ = s.event(ctx, task.ID, model.EventTypeRuntime, "queued", "Beautify inventory queued after source prepare", map[string]any{"project_path": preparedProjectPath})
+		}
 		return nil
 	}
 	templateResolution, err := s.runTemplateResolve(ctx, task, workspace, preparedProjectPath)
@@ -1979,11 +2030,30 @@ func (s *TaskService) processGenerate(ctx context.Context, task *model.Task) err
 		return err
 	}
 	workspace := s.resolveTaskWorkspace(task)
-	if err := s.writeConfirmationResult(ctx, task); err != nil {
-		_ = s.failWithMetadata(ctx, task, "confirmation_result", err, nil, map[string]any{
-			"workspace_path": workspace.HostDir,
-		})
-		return err
+	writeConfirmationResult := true
+	if task.Route == model.TaskRouteBeautify {
+		projectPath, err := s.findPersistentProjectPath(task)
+		if err != nil {
+			_ = s.failWithMetadata(ctx, task, "confirmation_result", err, nil, map[string]any{
+				"workspace_path": workspace.HostDir,
+			})
+			return err
+		}
+		writeConfirmationResult, err = confirmationResultWritePolicyForGenerate(task, projectPath)
+		if err != nil {
+			_ = s.failWithMetadata(ctx, task, "confirmation_result", err, nil, map[string]any{
+				"workspace_path": workspace.HostDir,
+			})
+			return err
+		}
+	}
+	if writeConfirmationResult {
+		if err := s.writeConfirmationResult(ctx, task); err != nil {
+			_ = s.failWithMetadata(ctx, task, "confirmation_result", err, nil, map[string]any{
+				"workspace_path": workspace.HostDir,
+			})
+			return err
+		}
 	}
 
 	if s.useFullPPTMaster(task) {
@@ -2089,7 +2159,7 @@ func (s *TaskService) processFullPPTMasterQueuedPhase(ctx context.Context, task 
 
 func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, startPhase PipelinePhase) error {
 	if !s.useFullPPTMaster(task) {
-		err := fmt.Errorf("full phase %s requires a locked full-ppt-master main task", startPhase)
+		err := fmt.Errorf("full phase %s requires a locked full-ppt-master full SVG route task", startPhase)
 		_ = s.failWithMetadata(ctx, task, string(startPhase)+".unsupported_profile", err, nil, map[string]any{"effective_profile": task.RunnerProfile})
 		return err
 	}
@@ -2109,7 +2179,7 @@ func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *m
 		return err
 	}
 	if startPhase == PhaseSpecGenerate {
-		if err := cleanupFullPPTMasterOutputsForRetry(projectPath, PhaseSpecGenerate); err != nil {
+		if err := cleanupFullPPTMasterOutputsForRetry(projectPath, PhaseSpecGenerate, task.Route); err != nil {
 			_ = s.failWithMetadata(ctx, task, string(PhaseSpecGenerate)+".cleanup", err, nil, map[string]any{
 				"project_path": projectPath,
 			})
@@ -2123,7 +2193,7 @@ func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *m
 			return err
 		}
 		projectPath = nextProjectPath
-		if shouldPauseForSpecPreview(projectPath) {
+		if task.Route == model.TaskRouteMain && shouldPauseForSpecPreview(projectPath) {
 			if err := s.transition(ctx, task, model.TaskStatusAwaitingSpecConfirm, "Awaiting spec confirmation", map[string]any{
 				"runtime_run_id": specRun.ID,
 				"project_path":   projectPath,
@@ -2197,7 +2267,7 @@ func (s *TaskService) processFullPPTMasterFromPhase(ctx context.Context, task *m
 
 	if startPhase == PhasePPTXValidate {
 		recovered, recoverErr := s.tryRecoverCompletedFullPhase(ctx, task, workspace, projectPath, PhasePPTXValidate, func() (map[string]any, error) {
-			return validatePPTXValidateContract(projectPath)
+			return validatePPTXValidateContractForTask(projectPath, task, "")
 		})
 		if recoverErr != nil {
 			return recoverErr
@@ -2266,8 +2336,8 @@ func (s *TaskService) tryRecoverCompletedFullPhase(ctx context.Context, task *mo
 }
 
 func (s *TaskService) queueResourceAfterSpecApproval(ctx context.Context, task *model.Task, projectPath, previousRuntimeRunID string) error {
-	if !s.useFullPPTMaster(task) || task.Route != model.TaskRouteMain {
-		return fmt.Errorf("resource acquisition requires full-ppt-master main route")
+	if !s.useFullPPTMaster(task) || !isFullSVGRoute(task.Route) {
+		return fmt.Errorf("resource acquisition requires full-ppt-master full SVG route")
 	}
 	if _, err := validateExistingSpecContract(projectPath, task, s.resolveTaskWorkspace(task)); err != nil {
 		return fmt.Errorf("resource acquisition requires valid spec contract: %w", err)
@@ -2297,7 +2367,7 @@ func (s *TaskService) runFullPPTMasterSpecPhase(ctx context.Context, task *model
 		return nil, projectPath, err
 	}
 	run, err := s.runAgent(ctx, task, string(PhaseSpecGenerate), AgentRunRequest{
-		Prompt:      s.fullPPTMasterSpecPrompt(task, projectPath),
+		Prompt:      s.fullPPTMasterStrategistPrompt(task, projectPath),
 		WorkDir:     workspace.HostDir,
 		ComposeFile: workspace.CLIComposeFile,
 		Detached:    true,
@@ -2327,6 +2397,16 @@ func (s *TaskService) runFullPPTMasterSpecPhase(ctx context.Context, task *model
 		return run, projectPath, err
 	}
 	contract, err := validateSpecGenerateContract(projectPath, task.ID)
+	if err == nil && task.Route == model.TaskRouteBeautify {
+		var beautifyContract map[string]any
+		beautifyContract, err = validateBeautifySpecGenerateContract(projectPath, task.ID)
+		if err == nil {
+			contract["beautify"] = beautifyContract
+			for key, value := range beautifyContract {
+				contract[key] = value
+			}
+		}
+	}
 	if err == nil {
 		contract, err = bindFullPhaseContract(projectPath, PhaseSpecGenerate, contract, task, workspace, runtimeRunID(run))
 	}
@@ -2368,7 +2448,7 @@ func (s *TaskService) runFullPPTMasterSVGPhase(ctx context.Context, task *model.
 		})
 	} else {
 		run, err = s.runAgent(ctx, task, string(PhaseSVGExecute), AgentRunRequest{
-			Prompt:      s.fullPPTMasterSVGPrompt(task, projectPath),
+			Prompt:      s.fullPPTMasterExecutorPrompt(task, projectPath),
 			WorkDir:     workspace.HostDir,
 			ComposeFile: workspace.CLIComposeFile,
 			Detached:    true,
@@ -2430,6 +2510,16 @@ func (s *TaskService) runFullPPTMasterSVGPhase(ctx context.Context, task *model.
 		return inspectorRun, projectPath, err
 	}
 	contract, err := validateSVGExecuteContract(projectPath, task.ID)
+	if err == nil && task.Route == model.TaskRouteBeautify {
+		var fidelity map[string]any
+		fidelity, err = validateBeautifySVGFidelity(projectPath, task.ID)
+		if err == nil {
+			contract["beautify_svg_fidelity"] = fidelity
+			for key, value := range fidelity {
+				contract[key] = value
+			}
+		}
+	}
 	if err == nil {
 		contract["task_id"] = task.ID
 		contract["route"] = task.Route
@@ -2478,6 +2568,16 @@ func hasRecoverableSVGInspectorInputs(projectPath string) bool {
 
 func (s *TaskService) recoverValidatedSVGBundlePhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string) (*model.TaskRuntimeRun, string, error) {
 	contract, err := validateSVGExecuteContract(projectPath, task.ID)
+	if err == nil && task.Route == model.TaskRouteBeautify {
+		var fidelity map[string]any
+		fidelity, err = validateExistingBeautifySVGFidelity(projectPath, task.ID)
+		if err == nil {
+			contract["beautify_svg_fidelity"] = fidelity
+			for key, value := range fidelity {
+				contract[key] = value
+			}
+		}
+	}
 	if err != nil {
 		_ = s.failWithMetadata(ctx, task, string(PhaseSVGExecute)+".contract_stale", err, nil, map[string]any{"project_path": s.projectRel(task, projectPath)})
 		return nil, projectPath, err
@@ -2541,7 +2641,9 @@ func (s *TaskService) runFullPPTMasterValidatePhase(ctx context.Context, task *m
 			shellArg(projectRel), shellArg(phaseRunID),
 		)
 	}
-	return s.runFullPPTMasterCommandPhase(ctx, task, workspace, projectPath, PhasePPTXValidate, command, validatePPTXValidateContractForRun)
+	return s.runFullPPTMasterCommandPhase(ctx, task, workspace, projectPath, PhasePPTXValidate, command, func(path, phaseRunID string) (map[string]any, error) {
+		return validatePPTXValidateContractForTask(path, task, phaseRunID)
+	})
 }
 
 func (s *TaskService) runFullPPTMasterCommandPhase(ctx context.Context, task *model.Task, workspace *TaskWorkspace, projectPath string, phase PipelinePhase, commandBuilder func(string) string, validate func(string, string) (map[string]any, error)) (*model.TaskRuntimeRun, string, error) {
@@ -2559,7 +2661,7 @@ func (s *TaskService) runFullPPTMasterCommandPhase(ctx context.Context, task *mo
 		return nil, projectPath, err
 	}
 	if phase == PhaseFinalizeExport || phase == PhasePPTXValidate {
-		if err := cleanupFullPPTMasterOutputsForRetry(projectPath, phase); err != nil {
+		if err := cleanupFullPPTMasterOutputsForRetry(projectPath, phase, task.Route); err != nil {
 			_ = s.failWithMetadata(ctx, task, string(phase)+".cleanup", err, nil, map[string]any{"project_path": s.projectRel(task, projectPath)})
 			return nil, projectPath, err
 		}
@@ -2643,7 +2745,11 @@ func (s *TaskService) applyRuntimeRunToTask(ctx context.Context, task *model.Tas
 	return s.saveTaskIfCurrent(ctx, task, expectedStatus)
 }
 
-func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase) error {
+func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase, routes ...string) error {
+	route := model.TaskRouteMain
+	if len(routes) > 0 && routes[0] != "" {
+		route = routes[0]
+	}
 	paths := []string{
 		filepath.Join(projectPath, ".slidesmith", "artifacts.json"),
 		filepath.Join(projectPath, ".slidesmith-artifacts.json"),
@@ -2651,6 +2757,11 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 	}
 	switch phase {
 	case PhaseSpecGenerate:
+		if route == model.TaskRouteBeautify {
+			if err := cleanupBeautifyManifestResourceOutputs(projectPath); err != nil {
+				return err
+			}
+		}
 		paths = append(paths,
 			filepath.Join(projectPath, "design_spec.md"),
 			filepath.Join(projectPath, "spec_lock.md"),
@@ -2664,10 +2775,17 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "analysis", "svg_resource_usage.json"),
 			filepath.Join(projectPath, "analysis", "chart_usage.json"),
 			filepath.Join(projectPath, "analysis", "notes_inventory.json"),
-			filepath.Join(projectPath, "images"),
+			filepath.Join(projectPath, "analysis", "beautify_svg_fidelity.json"),
 			filepath.Join(projectPath, "icons"),
 			filepath.Join(projectPath, "charts"),
-			filepath.Join(projectPath, ".slidesmith", "contracts"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseSpecGenerate)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseImageAcquire)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseSVGExecute)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseQualityCheck)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseFinalizeExport)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePPTXValidate)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhasePublish)+".json"),
+			filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
 			filepath.Join(projectPath, ".slidesmith", "quality_report.json"),
 			filepath.Join(projectPath, "svg_output"),
 			filepath.Join(projectPath, "notes"),
@@ -2675,6 +2793,9 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "exports"),
 			filepath.Join(projectPath, "validation"),
 		)
+		if route != model.TaskRouteBeautify {
+			paths = append(paths, filepath.Join(projectPath, "images"))
+		}
 	case PhaseImageAcquire:
 		paths = append(paths,
 			filepath.Join(projectPath, ".slidesmith", "contracts", string(PhaseImageAcquire)+".json"),
@@ -2690,6 +2811,7 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "analysis", "svg_resource_usage.json"),
 			filepath.Join(projectPath, "analysis", "chart_usage.json"),
 			filepath.Join(projectPath, "analysis", "notes_inventory.json"),
+			filepath.Join(projectPath, "analysis", "beautify_svg_fidelity.json"),
 			filepath.Join(projectPath, "svg_final"),
 			filepath.Join(projectPath, "exports"),
 			filepath.Join(projectPath, "validation"),
@@ -2709,6 +2831,7 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "analysis", "svg_resource_usage.json"),
 			filepath.Join(projectPath, "analysis", "chart_usage.json"),
 			filepath.Join(projectPath, "analysis", "notes_inventory.json"),
+			filepath.Join(projectPath, "analysis", "beautify_svg_fidelity.json"),
 			filepath.Join(projectPath, "svg_final"),
 			filepath.Join(projectPath, "exports"),
 			filepath.Join(projectPath, "validation"),
@@ -2729,6 +2852,7 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "validation", "pptx_readback.md"),
 			filepath.Join(projectPath, "validation", "pptx_text_inventory.json"),
 			filepath.Join(projectPath, "validation", "pptx_validate_report.json"),
+			filepath.Join(projectPath, "validation", "beautify_fidelity_report.json"),
 			filepath.Join(projectPath, "validation", "render"),
 		)
 	case PhaseFinalizeExport:
@@ -2742,6 +2866,7 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "validation", "pptx_readback.md"),
 			filepath.Join(projectPath, "validation", "pptx_text_inventory.json"),
 			filepath.Join(projectPath, "validation", "pptx_validate_report.json"),
+			filepath.Join(projectPath, "validation", "beautify_fidelity_report.json"),
 			filepath.Join(projectPath, "validation", "render"),
 		)
 	case PhasePPTXValidate:
@@ -2752,6 +2877,7 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 			filepath.Join(projectPath, "validation", "pptx_readback.md"),
 			filepath.Join(projectPath, "validation", "pptx_text_inventory.json"),
 			filepath.Join(projectPath, "validation", "pptx_validate_report.json"),
+			filepath.Join(projectPath, "validation", "beautify_fidelity_report.json"),
 			filepath.Join(projectPath, "validation", "render"),
 		)
 	case PhasePublish:
@@ -2763,6 +2889,63 @@ func cleanupFullPPTMasterOutputsForRetry(projectPath string, phase PipelinePhase
 		return fmt.Errorf("unsupported cleanup phase %q", phase)
 	}
 	return cleanupFullPPTMasterRetryPaths(projectPath, paths)
+}
+
+func cleanupBeautifyManifestResourceOutputs(projectPath string) error {
+	manifestPath := filepath.Join(projectPath, ".slidesmith", "resources_manifest.json")
+	raw, err := os.ReadFile(manifestPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var manifest resourcesManifest
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		return fmt.Errorf("decode prior Beautify resources manifest: %w", err)
+	}
+	protected := map[string]bool{"images/image_manifest.json": true}
+	if planRaw, readErr := os.ReadFile(filepath.Join(projectPath, ".slidesmith", "resource_plan.json")); readErr == nil {
+		var plan resourcePlan
+		if json.Unmarshal(planRaw, &plan) == nil {
+			for _, item := range plan.Requirements {
+				if item.AcquireVia == "source" || item.AcquireVia == "user" {
+					rel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(item.SourceReference)))
+					if safeBeautifyRelativePath(rel) {
+						protected[rel] = true
+					}
+				}
+			}
+		}
+	}
+	projectRoot, err := filepath.Abs(projectPath)
+	if err != nil {
+		return err
+	}
+	for _, item := range manifest.Resources {
+		if item.Output == nil || item.Output.Path == "" {
+			continue
+		}
+		rel := filepath.ToSlash(filepath.Clean(filepath.FromSlash(item.Output.Path)))
+		if protected[rel] || !safeBeautifyRelativePath(rel) || strings.HasPrefix(rel, "sources/") {
+			continue
+		}
+		candidate := filepath.Join(projectRoot, filepath.FromSlash(rel))
+		info, resolved, inspectErr := inspectContainedPath(projectRoot, candidate)
+		if os.IsNotExist(inspectErr) {
+			continue
+		}
+		if inspectErr != nil {
+			return inspectErr
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("prior Beautify resource output is not a regular file")
+		}
+		if err := os.Remove(resolved); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
 }
 
 func cleanupFullPPTMasterOutputsForSVGInspectorRetry(projectPath string) error {
@@ -2779,6 +2962,7 @@ func cleanupFullPPTMasterOutputsForSVGInspectorRetry(projectPath string) error {
 		filepath.Join(projectPath, ".slidesmith", "contracts", "final.json"),
 		filepath.Join(projectPath, "analysis", "svg_inventory.json"),
 		filepath.Join(projectPath, "analysis", "notes_inventory.json"),
+		filepath.Join(projectPath, "analysis", "beautify_svg_fidelity.json"),
 		filepath.Join(projectPath, "svg_final"),
 		filepath.Join(projectPath, "exports"),
 		filepath.Join(projectPath, "validation"),
@@ -2978,14 +3162,14 @@ func (s *TaskService) processPublish(ctx context.Context, task *model.Task, work
 	if workspace == nil {
 		workspace = s.resolveTaskWorkspace(task)
 	}
-	if task.Route == model.TaskRouteMain && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+	if isFullSVGRoute(task.Route) && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
 		if err := s.validateTaskRuntimeProfile(task, workspace); err != nil {
 			_ = s.failWithMetadata(ctx, task, failurePhaseRuntimeProfileMismatch, err, nil, map[string]any{"workspace_path": workspace.HostDir})
 			return err
 		}
 		projectPath, projectErr := s.findPersistentProjectPath(task)
 		if projectErr == nil {
-			_, projectErr = validatePublishQualityChain(projectPath)
+			_, projectErr = validatePublishQualityChainForTask(projectPath, task)
 		}
 		if projectErr != nil {
 			_ = s.failWithMetadata(ctx, task, "publish.quality_gate", projectErr, nil, map[string]any{"project_path": projectPath})
@@ -3052,13 +3236,13 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 			ProjectPath: projectPath,
 		})
 	}
-	if task.Route == model.TaskRouteTemplateFill {
+	if task.Route == model.TaskRouteTemplateFill || task.Route == model.TaskRouteBeautify {
 		if workspace == nil {
 			return nil, fmt.Errorf("task workspace is empty")
 		}
 		canonicalProjectPath, err := s.findPersistentProjectPath(task)
 		if err != nil {
-			return nil, fmt.Errorf("resolve canonical Template Fill project: %w", err)
+			return nil, fmt.Errorf("resolve canonical route project: %w", err)
 		}
 		addRoot(workspace.HostDir, "task_workspace", "", canonicalProjectPath)
 	} else {
@@ -3100,6 +3284,8 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 		var published []model.Artifact
 		if task.Route == model.TaskRouteTemplateFill {
 			published, err = s.publisher.PublishProject(ctx, task.ID, root.Path, root.ProjectPath, publishVersion)
+		} else if task.Route == model.TaskRouteBeautify {
+			published, err = s.publisher.PublishProjectForRoute(ctx, task.ID, root.Path, root.ProjectPath, publishVersion, task.Route)
 		} else {
 			published, err = s.publisher.Publish(ctx, task.ID, root.Path, publishVersion)
 		}
@@ -3428,6 +3614,22 @@ func (s *TaskService) writeConfirmationResult(ctx context.Context, task *model.T
 	return s.event(ctx, task.ID, model.EventTypeConfirmation, "result_written", "Confirmation result written to runtime project", map[string]any{"path": target})
 }
 
+func confirmationResultWritePolicyForGenerate(task *model.Task, projectPath string) (bool, error) {
+	if task == nil || task.Route != model.TaskRouteBeautify {
+		return true, nil
+	}
+	lockPath := filepath.Join(projectPath, ".slidesmith", "beautify_lock.json")
+	if _, err := os.Lstat(lockPath); os.IsNotExist(err) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	if _, err := ValidateBeautifyLock(projectPath, task.ID); err != nil {
+		return false, fmt.Errorf("validate immutable Beautify confirmation before generate: %w", err)
+	}
+	return false, nil
+}
+
 func shouldPauseForSpecPreview(projectPath string) bool {
 	return valueBool(readJSONMap(filepath.Join(projectPath, "confirm_ui", "result.json")), "refine_spec", false)
 }
@@ -3557,6 +3759,10 @@ func (s *TaskService) RetryTask(ctx context.Context, taskID, phase string) (*mod
 		return nil, err
 	}
 	switch phase {
+	case retryPhaseBeautifyInventory:
+		return s.retryBeautifyInventory(ctx, task)
+	case retryPhaseBeautifyPlan:
+		return s.retryBeautifyPlan(ctx, task)
 	case retryPhaseTemplateFillPlan:
 		return s.retryTemplateFillPhase(ctx, task, PhaseTemplateFillPlan, model.TaskStatusTemplateFillPlanning)
 	case retryPhaseTemplateFillCheck:
@@ -3633,7 +3839,7 @@ func (s *TaskService) ContinueTask(ctx context.Context, taskID, phase string) (*
 			"project_path": projectPath,
 		})
 	case "spec", "spec_generate", "regenerate":
-		if err := cleanupFullPPTMasterOutputsForRetry(projectPath, PhaseSpecGenerate); err != nil {
+		if err := cleanupFullPPTMasterOutputsForRetry(projectPath, PhaseSpecGenerate, task.Route); err != nil {
 			return nil, fmt.Errorf("cleanup before spec regenerate: %w", err)
 		}
 		if err := s.transition(ctx, task, model.TaskStatusSpecGenerating, "Spec regenerate queued", map[string]any{
@@ -3737,7 +3943,7 @@ func (s *TaskService) retryPipelinePhase(ctx context.Context, task *model.Task, 
 		if err := cleanupFullPPTMasterOutputsForSVGInspectorRetry(projectPath); err != nil {
 			return nil, fmt.Errorf("cleanup before inspector-only retry %s: %w", phase, err)
 		}
-	} else if err := cleanupFullPPTMasterOutputsForRetry(projectPath, phase); err != nil {
+	} else if err := cleanupFullPPTMasterOutputsForRetry(projectPath, phase, task.Route); err != nil {
 		return nil, fmt.Errorf("cleanup before retry %s: %w", phase, err)
 	}
 	retryPayload := map[string]any{
@@ -3839,7 +4045,7 @@ func (s *TaskService) retryTemplateFillPhase(ctx context.Context, task *model.Ta
 }
 
 func (s *TaskService) retryPublish(ctx context.Context, task *model.Task) (*model.Task, error) {
-	if task.Route == model.TaskRouteMain && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+	if isFullSVGRoute(task.Route) && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
 		if err := s.validateTaskRuntimeProfile(task, s.resolveTaskWorkspace(task)); err != nil {
 			return nil, err
 		}
@@ -3847,12 +4053,12 @@ func (s *TaskService) retryPublish(ctx context.Context, task *model.Task) (*mode
 	if _, err := s.findPersistentProjectPath(task); err != nil {
 		return nil, fmt.Errorf("cannot retry publish before prepared project exists: %w", err)
 	}
-	if task.Route == model.TaskRouteMain && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
+	if isFullSVGRoute(task.Route) && task.RunnerProfile == model.RunnerProfileFullPPTMaster {
 		projectPath, err := s.findPersistentProjectPath(task)
 		if err != nil {
 			return nil, err
 		}
-		if _, err := validatePublishQualityChain(projectPath); err != nil {
+		if _, err := validatePublishQualityChainForTask(projectPath, task); err != nil {
 			return nil, fmt.Errorf("cannot retry publish with stale quality chain: %w", err)
 		}
 	}
@@ -3883,6 +4089,10 @@ func normalizeRetryPhase(requested, failurePhase string) (string, error) {
 		return retryPhaseFinalizeExport, nil
 	case "pptx", "pptx_validate", "pptx_validating", "validate_pptx", "render":
 		return retryPhasePPTXValidate, nil
+	case "beautify_inventory", "inventory", "beautify_inventory_building":
+		return retryPhaseBeautifyInventory, nil
+	case "beautify_plan", "beautify_planning":
+		return retryPhaseBeautifyPlan, nil
 	case "template_fill_plan", "fill_plan", "plan", "template_fill_planning":
 		return retryPhaseTemplateFillPlan, nil
 	case "template_fill_check", "fill_check", "check", "template_fill_checking":
@@ -3916,6 +4126,10 @@ func inferRetryPhase(failurePhase string) string {
 		return retryPhaseFinalizeExport
 	case strings.HasPrefix(value, string(PhasePPTXValidate)), strings.HasPrefix(value, "pptx"), strings.HasPrefix(value, "render"):
 		return retryPhasePPTXValidate
+	case strings.HasPrefix(value, string(PhaseBeautifyInventory)):
+		return retryPhaseBeautifyInventory
+	case strings.HasPrefix(value, string(PhaseBeautifyPlan)):
+		return retryPhaseBeautifyPlan
 	case strings.HasPrefix(value, string(PhaseTemplateFillPlan)):
 		return retryPhaseTemplateFillPlan
 	case strings.HasPrefix(value, string(PhaseTemplateFillCheck)):
@@ -4424,7 +4638,104 @@ func (s *TaskService) commandRunnerProfile(task *model.Task) string {
 }
 
 func (s *TaskService) useFullPPTMaster(task *model.Task) bool {
-	return task != nil && task.Route != model.TaskRouteTemplateFill && task.RunnerProfile == model.RunnerProfileFullPPTMaster
+	return task != nil && isFullSVGRoute(task.Route) && task.RunnerProfile == model.RunnerProfileFullPPTMaster
+}
+
+func isFullSVGRoute(route string) bool {
+	return route == model.TaskRouteMain || route == model.TaskRouteBeautify
+}
+
+func (s *TaskService) fullPPTMasterStrategistPrompt(task *model.Task, projectPath string) string {
+	if task != nil && task.Route == model.TaskRouteBeautify {
+		return s.fullPPTMasterBeautifySpecPrompt(task, projectPath)
+	}
+	return s.fullPPTMasterSpecPrompt(task, projectPath)
+}
+
+func (s *TaskService) fullPPTMasterExecutorPrompt(task *model.Task, projectPath string) string {
+	if task != nil && task.Route == model.TaskRouteBeautify {
+		return s.fullPPTMasterBeautifySVGPrompt(task, projectPath)
+	}
+	return s.fullPPTMasterSVGPrompt(task, projectPath)
+}
+
+func (s *TaskService) fullPPTMasterBeautifySpecPrompt(task *model.Task, projectPath string) string {
+	projectRel := s.projectRel(task, projectPath)
+	return fmt.Sprintf(`You are the SlideSmith PPT Master strategist for a Beautify task.
+
+Goal:
+Create the strategist contracts for task %[1]s by redesigning the source presentation visually while preserving its frozen visible content and data exactly.
+
+Mandatory inputs:
+- Work only in %[2]s and read .slidesmith/runtime_manifest.json first.
+- Read %[2]s/.slidesmith/contracts/beautify_inputs.json, %[2]s/analysis/beautify_inventory.json, %[2]s/analysis/beautify_risk_report.json, %[2]s/analysis/beautify_plan.json, %[2]s/.slidesmith/contracts/beautify_inventory.json, %[2]s/.slidesmith/contracts/beautify_plan.json, %[2]s/.slidesmith/beautify_lock.json, and %[2]s/confirm_ui/result.json.
+- Treat beautify_lock.json as immutable and authoritative for page order, visible text units, table grids, chart categories/series/values, required image occurrences, accepted risks, identity, canvas, palette, and fonts.
+- Do not read or use platform template resolution for this Beautify v1 task. Source identity is the visual seed.
+
+Required outputs:
+1. Overwrite %[2]s/design_spec.md, %[2]s/spec_lock.md, and %[2]s/.slidesmith/resource_plan.json only. Do not create SVG or PPTX files.
+2. Create exactly the locked source slide count in continuous order P01..PN. PNN must map to source slide NN; never add, remove, merge, split, reorder, or summarize pages.
+3. Copy every frozen visible text unit verbatim on its owning page, preserving paragraph/list/number semantics. Never add a title, tagline, transition, summary, label, fact, number, unit, or punctuation that is not frozen in the lock.
+4. Bind every frozen table cell and chart category, series name, order, and value to the owning page. Layout and chart visual type may follow the confirmed plan, but source data semantics are immutable.
+5. Preserve every required source image occurrence on its owning page using its frozen source occurrence/hash and the confirmed image strategy. Do not silently replace source images with AI or Web content.
+6. Use the confirmed source identity/canvas/palette/fonts and record any confirmed override; do not default to generic business blue.
+7. resource_plan.json must use schema slidesmith.resource_plan.v1, task_id %[1]s, locked integer page_count, lowercase SHA-256 bindings for design_spec.md/spec_lock.md/confirm_ui/result.json, and requirements.
+8. The only resource types are image, illustration_sheet, illustration_slice, icon, formula, chart_template, chart_data, template_asset, and placeholder. type "template" is forbidden. The only acquire_via values are "user", "template", "icon", "formula", "chart_template", "source", "web", "ai", "slice", and "placeholder". acquire_via "render" is invalid and forbidden. The required type-to-acquire mapping is icon->icon, formula->formula, chart_template->chart_template, chart_data->source, illustration_sheet->ai, illustration_slice->slice, template_asset->template, and placeholder->placeholder. Beautify v1 must not use template_asset because no platform template is resolved. Source-deck pictures/logo/motifs must use type "image" with acquire_via "source" and a safe project-relative source_reference bound to a frozen occurrence/hash.
+9. A layout shell is never a resource. When there is no actual resource to acquire/copy/generate/render/slice, write requirements: [].
+10. Every requirement must use a stable ID, integer page, exact purpose, required boolean, canonical acquire_via, approved fallback, safe output_name, placement, and type-specific fields. fallback must be exactly one of "", "diagram", "shape", "text", "placeholder", or "omit_optional"; it is an enum, never prose. A required frozen source-deck image must use fallback "" because it cannot be replaced or omitted. Never write "source placeholder" or any other combined/free-text fallback. The same ID + PNN + complete purpose must occur together on one plain-text declaration line in both markdown files. For every requirement, copy the ID and complete purpose from resource_plan.json verbatim into this Markdown-only line format (substituting live values):
+   - resource image.p01.source | P01 | purpose=Required source image occurrence p01.image.01 for P01 | type=image | acquire_via=source | fallback=
+   The resource ID must be a clean unquoted token, the canonical PNN must be present, and the full purpose must remain on that same line. Raw JSON such as {"id":"image.p01.source",...} is not a valid Markdown declaration and must not be pasted into design_spec.md or spec_lock.md. The JSON examples below are exclusively for .slidesmith/resource_plan.json. Use this exact flat JSON shape for each required frozen source image (substituting live values from the lock):
+   {"id":"image.p01.source","page":1,"type":"image","purpose":"Required source image occurrence p01.image.01 for P01","required":true,"acquire_via":"source","fallback":"","output_name":"p01_source_image.png","placement":"P01 image area","source_reference":"images/source.png","publishable":true}
+11. Data-driven charts require paired chart_template and chart_data resources on the same page. Every chart_template must use acquire_via "chart_template" and a real chart name from skills/ppt-master/templates/charts/charts_index.json as source_reference. Every chart_data must use acquire_via "source", a safe project-relative sources/... source_reference, the frozen source citation, and exact canonical data. Tables are frozen content, not binary resources. Use these exact flat resource_plan.json machine shapes (with the live IDs, page, purpose, source reference, frozen citation, and data substituted):
+   {"id":"chart.p04.source.template","page":4,"type":"chart_template","purpose":"Template for the P04 source chart","required":true,"acquire_via":"chart_template","fallback":"diagram","output_name":"p04_source_chart_template.svg","placement":"P04 chart area","source_reference":"bar_chart","publishable":true}
+   {"id":"chart.p04.source.data","page":4,"type":"chart_data","purpose":"Canonical data for the P04 source chart","required":true,"acquire_via":"source","fallback":"text","output_name":"p04_source_chart_data.json","placement":"P04 chart area","source_reference":"sources/source.pptx","data":{"categories":["A","B"],"series":[{"name":"Series 1","values":[1,2]}]},"citation":{"file":"sources/source.pptx","section":"slide 4 chart"},"publishable":true}
+
+Prohibitions:
+- Do not mutate Beautify inputs, inventory, risk, plan, confirmations, or lock.
+- Do not create or modify svg_output, svg_final, exports, validation, images, icons, or charts.
+- Do not acquire resources, access the network, run renderers/exporters, or generate files with a batch script.
+- Do not invent platform templates or declare whole-page cover/content/ending shells as resources.
+
+Before stopping, verify exact page mapping and frozen text/table/chart/image coverage against beautify_lock.json, verify all SHA-256 bindings, verify the canonical resource enum, and prove svg_output and exports remain empty.
+`, task.ID, projectRel)
+}
+
+func (s *TaskService) fullPPTMasterBeautifySVGPrompt(task *model.Task, projectPath string) string {
+	projectRel := s.projectRel(task, projectPath)
+	return fmt.Sprintf(`You are the SlideSmith PPT Master SVG executor for a Beautify task.
+
+Goal:
+Create native SVG pages for task %[1]s while preserving the frozen source-deck content and data exactly.
+
+Mandatory inputs and boundaries:
+- Work only in %[2]s and read .slidesmith/runtime_manifest.json first.
+- Read %[2]s/.slidesmith/beautify_lock.json, analysis/beautify_inventory.json, analysis/beautify_plan.json, design_spec.md, spec_lock.md, confirm_ui/result.json, and .slidesmith/resources_manifest.json before writing SVG.
+- beautify_lock.json is immutable and authoritative. PNN maps to source slide NN.
+- resources_manifest.json is the only resource authority. Use only ready project-relative outputs or explicit approved fallbacks.
+- Change only layout, hierarchy, spacing, alignment, rhythm, and confirmed identity styling. Never change content.
+
+Required outputs:
+1. Create exactly the locked page count in %[2]s/svg_output as continuous <NN>_<safe-slug>.svg files.
+2. Every SVG root must have matching data-page-id="PNN", data-spec-page-id="PNN", data-source-slide="NN", and data-beautify-lock-hash equal to the live lock SHA-256.
+3. Emit every frozen visible text unit verbatim and in order on its owning page. Do not delete, abbreviate, rewrite, case-fold, move across pages, or add text. If content cannot fit, fail or emit a blocking finding; never split the page.
+4. Rebuild tables from the exact frozen cell grid and charts from exact frozen categories, series names/order, and values. Preserve data lineage in chart_usage.json.
+5. Use every required source image occurrence on its owning page with a real manifest-bound href and stable owner/data-resource-id. Cropping/scaling is allowed; missing or wrong-page usage is forbidden. Manifest output.path values are project-relative, but an SVG href is resolved relative to its svg_output/<page>.svg file: prefix the manifest path with "../" (for example, manifest output.path "images/acquired/p01_source.png" requires SVG and sidecar href "../images/acquired/p01_source.png"). Never paste the bare project-relative manifest path into href.
+6. Create notes/total.md, analysis/svg_resource_usage.json, and analysis/chart_usage.json with the exact SPEC6 schemas below. Do not invent usages, resources_manifest path, task_id, lock_sha256, owner_id, data_href, or template_href fields in place of the required fields. Do not create svg_inventory.json or notes_inventory.json; the platform inspector owns them.
+   notes/total.md must contain exactly one ordered section per page using the exact heading syntax "## PNN | Heading", for example "## P01 | Cover" followed by a non-empty page-specific body, then "## P02 | Summary", through the locked final page. PNN must be uppercase, headings must use exactly two # characters and one | separator, page IDs must be continuous and unique, and every page must have its own non-placeholder body. A deck-level prose report without these per-page sections is invalid.
+   analysis/svg_resource_usage.json must be exactly shaped as {"schema":"slidesmith.svg_resource_usage.v1","resources_manifest_sha256":"<live manifest SHA-256>","pages":[{"page_id":"P01","svg":"svg_output/01_slug.svg","svg_sha256":"<live SVG SHA-256>","resources":[{"resource_id":"image.p01.source","element_id":"p01_image_01","usage":"image","href":"../images/acquired/p01_source.png","fallback":""}]}]}. Include one pages entry for every PNN in order; use resources: [] when the page has no image/icon/formula resource.
+   analysis/chart_usage.json must be exactly shaped as {"schema":"slidesmith.chart_usage.v1","resources_manifest_sha256":"<live manifest SHA-256>","charts":[{"chart_id":"s04_ch3","page_id":"P04","svg":"svg_output/04_slug.svg","element_id":"s04_ch3","chart_type":"bar","verification_mode":"direct-calc","template_resource_id":"chart.p04.source.template","data_resource_id":"chart.p04.source.data","data_sha256":"<live chart_data output SHA-256>","source_citation":{"file":"sources/source.pptx","section":"slide 4 chart"},"plot_area":[150,214,790,620],"categories":["Q1","Q2"],"series":["Revenue"],"comparisons":[{"element_id":"bar_q1","attribute":"height","expected":120.0,"actual":120.0,"tolerance":1.0}]}]}. categories and series must exactly match the chart_data payload; series is an array of series-name strings, not series objects or values. direct-calc and formula-verify require a non-empty comparisons array computed from the bound chart data and actual SVG geometry; element_id and attribute must identify the compared SVG coordinate/size, expected is the calculated value, actual is the authored numeric attribute, and tolerance must be non-negative. Use charts: [] when there are no data-driven charts.
+7. Give every resource/chart owner stable IDs and exact sidecar bindings. A chart owner must have id and data-chart-id equal to chart_id, data-chart-data-resource-id equal to data_resource_id, and data-chart-template-resource-id equal to template_resource_id. A chart owner must not substitute generic data-resource-id for these two chart-specific attributes. Use SVG-file-relative local hrefs only as described above.
+
+Prohibitions:
+- Do not mutate spec, lock, plan, inventory, confirmations, resource plan, or manifest.
+- Do not acquire/generate/download resources or access the network.
+- Do not create svg_final or exports and do not run quality/finalize/PPTX tools.
+- Do not use scripts, foreignObject, external/file/data URIs, absolute paths, path escapes, or batch SVG generators.
+- Do not use <style> elements, class attributes, CSS selectors, or selector-based styling. Put presentation attributes such as fill, stroke, font-family, font-weight, and font-size directly on each element. Every font-size value must be a unitless numeric px value such as font-size="28"; font-size="28px", font-size="21pt", CSS font-size declarations, and other units are forbidden.
+- Never display a raster image wider or taller than the intrinsic width/height recorded by its ready manifest output; downscaling is allowed.
+
+Before stopping, verify page count/order/source-slide/lock-hash metadata; exact per-page text/table/chart/image coverage; live manifest href ownership; sidecar hashes; and absence of PPTX exports.
+`, task.ID, projectRel)
 }
 
 func (s *TaskService) fullPPTMasterSpecPrompt(task *model.Task, projectPath string) string {
@@ -4439,6 +4750,7 @@ Hard boundaries:
 - Read .slidesmith/runtime_manifest.json first.
 - If .slidesmith/template_lock.json exists, read it and treat its selected template as immutable for this task.
 - Read .slidesmith/template_resolution.json when present and use its template_root as the selected template package.
+- The locked template and its cover/content/ending layout shells are already-resolved execution inputs. Never declare an entire layout shell as a resource requirement. A selected layout alone must leave requirements empty when no binary/data resource must be acquired.
 - Read the core PPT Master skill declared by runtime_manifest.json: skills/ppt-master/SKILL.md.
 - Read strategist references when present: skills/ppt-master/references/strategist.md, skills/ppt-master/templates/design_spec_reference.md, and skills/ppt-master/templates/spec_lock_reference.md.
 - Prefer the selected template package listed in runtime_manifest.json template_roots when deriving visual structure, colors, page roles, and style.
@@ -4454,7 +4766,8 @@ Required output contract:
 3. The spec must match the confirmed page_count exactly when it is a valid integer from 3 to 10. If it is missing or invalid, use 3 slides.
 4. Assign every planned page the stable canonical ID P01, P02, ... in order. Each ID must appear as the leading identifier of its page entry in design_spec.md; if spec_lock.md contains page entries, it must contain the exact same ordered ID set.
 5. Create or overwrite %[2]s/.slidesmith/resource_plan.json using schema slidesmith.resource_plan.v1. It must contain task_id %[1]s, the confirmed page_count, SHA-256 values for design_spec.md, spec_lock.md and confirm_ui/result.json, and a requirements array. The array may be empty only when no planned page needs any external, template, icon, formula, chart-template, or chart-data resource. The three SHA-256 fields must be non-empty 64-character lowercase hexadecimal strings; never write null or placeholders.
-6. Every requirement must have a stable lowercase ID matching [a-z0-9][a-z0-9._-]{0,95}, a valid page, type, purpose, required flag, canonical acquire_via, approved fallback, safe output_name, placement, and source/prompt fields required by its type. Use the flat canonical fields prompt_or_query, source_reference, parent_id, expression, provider, data, citation, parameters, and publishable. Do not invent nested source or prompt objects.
+6. Every requirement must have a stable lowercase ID matching [a-z0-9][a-z0-9._-]{0,95}, a valid page, type, purpose, required flag, canonical acquire_via, approved fallback, safe output_name, placement, and source/prompt fields required by its type. The only canonical resource types are image, illustration_sheet, illustration_slice, icon, formula, chart_template, chart_data, template_asset, and placeholder. type "template" is invalid. Use the flat canonical fields prompt_or_query, source_reference, parent_id, expression, provider, data, citation, parameters, and publishable. Do not invent nested source or prompt objects.
+   Only a concrete logo, image, or decoration file that must be copied from template_resolution.template_root may use type "template_asset" with acquire_via "template" and a contained template-root-relative source_reference. Do not use template_asset for cover/content/ending layout SVGs or other whole-page shells. When no actual resource must be acquired, generated, copied, rendered, or sliced, write requirements: [].
    The root field page_count and every requirement page must be JSON integers. For example, use "page": 2; never use "page": "P02" or "page": "2". required and publishable must be JSON booleans, not strings. fallback must be exactly one of "", "diagram", "shape", "text", "placeholder", or "omit_optional"; never write fallback prose.
    For every icon requirement, source_reference must be exactly the confirmed icons value followed by "/" and a safe icon name, for example "tabler-outline/chart-bar". Never use templates/icons/..., a .svg suffix, "tabler/...", or any library other than the confirmed icons value. If confirmed icons is "none", do not declare icon requirements.
    Use this exact requirement shape for a chart template on page 2:
@@ -4703,6 +5016,29 @@ var tier2ConfirmationKeys = []string{
 	"image_notes",
 	"generation_mode",
 	"refine_spec",
+}
+
+func validateBeautifyConfirmationValues(status string, values map[string]any) error {
+	allowedKeys := tier1ConfirmationKeys
+	if status == model.TaskStatusAwaitingRealizationConfirm || status == model.TaskStatusRealizationDeriving {
+		allowedKeys = tier2ConfirmationKeys
+	}
+	allowed := make(map[string]bool, len(allowedKeys))
+	for _, key := range allowedKeys {
+		allowed[key] = true
+	}
+	for key := range values {
+		if key == "page_count" || key == "slide_count" {
+			return fmt.Errorf("beautify page count is locked to the source deck and cannot be edited")
+		}
+		if !allowed[key] {
+			return fmt.Errorf("beautify confirmation key %q is not allowed at status %q", key, status)
+		}
+		if key == "refine_spec" && valueBool(values, key, false) {
+			return fmt.Errorf("beautify does not pause for mutable spec refinement; edit the Beautify plan instead")
+		}
+	}
+	return nil
 }
 
 func filterConfirmationsForStatus(confirmations []model.TaskConfirmation, status string) []model.TaskConfirmation {

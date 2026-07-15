@@ -420,11 +420,14 @@ def fake_render(output: Path, expected_pages: int) -> tuple[dict[str, Any], list
 def promote_validation(project: Path, stage: Path) -> None:
     validation = project / "validation"
     validation.mkdir(parents=True, exist_ok=True)
-    for name in ("pptx_readback.md", "pptx_text_inventory.json", "pptx_validate_report.json"):
+    for name in ("pptx_readback.md", "pptx_text_inventory.json", "pptx_validate_report.json", "beautify_fidelity_report.json"):
+        staged = stage / name
+        if not staged.exists():
+            continue
         target = validation / name
         if target.exists() or target.is_symlink():
             target.unlink()
-        (stage / name).replace(target)
+        staged.replace(target)
     target_render = validation / "render"
     if target_render.exists() or target_render.is_symlink():
         if target_render.is_symlink():
@@ -463,7 +466,22 @@ def run(project: Path, export_contract_relative: str, phase_run_id: str, *, rend
     stage = Path(tempfile.mkdtemp(prefix=f"pptx-validate-{phase_run_id}-", dir=temp_root))
     try:
         render_report, render_findings = render_pptx(pptx, stage / "render", phase_run_id, expected_pages, soffice=soffice, pdfinfo=pdfinfo, pdftoppm=pdftoppm, timeout=timeout) if render else fake_render(stage / "render", expected_pages)
-        findings = text_findings + render_findings
+        beautify_report: dict[str, Any] | None = None
+        beautify_bindings: dict[str, Any] = {}
+        beautify_findings: list[dict[str, Any]] = []
+        beautify_lock = project / ".slidesmith" / "beautify_lock.json"
+        if beautify_lock.exists() or beautify_lock.is_symlink():
+            import beautify_runner
+
+            beautify_report, beautify_findings, beautify_bindings = beautify_runner.build_fidelity_report(
+                project,
+                pptx_runs,
+                pptx,
+                phase_run_id,
+                pptx_fonts=fonts,
+            )
+            atomic_json(stage / "beautify_fidelity_report.json", beautify_report)
+        findings = text_findings + render_findings + beautify_findings
         summary = summarize(findings)
         inventory = {
             "schema": TEXT_SCHEMA,
@@ -490,6 +508,13 @@ def run(project: Path, export_contract_relative: str, phase_run_id: str, *, rend
             "decision": summary["decision"],
             "checked_at": utc_now(),
         }
+        if beautify_report is not None:
+            report["beautify_fidelity"] = {
+                "path": "validation/beautify_fidelity_report.json",
+                "sha256": sha256_file(stage / "beautify_fidelity_report.json"),
+                "decision": beautify_report["decision"],
+                "summary": beautify_report["summary"],
+            }
         atomic_json(stage / "pptx_validate_report.json", report)
         promote_validation(project, stage)
         contract = {
@@ -511,6 +536,11 @@ def run(project: Path, export_contract_relative: str, phase_run_id: str, *, rend
             "decision": summary["decision"],
             "checked_at": utc_now(),
         }
+        if beautify_report is not None:
+            contract.update(beautify_bindings)
+            contract["beautify_fidelity_report_sha256"] = sha256_file(project / "validation/beautify_fidelity_report.json")
+            contract["beautify_fidelity_decision"] = beautify_report["decision"]
+            contract["beautify_fidelity_summary"] = beautify_report["summary"]
         atomic_json(project / ".slidesmith/contracts/pptx_validate.json", contract)
         return contract
     finally:

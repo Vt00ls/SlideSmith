@@ -1,0 +1,9 @@
+{
+  "name": "beautify-images",
+  "source_features": ["reused-binary", "multiple-occurrences", "crop", "cross-page-image"],
+  "expected_decision": "pass",
+  "negative_mutations": [
+    {"kind": "missing-image", "expected_rule": "beautify.image_fidelity"},
+    {"kind": "wrong-page-image", "expected_rule": "beautify.image_fidelity"}
+  ]
+}

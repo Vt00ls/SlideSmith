@@ -33,20 +33,10 @@ func (s *TaskService) publishSVGBundleArtifacts(ctx context.Context, task *model
 	if inventorySHA == "" {
 		return fmt.Errorf("SVG bundle publisher contract is missing inventory hash")
 	}
-	candidates := []svgBundlePublishCandidate{
-		{RelativePath: "analysis/svg_inventory.json", Kind: model.ArtifactKindSVGInventory},
-		{RelativePath: "analysis/svg_resource_usage.json", Kind: model.ArtifactKindSVGResourceUsage},
-		{RelativePath: "analysis/chart_usage.json", Kind: model.ArtifactKindChartUsage},
-		{RelativePath: "analysis/notes_inventory.json", Kind: model.ArtifactKindNotesInventory},
-		{RelativePath: "notes/total.md", Kind: model.ArtifactKindSpeakerNotes},
-		{RelativePath: ".slidesmith/contracts/svg_execute.json", Kind: model.ArtifactKindManifest},
+	candidates, err := svgBundlePublishCandidates(task, projectPath, contract, &inventory)
+	if err != nil {
+		return err
 	}
-	for _, page := range inventory.Pages {
-		candidates = append(candidates, svgBundlePublishCandidate{
-			RelativePath: page.Path, Kind: model.ArtifactKindSVGOutput, PageID: page.PageID, Page: page.Page,
-		})
-	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].RelativePath < candidates[j].RelativePath })
 
 	basePrefix := filepath.ToSlash(filepath.Join("tasks", task.ID, "svg-bundle")) + "/"
 	versionPrefix := filepath.ToSlash(filepath.Join(basePrefix, phaseRunID)) + "/"
@@ -117,6 +107,35 @@ func (s *TaskService) publishSVGBundleArtifacts(ctx context.Context, task *model
 		"phase_run_id": phaseRunID, "artifact_count": len(artifacts), "svg_inventory_sha256": inventorySHA,
 	})
 	return nil
+}
+
+func svgBundlePublishCandidates(task *model.Task, projectPath string, contract map[string]any, inventory *svgInventoryDocument) ([]svgBundlePublishCandidate, error) {
+	if task == nil || inventory == nil {
+		return nil, fmt.Errorf("SVG bundle publish candidates require task and inventory")
+	}
+	candidates := []svgBundlePublishCandidate{
+		{RelativePath: "analysis/svg_inventory.json", Kind: model.ArtifactKindSVGInventory},
+		{RelativePath: "analysis/svg_resource_usage.json", Kind: model.ArtifactKindSVGResourceUsage},
+		{RelativePath: "analysis/chart_usage.json", Kind: model.ArtifactKindChartUsage},
+		{RelativePath: "analysis/notes_inventory.json", Kind: model.ArtifactKindNotesInventory},
+		{RelativePath: "notes/total.md", Kind: model.ArtifactKindSpeakerNotes},
+		{RelativePath: ".slidesmith/contracts/svg_execute.json", Kind: model.ArtifactKindManifest},
+	}
+	if task.Route == model.TaskRouteBeautify {
+		expected, _ := contract["beautify_svg_fidelity_sha256"].(string)
+		actual, err := sha256File(filepath.Join(projectPath, "analysis", "beautify_svg_fidelity.json"))
+		if err != nil || expected == "" || actual != expected {
+			return nil, fmt.Errorf("SVG bundle publisher Beautify fidelity receipt is missing or stale")
+		}
+		candidates = append(candidates, svgBundlePublishCandidate{RelativePath: "analysis/beautify_svg_fidelity.json", Kind: model.ArtifactKindManifest})
+	}
+	for _, page := range inventory.Pages {
+		candidates = append(candidates, svgBundlePublishCandidate{
+			RelativePath: page.Path, Kind: model.ArtifactKindSVGOutput, PageID: page.PageID, Page: page.Page,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].RelativePath < candidates[j].RelativePath })
+	return candidates, nil
 }
 
 func (s *TaskService) cleanupSVGBundleArtifacts(ctx context.Context, taskID string) error {

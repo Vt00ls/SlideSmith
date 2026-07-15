@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/slidesmith/slidesmith/backend/internal/model"
 )
 
 func resourcePlanTestProject(t *testing.T, requirements []resourceRequirement, imageUsage any) (string, resourcePlan) {
@@ -74,6 +76,49 @@ func TestValidateResourcePlanContractAcceptsValidPlan(t *testing.T) {
 	}
 	if contract["resource_plan_sha256"] == "" {
 		t.Fatal("resource plan contract omitted SHA-256")
+	}
+}
+
+func TestValidateResourcePlanContractAllowsLockedLayoutWithEmptyRequirements(t *testing.T) {
+	projectPath, _ := resourcePlanTestProject(t, []resourceRequirement{}, nil)
+	plan, contract, err := validateResourcePlanContract(projectPath, "resource-plan-task")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Requirements) != 0 || contract["resource_count"] != 0 {
+		t.Fatalf("empty locked-layout resource plan = %#v", contract)
+	}
+}
+
+func TestValidateResourcePlanContractRejectsTemplateLayoutShellWithActionableError(t *testing.T) {
+	requirement := resourceRequirement{
+		ID: "template.p01.cover", Page: 1, Type: "template", Purpose: "Whole cover layout shell",
+		Required: true, AcquireVia: "template", OutputName: "cover.svg", SourceReference: "layouts/cover.svg",
+	}
+	projectPath, _ := resourcePlanTestProject(t, []resourceRequirement{requirement}, nil)
+	_, _, err := validateResourcePlanContract(projectPath, "resource-plan-task")
+	if err == nil {
+		t.Fatal("type template layout shell was accepted")
+	}
+	for _, expected := range []string{"template.p01.cover", `unsupported type "template"`, "template_lock/template_resolution", "template_asset", "acquire_via"} {
+		if !strings.Contains(err.Error(), expected) {
+			t.Fatalf("actionable template boundary error missing %q: %v", expected, err)
+		}
+	}
+}
+
+func TestFullPPTMasterSpecPromptDefinesTemplateResourceBoundary(t *testing.T) {
+	service := &TaskService{}
+	task := &model.Task{ID: "prompt-task", Route: model.TaskRouteMain}
+	prompt := service.fullPPTMasterSpecPrompt(task, "/workspace/projects/prompt-task")
+	for _, expected := range []string{
+		"locked template", "layout shells", "requirements: []", "type \"template\" is invalid",
+		"image, illustration_sheet, illustration_slice, icon, formula, chart_template, chart_data, template_asset, and placeholder",
+		"template_resolution.template_root", "acquire_via \"template\"",
+	} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("main strategist prompt missing %q", expected)
+		}
 	}
 }
 

@@ -50,8 +50,8 @@ CHART_VERIFICATION_MODES = {
     "not-data-driven",
 }
 NOTES_HEADING_PATTERN = re.compile(r"^##\s+(P[0-9]{2})\s*\|\s*(.+?)\s*$")
-SPEC_PAGE_HEADING_PATTERN = re.compile(r"(?im)^\s*#{1,6}\s+(P[0-9]{2})\b")
-SPEC_PAGE_LINE_PATTERN = re.compile(r"(?im)^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(P[0-9]{2})\b")
+SPEC_PAGE_HEADING_PATTERN = re.compile(r"(?m)^\s*#{1,6}\s+(P[0-9]{2})\b")
+SPEC_PAGE_LINE_PATTERN = re.compile(r"(?m)^\s*(?:#{1,6}\s*)?(?:[-*]\s*)?(P[0-9]{2})\b")
 NOTES_PLACEHOLDERS = ("lorem ipsum", "todo", "tbd", "speaker notes here")
 
 

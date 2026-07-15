@@ -75,7 +75,7 @@ func TestProcessPrepareRecoversUnsupportedWorkflowTaskWriteAfterSourcePrepare(t 
 				}
 			} else {
 				for _, want := range []string{
-					"route beautify source intake is complete",
+					"route beautify is disabled by SLIDESMITH_BEAUTIFY_ENABLED",
 					"forced post-source-prepare task save failure",
 				} {
 					if !strings.Contains(err.Error(), want) {

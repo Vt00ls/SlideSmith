@@ -46,8 +46,8 @@ type resourcePolicySnapshot struct {
 }
 
 func (s *TaskService) writeResourcePolicySnapshot(task *model.Task, projectPath, phaseRunID string) (*resourcePolicySnapshot, error) {
-	if task == nil || !s.useFullPPTMaster(task) || task.Route != model.TaskRouteMain {
-		return nil, fmt.Errorf("resource policy requires a locked full-ppt-master main task")
+	if task == nil || !s.useFullPPTMaster(task) || !isFullSVGRoute(task.Route) {
+		return nil, fmt.Errorf("resource policy requires a locked full-ppt-master full SVG route task")
 	}
 	if task.RunnerProfileLockedAt == nil {
 		return nil, fmt.Errorf("resource policy requires runner profile lock time")

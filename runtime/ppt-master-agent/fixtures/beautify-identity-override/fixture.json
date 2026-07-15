@@ -1,0 +1,9 @@
+{
+  "name": "beautify-identity-override",
+  "source_features": ["source-canvas", "theme-fonts", "observed-fonts", "palette-override", "typography-override"],
+  "expected_decision": "pass_with_warnings",
+  "expected_risks": ["beautify.font_substitution"],
+  "negative_mutations": [
+    {"kind": "canvas-change", "expected_rule": "beautify.canvas_mismatch"}
+  ]
+}

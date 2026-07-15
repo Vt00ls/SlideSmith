@@ -217,6 +217,63 @@ func (h *TaskHandler) RegenerateTemplateFillPlan(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, gin.H{"data": task})
 }
 
+func (h *TaskHandler) GetBeautifyPlan(ctx *gin.Context) {
+	preview, err := h.tasks.GetBeautifyPlan(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": preview})
+}
+
+func (h *TaskHandler) SaveBeautifyPlan(ctx *gin.Context) {
+	var req struct {
+		Plan               map[string]any `json:"plan"`
+		ExpectedPlanSHA256 string         `json:"expected_plan_sha256"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	if req.Plan == nil || req.ExpectedPlanSHA256 == "" {
+		errorJSON(ctx, http.StatusBadRequest, errors.New("beautify plan and expected_plan_sha256 are required"))
+		return
+	}
+	preview, err := h.tasks.SaveBeautifyPlan(ctx.Request.Context(), ctx.Param("id"), req.Plan, req.ExpectedPlanSHA256)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": preview})
+}
+
+func (h *TaskHandler) CheckBeautifyPlan(ctx *gin.Context) {
+	task, err := h.tasks.CheckBeautifyPlan(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) ConfirmBeautifyPlan(ctx *gin.Context) {
+	task, err := h.tasks.ConfirmBeautifyPlan(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
+func (h *TaskHandler) RegenerateBeautifyPlan(ctx *gin.Context) {
+	task, err := h.tasks.RegenerateBeautifyPlan(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": task})
+}
+
 func (h *TaskHandler) ListEvents(ctx *gin.Context) {
 	afterSeq, _ := strconv.ParseInt(ctx.DefaultQuery("after_seq", "0"), 10, 64)
 	limit, _ := strconv.Atoi(ctx.DefaultQuery("limit", "200"))

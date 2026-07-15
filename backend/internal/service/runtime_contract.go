@@ -225,6 +225,7 @@ func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map
 	}
 	contract["runner_profile"] = task.RunnerProfile
 	contract["task_id"] = task.ID
+	contract["route"] = task.Route
 	contract["runner_profile_locked_at"] = task.RunnerProfileLockedAt.UTC().Format(time.RFC3339Nano)
 	contract["runtime_run_id"] = runtimeRunID
 	if workspace != nil {
@@ -244,6 +245,29 @@ func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map
 			} else if !os.IsNotExist(err) {
 				return nil, err
 			}
+		}
+	}
+	if task.Route == model.TaskRouteBeautify {
+		lock, err := ValidateBeautifyLock(projectPath, task.ID)
+		if err != nil {
+			return nil, fmt.Errorf("%s Beautify lock binding: %w", phase, err)
+		}
+		lockSHA, err := sha256File(filepath.Join(projectPath, ".slidesmith", "beautify_lock.json"))
+		if err != nil {
+			return nil, err
+		}
+		contract["beautify_inputs_sha256"] = lock.InputsSHA256
+		contract["beautify_inventory_sha256"] = lock.InventorySHA256
+		contract["beautify_plan_sha256"] = lock.PlanSHA256
+		contract["beautify_lock_sha256"] = lockSHA
+		contract["source_pptx_sha256"] = lock.SourcePPTXSHA256
+		contract["source_slide_count"] = lock.SlideCount
+		if phase == PhaseSVGExecute || phase == PhaseQualityCheck || phase == PhaseFinalizeExport || phase == PhasePPTXValidate {
+			svgFidelity, err := validateExistingBeautifySVGFidelity(projectPath, task.ID)
+			if err != nil {
+				return nil, fmt.Errorf("%s Beautify SVG fidelity binding: %w", phase, err)
+			}
+			contract["beautify_svg_fidelity_sha256"] = svgFidelity["beautify_svg_fidelity_sha256"]
 		}
 	}
 
@@ -304,7 +328,12 @@ func bindFullPhaseContract(projectPath string, phase PipelinePhase, contract map
 		manifest := readJSONMap(manifestPath)
 		manifest["phase_run_id"] = valueString(contract, "phase_run_id", "")
 		manifest["task_id"] = task.ID
+		manifest["route"] = task.Route
 		manifest["quality_summary_sha256"] = qualitySummarySHA
+		if task.Route == model.TaskRouteBeautify {
+			manifest["source_pptx_sha256"] = contract["source_pptx_sha256"]
+			manifest["beautify_lock_sha256"] = contract["beautify_lock_sha256"]
+		}
 		if err := writeJSONPretty(manifestPath, manifest); err != nil {
 			return nil, err
 		}
@@ -338,12 +367,37 @@ func validateExistingSpecContract(projectPath string, task *model.Task, workspac
 	if value, _ := contract["runner_profile"].(string); task == nil || value != task.RunnerProfile {
 		return nil, fmt.Errorf("spec contract runner profile %q does not match task lock", value)
 	}
+	if route, _ := contract["route"].(string); (task.Route == model.TaskRouteBeautify && route != task.Route) || (task.Route != model.TaskRouteBeautify && route != "" && route != task.Route) {
+		return nil, fmt.Errorf("spec contract route %q does not match task route %q", route, task.Route)
+	}
+	if task.Route == model.TaskRouteBeautify {
+		lock, err := ValidateBeautifyLock(projectPath, task.ID)
+		if err != nil {
+			return nil, err
+		}
+		lockSHA, err := sha256File(filepath.Join(projectPath, ".slidesmith", "beautify_lock.json"))
+		if err != nil {
+			return nil, err
+		}
+		for field, expected := range map[string]string{
+			"beautify_inputs_sha256":    lock.InputsSHA256,
+			"beautify_inventory_sha256": lock.InventorySHA256,
+			"beautify_plan_sha256":      lock.PlanSHA256,
+			"beautify_lock_sha256":      lockSHA,
+			"source_pptx_sha256":        lock.SourcePPTXSHA256,
+		} {
+			if valueString(contract, field, "") != expected {
+				return nil, fmt.Errorf("spec contract Beautify binding %s is stale", field)
+			}
+		}
+	}
 	checks := []struct {
 		field string
 		path  string
 	}{
 		{"design_spec_sha256", filepath.Join(projectPath, "design_spec.md")},
 		{"spec_lock_sha256", filepath.Join(projectPath, "spec_lock.md")},
+		{"resource_plan_sha256", filepath.Join(projectPath, ".slidesmith", "resource_plan.json")},
 	}
 	if workspace != nil {
 		checks = append(checks, struct {
@@ -414,6 +468,38 @@ func validateFullSVGUpstreamContract(projectPath string, upstream PipelinePhase,
 	if profile, _ := contract["runner_profile"].(string); profile != task.RunnerProfile {
 		return nil, fmt.Errorf("%s upstream contract runner profile %q does not match task lock", upstream, profile)
 	}
+	if route, _ := contract["route"].(string); (task.Route == model.TaskRouteBeautify && route != task.Route) || (task.Route != model.TaskRouteBeautify && route != "" && route != task.Route) {
+		return nil, fmt.Errorf("%s upstream contract route %q does not match task route %q", upstream, route, task.Route)
+	}
+	if task.Route == model.TaskRouteBeautify {
+		lock, err := ValidateBeautifyLock(projectPath, task.ID)
+		if err != nil {
+			return nil, fmt.Errorf("%s upstream Beautify lock: %w", upstream, err)
+		}
+		lockSHA, err := sha256File(filepath.Join(projectPath, ".slidesmith", "beautify_lock.json"))
+		if err != nil {
+			return nil, err
+		}
+		for field, expected := range map[string]string{
+			"beautify_inputs_sha256":    lock.InputsSHA256,
+			"beautify_inventory_sha256": lock.InventorySHA256,
+			"beautify_plan_sha256":      lock.PlanSHA256,
+			"beautify_lock_sha256":      lockSHA,
+		} {
+			if valueString(contract, field, "") != expected {
+				return nil, fmt.Errorf("%s upstream contract Beautify binding %s is stale", upstream, field)
+			}
+		}
+		if upstream == PhaseSVGExecute || upstream == PhaseQualityCheck || upstream == PhaseFinalizeExport || upstream == PhasePPTXValidate {
+			svgFidelity, err := validateExistingBeautifySVGFidelity(projectPath, task.ID)
+			if err != nil {
+				return nil, fmt.Errorf("%s upstream Beautify SVG fidelity: %w", upstream, err)
+			}
+			if valueString(contract, "beautify_svg_fidelity_sha256", "") != valueString(svgFidelity, "beautify_svg_fidelity_sha256", "") {
+				return nil, fmt.Errorf("%s upstream contract Beautify SVG fidelity is stale", upstream)
+			}
+		}
+	}
 	actualHashes, err := svgBundleContractHashes(projectPath)
 	if err != nil {
 		return nil, err
@@ -451,6 +537,9 @@ func buildPublishedArtifactsContract(projectPath string, storage StorageService,
 		}
 	}
 	for _, artifact := range artifacts {
+		if route == model.TaskRouteBeautify && artifact.Kind == model.ArtifactKindSource {
+			return nil, fmt.Errorf("Beautify final publish must not copy source artifacts")
+		}
 		report, err := validateStoredArtifact(storage, artifact)
 		if err != nil {
 			return nil, err
@@ -502,6 +591,31 @@ func buildPublishedArtifactsContract(projectPath string, storage StorageService,
 	if route == model.TaskRouteTemplateFill {
 		contract["required_template_fill_artifacts"] = requiredTemplateFillArtifacts
 	}
+	if route == model.TaskRouteBeautify {
+		required, err := validateBeautifyPublishedArtifactBindings(artifacts, publishVersion)
+		if err != nil {
+			return nil, err
+		}
+		pptxFiles, err := listRegularFiles(filepath.Join(projectPath, "exports"), "*.pptx")
+		if err != nil || len(pptxFiles) != 1 {
+			return nil, fmt.Errorf("Beautify publish requires one canonical export")
+		}
+		outputSHA, err := sha256File(pptxFiles[0])
+		if err != nil {
+			return nil, err
+		}
+		fidelity, err := ValidateBeautifyFidelityReport(projectPath, valueString(readJSONMap(filepath.Join(projectPath, ".slidesmith", "beautify_lock.json")), "task_id", ""), outputSHA)
+		if err != nil {
+			return nil, fmt.Errorf("publish.beautify_gate: %w", err)
+		}
+		contract["required_beautify_artifacts"] = required
+		contract["beautify_fidelity"] = fidelity
+		contract["source_output_lineage"] = map[string]any{
+			"source_pptx_sha256": fidelity.SourcePPTXSHA256,
+			"output_pptx_sha256": fidelity.OutputPPTXSHA256,
+			"route":              model.TaskRouteBeautify,
+		}
+	}
 	return contract, nil
 }
 
@@ -509,7 +623,50 @@ func expectedPublishedSlideCount(projectPath, route string) (int, error) {
 	if route == model.TaskRouteTemplateFill {
 		return templateFillExpectedSlideCount(projectPath)
 	}
+	if route == model.TaskRouteBeautify {
+		lockTaskID := valueString(readJSONMap(filepath.Join(projectPath, ".slidesmith", "beautify_lock.json")), "task_id", "")
+		lock, err := ValidateBeautifyLock(projectPath, lockTaskID)
+		if err != nil {
+			return 0, err
+		}
+		return lock.SlideCount, nil
+	}
 	return confirmedPageCount(projectPath), nil
+}
+
+func validateBeautifyPublishedArtifactBindings(artifacts []model.Artifact, publishVersion string) (map[string]bool, error) {
+	required := map[string]string{
+		"analysis/beautify_inventory.json":         model.ArtifactKindBeautifyInventory,
+		"analysis/beautify_risk_report.json":       model.ArtifactKindBeautifyRiskReport,
+		"analysis/beautify_plan.json":              model.ArtifactKindBeautifyPlan,
+		"manifest/beautify_lock.json":              model.ArtifactKindBeautifyLock,
+		"validation/beautify_fidelity_report.json": model.ArtifactKindBeautifyFidelityReport,
+	}
+	found := make(map[string]bool, len(required))
+	for path := range required {
+		found[path] = false
+	}
+	for _, artifact := range artifacts {
+		relative, err := exactPublishedArtifactRelativePath(artifact, publishVersion)
+		if err != nil {
+			return nil, err
+		}
+		if strings.HasPrefix(relative, "source/") || strings.HasPrefix(relative, "sources/") {
+			return nil, fmt.Errorf("Beautify final publish contains forbidden source path %s", relative)
+		}
+		if kind, ok := required[relative]; ok {
+			if artifact.Kind != kind {
+				return nil, fmt.Errorf("Beautify artifact %s has kind %q, expected %q", relative, artifact.Kind, kind)
+			}
+			found[relative] = true
+		}
+	}
+	for path, ok := range found {
+		if !ok {
+			return nil, fmt.Errorf("published artifacts missing required Beautify artifact %s", path)
+		}
+	}
+	return found, nil
 }
 
 func templateFillRequiredPublishedArtifactKinds() []string {

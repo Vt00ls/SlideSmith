@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,6 +22,31 @@ func TestValidatePPTXExportContractRejectsSlideCountMismatch(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "has 2 slides, expected 3") {
 		t.Fatalf("error = %q, want slide count mismatch", err)
+	}
+}
+
+func TestValidateExistingSpecContractRejectsResourcePlanMutation(t *testing.T) {
+	projectPath := t.TempDir()
+	mustWriteFileNoTest(projectPath, "design_spec.md", "# Design\n")
+	mustWriteFileNoTest(projectPath, "spec_lock.md", "# Lock\n")
+	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "resource_plan.json"), `{"schema":"slidesmith.resource_plan.v1","requirements":[]}`+"\n")
+	task := &model.Task{ID: "task-spec-plan", Route: model.TaskRouteMain}
+	lockRunnerProfileForTest(task, model.RunnerProfileFullPPTMaster)
+	designSHA, _ := sha256File(filepath.Join(projectPath, "design_spec.md"))
+	lockSHA, _ := sha256File(filepath.Join(projectPath, "spec_lock.md"))
+	planSHA, _ := sha256File(filepath.Join(projectPath, ".slidesmith", "resource_plan.json"))
+	if err := writeJSONPretty(filepath.Join(projectPath, ".slidesmith", "spec_contract.json"), map[string]any{
+		"runner_profile": task.RunnerProfile, "route": task.Route,
+		"design_spec_sha256": designSHA, "spec_lock_sha256": lockSHA, "resource_plan_sha256": planSHA,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateExistingSpecContract(projectPath, task, nil); err != nil {
+		t.Fatal(err)
+	}
+	mustWriteFileNoTest(projectPath, filepath.Join(".slidesmith", "resource_plan.json"), `{"schema":"slidesmith.resource_plan.v1","requirements":[{"id":"tampered"}]}`+"\n")
+	if _, err := validateExistingSpecContract(projectPath, task, nil); err == nil || !strings.Contains(err.Error(), "resource_plan.json") {
+		t.Fatalf("resource plan mutation error = %v", err)
 	}
 }
 
@@ -224,6 +250,68 @@ func TestBuildPublishedArtifactsContractMainRouteIgnoresTemplateFillPlan(t *test
 	}
 	if _, ok := contract["required_template_fill_artifacts"]; ok {
 		t.Fatalf("main-route contract unexpectedly requires template fill artifacts: %#v", contract)
+	}
+}
+
+func TestBuildPublishedArtifactsContractBeautifyRequiresAuditChainAndLineageWithoutSource(t *testing.T) {
+	fixture := newBeautifyContractFixture(t, 1)
+	lock := fixture.buildLock(t)
+	outputPath := filepath.Join(fixture.projectPath, "exports", "beautified.pptx")
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeBeautifyTestPPTX(t, outputPath, 1)
+	outputSHA, _ := sha256File(outputPath)
+	writePassingBeautifyFidelityReport(t, fixture, lock, outputSHA)
+
+	storage := NewLocalStorage(filepath.Join(t.TempDir(), "storage"))
+	version := "v-beautify-contract"
+	type publishInput struct{ source, relative, kind string }
+	inputs := []publishInput{
+		{filepath.Join(fixture.projectPath, "analysis", "beautify_inventory.json"), "analysis/beautify_inventory.json", model.ArtifactKindBeautifyInventory},
+		{filepath.Join(fixture.projectPath, "analysis", "beautify_risk_report.json"), "analysis/beautify_risk_report.json", model.ArtifactKindBeautifyRiskReport},
+		{filepath.Join(fixture.projectPath, "analysis", "beautify_plan.json"), "analysis/beautify_plan.json", model.ArtifactKindBeautifyPlan},
+		{filepath.Join(fixture.projectPath, ".slidesmith", "beautify_lock.json"), "manifest/beautify_lock.json", model.ArtifactKindBeautifyLock},
+		{filepath.Join(fixture.projectPath, "validation", "beautify_fidelity_report.json"), "validation/beautify_fidelity_report.json", model.ArtifactKindBeautifyFidelityReport},
+		{outputPath, "exports/beautified.pptx", model.ArtifactKindPPTX},
+	}
+	artifacts := make([]model.Artifact, 0, len(inputs))
+	for _, input := range inputs {
+		objectKey := filepath.ToSlash(filepath.Join("tasks", fixture.taskID, "artifacts", version, input.relative))
+		stored, err := storage.CopyFileToObject(context.Background(), objectKey, input.source)
+		if err != nil {
+			t.Fatal(err)
+		}
+		artifacts = append(artifacts, model.Artifact{
+			TaskID: fixture.taskID, Kind: input.kind, Name: stored.Name, ObjectKey: stored.ObjectKey,
+			Size: stored.Size, SHA256: stored.SHA256, PublishVersion: version,
+		})
+	}
+	contract, err := buildPublishedArtifactsContract(fixture.projectPath, storage, artifacts, version, model.TaskRouteBeautify)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lineage, ok := contract["source_output_lineage"].(map[string]any)
+	if !ok || lineage["source_pptx_sha256"] != lock.SourcePPTXSHA256 || lineage["output_pptx_sha256"] != outputSHA || lineage["route"] != model.TaskRouteBeautify {
+		t.Fatalf("Beautify lineage = %#v", contract["source_output_lineage"])
+	}
+
+	sourceStored, err := storage.CopyFileToObject(context.Background(), filepath.ToSlash(filepath.Join("tasks", fixture.taskID, "artifacts", version, "source", "deck.pptx")), filepath.Join(fixture.projectPath, "sources", "deck.pptx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	withSource := append(append([]model.Artifact(nil), artifacts...), model.Artifact{
+		TaskID: fixture.taskID, Kind: model.ArtifactKindSource, Name: sourceStored.Name,
+		ObjectKey: sourceStored.ObjectKey, Size: sourceStored.Size, SHA256: sourceStored.SHA256, PublishVersion: version,
+	})
+	if _, err := buildPublishedArtifactsContract(fixture.projectPath, storage, withSource, version, model.TaskRouteBeautify); err == nil || !strings.Contains(err.Error(), "must not copy source") {
+		t.Fatalf("Beautify source publish error = %v", err)
+	}
+
+	withoutPlan := append([]model.Artifact(nil), artifacts[:2]...)
+	withoutPlan = append(withoutPlan, artifacts[3:]...)
+	if _, err := buildPublishedArtifactsContract(fixture.projectPath, storage, withoutPlan, version, model.TaskRouteBeautify); err == nil || !strings.Contains(err.Error(), "beautify_plan.json") {
+		t.Fatalf("Beautify missing plan error = %v", err)
 	}
 }
 

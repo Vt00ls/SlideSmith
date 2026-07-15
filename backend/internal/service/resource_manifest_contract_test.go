@@ -287,3 +287,25 @@ func TestValidateResourceManifestContractEnforcesPurposeFallbackAndProjectBindin
 		})
 	}
 }
+
+func TestValidateResourceManifestContractRejectsPolicyFromAnotherRoute(t *testing.T) {
+	requirement, item := readyManifestRequirement()
+	fixture := newResourceManifestFixture(t, requirement, item)
+	fixture.manifest.Resources[0].Output = writeResourcePNG(t, fixture.projectPath, "images/ready.png")
+	fixture.policy.Route = model.TaskRouteBeautify
+	fixture.policy.PolicySHA256 = ""
+	var err error
+	fixture.policy.PolicySHA256, err = resourcePolicyDigest(fixture.policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeJSONPretty(filepath.Join(fixture.projectPath, ".slidesmith", "resource_policy.json"), fixture.policy); err != nil {
+		t.Fatal(err)
+	}
+	fixture.manifest.PolicySHA256 = fixture.policy.PolicySHA256
+	fixture.recomputeSummary()
+	fixture.write(t)
+	if _, err := validateResourceManifestContract(fixture.projectPath, fixture.task, fixture.phaseRunID); err == nil || !strings.Contains(err.Error(), "route") {
+		t.Fatalf("policy route binding error = %v", err)
+	}
+}

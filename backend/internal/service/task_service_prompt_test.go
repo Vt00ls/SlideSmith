@@ -139,3 +139,88 @@ func TestSplitPPTMasterPromptsKeepPhaseBoundaries(t *testing.T) {
 		t.Fatalf("svg prompt should not ask to rewrite design spec\n%s", svgPrompt)
 	}
 }
+
+func TestBeautifyStrategistAndExecutorPromptsEnforceFrozenSourceContract(t *testing.T) {
+	service := &TaskService{agentCfg: config.AgentComposeConfig{WorkDir: "/workspace"}}
+	task := &model.Task{ID: "beautify-task", Route: model.TaskRouteBeautify}
+	projectPath := "/workspace/projects/beautify_task_ppt169_20260715"
+	strategist := service.fullPPTMasterStrategistPrompt(task, projectPath)
+	for _, expected := range []string{
+		"Beautify task", ".slidesmith/beautify_lock.json", "P01..PN", "verbatim",
+		"never add, remove, merge, split, reorder", "type \"template\" is forbidden",
+		"must not use template_asset", `acquire_via "source"`, "requirements: []",
+		"frozen table cell", "chart category", "required source image occurrence",
+		`The only acquire_via values are "user", "template", "icon", "formula", "chart_template", "source", "web", "ai", "slice", and "placeholder"`,
+		`acquire_via "render" is invalid and forbidden`,
+		`chart_template->chart_template`, `chart_data->source`,
+		`fallback must be exactly one of "", "diagram", "shape", "text", "placeholder", or "omit_optional"`,
+		`required frozen source-deck image must use fallback ""`,
+		`Never write "source placeholder"`,
+		`plain-text declaration line in both markdown files`,
+		`- resource image.p01.source | P01 | purpose=Required source image occurrence p01.image.01 for P01`,
+		`resource ID must be a clean unquoted token`,
+		`Raw JSON such as {"id":"image.p01.source",...} is not a valid Markdown declaration`,
+		`JSON examples below are exclusively for .slidesmith/resource_plan.json`,
+		`"type":"image"`, `"fallback":""`,
+		`"type":"chart_template"`, `"acquire_via":"chart_template"`,
+		`"type":"chart_data"`, `"acquire_via":"source"`,
+		"skills/ppt-master/templates/charts/charts_index.json",
+	} {
+		if !strings.Contains(strategist, expected) {
+			t.Fatalf("Beautify strategist prompt missing %q", expected)
+		}
+	}
+	executor := service.fullPPTMasterExecutorPrompt(task, projectPath)
+	for _, expected := range []string{
+		"Beautify task", ".slidesmith/beautify_lock.json", `data-source-slide="NN"`,
+		`data-beautify-lock-hash`, "Never change content", "never split the page",
+		"exact frozen cell grid", "exact frozen categories", "required source image occurrence",
+		`prefix the manifest path with "../"`, `Never paste the bare project-relative manifest path into href`,
+		`notes/total.md must contain exactly one ordered section per page`, `"## PNN | Heading"`,
+		`"## P01 | Cover"`, `headings must use exactly two # characters and one | separator`,
+		`deck-level prose report without these per-page sections is invalid`,
+		`"schema":"slidesmith.svg_resource_usage.v1"`, `"resources_manifest_sha256":"<live manifest SHA-256>"`,
+		`"pages":[{"page_id":"P01"`, `"svg_sha256":"<live SVG SHA-256>"`, `resources: []`,
+		`"schema":"slidesmith.chart_usage.v1"`, `"verification_mode":"direct-calc"`,
+		`"source_citation":{"file":"sources/source.pptx"`, `"plot_area":[150,214,790,620]`,
+		`"comparisons":[{"element_id":"bar_q1","attribute":"height"`,
+		`direct-calc and formula-verify require a non-empty comparisons array`,
+		`computed from the bound chart data and actual SVG geometry`,
+		`series is an array of series-name strings`, `data-chart-data-resource-id`,
+		`data-chart-template-resource-id`, `must not substitute generic data-resource-id`,
+		`Do not use <style> elements, class attributes, CSS selectors`,
+		`Every font-size value must be a unitless numeric px value`, `font-size="28px"`,
+		`Never display a raster image wider or taller than the intrinsic width/height`,
+		"Do not invent usages, resources_manifest path, task_id, lock_sha256, owner_id, data_href, or template_href fields",
+	} {
+		if !strings.Contains(executor, expected) {
+			t.Fatalf("Beautify executor prompt missing %q", expected)
+		}
+	}
+	if strategist == service.fullPPTMasterSpecPrompt(task, projectPath) || executor == service.fullPPTMasterSVGPrompt(task, projectPath) {
+		t.Fatal("Beautify route reused the main prompt")
+	}
+}
+
+func TestBeautifyPlanPromptPinsExactMachineSchema(t *testing.T) {
+	service := &TaskService{agentCfg: config.AgentComposeConfig{WorkDir: "/workspace"}}
+	task := &model.Task{ID: "beautify-task", Route: model.TaskRouteBeautify}
+	prompt := service.fullPPTMasterBeautifyPlanPrompt(task, "/workspace/projects/beautify_task_ppt169_20260715")
+	for _, expected := range []string{
+		`"task_id": "beautify-task"`,
+		`"revision": 1`,
+		`"source": "source-replica"`,
+		`"canvas_override": false`,
+		`"accepted_risks": ["risk.id"]`,
+		`"risks": ["risk.id"]`,
+		`"global_ignored": []`,
+		"Every array field must be a JSON array, never null",
+		"arrays of risk ID strings only; objects are forbidden",
+		"objects with exactly string id and reason fields",
+		"do not embed canvas, theme, palette, fonts, sizes, confirmations",
+	} {
+		if !strings.Contains(prompt, expected) {
+			t.Fatalf("Beautify plan prompt missing %q\n%s", expected, prompt)
+		}
+	}
+}

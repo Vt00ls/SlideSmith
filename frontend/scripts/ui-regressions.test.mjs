@@ -26,6 +26,7 @@ async function loadAppHelpersModule() {
     "templateFillPlanInputRecoveryNote",
     "templateFillPlanStatuses",
     "templateFillPlanReadableStatuses",
+    "beautifyPlanStatuses",
   ]);
   const functionNames = new Set([
     "isConfirmationStatus",
@@ -34,31 +35,43 @@ async function loadAppHelpersModule() {
     "emptyTaskResources",
     "emptySVGBundle",
     "resourceItemsByStatus",
+    "fidelityMetricCount",
+    "beautifyFidelityMetricText",
+    "isFullSVGRouteUI",
     "templateFillText",
     "templateFillSlideRows",
     "templateFillCheckRows",
     "templateFillActionState",
+    "beautifyPlanSlideRows",
+    "beautifyPlanErrorCount",
+    "beautifyPlanActionState",
     "templateFillBasename",
     "templateFillPageKey",
+    "beautifyPlanPageKey",
     "taskDetailPageKey",
     "createTaskDetailRequestScope",
     "loadTaskDetailData",
     "taskDetailRetryTaskID",
     "templateFillPlanReadableStatus",
+    "beautifyPlanReadableStatus",
     "createTemplateFillRequestScope",
     "templateFillScopedTaskID",
     "scopedTemplateFillRequest",
     "startTemplateFillRequestGeneration",
+    "createBeautifyPlanRequestScope",
+    "scopedBeautifyPlanRequest",
     "taskRouteMatches",
     "retryOptionsForFailure",
     "retryGuidanceForFailure",
     "canOpenTemplateFillPlan",
+    "canOpenBeautifyPlan",
     "completedTaskRoute",
     "visibleTaskArtifacts",
     "loadPreviewPageData",
     "previewPageKey",
     "createPreviewPageState",
     "previewPageStateForTask",
+    "confirmationSubmissionValues",
   ]);
   const declarations = [];
   const found = new Set();
@@ -165,6 +178,54 @@ test("Template Fill API surface includes every status, phase, type field, and en
   }
 });
 
+test("Beautify API surface exposes typed plan and fidelity contracts", () => {
+  const taskStatus = typeAliasSource(apiSource, "api.ts", "TaskStatus");
+  const pipelinePhase = typeAliasSource(apiSource, "api.ts", "PipelinePhase");
+  const retryPhase = typeAliasSource(apiSource, "api.ts", "RetryPhase");
+  for (const status of ["beautify_inventory_building", "beautify_planning", "awaiting_beautify_confirm"]) {
+    assert.match(taskStatus, new RegExp(`\\| \\"${status}\\"`));
+  }
+  for (const phase of ["beautify_inventory", "beautify_plan"]) {
+    assert.match(pipelinePhase, new RegExp(`\\| \\"${phase}\\"`));
+    assert.match(retryPhase, new RegExp(`\\| \\"${phase}\\"`));
+  }
+  const preview = typeAliasSource(apiSource, "api.ts", "BeautifyPlanPreview");
+  for (const field of [
+    "task_id", "source", "identity", "inventory", "risks", "plan", "findings",
+    "summary", "plan_sha256", "revision", "can_edit", "can_confirm",
+  ]) {
+    assert.match(preview, new RegExp(`\\b${field}:`), `missing BeautifyPlanPreview.${field}`);
+  }
+  const slide = typeAliasSource(apiSource, "api.ts", "BeautifyPlanSlide");
+  for (const field of [
+    "source_slide", "output_page", "page_rhythm", "layout_strategy", "text_block_ids",
+    "image_ids", "table_ids", "chart_ids", "ignored", "unsupported", "risks",
+  ]) {
+    assert.match(slide, new RegExp(`\\b${field}:`), `missing BeautifyPlanSlide.${field}`);
+  }
+  const source = typeAliasSource(apiSource, "api.ts", "BeautifySourceSummary");
+  for (const forbidden of ["path", "project_path", "content", "source_binary", "host_path"]) {
+    assert.doesNotMatch(source, new RegExp(`\\b${forbidden}\\??:`), `unsafe BeautifySourceSummary.${forbidden}`);
+  }
+  const fidelity = typeAliasSource(apiSource, "api.ts", "BeautifyFidelitySummary");
+  for (const field of [
+    "decision", "source_slide_count", "output_slide_count", "pages", "identity",
+    "ignored", "unsupported", "warning", "error", "blocking", "report_artifact_id",
+  ]) {
+    assert.match(fidelity, new RegExp(`\\b${field}:`), `missing BeautifyFidelitySummary.${field}`);
+  }
+  for (const method of [
+    "getBeautifyPlan", "saveBeautifyPlan", "checkBeautifyPlan", "confirmBeautifyPlan", "regenerateBeautifyPlan",
+  ]) {
+    assert.match(apiSource, new RegExp(`\\b${method}:`), `missing API method ${method}`);
+  }
+  assert.match(apiSource, /\/beautify-plan/);
+  assert.match(apiSource, /\/beautify-plan\/check/);
+  assert.match(apiSource, /\/beautify-plan\/confirm/);
+  assert.match(apiSource, /\/beautify-plan\/regenerate/);
+  assert.match(apiSource, /saveBeautifyPlan:[\s\S]*?method:\s*"PUT"[\s\S]*?expected_plan_sha256/);
+});
+
 test("resource API surface exposes only safe summary and artifact-bound preview fields", () => {
   const retryPhase = typeAliasSource(apiSource, "api.ts", "RetryPhase");
   const summary = typeAliasSource(apiSource, "api.ts", "ResourceSummary");
@@ -221,9 +282,9 @@ test("quality API and completed warning view remain task-scoped", () => {
   for (const field of [
     "task_id", "current_gate", "decision", "warning_badge", "svg_summary", "pptx_summary",
     "findings", "chart_receipts", "text_coverage", "render_artifact_ids",
-    "contact_sheet_artifact_id", "readback_artifact_id", "allowed_retry_phases",
+    "contact_sheet_artifact_id", "readback_artifact_id", "allowed_retry_phases", "beautify_fidelity",
   ]) {
-    assert.match(quality, new RegExp(`\\b${field}:`), `missing TaskQuality.${field}`);
+    assert.match(quality, new RegExp(`\\b${field}\\??:`), `missing TaskQuality.${field}`);
   }
   for (const field of ["rule", "severity", "page_id", "message", "owner_phase", "retry_phase"]) {
     assert.match(finding, new RegExp(`\\b${field}:`), `missing QualityFinding.${field}`);
@@ -237,6 +298,7 @@ test("quality API and completed warning view remain task-scoped", () => {
   assert.match(appSource, /quality\.warning_badge/);
   assert.match(appSource, /联系表/);
   assert.match(appSource, /PPTX 回读/);
+  assert.match(appSource, /源 PPTX → 输出 PPTX 保真/);
 });
 
 test("Template Fill router parses and serializes the plan hash", async () => {
@@ -246,6 +308,13 @@ test("Template Fill router parses and serializes the plan hash", async () => {
   assert.equal(routeToHash({ name: "templateFill", id: "task%20one" }), "#/tasks/task%20one/template-fill");
   window.location.hash = routeToHash({ name: "templateFill", id: "task-2" });
   assert.deepEqual(parseRoute(), { name: "templateFill", id: "task-2" });
+});
+
+test("Beautify router parses and serializes the typed plan hash", async () => {
+  globalThis.window = { location: { hash: "#/tasks/task%20one/beautify-plan" } };
+  const { parseRoute, routeToHash } = await loadSourceModule(routerSource, "router.ts");
+  assert.deepEqual(parseRoute(), { name: "beautifyPlan", id: "task%20one" });
+  assert.equal(routeToHash({ name: "beautifyPlan", id: "task-2" }), "#/tasks/task-2/beautify-plan");
 });
 
 test("replaceRoute canonicalizes with history replacement and dispatches routing", async () => {
@@ -304,6 +373,35 @@ test("Template Fill labels and status classifications are exact", async () => {
   assert.ok(helpers.activeStatuses.includes("template_fill_validating"));
   assert.equal(helpers.isWaitingStatus("awaiting_template_fill_confirm"), true);
   assert.equal(helpers.isConfirmationStatus("awaiting_template_fill_confirm"), false);
+});
+
+test("Beautify labels, statuses, phases, and artifacts are route-aware", async () => {
+  const [{ statusLabel, statusTone, phaseLabel, artifactKindLabel }, helpers] = await Promise.all([
+    loadSourceModule(formatSource, "format.ts"),
+    loadAppHelpersModule(),
+  ]);
+  assert.deepEqual(
+    ["beautify_inventory_building", "beautify_planning", "awaiting_beautify_confirm"].map(
+      (status) => [statusLabel[status], statusTone[status]],
+    ),
+    [["构建美化清单", "active"], ["生成美化计划", "active"], ["审查美化计划", "waiting"]],
+  );
+  assert.deepEqual(
+    ["beautify_inventory", "beautify_plan"].map((phase) => phaseLabel[phase]),
+    ["美化清单", "美化计划"],
+  );
+  for (const kind of [
+    "beautify_inputs", "beautify_inventory", "beautify_risk_report", "beautify_plan",
+    "beautify_lock", "beautify_fidelity_report", "source_svg_reference",
+  ]) {
+    assert.ok(artifactKindLabel[kind], `missing ${kind} label`);
+  }
+  assert.ok(helpers.activeStatuses.includes("beautify_inventory_building"));
+  assert.ok(helpers.activeStatuses.includes("beautify_planning"));
+  assert.equal(helpers.isWaitingStatus("awaiting_beautify_confirm"), true);
+  assert.equal(helpers.isFullSVGRouteUI("main"), true);
+  assert.equal(helpers.isFullSVGRouteUI("beautify"), true);
+  assert.equal(helpers.isFullSVGRouteUI("template-fill"), false);
 });
 
 test("runner profiles expose locked engine labels and resource phase copy", async () => {
@@ -439,6 +537,49 @@ test("dirty and check-error action guards never act on stale JSON", async () => 
   assert.equal(templateFillActionState({ ...base, checkWarningCount: 9 }).confirmDisabled, false, "warnings do not block confirm");
 });
 
+test("Beautify typed rows expose only counts and editable visual controls", async () => {
+  const { beautifyPlanSlideRows, beautifyPlanActionState, beautifyPlanErrorCount } = await loadAppHelpersModule();
+  const preview = {
+    inventory: { pages: [{ source_slide: 1, text_count: 4, image_count: 1, table_count: 0, chart_count: 1 }] },
+    plan: {
+      slides: [{
+        source_slide: 1, output_page: 1, page_role: "cover", page_rhythm: "anchor",
+        layout_strategy: "hero", text_block_ids: ["text-1"], image_ids: ["image-1"],
+        table_ids: [], chart_ids: ["chart-1"], ignored: [], unsupported: [], risks: ["risk-1"],
+      }],
+    },
+    findings: [{ severity: "warning" }, { severity: "error" }],
+  };
+  const rows = beautifyPlanSlideRows(preview);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].source_slide, 1);
+  assert.equal(rows[0].output_page, 1);
+  assert.equal(rows[0].inventory.text_count, 4);
+  assert.equal(beautifyPlanErrorCount(preview), 1);
+  const base = {
+    canEdit: true, canConfirm: true, taskStatus: "awaiting_beautify_confirm",
+    busy: false, dirty: false, errorCount: 0,
+  };
+  assert.equal(beautifyPlanActionState(base).confirmDisabled, false);
+  assert.equal(beautifyPlanActionState({ ...base, dirty: true }).confirmDisabled, true);
+  assert.equal(beautifyPlanActionState({ ...base, errorCount: 1 }).confirmDisabled, true);
+  assert.equal(beautifyPlanActionState({ ...base, dirty: false }).saveDisabled, true);
+  assert.equal(beautifyPlanActionState({ ...base, dirty: true }).saveDisabled, false);
+});
+
+test("Beautify fidelity metric counts are safe for numeric and ID-array payloads", async () => {
+  const { fidelityMetricCount, beautifyFidelityMetricText } = await loadAppHelpersModule();
+  assert.equal(fidelityMetricCount(2), 2);
+  assert.equal(fidelityMetricCount(["a", "b"]), 2);
+  assert.equal(fidelityMetricCount(undefined), 0);
+  assert.equal(beautifyFidelityMetricText({ expected: 5, matched: 5 }), "5/5");
+  assert.equal(
+    beautifyFidelityMetricText({ expected: 5, matched: 4, missing: ["text-3"], changed: 1 }),
+    "4/5 · 2 异常",
+  );
+  assert.equal(beautifyFidelityMetricText({ expected: 0, matched: 0, required: 1, used: 1 }), "1/1");
+});
+
 test("Template Fill task switches fail closed and discard late task responses", async () => {
   const {
     createTemplateFillRequestScope,
@@ -529,6 +670,7 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
     taskDetailPageKey,
     taskDetailRetryTaskID,
     templateFillPlanReadableStatus,
+    beautifyPlanReadableStatus,
   } = await loadAppHelpersModule();
 
   assert.notEqual(taskDetailPageKey("task-a"), taskDetailPageKey("task-b"), "task IDs must remount detail state");
@@ -538,6 +680,9 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
   assert.equal(templateFillPlanReadableStatus({ route: "template-fill", status: "source_converting" }), false);
   assert.equal(templateFillPlanReadableStatus({ route: "template-fill", status: "cancelled" }), false);
   assert.equal(templateFillPlanReadableStatus({ route: "main", status: "completed" }), false);
+  assert.equal(beautifyPlanReadableStatus({ route: "beautify", status: "awaiting_beautify_confirm" }), true);
+  assert.equal(beautifyPlanReadableStatus({ route: "beautify", status: "beautify_planning" }), false);
+  assert.equal(beautifyPlanReadableStatus({ route: "main", status: "completed" }), false);
 
   const deferred = () => {
     let resolve;
@@ -558,6 +703,7 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
     listRuntimeRuns: () => waits.runtimeRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "runtime" }]),
     listPhaseRuns: () => waits.phaseRuns?.promise || Promise.resolve([{ task_id: task.id, kind: "phase" }]),
     getTemplateFillPlan: () => waits.preview?.promise || Promise.resolve({ task_id: task.id, plan: { title: task.id } }),
+    getBeautifyPlan: () => waits.beautifyPreview?.promise || Promise.resolve({ task_id: task.id, plan: { title: task.id } }),
   });
 
   let currentTaskId = "task-a";
@@ -643,6 +789,24 @@ test("task detail discards delayed A and older overlapping poll snapshots", asyn
     }),
   );
   assert.equal(mismatchedBundle, undefined, "an SVG bundle response for another task must never be committed");
+
+  const mismatchedQuality = await loadTaskDetailData(
+    scopeB,
+    "task-b",
+    requestSet({ id: "task-b", route: "beautify", status: "completed" }, {
+      quality: { promise: Promise.resolve({ task_id: "task-a", decision: "pass", beautify_fidelity: { pages: [] } }) },
+    }),
+  );
+  assert.equal(mismatchedQuality, undefined, "Beautify fidelity from another task must never be committed");
+
+  const mismatchedBeautifyPlan = await loadTaskDetailData(
+    scopeB,
+    "task-b",
+    requestSet({ id: "task-b", route: "beautify", status: "completed" }, {
+      beautifyPreview: { promise: Promise.resolve({ task_id: "task-a", plan: { title: "leak" } }) },
+    }),
+  );
+  assert.equal(mismatchedBeautifyPlan, undefined, "a Beautify plan for another task must never be committed");
 });
 
 test("task detail preview requests are gated to backend-readable statuses", async () => {
@@ -707,10 +871,21 @@ test("Template Fill retry recovery is failure-phase-aware and main retry behavio
   assert.match(retryGuidanceForFailure("template_fill_plan.inputs"), /没有源文件删除 API/);
   assert.match(retryGuidanceForFailure("template_fill_plan.inputs"), /恰好一个.*\.pptx.*可读内容/);
   assert.equal(retryGuidanceForFailure("template_fill_plan.contract"), "");
+  assert.deepEqual(retryOptionsForFailure("beautify_inventory.inputs", "beautify"), [
+    { phase: "prepare", label: "重新准备" },
+    { phase: "beautify_inventory", label: "重建美化清单" },
+  ]);
+  assert.deepEqual(retryOptionsForFailure("beautify_inventory.contract", "beautify"), [
+    { phase: "beautify_inventory", label: "重建美化清单" },
+  ]);
+  assert.deepEqual(retryOptionsForFailure("beautify_plan.contract", "beautify"), [
+    { phase: "beautify_plan", label: "重建美化计划" },
+  ]);
+  assert.ok(retryOptionsForFailure("pptx_validate.beautify_fidelity", "beautify").some((option) => option.phase === "pptx_validate"));
 });
 
 test("completed navigation, plan entry, and artifact visibility are route-aware", async () => {
-  const { canOpenTemplateFillPlan, completedTaskRoute, visibleTaskArtifacts } = await loadAppHelpersModule();
+  const { canOpenTemplateFillPlan, canOpenBeautifyPlan, completedTaskRoute, visibleTaskArtifacts } = await loadAppHelpersModule();
   assert.deepEqual(completedTaskRoute("task-1", "main"), { name: "preview", id: "task-1" });
   assert.deepEqual(completedTaskRoute("task-1", "template-fill"), { name: "templateFill", id: "task-1" });
   for (const status of [
@@ -720,9 +895,14 @@ test("completed navigation, plan entry, and artifact visibility are route-aware"
     assert.equal(canOpenTemplateFillPlan({ route: "template-fill", status }), true, status);
   }
   assert.equal(canOpenTemplateFillPlan({ route: "main", status: "completed" }), false);
+  for (const status of ["awaiting_beautify_confirm", "spec_generating", "pptx_validating", "completed", "failed"]) {
+    assert.equal(canOpenBeautifyPlan({ route: "beautify", status }), true, status);
+  }
+  assert.equal(canOpenBeautifyPlan({ route: "main", status: "completed" }), false);
   const artifacts = Array.from({ length: 12 }, (_, index) => ({ id: String(index) }));
   assert.equal(visibleTaskArtifacts(artifacts, "main").length, 8);
   assert.equal(visibleTaskArtifacts(artifacts, "template-fill").length, 12);
+  assert.equal(visibleTaskArtifacts(artifacts, "beautify").length, 12);
 });
 
 test("direct preview canonicalization fetches task first, skips Template Fill artifacts, and ignores stale completion", async () => {
@@ -862,7 +1042,8 @@ test("Template Fill component uses production helpers and required actions", () 
   assert.match(detail, /api\.artifactContentUrl\(task\.id, item\.artifact_id\)/);
   assert.match(detail, /retry\("image_acquire"\)/);
   assert.match(detail, /taskDetailRetryTaskID\s*\(/);
-  assert.match(detail, /taskRoute !== "template-fill"[\s\S]*?<span>SVG<\/span>/);
+  assert.match(detail, /const fullSVGRoute = isFullSVGRouteUI\(taskRoute\)/);
+  assert.ok((detail.match(/\{fullSVGRoute && \(/g) || []).length >= 3, "resources, SVG, and quality must share the full-route guard");
   assert.match(previewPage, /loadPreviewPageData\([\s\S]*?replaceRoute/);
   assert.match(app, /route\.name === "preview"[\s\S]*?<PreviewPage key=\{previewPageKey\(route\.id\)\} taskId=\{route\.id\}/);
   assert.match(previewPage, /previewPageStateForTask\(state, taskId\)/);
@@ -870,6 +1051,25 @@ test("Template Fill component uses production helpers and required actions", () 
   assert.match(previewPage, /taskRouteMatches\(parseRoute\(\), "preview", taskId\)/);
   assert.match(previewPage, /catch \(err\)[\s\S]*?active && taskRouteMatches\(parseRoute\(\), "preview", taskId\)/);
   assert.match(previewPage, /return \(\) => \{\s*active = false;/);
+});
+
+test("Beautify component is task-scoped and never exposes a raw plan editor", () => {
+  const app = appFunctionSource("App");
+  const page = appFunctionSource("BeautifyPlanPage");
+  const detail = appFunctionSource("TaskDetailPage");
+  assert.match(app, /route\.name === "beautifyPlan"[\s\S]*?<BeautifyPlanPage key=\{beautifyPlanPageKey\(route\.id\)\} taskId=\{route\.id\}/);
+  assert.match(page, /createBeautifyPlanRequestScope\([\s\S]*?taskRouteMatches\(parseRoute\(\), "beautifyPlan", taskId\)/);
+  assert.ok((page.match(/scopedBeautifyPlanRequest\s*\(/g) || []).length >= 8, "all Beautify requests must be task scoped");
+  assert.match(page, /if \(nextTask\.route !== "beautify"\)[\s\S]*?replaceRoute\(\{ name: "task", id: nextTask\.id \}\)/);
+  assert.match(page, /nextPreview\.task_id !== taskId/);
+  assert.doesNotMatch(page, /<textarea|plan-json-editor|保存 JSON/);
+  assert.doesNotMatch(page, /onChange=\{[^}]*?(?:text_block_ids|table_ids|chart_ids|image_ids)/);
+  for (const label of ["内容与数据已冻结", "页数、页面顺序、可见文字", "布局策略", "页面节奏", "风险决策", "确认美化计划"]) {
+    assert.ok(page.includes(label), `missing Beautify UX copy: ${label}`);
+  }
+  assert.match(detail, /canOpenBeautifyPlan\s*\(/);
+  assert.match(detail, /quality\.beautify_fidelity/);
+  assert.match(detail, /源 PPTX → 输出 PPTX 保真/);
 });
 
 test("save and check refetch canonical previews while only confirm advances", () => {
@@ -891,7 +1091,7 @@ test("task detail commits one generation-scoped snapshot", () => {
   const detail = appFunctionSource("TaskDetailPage");
   assert.match(detail, /const next = await loadTaskDetailData\(/);
   assert.match(detail, /if \(next\)[\s\S]*?setDetail\(next\)/);
-  assert.doesNotMatch(detail, /setTask\(|setEvents\(|setArtifacts\(|setRuntimeRuns\(|setPhaseRuns\(|setTemplateFillPreview\(/);
+  assert.doesNotMatch(detail, /setTask\(|setEvents\(|setArtifacts\(|setRuntimeRuns\(|setPhaseRuns\(|setTemplateFillPreview\(|setBeautifyPlanPreview\(/);
   assert.match(detail, /return \(\) => \{[\s\S]*?requestScope\.deactivate\(\)/);
 });
 
@@ -924,6 +1124,44 @@ test("Template Fill layout is stable and collapses without narrow-screen overflo
   assert.match(narrow, /\.plan-slide-row[\s\S]*grid-template-columns:\s*1fr\s*;/);
   assert.match(narrow, /\.check-report-row[\s\S]*grid-template-columns:\s*1fr\s*;/);
   assert.match(narrow, /overflow-wrap:\s*anywhere\s*;/);
+});
+
+test("Beautify typed plan and fidelity layouts collapse without exposing frozen data editors", () => {
+  const planLayout = stylesSource.match(/\.beautify-plan-layout\s*\{([^}]*)\}/s);
+  const controls = stylesSource.match(/\.beautify-plan-controls\s*\{([^}]*)\}/s);
+  const fidelity = stylesSource.match(/\.beautify-fidelity-row\s*\{([^}]*)\}/s);
+  assert.ok(planLayout && controls && fidelity, "missing Beautify plan/fidelity layout rules");
+  assert.match(planLayout[1], /grid-template-columns:/);
+  assert.match(controls[1], /min-width:\s*0\s*;/);
+  assert.match(fidelity[1], /grid-template-columns:/);
+  const tablet = mediaQuerySource(980);
+  assert.match(tablet, /\.beautify-plan-layout[\s\S]*grid-template-columns:\s*1fr\s*;/);
+  const narrow = mediaQuerySource(620);
+  assert.match(narrow, /\.beautify-fidelity-row[\s\S]*grid-template-columns:\s*1fr\s*;/);
+  assert.match(narrow, /\.beautify-plan-controls[\s\S]*grid-template-columns:\s*1fr\s*;/);
+  const page = appFunctionSource("BeautifyPlanPage");
+  assert.doesNotMatch(page, /textarea|contenteditable/i);
+});
+
+test("Beautify Tier 2 keeps source page count read-only and out of the confirmation payload", async () => {
+  const helpers = await loadAppHelpersModule();
+  assert.deepEqual(
+    helpers.confirmationSubmissionValues(
+      { route: "beautify", status: "awaiting_realization_confirm" },
+      { page_count: "4", slide_count: 4, color: "source", typography: "source fonts" },
+    ),
+    { color: "source", typography: "source fonts" },
+  );
+  assert.deepEqual(
+    helpers.confirmationSubmissionValues(
+      { route: "main", status: "awaiting_realization_confirm" },
+      { page_count: "4", color: "source" },
+    ),
+    { page_count: "4", color: "source" },
+  );
+  assert.match(appSource, /confirmationSubmissionValues\(task, values\)/);
+  assert.match(appSource, /locked=\{task\?\.route === "beautify" && confirmation\.key === "page_count"\}/);
+  assert.match(appSource, /<input value=\{stringValue\} readOnly aria-readonly="true" \/>/);
 });
 
 test("source profile renders only a non-empty trimmed string", () => {

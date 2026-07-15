@@ -46,6 +46,9 @@ SLIDESMITH_QUALITY_GATE_STRICT=true
 SLIDESMITH_PPTX_VALIDATE_ENABLED=true
 SLIDESMITH_VISUAL_REVIEW_ENABLED=false
 SLIDESMITH_VISUAL_REVIEW_DEFAULT=false
+SLIDESMITH_BEAUTIFY_ENABLED=false
+SLIDESMITH_BEAUTIFY_FIDELITY_STRICT=true
+SLIDESMITH_BEAUTIFY_SOURCE_SVG_REFERENCE_ENABLED=false
 POSTGRES_PASSWORD=<strong password>
 ```
 
@@ -69,6 +72,12 @@ LLM_TIMEOUT=5m
 Use `SLIDESMITH_PPT_RUNNER_PROFILE=real-lite` explicitly for the first smoke
 validation. The standard configuration requests `full-ppt-master` while
 `SLIDESMITH_FULL_PPT_DEFAULT_ENABLED=false` keeps the rollout gate closed.
+
+`SLIDESMITH_BEAUTIFY_ENABLED=false` independently keeps new Beautify tasks
+closed. Enable it only with `SLIDESMITH_BEAUTIFY_FIDELITY_STRICT=true`; the
+source-SVG reference path remains opt-in because it may retain proprietary
+visual structure. Tasks use the capability snapshot captured at route
+selection, so changing these switches does not silently alter in-flight work.
 
 ## Build Runtime Image
 

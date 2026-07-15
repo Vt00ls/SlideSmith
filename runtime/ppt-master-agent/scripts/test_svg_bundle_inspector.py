@@ -189,6 +189,22 @@ class SVGBundleInspectorTests(unittest.TestCase):
 
         self.assertEqual([page["page_id"] for page in inventory["pages"]], ["P01", "P02"])
 
+    def test_spec_lock_lowercase_resource_ids_do_not_become_page_ids(self) -> None:
+        (self.project / "spec_lock.md").write_text(
+            "# Spec Lock\n\n"
+            "canvas: ppt169\n"
+            "viewBox: 0 0 1280 720\n\n"
+            "## P01 Lock\n"
+            "- p01.image.01: source occurrence\n\n"
+            "## P02 Lock\n"
+            "- p02.chart.01: source occurrence\n",
+            encoding="utf-8",
+        )
+
+        inventory = inspector.inspect_bundle(self.project)
+
+        self.assertEqual([page["page_id"] for page in inventory["pages"]], ["P01", "P02"])
+
     def test_xml_and_static_security_rejections(self) -> None:
         cases = [
             ("xml_invalid", "<g>"),

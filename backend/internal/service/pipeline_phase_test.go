@@ -152,3 +152,64 @@ func TestTemplateFillArtifactKindConstants(t *testing.T) {
 		}
 	}
 }
+
+func TestBeautifyPhaseOrderingIsRouteAware(t *testing.T) {
+	want := []PipelinePhase{
+		PhaseRouteSelect,
+		PhaseSourcePrepare,
+		PhaseBeautifyInventory,
+		PhaseAnchorConfirm,
+		PhaseRealizationConfirm,
+		PhaseBeautifyPlan,
+		PhaseSpecGenerate,
+		PhaseImageAcquire,
+		PhaseSVGExecute,
+		PhaseQualityCheck,
+		PhaseFinalizeExport,
+		PhasePPTXValidate,
+		PhasePublish,
+	}
+	definitions := PipelinePhaseDefinitionsForRoute(model.TaskRouteBeautify)
+	if len(definitions) != len(want) {
+		t.Fatalf("beautify definitions = %d, want %d", len(definitions), len(want))
+	}
+	for i, phase := range want {
+		if definitions[i].Phase != phase {
+			t.Fatalf("beautify definition[%d] = %q, want %q", i, definitions[i].Phase, phase)
+		}
+	}
+	next, ok := NextPipelinePhaseForRoute(model.TaskRouteBeautify, PhaseSourcePrepare)
+	if !ok || next != PhaseBeautifyInventory {
+		t.Fatalf("beautify source_prepare next = %q, %v", next, ok)
+	}
+	next, ok = NextPipelinePhaseForRoute(model.TaskRouteBeautify, PhaseBeautifyPlan)
+	if !ok || next != PhaseSpecGenerate {
+		t.Fatalf("beautify plan next = %q, %v", next, ok)
+	}
+}
+
+func TestBeautifyPhaseAndArtifactConstants(t *testing.T) {
+	for phase, nextStatus := range map[PipelinePhase]string{
+		PhaseBeautifyInventory: model.TaskStatusAwaitingAnchorConfirm,
+		PhaseBeautifyPlan:      model.TaskStatusAwaitingBeautifyConfirm,
+	} {
+		definition, ok := PipelinePhaseDefinitionFor(phase)
+		if !ok || definition.NextStatus != nextStatus || !definition.Retryable {
+			t.Fatalf("beautify phase %q = %#v", phase, definition)
+		}
+	}
+	wantKinds := map[string]string{
+		model.ArtifactKindBeautifyInputs:         "beautify_inputs",
+		model.ArtifactKindBeautifyInventory:      "beautify_inventory",
+		model.ArtifactKindBeautifyRiskReport:     "beautify_risk_report",
+		model.ArtifactKindBeautifyPlan:           "beautify_plan",
+		model.ArtifactKindBeautifyLock:           "beautify_lock",
+		model.ArtifactKindBeautifyFidelityReport: "beautify_fidelity_report",
+		model.ArtifactKindSourceSVGReference:     "source_svg_reference",
+	}
+	for got, want := range wantKinds {
+		if got != want {
+			t.Fatalf("beautify artifact kind = %q, want %q", got, want)
+		}
+	}
+}

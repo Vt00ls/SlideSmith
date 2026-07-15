@@ -1,0 +1,9 @@
+{
+  "name": "beautify-complex",
+  "source_features": ["hidden-slide", "smartart", "ole", "video", "audio", "transition", "animation", "notes", "comments"],
+  "expected_decision": "pass_with_warnings",
+  "expected_risks": ["beautify.hidden_slide", "beautify.oleobject_unsupported", "beautify.audio_unsupported"],
+  "negative_mutations": [
+    {"kind": "unreported-complex-object", "expected_rule": "beautify_inventory.contract"}
+  ]
+}

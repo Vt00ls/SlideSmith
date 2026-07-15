@@ -10,8 +10,8 @@ import (
 )
 
 func (s *TaskService) processResourceAcquire(ctx context.Context, task *model.Task) error {
-	if !s.useFullPPTMaster(task) || task.Route != model.TaskRouteMain {
-		err := fmt.Errorf("resource acquisition requires a locked full-ppt-master main task")
+	if !s.useFullPPTMaster(task) || !isFullSVGRoute(task.Route) {
+		err := fmt.Errorf("resource acquisition requires a locked full-ppt-master full SVG route task")
 		_ = s.failWithMetadata(ctx, task, string(PhaseImageAcquire)+".unsupported_profile", err, nil, nil)
 		return err
 	}

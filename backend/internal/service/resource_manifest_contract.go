@@ -128,7 +128,7 @@ func validateResourceManifestContractWithBindings(projectPath string, task *mode
 	if manifest.Schema != resourcesManifestSchema {
 		return nil, fmt.Errorf("resources manifest schema = %q", manifest.Schema)
 	}
-	if task == nil || manifest.TaskID != task.ID || manifest.Route != model.TaskRouteMain || manifest.RunnerProfile != model.RunnerProfileFullPPTMaster || manifest.RunnerProfile != task.RunnerProfile {
+	if task == nil || !isFullSVGRoute(task.Route) || manifest.TaskID != task.ID || manifest.Route != task.Route || manifest.RunnerProfile != model.RunnerProfileFullPPTMaster || manifest.RunnerProfile != task.RunnerProfile {
 		return nil, fmt.Errorf("resources manifest task/route/profile binding mismatch")
 	}
 	if phaseRunID == "" || manifest.PhaseRunID != phaseRunID {
@@ -158,8 +158,8 @@ func validateResourceManifestContractWithBindings(projectPath string, task *mode
 	if manifest.ResourcePlanSHA256 != planSHA || manifest.PolicySHA256 != policy.PolicySHA256 || manifest.SpecSHA256 != plan.SpecSHA256 || manifest.SpecLockSHA256 != plan.SpecLockSHA256 {
 		return nil, fmt.Errorf("resources manifest upstream hash binding mismatch")
 	}
-	if policy.TaskID != task.ID || policy.PhaseRunID != phaseRunID || policy.RunnerProfile != task.RunnerProfile {
-		return nil, fmt.Errorf("resource policy task/profile/phase binding mismatch")
+	if policy.TaskID != task.ID || policy.Route != task.Route || policy.PhaseRunID != phaseRunID || policy.RunnerProfile != task.RunnerProfile {
+		return nil, fmt.Errorf("resource policy task/route/profile/phase binding mismatch")
 	}
 	requirements := make(map[string]resourceRequirement, len(plan.Requirements))
 	for _, requirement := range plan.Requirements {

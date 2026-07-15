@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import pptx_validate_runner
+import beautify_runner
 from quality_schema import sha256_file
 
 
@@ -138,6 +140,41 @@ class PPTXValidateRunnerTest(unittest.TestCase):
             pages[0]["pptx_aggregate"],
             "生成页面结构与基础视觉 转换为 PPTX发布形态 发布按顺序串联,阻断级问题必须拦截。",
         )
+
+    def write_beautify_contracts(self) -> None:
+        source = self.project / "sources/source.pptx"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(self.pptx, source)
+        self.write_json(".slidesmith/contracts/beautify_inputs.json", {
+            "schema": beautify_runner.INPUTS_SCHEMA,
+            "task_id": "task-pptx",
+            "source_pptx": {"path": "sources/source.pptx", "sha256": sha256_file(source), "size": source.stat().st_size},
+        })
+        self.write_json("analysis/beautify_inventory.json", {"schema": beautify_runner.INVENTORY_SCHEMA, "slides": []})
+        self.write_json("analysis/beautify_plan.json", {"schema": "slidesmith.beautify_plan.v1", "pages": []})
+        inputs_sha = sha256_file(self.project / ".slidesmith/contracts/beautify_inputs.json")
+        inventory_sha = sha256_file(self.project / "analysis/beautify_inventory.json")
+        plan_sha = sha256_file(self.project / "analysis/beautify_plan.json")
+        self.write_json(".slidesmith/beautify_lock.json", {
+            "schema": beautify_runner.LOCK_SCHEMA,
+            "inputs_sha256": inputs_sha,
+            "inventory_sha256": inventory_sha,
+            "plan_sha256": plan_sha,
+            "identity": {"source": "source"},
+            "slides": [{"source_slide": 1, "output_page": 1, "text_blocks": [{"id": "title", "text": "标题 Hello 123"}]}],
+        })
+
+    def test_beautify_fidelity_is_atomically_promoted_and_contract_bound(self) -> None:
+        self.write_beautify_contracts()
+        contract = pptx_validate_runner.run(self.project, ".slidesmith/contracts/finalize_export.json", "validate-beautify", render=False)
+        self.assertEqual(contract["decision"], "pass")
+        self.assertEqual(contract["beautify_fidelity_decision"], "pass")
+        self.assertEqual(contract["source_slide_count"], 1)
+        report_path = self.project / "validation/beautify_fidelity_report.json"
+        self.assertTrue(report_path.is_file())
+        self.assertEqual(contract["beautify_fidelity_report_sha256"], sha256_file(report_path))
+        report = json.loads((self.project / "validation/pptx_validate_report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["beautify_fidelity"]["decision"], "pass")
 
 
 if __name__ == "__main__":

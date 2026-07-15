@@ -1,0 +1,10 @@
+{
+  "name": "beautify-table",
+  "source_features": ["native-table", "merged-cell", "multi-header"],
+  "expected_decision": "pass_with_warnings",
+  "expected_risks": ["beautify.merged_table"],
+  "negative_mutations": [
+    {"kind": "cell-text-change", "expected_rule": "beautify.table_fidelity"},
+    {"kind": "grid-shape-change", "expected_rule": "beautify.table_fidelity"}
+  ]
+}
