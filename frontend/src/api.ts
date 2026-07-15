@@ -559,6 +559,31 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return payload?.data as T;
 }
 
+function normalizeTaskQuality(quality: TaskQuality): TaskQuality {
+  const fidelity = quality.beautify_fidelity;
+  return {
+    ...quality,
+    findings: quality.findings ?? [],
+    chart_receipts: quality.chart_receipts ?? [],
+    render_artifact_ids: quality.render_artifact_ids ?? [],
+    allowed_retry_phases: quality.allowed_retry_phases ?? [],
+    beautify_fidelity: fidelity
+      ? {
+          ...fidelity,
+          pages: fidelity.pages ?? [],
+          identity: {
+            ...(fidelity.identity ?? { selected_source: "" }),
+            selected_source: fidelity.identity?.selected_source ?? "",
+            overrides: fidelity.identity?.overrides ?? [],
+            font_substitutions: fidelity.identity?.font_substitutions ?? [],
+          },
+          ignored: fidelity.ignored ?? [],
+          unsupported: fidelity.unsupported ?? [],
+        }
+      : undefined,
+  };
+}
+
 export const api = {
   listTemplates: () => request<TemplateCatalogItem[]>("/templates"),
   getTemplate: (id: string) => request<TemplateCatalogItem>(`/templates/${encodeURIComponent(id)}`),
@@ -641,7 +666,8 @@ export const api = {
   listArtifacts: (id: string) => request<Artifact[]>(`/tasks/${encodeURIComponent(id)}/artifacts`),
   getResources: (id: string) => request<TaskResources>(`/tasks/${encodeURIComponent(id)}/resources`),
   getSVGBundle: (id: string) => request<SVGBundleSummary>(`/tasks/${encodeURIComponent(id)}/svg-bundle`),
-  getQuality: (id: string) => request<TaskQuality>(`/tasks/${encodeURIComponent(id)}/quality`),
+  getQuality: (id: string) =>
+    request<TaskQuality>(`/tasks/${encodeURIComponent(id)}/quality`).then(normalizeTaskQuality),
   artifactContentUrl: (taskId: string, artifactId: string) =>
     `${API_BASE}/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
   pptxDownloadUrl: (taskId: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/download/pptx`,

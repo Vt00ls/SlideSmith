@@ -73,9 +73,13 @@ func (s *TaskService) GetQuality(ctx context.Context, taskID string) (*TaskQuali
 		return nil, err
 	}
 	result := &TaskQuality{
-		TaskID:      task.ID,
-		CurrentGate: qualityCurrentGate(task),
-		Decision:    "pending",
+		TaskID:             task.ID,
+		CurrentGate:        qualityCurrentGate(task),
+		Decision:           "pending",
+		Findings:           make([]TaskQualityFinding, 0),
+		ChartReceipts:      make([]TaskChartReceiptSummary, 0),
+		RenderArtifactIDs:  make([]string, 0),
+		AllowedRetryPhases: make([]string, 0),
 	}
 	projectPath, err := s.findPersistentProjectPath(task)
 	if err == nil {
@@ -158,10 +162,17 @@ func (s *TaskService) loadTaskQualityReports(projectPath string, result *TaskQua
 	}
 	var fidelity BeautifyFidelityReport
 	if err := readOptionalQualityJSON(projectPath, "validation/beautify_fidelity_report.json", &fidelity); err == nil && fidelity.Schema == beautifyFidelityReportSchema && fidelity.TaskID == result.TaskID {
+		identity := fidelity.Identity
+		identity.Overrides = append(make([]string, 0, len(fidelity.Identity.Overrides)), fidelity.Identity.Overrides...)
+		identity.FontSubstitutions = append(make([]string, 0, len(fidelity.Identity.FontSubstitutions)), fidelity.Identity.FontSubstitutions...)
 		view := &TaskBeautifyFidelity{
 			Present: true, Decision: fidelity.Decision, SourceSlideCount: fidelity.SourceSlideCount,
-			OutputSlideCount: fidelity.OutputSlideCount, Pages: fidelity.Pages, Identity: fidelity.Identity,
-			Warning: fidelity.Summary.Warning, Error: fidelity.Summary.Error, Blocking: fidelity.Summary.Blocking,
+			OutputSlideCount: fidelity.OutputSlideCount,
+			Pages:            append(make([]BeautifyFidelityPage, 0, len(fidelity.Pages)), fidelity.Pages...),
+			Identity:         identity,
+			Ignored:          make([]string, 0, len(fidelity.Ignored)),
+			Unsupported:      make([]string, 0, len(fidelity.Unsupported)),
+			Warning:          fidelity.Summary.Warning, Error: fidelity.Summary.Error, Blocking: fidelity.Summary.Blocking,
 		}
 		for _, item := range fidelity.Ignored {
 			view.Ignored = append(view.Ignored, beautifyDecisionLabel(item))

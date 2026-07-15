@@ -95,6 +95,18 @@ async function loadAppHelpersModule() {
   return loadSourceModule(`${declarations.join("\n")}\nexport { ${[...variableNames, ...functionNames].join(", ")} };`, "App.tsx");
 }
 
+async function loadAPIHelpersModule() {
+  const sourceFile = ts.createSourceFile("api.ts", apiSource, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TS);
+  let declaration = "";
+  sourceFile.forEachChild((node) => {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === "normalizeTaskQuality") {
+      declaration = node.getText(sourceFile);
+    }
+  });
+  assert.ok(declaration, "missing normalizeTaskQuality declaration");
+  return loadSourceModule(`${declaration}\nexport { normalizeTaskQuality };`, "api.ts");
+}
+
 function appFunctionSource(name) {
   const sourceFile = ts.createSourceFile("App.tsx", appSource, ts.ScriptTarget.ES2020, true, ts.ScriptKind.TSX);
   let result = "";
@@ -294,11 +306,42 @@ test("quality API and completed warning view remain task-scoped", () => {
   }
   assert.match(apiSource, /getQuality:\s*\(id: string\)\s*=>\s*request<TaskQuality>/);
   assert.match(apiSource, /\/tasks\/\$\{encodeURIComponent\(id\)\}\/quality/);
+  assert.match(apiSource, /request<TaskQuality>[\s\S]*?\.then\(normalizeTaskQuality\)/);
   assert.match(appSource, /生成质量门禁/);
   assert.match(appSource, /quality\.warning_badge/);
   assert.match(appSource, /联系表/);
   assert.match(appSource, /PPTX 回读/);
   assert.match(appSource, /源 PPTX → 输出 PPTX 保真/);
+});
+
+test("completed historical quality payloads normalize nullable collections", async () => {
+  const { normalizeTaskQuality } = await loadAPIHelpersModule();
+  const normalized = normalizeTaskQuality({
+    task_id: "33509197-30b2-4ed5-9681-e1bdb03b74d7",
+    decision: "pending",
+    findings: null,
+    chart_receipts: null,
+    render_artifact_ids: null,
+    allowed_retry_phases: null,
+    beautify_fidelity: {
+      pages: null,
+      identity: null,
+      ignored: null,
+      unsupported: null,
+    },
+  });
+  assert.deepEqual(normalized.findings, []);
+  assert.deepEqual(normalized.chart_receipts, []);
+  assert.deepEqual(normalized.render_artifact_ids, []);
+  assert.deepEqual(normalized.allowed_retry_phases, []);
+  assert.deepEqual(normalized.beautify_fidelity.pages, []);
+  assert.deepEqual(normalized.beautify_fidelity.identity, {
+    selected_source: "",
+    overrides: [],
+    font_substitutions: [],
+  });
+  assert.deepEqual(normalized.beautify_fidelity.ignored, []);
+  assert.deepEqual(normalized.beautify_fidelity.unsupported, []);
 });
 
 test("Template Fill router parses and serializes the plan hash", async () => {
