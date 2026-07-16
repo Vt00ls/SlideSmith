@@ -458,13 +458,17 @@ func collectRuntimeArtifacts(ctx context.Context, workspacePath, projectPath str
 		{"design_spec.md", "design_spec.md"},
 		{"spec_lock.md", "spec_lock.md"},
 		{"notes", "notes"},
+		{"resources", "resources"},
 		{"svg_output", "svg_output"},
 		{"svg_final", "svg_final"},
 		{"exports", "exports"},
 		{"logs", "logs"},
+		{"live_preview", "live_preview"},
 		{filepath.Join(".slidesmith", "contracts"), "contracts"},
 		{filepath.Join(".slidesmith", "quality_report.json"), filepath.Join("manifest", "quality_report.json")},
 		{filepath.Join(".slidesmith", "artifacts.json"), filepath.Join("manifest", "runtime_artifacts.json")},
+		{filepath.Join(".slidesmith", "resources_manifest.json"), filepath.Join("manifest", "resources_manifest.json")},
+		{filepath.Join(".slidesmith", "manual_edit_lock.json"), filepath.Join("manifest", "manual_edit_lock.json")},
 		{".slidesmith-artifacts.json", filepath.Join("manifest", "runtime_artifacts.json")},
 	}
 	if route != model.TaskRouteBeautify {
@@ -612,6 +616,18 @@ func pathWithinRoot(root, candidate string) bool {
 func artifactKindFromRuntimePath(path string) string {
 	lowerPath := strings.ToLower(filepath.ToSlash(path))
 	switch {
+	case lowerPath == "analysis/manual_edit_patch.json":
+		return model.ArtifactKindManualEditPatch
+	case lowerPath == "analysis/manual_edit_apply_report.json":
+		return model.ArtifactKindManualEditApplyReport
+	case lowerPath == "analysis/annotation_apply_report.json":
+		return model.ArtifactKindAnnotationApplyReport
+	case lowerPath == "analysis/manual_edit_diff_report.json":
+		return model.ArtifactKindManualEditDiffReport
+	case lowerPath == "manifest/manual_edit_lock.json":
+		return model.ArtifactKindManualEditLock
+	case lowerPath == "live_preview/annotations.jsonl":
+		return model.ArtifactKindManualEditLog
 	case strings.HasPrefix(path, "source/"):
 		return model.ArtifactKindSource
 	case lowerPath == "analysis/source_profile.json":

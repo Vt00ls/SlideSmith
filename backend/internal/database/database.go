@@ -38,15 +38,23 @@ func Migrate(db *gorm.DB) error {
 	if release != nil {
 		defer release()
 	}
-	return db.AutoMigrate(
+	if err := db.AutoMigrate(
 		&model.Task{},
 		&model.TaskEvent{},
 		&model.Artifact{},
+		&model.TaskArtifactVersion{},
+		&model.TaskEditSession{},
+		&model.TaskEditRun{},
 		&model.TaskRuntimeRun{},
 		&model.TaskPhaseRun{},
 		&model.TaskConfirmation{},
 		&model.TemplateRegistryEntry{},
-	)
+	); err != nil {
+		return err
+	}
+	return db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_task_edit_sessions_one_active
+		ON task_edit_sessions (task_id)
+		WHERE status IN ('draft','queued','materializing','applying_direct_edits','applying_annotations','svg_validating','quality_checking','exporting','pptx_validating','publishing')`).Error
 }
 
 func acquireMigrationLock(db *gorm.DB) (func(), error) {

@@ -116,6 +116,12 @@ const (
 	ArtifactKindBeautifyLock            = "beautify_lock"
 	ArtifactKindBeautifyFidelityReport  = "beautify_fidelity_report"
 	ArtifactKindSourceSVGReference      = "source_svg_reference"
+	ArtifactKindManualEditPatch         = "manual_edit_patch"
+	ArtifactKindManualEditApplyReport   = "manual_edit_apply_report"
+	ArtifactKindAnnotationApplyReport   = "annotation_apply_report"
+	ArtifactKindManualEditDiffReport    = "manual_edit_diff_report"
+	ArtifactKindManualEditLock          = "manual_edit_lock"
+	ArtifactKindManualEditLog           = "manual_edit_log"
 	ArtifactKindOther                   = "other"
 )
 
@@ -195,6 +201,135 @@ type Artifact struct {
 func (Artifact) TableName() string {
 	return "artifacts"
 }
+
+const (
+	ArtifactVersionStatusStaging = "staging"
+	ArtifactVersionStatusActive  = "active"
+	ArtifactVersionStatusFailed  = "failed"
+
+	ArtifactVersionSourceGeneration = "generation"
+	ArtifactVersionSourceManualEdit = "manual_edit"
+)
+
+type TaskArtifactVersion struct {
+	ID                     string     `json:"id" gorm:"primaryKey;size:64"`
+	TaskID                 string     `json:"task_id" gorm:"not null;size:64;uniqueIndex:idx_task_artifact_version,priority:1;index"`
+	Version                string     `json:"version" gorm:"not null;size:64;uniqueIndex:idx_task_artifact_version,priority:2"`
+	Status                 string     `json:"status" gorm:"not null;size:32;index"`
+	Source                 string     `json:"source" gorm:"not null;size:32;index"`
+	ParentVersion          string     `json:"parent_version" gorm:"not null;size:64;default:''"`
+	ArtifactManifestSHA256 string     `json:"artifact_manifest_sha256" gorm:"not null;size:64"`
+	PPTXArtifactID         string     `json:"pptx_artifact_id" gorm:"not null;size:64;default:''"`
+	EditSessionID          string     `json:"edit_session_id" gorm:"not null;size:64;default:'';index"`
+	EditRevision           int64      `json:"edit_revision" gorm:"not null;default:0"`
+	MetadataJSON           string     `json:"metadata_json" gorm:"not null;type:text;default:'{}'"`
+	CreatedAt              time.Time  `json:"created_at" gorm:"not null"`
+	ActivatedAt            *time.Time `json:"activated_at,omitempty" gorm:"index"`
+	FailedAt               *time.Time `json:"failed_at,omitempty"`
+}
+
+func (TaskArtifactVersion) TableName() string { return "task_artifact_versions" }
+
+const (
+	EditSessionStatusDraft               = "draft"
+	EditSessionStatusQueued              = "queued"
+	EditSessionStatusMaterializing       = "materializing"
+	EditSessionStatusApplyingDirect      = "applying_direct_edits"
+	EditSessionStatusApplyingAnnotations = "applying_annotations"
+	EditSessionStatusSVGValidating       = "svg_validating"
+	EditSessionStatusQualityChecking     = "quality_checking"
+	EditSessionStatusExporting           = "exporting"
+	EditSessionStatusPPTXValidating      = "pptx_validating"
+	EditSessionStatusPublishing          = "publishing"
+	EditSessionStatusPublished           = "published"
+	EditSessionStatusFailed              = "failed"
+	EditSessionStatusStale               = "stale"
+	EditSessionStatusDiscarded           = "discarded"
+)
+
+var ActiveEditSessionStatuses = []string{
+	EditSessionStatusDraft,
+	EditSessionStatusQueued,
+	EditSessionStatusMaterializing,
+	EditSessionStatusApplyingDirect,
+	EditSessionStatusApplyingAnnotations,
+	EditSessionStatusSVGValidating,
+	EditSessionStatusQualityChecking,
+	EditSessionStatusExporting,
+	EditSessionStatusPPTXValidating,
+	EditSessionStatusPublishing,
+}
+
+func IsActiveEditSessionStatus(status string) bool {
+	for _, active := range ActiveEditSessionStatuses {
+		if status == active {
+			return true
+		}
+	}
+	return false
+}
+
+type TaskEditSession struct {
+	ID                         string     `json:"id" gorm:"primaryKey;size:64"`
+	TaskID                     string     `json:"task_id" gorm:"not null;size:64;index"`
+	BasePublishVersion         string     `json:"base_publish_version" gorm:"not null;size:64;index"`
+	BaseArtifactManifestSHA256 string     `json:"base_artifact_manifest_sha256" gorm:"not null;size:64"`
+	BaseSVGInventorySHA256     string     `json:"base_svg_inventory_sha256" gorm:"not null;size:64"`
+	Status                     string     `json:"status" gorm:"not null;size:48;index"`
+	Revision                   int64      `json:"revision" gorm:"not null;default:1"`
+	DraftJSON                  string     `json:"draft" gorm:"not null;type:text;default:'{}'"`
+	DraftSHA256                string     `json:"draft_sha256" gorm:"not null;size:64"`
+	FrozenRevision             int64      `json:"frozen_revision" gorm:"not null;default:0"`
+	FrozenPatchSHA256          string     `json:"frozen_patch_sha256" gorm:"not null;size:64;default:''"`
+	ResultPublishVersion       string     `json:"result_publish_version" gorm:"not null;size:64;default:''"`
+	CapabilitySnapshotJSON     string     `json:"capability_snapshot" gorm:"not null;type:text;default:'{}'"`
+	ExecutionClaimToken        string     `json:"-" gorm:"not null;size:64;default:''"`
+	ExecutionClaimedAt         *time.Time `json:"-"`
+	LastRunID                  string     `json:"last_run_id" gorm:"not null;size:64;default:''"`
+	ErrorMessage               string     `json:"error_message" gorm:"not null;type:text;default:''"`
+	FailurePhase               string     `json:"failure_phase" gorm:"not null;size:128;default:''"`
+	FailureMetadataJSON        string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
+	CreatedAt                  time.Time  `json:"created_at" gorm:"not null"`
+	UpdatedAt                  time.Time  `json:"updated_at" gorm:"not null"`
+	AppliedAt                  *time.Time `json:"applied_at,omitempty"`
+	PublishedAt                *time.Time `json:"published_at,omitempty"`
+	DiscardedAt                *time.Time `json:"discarded_at,omitempty"`
+}
+
+func (TaskEditSession) TableName() string { return "task_edit_sessions" }
+
+const (
+	EditPhaseMaterialize     = "manual_edit_materialize"
+	EditPhaseApplyDirect     = "manual_edit_apply_direct"
+	EditPhaseApplyAnnotation = "manual_edit_apply_annotations"
+	EditPhaseSVGValidate     = "manual_edit_svg_validate"
+	EditPhaseQualityCheck    = "manual_edit_quality_check"
+	EditPhaseFinalizeExport  = "manual_edit_finalize_export"
+	EditPhasePPTXValidate    = "manual_edit_pptx_validate"
+	EditPhasePublish         = "manual_edit_publish"
+)
+
+type TaskEditRun struct {
+	ID              string     `json:"id" gorm:"primaryKey;size:64"`
+	TaskID          string     `json:"task_id" gorm:"not null;size:64;index"`
+	EditSessionID   string     `json:"edit_session_id" gorm:"not null;size:64;index"`
+	Phase           string     `json:"phase" gorm:"not null;size:64;index"`
+	Attempt         int        `json:"attempt" gorm:"not null;default:1"`
+	Runner          string     `json:"runner" gorm:"not null;size:64"`
+	Status          string     `json:"status" gorm:"not null;size:32;index"`
+	WorkspacePath   string     `json:"-" gorm:"not null;type:text;default:''"`
+	RuntimeRunID    string     `json:"runtime_run_id" gorm:"not null;size:128;default:''"`
+	InputJSON       string     `json:"input" gorm:"not null;type:text;default:'{}'"`
+	OutputJSON      string     `json:"output" gorm:"not null;type:text;default:'{}'"`
+	ErrorMessage    string     `json:"error_message" gorm:"not null;type:text;default:''"`
+	FailureMetadata string     `json:"failure_metadata" gorm:"not null;type:text;default:'{}'"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	FinishedAt      *time.Time `json:"finished_at,omitempty"`
+	CreatedAt       time.Time  `json:"created_at" gorm:"not null"`
+	UpdatedAt       time.Time  `json:"updated_at" gorm:"not null"`
+}
+
+func (TaskEditRun) TableName() string { return "task_edit_runs" }
 
 type TaskRuntimeRun struct {
 	ID                  string     `json:"id" gorm:"primaryKey;size:64"`

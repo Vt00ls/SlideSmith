@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -351,6 +352,172 @@ func (h *TaskHandler) ListArtifacts(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, gin.H{"data": artifacts})
 }
 
+func (h *TaskHandler) ListArtifactVersions(ctx *gin.Context) {
+	versions, err := h.tasks.ListArtifactVersions(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": versions})
+}
+
+func (h *TaskHandler) GetArtifactVersion(ctx *gin.Context) {
+	version, err := h.tasks.GetArtifactVersion(ctx.Request.Context(), ctx.Param("id"), ctx.Param("version"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": version})
+}
+
+func (h *TaskHandler) ListArtifactsByVersion(ctx *gin.Context) {
+	artifacts, err := h.tasks.ListArtifactsByVersion(ctx.Request.Context(), ctx.Param("id"), ctx.Param("version"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": artifacts})
+}
+
+func (h *TaskHandler) CreateEditSession(ctx *gin.Context) {
+	var req struct {
+		BasePublishVersion string `json:"base_publish_version"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	session, err := h.tasks.CreateEditSession(ctx.Request.Context(), ctx.Param("id"), req.BasePublishVersion)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusCreated, gin.H{"data": session})
+}
+
+func (h *TaskHandler) ListEditSessions(ctx *gin.Context) {
+	sessions, err := h.tasks.ListEditSessions(ctx.Request.Context(), ctx.Param("id"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": sessions})
+}
+
+func (h *TaskHandler) GetEditSession(ctx *gin.Context) {
+	session, err := h.tasks.GetEditSession(ctx.Request.Context(), ctx.Param("id"), ctx.Param("sessionId"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": session})
+}
+
+func (h *TaskHandler) SaveEditSessionDraft(ctx *gin.Context) {
+	var req struct {
+		ExpectedRevision int64           `json:"expected_revision"`
+		Draft            json.RawMessage `json:"draft"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	session, err := h.tasks.SaveEditSessionDraft(ctx.Request.Context(), ctx.Param("id"), ctx.Param("sessionId"), req.ExpectedRevision, req.Draft)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": session})
+}
+
+func (h *TaskHandler) ApplyEditSession(ctx *gin.Context) {
+	var req struct {
+		ExpectedRevision    int64  `json:"expected_revision"`
+		ExpectedDraftSHA256 string `json:"expected_draft_sha256"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	session, err := h.tasks.ApplyEditSession(ctx.Request.Context(), ctx.Param("id"), ctx.Param("sessionId"), req.ExpectedRevision, req.ExpectedDraftSHA256)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusAccepted, gin.H{"data": session})
+}
+
+func (h *TaskHandler) DiscardEditSession(ctx *gin.Context) {
+	session, err := h.tasks.DiscardEditSession(ctx.Request.Context(), ctx.Param("id"), ctx.Param("sessionId"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": session})
+}
+
+func (h *TaskHandler) CloneEditSession(ctx *gin.Context) {
+	session, err := h.tasks.CloneEditSession(ctx.Request.Context(), ctx.Param("id"), ctx.Param("sessionId"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusCreated, gin.H{"data": session})
+}
+
+func (h *TaskHandler) RetryEditSession(ctx *gin.Context) {
+	var req struct {
+		Phase string `json:"phase"`
+	}
+	if err := ctx.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		errorJSON(ctx, http.StatusBadRequest, err)
+		return
+	}
+	session, err := h.tasks.RetryEditSession(ctx.Request.Context(), ctx.Param("id"), ctx.Param("sessionId"), req.Phase)
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusAccepted, gin.H{"data": session})
+}
+
+func (h *TaskHandler) ListEditRuns(ctx *gin.Context) {
+	runs, err := h.tasks.ListEditRuns(ctx.Request.Context(), ctx.Param("id"), ctx.Param("sessionId"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": runs})
+}
+
+func (h *TaskHandler) GetEditSessionPage(ctx *gin.Context) {
+	page, err := h.tasks.GetEditSessionPage(ctx.Request.Context(), ctx.Param("id"), ctx.Param("sessionId"), ctx.Param("pageId"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.Header("Cache-Control", "no-store")
+	ctx.JSON(http.StatusOK, gin.H{"data": page})
+}
+
+func (h *TaskHandler) GetSVGBundleByVersion(ctx *gin.Context) {
+	bundle, err := h.tasks.GetSVGBundleByVersion(ctx.Request.Context(), ctx.Param("id"), ctx.Param("version"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.JSON(http.StatusOK, gin.H{"data": bundle})
+}
+
+func (h *TaskHandler) DownloadPPTXByVersion(ctx *gin.Context) {
+	artifact, path, err := h.tasks.PPTXByVersion(ctx.Request.Context(), ctx.Param("id"), ctx.Param("version"))
+	if err != nil {
+		handleServiceError(ctx, err)
+		return
+	}
+	ctx.FileAttachment(path, artifact.Name)
+}
+
 func (h *TaskHandler) GetResources(ctx *gin.Context) {
 	resources, err := h.tasks.GetResources(ctx.Request.Context(), ctx.Param("id"))
 	if err != nil {
@@ -403,6 +570,26 @@ func (h *TaskHandler) DownloadPPTX(ctx *gin.Context) {
 func handleServiceError(ctx *gin.Context, err error) {
 	if errors.Is(err, repository.ErrNotFound) {
 		errorJSON(ctx, http.StatusNotFound, err)
+		return
+	}
+	if errors.Is(err, repository.ErrConflict) {
+		errorJSON(ctx, http.StatusConflict, err)
+		return
+	}
+	if errors.Is(err, repository.ErrLocked) {
+		errorJSON(ctx, http.StatusLocked, err)
+		return
+	}
+	if errors.Is(err, service.ErrUnprocessable) {
+		errorJSON(ctx, http.StatusUnprocessableEntity, err)
+		return
+	}
+	if errors.Is(err, service.ErrGone) {
+		errorJSON(ctx, http.StatusGone, err)
+		return
+	}
+	if errors.Is(err, service.ErrUnavailable) {
+		errorJSON(ctx, http.StatusServiceUnavailable, err)
 		return
 	}
 	errorJSON(ctx, http.StatusBadRequest, err)

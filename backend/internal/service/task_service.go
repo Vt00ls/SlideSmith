@@ -3384,6 +3384,11 @@ func (s *TaskService) publishRuntimeArtifacts(ctx context.Context, task *model.T
 		}); err != nil {
 			return nil, true, err
 		}
+		versionRow, err := s.registerGenerationArtifactVersion(ctx, task.ID, publishVersion, persisted)
+		if err != nil {
+			return nil, true, fmt.Errorf("activate artifact version: %w", err)
+		}
+		contract["artifact_manifest_sha256"] = versionRow.ArtifactManifestSHA256
 		attempt.disarm()
 		return contract, true, nil
 	}

@@ -83,6 +83,119 @@ export type Artifact = {
   updated_at: string;
 };
 
+export type ArtifactVersion = {
+  version: string;
+  status: "active" | string;
+  source: "generation" | "manual_edit" | string;
+  parent_version: string;
+  is_latest: boolean;
+  edit_session_id: string;
+  edit_revision: number;
+  pptx_artifact_id: string;
+  artifact_manifest_sha256: string;
+  activated_at?: string;
+};
+
+export type EditSessionStatus =
+  | "draft" | "queued" | "materializing" | "applying_direct_edits" | "applying_annotations"
+  | "svg_validating" | "quality_checking" | "exporting" | "pptx_validating" | "publishing"
+  | "published" | "failed" | "stale" | "discarded";
+
+export type EditSession = {
+  id: string;
+  task_id: string;
+  base_publish_version: string;
+  base_artifact_manifest_sha256: string;
+  base_svg_inventory_sha256: string;
+  status: EditSessionStatus;
+  revision: number;
+  draft: string;
+  draft_sha256: string;
+  frozen_revision: number;
+  frozen_patch_sha256: string;
+  result_publish_version: string;
+  capability_snapshot: string;
+  last_run_id: string;
+  error_message: string;
+  failure_phase: string;
+  failure_metadata: string;
+  created_at: string;
+  updated_at: string;
+  applied_at?: string;
+  published_at?: string;
+  discarded_at?: string;
+};
+
+export type EditRun = {
+  id: string;
+  task_id: string;
+  edit_session_id: string;
+  phase: string;
+  attempt: number;
+  runner: string;
+  status: string;
+  runtime_run_id: string;
+  input: string;
+  output: string;
+  error_message: string;
+  failure_metadata: string;
+  started_at?: string;
+  finished_at?: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ManualEditTarget = {
+  element_id: string;
+  source_id?: string;
+  tag: string;
+  element_fingerprint: string;
+};
+
+export type ManualEditOperation = {
+  operation_id: string;
+  type: "set_text" | "translate" | "set_fill" | "set_stroke" | "set_opacity" | "set_font_size" | "set_font_family" | "set_font_weight" | "set_text_anchor";
+  target: ManualEditTarget;
+  value: Record<string, string | number>;
+};
+
+export type ManualEditDraft = {
+  schema: "slidesmith.manual_edit_draft.v1";
+  task_id?: string;
+  edit_session_id?: string;
+  base_publish_version?: string;
+  base_artifact_manifest_sha256?: string;
+  base_svg_inventory_sha256?: string;
+  pages: Array<{ page_id: string; base_svg_sha256?: string; operations: ManualEditOperation[] }>;
+  annotations: Array<{
+    annotation_id: string;
+    scope: "element" | "page";
+    page_id: string;
+    target?: ManualEditTarget;
+    instruction: string;
+    status: "pending";
+  }>;
+  client_updated_at?: string;
+};
+
+export type ManualEditSnapshotElement = ManualEditTarget & {
+  text?: string;
+  attributes: Record<string, string>;
+};
+
+export type ManualEditPageSnapshot = {
+  task_id: string;
+  session_id: string;
+  revision: number;
+  page_id: string;
+  base_svg_sha256: string;
+  editor_snapshot_sha256: string;
+  canvas: { width: number; height: number; view_box: string };
+  svg: string;
+  elements: ManualEditSnapshotElement[];
+  warnings: string[];
+};
+
 export type RuntimeRun = {
   id: string;
   task_id: string;
@@ -248,7 +361,8 @@ export type SVGPageSummary = {
 };
 
 export type SVGBundleSummary = {
-  task_id: string;
+	task_id: string;
+	publish_version?: string;
   phase_status: string;
   passed: boolean;
   canvas: SVGCanvasSummary;
@@ -663,14 +777,28 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ values }),
     }),
-  listArtifacts: (id: string) => request<Artifact[]>(`/tasks/${encodeURIComponent(id)}/artifacts`),
+	listArtifacts: (id: string) => request<Artifact[]>(`/tasks/${encodeURIComponent(id)}/artifacts`),
+	listArtifactVersions: (id: string) => request<ArtifactVersion[]>(`/tasks/${encodeURIComponent(id)}/versions`),
+	listArtifactsByVersion: (id: string, version: string) => request<Artifact[]>(`/tasks/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/artifacts`),
+	getSVGBundleByVersion: (id: string, version: string) => request<SVGBundleSummary>(`/tasks/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/svg-bundle`),
+	createEditSession: (id: string, basePublishVersion: string) => request<EditSession>(`/tasks/${encodeURIComponent(id)}/edit-sessions`, { method: "POST", body: JSON.stringify({ base_publish_version: basePublishVersion }) }),
+	listEditSessions: (id: string) => request<EditSession[]>(`/tasks/${encodeURIComponent(id)}/edit-sessions`),
+	getEditSession: (id: string, sessionId: string) => request<EditSession>(`/tasks/${encodeURIComponent(id)}/edit-sessions/${encodeURIComponent(sessionId)}`),
+	saveEditSessionDraft: (id: string, sessionId: string, expectedRevision: number, draft: ManualEditDraft) => request<EditSession>(`/tasks/${encodeURIComponent(id)}/edit-sessions/${encodeURIComponent(sessionId)}/draft`, { method: "PUT", body: JSON.stringify({ expected_revision: expectedRevision, draft }) }),
+	applyEditSession: (id: string, sessionId: string, expectedRevision: number, expectedDraftSHA256: string) => request<EditSession>(`/tasks/${encodeURIComponent(id)}/edit-sessions/${encodeURIComponent(sessionId)}/apply`, { method: "POST", body: JSON.stringify({ expected_revision: expectedRevision, expected_draft_sha256: expectedDraftSHA256 }) }),
+	retryEditSession: (id: string, sessionId: string, phase = "") => request<EditSession>(`/tasks/${encodeURIComponent(id)}/edit-sessions/${encodeURIComponent(sessionId)}/retry`, { method: "POST", body: JSON.stringify({ phase }) }),
+	discardEditSession: (id: string, sessionId: string) => request<EditSession>(`/tasks/${encodeURIComponent(id)}/edit-sessions/${encodeURIComponent(sessionId)}/discard`, { method: "POST", body: "{}" }),
+	cloneEditSession: (id: string, sessionId: string) => request<EditSession>(`/tasks/${encodeURIComponent(id)}/edit-sessions/${encodeURIComponent(sessionId)}/clone`, { method: "POST", body: "{}" }),
+	listEditRuns: (id: string, sessionId: string) => request<EditRun[]>(`/tasks/${encodeURIComponent(id)}/edit-sessions/${encodeURIComponent(sessionId)}/runs`),
+	getEditSessionPage: (id: string, sessionId: string, pageId: string) => request<ManualEditPageSnapshot>(`/tasks/${encodeURIComponent(id)}/edit-sessions/${encodeURIComponent(sessionId)}/pages/${encodeURIComponent(pageId)}`),
   getResources: (id: string) => request<TaskResources>(`/tasks/${encodeURIComponent(id)}/resources`),
   getSVGBundle: (id: string) => request<SVGBundleSummary>(`/tasks/${encodeURIComponent(id)}/svg-bundle`),
   getQuality: (id: string) =>
     request<TaskQuality>(`/tasks/${encodeURIComponent(id)}/quality`).then(normalizeTaskQuality),
   artifactContentUrl: (taskId: string, artifactId: string) =>
     `${API_BASE}/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
-  pptxDownloadUrl: (taskId: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/download/pptx`,
+	pptxDownloadUrl: (taskId: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/download/pptx`,
+	versionPPTXDownloadUrl: (taskId: string, version: string) => `${API_BASE}/tasks/${encodeURIComponent(taskId)}/versions/${encodeURIComponent(version)}/download/pptx`,
 };
 
 export function parseJSON<T>(value: string, fallback: T): T {

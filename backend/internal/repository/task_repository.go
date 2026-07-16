@@ -523,6 +523,13 @@ func (r *Repository) DeleteArtifactsByIDsOrObjectKeyPrefix(ctx context.Context, 
 }
 
 func (r *Repository) latestPublishVersion(ctx context.Context, taskID string) (string, error) {
+	latest, versionErr := r.LatestArtifactVersion(ctx, taskID)
+	if versionErr == nil {
+		return latest.Version, nil
+	}
+	if !errors.Is(versionErr, ErrNotFound) {
+		return "", versionErr
+	}
 	var artifact model.Artifact
 	err := r.db.WithContext(ctx).
 		Where("task_id = ? AND publish_version <> ''", taskID).
@@ -567,9 +574,15 @@ func (r *Repository) FirstArtifactByKind(ctx context.Context, taskID, kind strin
 }
 
 func (r *Repository) LatestPPTXArtifact(ctx context.Context, taskID string) (*model.Artifact, error) {
+	latestVersion, versionErr := r.LatestArtifactVersion(ctx, taskID)
 	var artifact model.Artifact
-	err := r.db.WithContext(ctx).
-		Where("task_id = ? AND kind = ?", taskID, model.ArtifactKindPPTX).
+	query := r.db.WithContext(ctx).Where("task_id = ? AND kind = ?", taskID, model.ArtifactKindPPTX)
+	if versionErr == nil {
+		query = query.Where("publish_version = ?", latestVersion.Version)
+	} else if !errors.Is(versionErr, ErrNotFound) {
+		return nil, versionErr
+	}
+	err := query.
 		Order("created_at DESC").
 		First(&artifact).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {

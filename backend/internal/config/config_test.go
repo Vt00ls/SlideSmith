@@ -139,3 +139,24 @@ func TestLoadResourcePolicyOverrides(t *testing.T) {
 		t.Fatalf("resource limit overrides = %#v", cfg)
 	}
 }
+
+func TestLoadLivePreviewDefaultsAndOverrides(t *testing.T) {
+	for _, key := range []string{
+		"SLIDESMITH_LIVE_PREVIEW_EDIT_ENABLED", "SLIDESMITH_LIVE_PREVIEW_ANNOTATION_ENABLED",
+		"SLIDESMITH_LIVE_PREVIEW_MAX_ACTIVE_SESSIONS_PER_TASK", "SLIDESMITH_LIVE_PREVIEW_SESSION_TTL_HOURS",
+	} {
+		t.Setenv(key, "")
+	}
+	defaults := Load().AgentCompose
+	if defaults.LivePreviewEditEnabled || defaults.LivePreviewAnnotationEnabled || defaults.LivePreviewMaxActiveSessions != 1 || defaults.LivePreviewSessionTTL != 168*time.Hour {
+		t.Fatalf("live preview defaults = %#v", defaults)
+	}
+	t.Setenv("SLIDESMITH_LIVE_PREVIEW_EDIT_ENABLED", "true")
+	t.Setenv("SLIDESMITH_LIVE_PREVIEW_ANNOTATION_ENABLED", "true")
+	t.Setenv("SLIDESMITH_LIVE_PREVIEW_MAX_ACTIVE_SESSIONS_PER_TASK", "2")
+	t.Setenv("SLIDESMITH_LIVE_PREVIEW_SESSION_TTL_HOURS", "24")
+	overrides := Load().AgentCompose
+	if !overrides.LivePreviewEditEnabled || !overrides.LivePreviewAnnotationEnabled || overrides.LivePreviewMaxActiveSessions != 2 || overrides.LivePreviewSessionTTL != 24*time.Hour {
+		t.Fatalf("live preview overrides = %#v", overrides)
+	}
+}

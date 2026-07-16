@@ -65,6 +65,10 @@ type AgentComposeConfig struct {
 	ResourceWebProviders              string
 	ResourceAIProviders               string
 	ResourceFormulaNetwork            bool
+	LivePreviewEditEnabled            bool
+	LivePreviewAnnotationEnabled      bool
+	LivePreviewMaxActiveSessions      int
+	LivePreviewSessionTTL             time.Duration
 	SessionDataRoot                   string
 	Timeout                           time.Duration
 }
@@ -127,6 +131,10 @@ func Load() Config {
 			ResourceWebProviders:              env("SLIDESMITH_RESOURCE_ALLOWED_WEB_PROVIDERS", "openverse,wikimedia"),
 			ResourceAIProviders:               env("SLIDESMITH_RESOURCE_ALLOWED_AI_PROVIDERS", ""),
 			ResourceFormulaNetwork:            envBool("SLIDESMITH_RESOURCE_FORMULA_NETWORK_ENABLED", false),
+			LivePreviewEditEnabled:            envBool("SLIDESMITH_LIVE_PREVIEW_EDIT_ENABLED", false),
+			LivePreviewAnnotationEnabled:      envBool("SLIDESMITH_LIVE_PREVIEW_ANNOTATION_ENABLED", false),
+			LivePreviewMaxActiveSessions:      envInt("SLIDESMITH_LIVE_PREVIEW_MAX_ACTIVE_SESSIONS_PER_TASK", 1),
+			LivePreviewSessionTTL:             time.Duration(envInt("SLIDESMITH_LIVE_PREVIEW_SESSION_TTL_HOURS", 168)) * time.Hour,
 			SessionDataRoot:                   env("SLIDESMITH_AGENT_COMPOSE_SESSION_ROOT", ""),
 			Timeout:                           envDuration("SLIDESMITH_AGENT_COMPOSE_TIMEOUT", 30*time.Minute),
 		},
