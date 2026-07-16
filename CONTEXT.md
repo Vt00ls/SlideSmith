@@ -53,12 +53,24 @@ A single request within a Personal Workspace to create, restyle, or fill one Dec
 _Avoid_: Project, job, run
 
 **Task Workspace**:
-A Task's sole mutable working state, reused across its Phases and replaceable by restoring a Checkpoint. It is neither a User ownership boundary nor a durable Task output.
+A Task's sole logical identity for mutable working state, reused across its Phases; its physical materialization may expire and be rebuilt from a Checkpoint. It is neither a User ownership boundary nor a durable Task output.
 _Avoid_: Personal Workspace, Execution Workspace, Sandbox Workspace, run snapshot
 
+**Task Workspace Revision**:
+An authoritative immutable identity for the Task Workspace state produced by one validated mutation. Revisions order recoverable state without exposing how or where its bytes are materialized.
+_Avoid_: Checkpoint, directory version, run snapshot
+
+**Runtime View**:
+An isolated, disposable view through which one Runtime Run proposes mutations from a Task Workspace Revision. Its changes are not authoritative unless validation succeeds and the view is committed.
+_Avoid_: Task Workspace, Sandbox Workspace, session directory
+
 **Checkpoint**:
-An immutable capture of validated Task Workspace state at a successful Phase boundary, retained so production can resume without treating the live Task Workspace as durable truth.
-_Avoid_: Artifact Version, workspace backup, autosave
+An immutable recovery record created for every successful Phase Run and other validated Task Workspace commit, binding a Task Workspace Revision to only the declared recoverable Task-owned state. Different Checkpoints may share deduplicated content but remain distinct recovery identities.
+_Avoid_: Artifact Version, workspace backup, directory snapshot, autosave
+
+**Cleanup Debt**:
+A persistent obligation representing execution data that should have been reclaimed but was not. It remains retriable and observable until cleanup succeeds or an authorized decision resolves it.
+_Avoid_: Cleanup marker, log-only cleanup failure, failed residue
 
 **Source Material**:
 User-provided information that supplies the meaning and content of a Deck independently of its visual structure.
@@ -175,7 +187,7 @@ One attempt by a Task to enact a Phase from its pinned Pipeline Version, aggrega
 _Avoid_: Phase, Runtime Run, Task status
 
 **Runtime Run**:
-One invocation of an approved runtime capability that belongs to exactly one Phase Run. A Phase Run may require no Runtime Runs or may coordinate several of them before determining its outcome.
+One invocation of an approved runtime capability that belongs to exactly one Phase Run. A mutating Runtime Run operates through one isolated Runtime View, while a Phase Run may require no Runtime Runs or coordinate several before determining its outcome.
 _Avoid_: Phase Run, Task, Sandbox Lease
 
 **Sandbox Lease**:

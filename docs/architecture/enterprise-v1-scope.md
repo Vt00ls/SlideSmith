@@ -85,7 +85,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Confirmation Gates for reviewing and approving route-specific plans and constraints.
 - Task cancellation, retry, and recovery from validated Checkpoints.
 - Artifact Version history, individual Artifact downloads, and read-only sharing through Share Links and Access Codes.
-- Live Preview and post-publication manual edits that publish a new Artifact Version with parent lineage.
+- Live Preview and post-publication manual edits of the latest Artifact Version that reuse the Task's Task Workspace identity, reconstruct expired execution state when necessary, and create a new Task Workspace Revision and Checkpoint before publishing a child Artifact Version.
 
 ### Out of scope
 
@@ -119,7 +119,11 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Revoking Share Links when their Artifact Version is deleted or becomes unavailable.
 - Automatically releasing Sandbox Leases and cleaning sandbox state, Runtime Run temporary directories, expired Task Workspaces, disposable Checkpoints, caches, and incomplete publication residue.
 - Recovering required mutable execution state from validated Checkpoints rather than treating a live Task Workspace as permanent storage.
-- Configurable cleanup policies with observable cleanup failures and retriable cleanup debt.
+- Configurable cleanup policies with observable cleanup failures and retriable Cleanup Debt.
+- Treating Task Workspace as one logical identity whose node-local materialization is disposable and reconstructable.
+- Capturing only declared recoverable Task-owned mutable state in Checkpoints; Runtime Releases, Template Versions, Resource Bundles, Source Material, shared caches, sessions, and failed residue stay outside.
+- Retaining Checkpoints by recovery reachability and explicit references while allowing distinct Checkpoints to share content-addressed payloads.
+- Recording unresolved cleanup as durable Cleanup Debt with resource identity, retry history, failure evidence, and estimated bytes and inodes.
 
 ### Out of scope
 
@@ -149,3 +153,19 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Global scheduling or multi-region data replication.
 
 A single-server deployment is acceptable for development and acceptance testing, but it is not a highly available production topology.
+
+## Task Workspace lifecycle cutover
+
+### In scope
+
+- A hard cutover with no migration of legacy Task Workspace, Agent Compose session, cache, or failed-residue directories.
+- Preserving Task metadata, Source Material, Artifact Versions and Artifacts, release and template locks, and Phase Run and Runtime Run history.
+- Terminating old non-terminal Tasks as non-recoverable and requiring a new Task to continue from retained inputs or publications.
+- Deleting legacy execution data and recording every failed deletion as Cleanup Debt.
+- Using a production remote-but-owned transport adapter and node-independent durable Checkpoint content so workers do not share or learn host workspace paths.
+
+### Out of scope
+
+- Inferring validated Checkpoints by scanning legacy session directories.
+- Retaining a path-based compatibility facade after cutover.
+- Migrating or resuming in-flight legacy execution state.
