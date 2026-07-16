@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 
 type TaskSVGBundleView struct {
 	TaskID          string            `json:"task_id"`
+	PublishVersion  string            `json:"publish_version,omitempty"`
 	PhaseStatus     string            `json:"phase_status"`
 	Passed          bool              `json:"passed"`
 	Canvas          TaskSVGCanvasView `json:"canvas"`
@@ -25,6 +27,100 @@ type TaskSVGBundleView struct {
 	ArtifactIDs     map[string]string `json:"artifact_ids"`
 	InventorySHA256 string            `json:"inventory_sha256"`
 	PhaseRunID      string            `json:"phase_run_id"`
+}
+
+func (s *TaskService) GetSVGBundleByVersion(ctx context.Context, taskID, publishVersion string) (*TaskSVGBundleView, error) {
+	artifacts, err := s.ListArtifactsByVersion(ctx, taskID, publishVersion)
+	if err != nil {
+		return nil, err
+	}
+	view := &TaskSVGBundleView{
+		TaskID: taskID, PublishVersion: publishVersion, PhaseStatus: PhaseRunStatusSucceeded,
+		Pages: []TaskSVGPageView{}, ResourceSummary: map[string]int{}, ChartSummary: map[string]int{},
+		Errors: []string{}, Warnings: []string{}, ArtifactIDs: map[string]string{},
+	}
+	var inventory svgInventoryDocument
+	var notes notesInventoryDocument
+	foundInventory := false
+	artifactByPath := map[string]string{}
+	for _, artifact := range artifacts {
+		view.ArtifactIDs[artifact.Kind] = artifact.ID
+		relative := versionArtifactRelativePath(taskID, publishVersion, artifact.ObjectKey)
+		artifactByPath[relative] = artifact.ID
+		switch artifact.Kind {
+		case model.ArtifactKindSVGInventory:
+			if err := readStoredJSONArtifact(s.storage, artifact, &inventory); err != nil {
+				return nil, err
+			}
+			foundInventory = true
+		case model.ArtifactKindNotesInventory:
+			if err := readStoredJSONArtifact(s.storage, artifact, &notes); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if !foundInventory || inventory.Schema != svgInventorySchema || inventory.TaskID != taskID {
+		return nil, fmt.Errorf("version %s has no valid SVG inventory", publishVersion)
+	}
+	view.Passed = true
+	view.Canvas.ID = inventory.Canvas
+	view.PageCount = inventory.PageCount
+	view.ResourceSummary = inventory.ResourceSummary
+	view.ChartSummary = inventory.ChartSummary
+	for _, page := range inventory.Pages {
+		if view.Canvas.Width == 0 {
+			view.Canvas.Width, view.Canvas.Height = page.Width, page.Height
+		}
+		notesPresent := false
+		for _, note := range notes.Pages {
+			if note.PageID == page.PageID {
+				notesPresent = true
+				if note.Empty {
+					view.Notes.EmptyPages++
+				}
+				break
+			}
+		}
+		view.Pages = append(view.Pages, TaskSVGPageView{
+			PageID: page.PageID, Page: page.Page, Filename: filepath.Base(filepath.FromSlash(page.Path)), SHA256: page.SHA256,
+			TextCount: page.TextCount, ImageCount: page.ImageCount, ChartCount: page.ChartCount,
+			ResourceCount: len(page.ResourceIDs), NotesPresent: notesPresent, Warnings: append([]string{}, page.Warnings...),
+			ArtifactID: artifactByPath[page.Path],
+		})
+		view.Warnings = append(view.Warnings, page.Warnings...)
+	}
+	view.Notes.Present = notes.PageCount == inventory.PageCount
+	view.Notes.PageCount = notes.PageCount
+	view.InventorySHA256 = inventoryArtifactSHA(artifacts)
+	return view, nil
+}
+
+func versionArtifactRelativePath(taskID, version, objectKey string) string {
+	prefix := filepath.ToSlash(filepath.Join("tasks", taskID, "artifacts", version)) + "/"
+	return strings.TrimPrefix(filepath.ToSlash(objectKey), prefix)
+}
+
+func readStoredJSONArtifact(storage StorageService, artifact model.Artifact, target any) error {
+	if _, err := validateStoredArtifact(storage, artifact); err != nil {
+		return err
+	}
+	raw, err := os.ReadFile(storage.Path(artifact.ObjectKey))
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(raw, target); err != nil {
+		return fmt.Errorf("decode stored artifact %s: %w", artifact.ObjectKey, err)
+	}
+	return nil
+}
+
+func inventoryArtifactSHA(artifacts []model.Artifact) string {
+	for _, artifact := range artifacts {
+		if artifact.Kind == model.ArtifactKindSVGInventory {
+			return artifact.SHA256
+		}
+	}
+	return ""
 }
 
 type TaskSVGCanvasView struct {

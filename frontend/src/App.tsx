@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowLeft,
@@ -24,12 +24,20 @@ import {
   XCircle,
 } from "lucide-react";
 import {
-  api,
-  Artifact,
+	api,
+	APIError,
+	Artifact,
+	ArtifactVersion,
   BeautifyFidelityMetric,
   BeautifyPlan,
   BeautifyPlanPreview,
-  Confirmation,
+	Confirmation,
+	EditRun,
+	EditSession,
+	ManualEditDraft,
+	ManualEditOperation,
+	ManualEditPageSnapshot,
+	ManualEditSnapshotElement,
   parseJSON,
   RetryPhase,
   RuntimeRun,
@@ -729,13 +737,18 @@ function previewPageKey(taskId: string) {
 }
 
 function createPreviewPageState(taskId: string) {
-  return {
-    taskId,
-    task: null as Task | null,
-    artifacts: [] as Artifact[],
-    selectedId: "",
-    error: "",
-  };
+	return {
+		taskId,
+		task: null as Task | null,
+		artifacts: [] as Artifact[],
+		versions: [] as ArtifactVersion[],
+		selectedVersion: "",
+		bundle: emptySVGBundle(taskId),
+		sessions: [] as EditSession[],
+		activeSession: null as EditSession | null,
+		selectedId: "",
+		error: "",
+	};
 }
 
 function previewPageStateForTask(state: ReturnType<typeof createPreviewPageState>, taskId: string) {
@@ -3021,98 +3034,312 @@ function SpecFilePanel({ file, title }: { file: SpecPreview["design_spec"]; titl
   );
 }
 
+const activeEditSessionStatuses = new Set(["draft", "queued", "materializing", "applying_direct_edits", "applying_annotations", "svg_validating", "quality_checking", "exporting", "pptx_validating", "publishing"]);
+
+function emptyManualEditDraft(): ManualEditDraft {
+	return { schema: "slidesmith.manual_edit_draft.v1", pages: [], annotations: [] };
+}
+
+function editSessionStatusText(status?: string) {
+	return ({
+		draft: "草稿", queued: "已排队", materializing: "准备隔离副本", applying_direct_edits: "应用直接修改",
+		applying_annotations: "应用 AI 批注", svg_validating: "校验 SVG", quality_checking: "质量门禁",
+		exporting: "重新导出", pptx_validating: "校验 PPTX", publishing: "发布新版本", published: "已发布",
+		failed: "失败", stale: "基线已过期", discarded: "已放弃",
+	} as Record<string, string>)[status || ""] || status || "未开始";
+}
+
+function previewIframeDocument(snapshot: ManualEditPageSnapshot) {
+	const controller = `<script>(()=>{const meta=${JSON.stringify({ session_id: snapshot.session_id, page_id: snapshot.page_id, revision: snapshot.revision })};const nodes=()=>Array.from(document.querySelectorAll('[data-editor-selectable="true"]'));document.addEventListener('click',event=>{const node=event.target.closest('[data-editor-selectable="true"]');if(!node)return;event.preventDefault();nodes().forEach(item=>item.removeAttribute('data-editor-selected'));node.setAttribute('data-editor-selected','true');parent.postMessage({schema:'slidesmith.editor_message.v1',type:'select',...meta,element_id:node.getAttribute('data-editor-id'),element_fingerprint:node.getAttribute('data-editor-fingerprint')},'*')});addEventListener('message',event=>{const message=event.data||{};if(message.schema!=='slidesmith.editor_message.v1'||message.type!=='apply_preview'||message.session_id!==meta.session_id||message.page_id!==meta.page_id||message.revision!==meta.revision)return;const node=nodes().find(item=>item.getAttribute('data-editor-id')===message.element_id);if(!node)return;if(message.operation==='set_text')node.textContent=String(message.value.text??'');else if(message.operation==='translate'){const dx=message.value.dx===undefined?Number(node.dataset.editorDx||0):Number(message.value.dx);const dy=message.value.dy===undefined?Number(node.dataset.editorDy||0):Number(message.value.dy);node.dataset.editorDx=String(dx);node.dataset.editorDy=String(dy);node.setAttribute('transform','translate('+dx+' '+dy+')')}else{const attrs={set_fill:'fill',set_stroke:'stroke',set_opacity:'opacity',set_font_size:'font-size',set_font_family:'font-family',set_font_weight:'font-weight',set_text_anchor:'text-anchor'};const attr=attrs[message.operation];if(attr)node.setAttribute(attr,String(message.value[message.operation.replace('set_','')]??''));}});})();</script>`;
+	return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'"><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#fff}svg{display:block;width:100%;height:100%}[data-editor-selectable="true"]{cursor:pointer}[data-editor-selected="true"]{outline:3px solid #d8762f;outline-offset:3px}</style></head><body>${snapshot.svg}${controller}</body></html>`;
+}
+
+let editClientIDSequence = 0;
+
+function newEditClientID() {
+	if (typeof globalThis.crypto?.randomUUID === "function") return globalThis.crypto.randomUUID();
+	const random = new Uint8Array(16);
+	if (typeof globalThis.crypto?.getRandomValues === "function") globalThis.crypto.getRandomValues(random);
+	else for (let index = 0; index < random.length; index += 1) random[index] = Math.floor(Math.random() * 256);
+	random[6] = (random[6] & 0x0f) | 0x40;
+	random[8] = (random[8] & 0x3f) | 0x80;
+	const hex = Array.from(random, (value) => value.toString(16).padStart(2, "0")).join("");
+	editClientIDSequence += 1;
+	return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}-${editClientIDSequence.toString(16)}`;
+}
+
+function manualEditOperationMatchesBase(type: ManualEditOperation["type"], value: ManualEditOperation["value"], element: ManualEditSnapshotElement) {
+	switch (type) {
+		case "set_text": return String(value.text ?? "") === (element.text || "");
+		case "set_fill": return String(value.fill ?? "").trim().toLowerCase() === (element.attributes.fill || "#000000").trim().toLowerCase();
+		case "set_stroke": return String(value.stroke ?? "").trim().toLowerCase() === (element.attributes.stroke || "none").trim().toLowerCase();
+		case "set_opacity": return Number(value.opacity) === Number(element.attributes.opacity || "1");
+		case "set_font_size": return Number(value.font_size) === Number(element.attributes["font-size"] || "32");
+		case "set_font_family": return String(value.font_family ?? "").trim() === (element.attributes["font-family"] || "Arial").trim();
+		case "set_font_weight": return String(value.font_weight ?? "").trim() === (element.attributes["font-weight"] || "normal").trim();
+		case "set_text_anchor": return String(value.text_anchor ?? "").trim() === (element.attributes["text-anchor"] || "start").trim();
+		default: return false;
+	}
+}
+
 function PreviewPage({ taskId }: { taskId: string }) {
-  const [state, setState] = useState(() => createPreviewPageState(taskId));
-  const visibleState = previewPageStateForTask(state, taskId);
+	const [state, setState] = useState(() => createPreviewPageState(taskId));
+	const visibleState = previewPageStateForTask(state, taskId);
+	const [selectedPageId, setSelectedPageId] = useState("");
+	const [snapshot, setSnapshot] = useState<ManualEditPageSnapshot | null>(null);
+	const [selectedElementId, setSelectedElementId] = useState("");
+	const [draft, setDraft] = useState<ManualEditDraft>(emptyManualEditDraft);
+	const [dirty, setDirty] = useState(false);
+	const [conflict, setConflict] = useState(false);
+	const [busy, setBusy] = useState("");
+	const [annotationText, setAnnotationText] = useState("");
+	const [runs, setRuns] = useState<EditRun[]>([]);
+	const iframeRef = useRef<HTMLIFrameElement>(null);
 
-  useEffect(() => {
-    let active = true;
-    async function load() {
-      try {
-        const result = await loadPreviewPageData(
-          taskId,
-          api.getTask,
-          api.listArtifacts,
-          () => active && taskRouteMatches(parseRoute(), "preview", taskId),
-          replaceRoute,
-        );
-        if (!result) {
-          return;
-        }
-        const { task: nextTask, artifacts: nextArtifacts } = result;
-        const svg = nextArtifacts.filter((artifact) => artifact.kind === "svg_final");
-        setState({
-          taskId,
-          task: nextTask,
-          artifacts: nextArtifacts,
-          selectedId: svg[0]?.id || "",
-          error: "",
-        });
-      } catch (err) {
-        if (active && taskRouteMatches(parseRoute(), "preview", taskId)) {
-          setState({
-            ...createPreviewPageState(taskId),
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      }
-    }
-    void load();
-    return () => {
-      active = false;
-    };
-  }, [taskId]);
+	const setError = useCallback((error: string) => setState((current) => current.taskId === taskId ? { ...current, error } : current), [taskId]);
+	const setActiveSession = useCallback((session: EditSession | null) => {
+		setState((current) => current.taskId === taskId ? { ...current, activeSession: session } : current);
+		setDraft(session ? parseJSON<ManualEditDraft>(session.draft, emptyManualEditDraft()) : emptyManualEditDraft());
+		setDirty(false);
+		setConflict(false);
+	}, [taskId]);
 
-  const svgArtifacts = visibleState.artifacts.filter((artifact) => artifact.kind === "svg_final");
-  const selected = svgArtifacts.find((artifact) => artifact.id === visibleState.selectedId) || svgArtifacts[0];
-  const pptx = visibleState.artifacts.find((artifact) => artifact.kind === "pptx");
+	useEffect(() => {
+		let active = true;
+		async function load() {
+			try {
+				const result = await loadPreviewPageData(
+					taskId, api.getTask, api.listArtifacts,
+					() => active && taskRouteMatches(parseRoute(), "preview", taskId), replaceRoute,
+				);
+				if (!result) return;
+				const { task: nextTask, artifacts: legacyArtifacts } = result;
+				const [versions, sessions] = await Promise.all([api.listArtifactVersions(taskId), api.listEditSessions(taskId)]);
+				if (!active || !taskRouteMatches(parseRoute(), "preview", taskId)) return;
+				const selectedVersion = versions.find((version) => version.is_latest)?.version || versions[0]?.version || "";
+				const [nextArtifacts, bundle] = selectedVersion
+					? await Promise.all([api.listArtifactsByVersion(taskId, selectedVersion), api.getSVGBundleByVersion(taskId, selectedVersion)])
+					: [legacyArtifacts, emptySVGBundle(taskId)];
+				if (!active || !taskRouteMatches(parseRoute(), "preview", taskId)) return;
+				const activeSession = sessions.find((session) => activeEditSessionStatuses.has(session.status) && session.base_publish_version === selectedVersion)
+					|| sessions.find((session) => session.status === "failed" && session.base_publish_version === selectedVersion)
+					|| null;
+				setState({ taskId, task: nextTask, artifacts: nextArtifacts, versions, selectedVersion, bundle, sessions, activeSession, selectedId: "", error: "" });
+				setSelectedPageId(bundle.pages[0]?.page_id || "");
+				setDraft(activeSession ? parseJSON<ManualEditDraft>(activeSession.draft, emptyManualEditDraft()) : emptyManualEditDraft());
+			} catch (err) {
+				if (active && taskRouteMatches(parseRoute(), "preview", taskId)) {
+					setState({ ...createPreviewPageState(taskId), error: err instanceof Error ? err.message : String(err) });
+				}
+			}
+		}
+		void load();
+		return () => { active = false; };
+	}, [taskId]);
 
-  return (
-    <section className="page preview-page">
-      <PageHeader
-        title="预览与下载"
-        subtitle={visibleState.task?.title || taskId}
-        actions={
-          <>
-            <button className="secondary-button" onClick={() => go({ name: "task", id: taskId })}>
-              <ArrowLeft size={16} />
-              <span>返回</span>
-            </button>
-            <a className={pptx ? "primary-button" : "primary-button disabled"} href={pptx ? api.pptxDownloadUrl(taskId) : undefined}>
-              <Download size={17} />
-              <span>下载 PPTX</span>
-            </a>
-          </>
-        }
-      />
+	useEffect(() => {
+		const session = visibleState.activeSession;
+		if (!session || !selectedPageId || visibleState.selectedVersion !== session.base_publish_version) {
+			setSnapshot(null);
+			setSelectedElementId("");
+			return;
+		}
+		let active = true;
+		api.getEditSessionPage(taskId, session.id, selectedPageId).then((page) => {
+			if (active) { setSnapshot(page); setSelectedElementId(""); }
+		}).catch((err) => { if (active) { setSnapshot(null); setError(err instanceof Error ? err.message : String(err)); } });
+		return () => { active = false; };
+	}, [taskId, selectedPageId, visibleState.activeSession?.id, visibleState.activeSession?.revision, visibleState.selectedVersion, setError]);
 
-      {visibleState.error && <InlineState icon={<XCircle size={18} />} text={visibleState.error} bad />}
-      <div className="preview-layout">
-        <div className="slide-rail">
-          {svgArtifacts.map((artifact, index) => (
-            <button
-              className={artifact.id === selected?.id ? "slide-thumb active" : "slide-thumb"}
-              key={artifact.id}
-              onClick={() => setState((current) => current.taskId === taskId
-                ? { ...current, selectedId: artifact.id }
-                : current)}
-            >
-              <span>{String(index + 1).padStart(2, "0")}</span>
-              <small>{artifact.name}</small>
-            </button>
-          ))}
-          {svgArtifacts.length === 0 && <InlineState icon={<Clock3 size={18} />} text="暂无 SVG" />}
-        </div>
-        <div className="svg-stage">
-          {selected ? (
-            <img alt={selected.name} src={api.artifactContentUrl(taskId, selected.id)} />
-          ) : (
-            <InlineState icon={<Clock3 size={18} />} text="-" />
-          )}
-        </div>
-      </div>
-    </section>
-  );
+	useEffect(() => {
+		function onMessage(event: MessageEvent) {
+			const message = event.data as Record<string, unknown>;
+			if (event.source !== iframeRef.current?.contentWindow || message?.schema !== "slidesmith.editor_message.v1" || message.type !== "select") return;
+			if (!snapshot || message.session_id !== snapshot.session_id || message.page_id !== snapshot.page_id || message.revision !== snapshot.revision) return;
+			if (typeof message.element_id === "string" && snapshot.elements.some((element) => element.element_id === message.element_id && element.element_fingerprint === message.element_fingerprint)) setSelectedElementId(message.element_id);
+		}
+		window.addEventListener("message", onMessage);
+		return () => window.removeEventListener("message", onMessage);
+	}, [snapshot]);
+
+	useEffect(() => {
+		if (!dirty) return;
+		const guard = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+		window.addEventListener("beforeunload", guard);
+		return () => window.removeEventListener("beforeunload", guard);
+	}, [dirty]);
+
+	useEffect(() => {
+		const session = visibleState.activeSession;
+		if (!session || session.status === "draft" || !activeEditSessionStatuses.has(session.status)) return;
+		let active = true;
+		const poll = async () => {
+			try {
+				const [next, nextRuns] = await Promise.all([api.getEditSession(taskId, session.id), api.listEditRuns(taskId, session.id)]);
+				if (!active) return;
+				setRuns(nextRuns);
+				setActiveSession(next);
+				if (next.status === "published" && next.result_publish_version) await selectVersion(next.result_publish_version);
+			} catch (err) { if (active) setError(err instanceof Error ? err.message : String(err)); }
+		};
+		const timer = window.setInterval(() => void poll(), 2000);
+		void poll();
+		return () => { active = false; window.clearInterval(timer); };
+	}, [taskId, visibleState.activeSession?.id, visibleState.activeSession?.status]);
+
+	async function selectVersion(version: string) {
+		setBusy("version"); setError(""); setSnapshot(null);
+		try {
+			const versions = await api.listArtifactVersions(taskId);
+			const selectedVersion = versions.some((candidate) => candidate.version === version)
+				? version
+				: versions.find((candidate) => candidate.is_latest)?.version || versions[0]?.version || "";
+			const [artifacts, bundle, sessions] = selectedVersion
+				? await Promise.all([api.listArtifactsByVersion(taskId, selectedVersion), api.getSVGBundleByVersion(taskId, selectedVersion), api.listEditSessions(taskId)])
+				: [[], emptySVGBundle(taskId), await api.listEditSessions(taskId)];
+			const activeSession = sessions.find((session) => activeEditSessionStatuses.has(session.status) && session.base_publish_version === selectedVersion) || null;
+			setState((current) => current.taskId === taskId ? { ...current, artifacts, bundle, sessions, versions, selectedVersion, activeSession } : current);
+			setSelectedPageId(bundle.pages[0]?.page_id || "");
+			setActiveSession(activeSession);
+		} catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+		finally { setBusy(""); }
+	}
+
+	async function startEditing() {
+		if (!visibleState.selectedVersion) return;
+		setBusy("create"); setError("");
+		try { const session = await api.createEditSession(taskId, visibleState.selectedVersion); setActiveSession(session); }
+		catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+		finally { setBusy(""); }
+	}
+
+	function stageOperation(type: ManualEditOperation["type"], value: ManualEditOperation["value"]) {
+		const session = visibleState.activeSession;
+		const element = snapshot?.elements.find((candidate) => candidate.element_id === selectedElementId);
+		if (!session || session.status !== "draft" || !element || !snapshot) return;
+		const target = { element_id: element.element_id, source_id: element.source_id, tag: element.tag, element_fingerprint: element.element_fingerprint };
+		const next = structuredClone(draft);
+		let page = next.pages.find((candidate) => candidate.page_id === snapshot.page_id);
+		let existing = page?.operations.find((operation) => operation.type === type && operation.target.element_id === element.element_id);
+		let nextValue = value;
+		let remove = manualEditOperationMatchesBase(type, value, element);
+		if (type === "translate") {
+			nextValue = { dx:0, dy:0, ...(existing?.value || {}), ...value };
+			remove = Number(nextValue.dx) === 0 && Number(nextValue.dy) === 0;
+		}
+		if (remove) {
+			if (!page || !existing) return;
+			page.operations = page.operations.filter((operation) => operation !== existing);
+			if (page.operations.length === 0) next.pages = next.pages.filter((candidate) => candidate !== page);
+		} else {
+			if (!page) { page = { page_id: snapshot.page_id, base_svg_sha256: snapshot.base_svg_sha256, operations: [] }; next.pages.push(page); }
+			existing = page.operations.find((operation) => operation.type === type && operation.target.element_id === element.element_id);
+			if (existing) {
+				if (JSON.stringify(existing.value) === JSON.stringify(nextValue)) return;
+				existing.value = nextValue;
+			} else page.operations.push({ operation_id: newEditClientID(), type, target, value: nextValue });
+		}
+		next.client_updated_at = new Date().toISOString();
+		setDraft(next);
+		setDirty(true); setConflict(false);
+		iframeRef.current?.contentWindow?.postMessage({ schema:"slidesmith.editor_message.v1", type:"apply_preview", session_id:session.id, page_id:snapshot.page_id, revision:snapshot.revision, element_id:element.element_id, operation:type, value }, "*");
+	}
+
+	async function saveDraft() {
+		const session = visibleState.activeSession;
+		if (!session || session.status !== "draft" || conflict) return session;
+		setBusy("save"); setError("");
+		try {
+			const updated = await api.saveEditSessionDraft(taskId, session.id, session.revision, draft);
+			setActiveSession(updated); setDirty(false); return updated;
+		} catch (err) {
+			if (err instanceof APIError && err.status === 409) setConflict(true);
+			setError(err instanceof Error ? err.message : String(err)); return null;
+		} finally { setBusy(""); }
+	}
+
+	async function applyDraft() {
+		let session = visibleState.activeSession;
+		if (!session || conflict) return;
+		if (dirty) session = await saveDraft();
+		if (!session) return;
+		setBusy("apply"); setError("");
+		try { setActiveSession(await api.applyEditSession(taskId, session.id, session.revision, session.draft_sha256)); }
+		catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+		finally { setBusy(""); }
+	}
+
+	function addAnnotation() {
+		const instruction = annotationText.trim();
+		if (!instruction || !selectedPageId) return;
+		const element = snapshot?.elements.find((candidate) => candidate.element_id === selectedElementId);
+		setDraft((current) => ({ ...current, annotations: [...current.annotations, {
+			annotation_id: newEditClientID(), scope: element ? "element" : "page", page_id: selectedPageId,
+			...(element ? { target: { element_id:element.element_id, source_id:element.source_id, tag:element.tag, element_fingerprint:element.element_fingerprint } } : {}), instruction, status:"pending",
+		}], client_updated_at:new Date().toISOString() }));
+		setAnnotationText(""); setDirty(true);
+	}
+
+	const selectedElement: ManualEditSnapshotElement | undefined = snapshot?.elements.find((element) => element.element_id === selectedElementId);
+	const selectedVersion = visibleState.versions.find((version) => version.version === visibleState.selectedVersion);
+	const editCapabilities = parseJSON<{ annotation?: boolean }>(visibleState.activeSession?.capability_snapshot || "{}", {});
+	const isLatest = !!selectedVersion?.is_latest;
+	const canCreateSession = visibleState.task?.status === "completed" && visibleState.task.route === "main" && visibleState.task.runner_profile === "full-ppt-master" && isLatest && !visibleState.activeSession;
+	const editable = visibleState.activeSession?.status === "draft" && isLatest && !!snapshot;
+	const svgArtifacts = visibleState.artifacts.filter((artifact) => artifact.kind === "svg_final");
+	const pageIndex = Math.max(0, visibleState.bundle.pages.findIndex((page) => page.page_id === selectedPageId));
+	const fallbackSVG = svgArtifacts[pageIndex] || svgArtifacts[0];
+	const pptx = visibleState.artifacts.find((artifact) => artifact.kind === "pptx");
+
+	return (
+		<section className="page preview-page live-preview-page">
+			<PageHeader title="Live Preview 与人工修改" subtitle={visibleState.task?.title || taskId} actions={<>
+				<button className="secondary-button" onClick={() => { if (!dirty || window.confirm("有未保存修改，确定离开？")) go({ name:"task", id:taskId }); }}><ArrowLeft size={16}/><span>返回</span></button>
+				<select className="version-selector" value={visibleState.selectedVersion} disabled={busy === "version"} onChange={(event) => void selectVersion(event.target.value)} aria-label="发布版本">
+					{visibleState.versions.map((version) => <option key={version.version} value={version.version}>{version.is_latest ? "最新 · " : ""}{version.version} · {version.source === "manual_edit" ? "人工修改" : "生成"}</option>)}
+				</select>
+				{canCreateSession && <button className="secondary-button" disabled={!!busy} onClick={() => void startEditing()}><Palette size={16}/><span>开始编辑</span></button>}
+				<a className={pptx ? "primary-button" : "primary-button disabled"} href={pptx ? api.versionPPTXDownloadUrl(taskId, visibleState.selectedVersion) : undefined}><Download size={17}/><span>下载此版本</span></a>
+			</>}/>
+			{visibleState.error && <InlineState icon={<XCircle size={18}/>} text={visibleState.error} bad/>}
+			{conflict && <InlineState icon={<XCircle size={18}/>} text="草稿已被其他窗口更新；已停止保存，请刷新或复制本地内容后重试。" bad/>}
+			<div className="live-preview-meta">
+				<span>{selectedVersion?.source === "manual_edit" ? "人工修改版本" : "生成版本"}</span><span className="mono">{visibleState.selectedVersion || "-"}</span>
+				<span>父版本 {selectedVersion?.parent_version || "-"}</span><span>质量 {visibleState.bundle.passed ? "通过" : "只读回退"}</span>
+				<span>会话 {editSessionStatusText(visibleState.activeSession?.status)}</span>{dirty && <strong>有未保存修改</strong>}
+			</div>
+			<div className="preview-layout live-preview-layout">
+				<div className="slide-rail">
+					{visibleState.bundle.pages.map((page) => <button className={page.page_id === selectedPageId ? "slide-thumb active" : "slide-thumb"} key={page.page_id} onClick={() => setSelectedPageId(page.page_id)}>
+						<span>{String(page.page).padStart(2,"0")}</span><small>{page.filename}</small>
+						{draft.pages.some((candidate) => candidate.page_id === page.page_id && candidate.operations.length) && <b>已改</b>}
+						{draft.annotations.some((annotation) => annotation.page_id === page.page_id) && <b>AI</b>}
+					</button>)}
+					{visibleState.bundle.pages.length === 0 && <InlineState icon={<Clock3 size={18}/>} text="暂无 SVG"/>}
+				</div>
+				<div className="svg-stage live-svg-stage">
+					{snapshot && visibleState.activeSession && visibleState.selectedVersion === visibleState.activeSession.base_publish_version ? <iframe ref={iframeRef} title={`${snapshot.page_id} editor`} sandbox="allow-scripts" srcDoc={previewIframeDocument(snapshot)}/> : fallbackSVG ? <img alt={fallbackSVG.name} src={api.artifactContentUrl(taskId, fallbackSVG.id)}/> : <InlineState icon={<Clock3 size={18}/>} text="-"/>}
+					{!editable && fallbackSVG && <span className="readonly-badge">只读预览</span>}
+				</div>
+				<aside className="edit-inspector">
+					<div className="section-title"><Layers size={16}/><span>Inspect / 修改</span></div>
+					{selectedElement ? <>
+						<div className="element-identity"><strong>{selectedElement.tag} · {selectedElement.element_id}</strong><small className="mono">{selectedElement.element_fingerprint.slice(0,24)}</small></div>
+						{(selectedElement.tag === "text" || selectedElement.tag === "tspan") && <label>文字<textarea disabled={!editable} defaultValue={selectedElement.text || ""} onBlur={(event) => stageOperation("set_text",{text:event.target.value})}/></label>}
+						<div className="two-field"><label>水平移动<input type="number" disabled={!editable} defaultValue={0} onBlur={(event)=>stageOperation("translate",{dx:Number(event.target.value)})}/></label><label>垂直移动<input type="number" disabled={!editable} defaultValue={0} onBlur={(event)=>stageOperation("translate",{dy:Number(event.target.value)})}/></label></div>
+						<label>填充色<input disabled={!editable} defaultValue={selectedElement.attributes.fill || "#000000"} onBlur={(event)=>stageOperation("set_fill",{fill:event.target.value})}/></label>
+						<label>透明度<input type="number" min="0" max="1" step="0.05" disabled={!editable} defaultValue={selectedElement.attributes.opacity || "1"} onBlur={(event)=>stageOperation("set_opacity",{opacity:Number(event.target.value)})}/></label>
+						{(selectedElement.tag === "text" || selectedElement.tag === "tspan") && <><label>字号<input type="number" disabled={!editable} defaultValue={selectedElement.attributes["font-size"] || "32"} onBlur={(event)=>stageOperation("set_font_size",{font_size:Number(event.target.value)})}/></label><label>字体<input disabled={!editable} defaultValue={selectedElement.attributes["font-family"] || "Arial"} onBlur={(event)=>stageOperation("set_font_family",{font_family:event.target.value})}/></label></>}
+					</> : <span className="muted">点击画布元素后显示安全属性</span>}
+					<div className="annotation-editor"><label>让 AI 调整<textarea disabled={!editable || !editCapabilities.annotation} value={annotationText} onChange={(event)=>setAnnotationText(event.target.value)} placeholder={editCapabilities.annotation ? "仅调整现有元素、排版或层级" : "当前灰度未启用 AI 批注"}/></label><button className="secondary-button" disabled={!editable || !editCapabilities.annotation || !annotationText.trim()} onClick={addAnnotation}>添加批注</button></div>
+					{draft.annotations.map((annotation) => <div className="annotation-chip" key={annotation.annotation_id}><span>{annotation.page_id} · {annotation.scope}</span><small>{annotation.instruction}</small><button disabled={!editable} onClick={()=>{setDraft((current)=>({...current,annotations:current.annotations.filter((item)=>item.annotation_id!==annotation.annotation_id)}));setDirty(true);}}>移除</button></div>)}
+					{visibleState.activeSession && <div className="session-progress"><strong>{editSessionStatusText(visibleState.activeSession.status)}</strong><span>revision {visibleState.activeSession.revision}</span><span>操作 {draft.pages.reduce((sum,page)=>sum+page.operations.length,0)} · 批注 {draft.annotations.length}</span>{runs.slice(-3).map((run)=><small key={run.id}>{run.phase} · {run.status}</small>)}</div>}
+					{visibleState.activeSession?.status === "draft" && <div className="inspector-actions"><button className="secondary-button" disabled={!dirty || !!busy || conflict} onClick={()=>void saveDraft()}>{busy==="save"?<Loader2 className="spin" size={15}/>:null}保存草稿</button><button className="primary-button" disabled={!!busy || conflict} onClick={()=>void applyDraft()}>应用并导出</button><button className="text-button" disabled={!!busy} onClick={()=>void api.discardEditSession(taskId,visibleState.activeSession!.id).then(()=>setActiveSession(null))}>放弃</button></div>}
+					{visibleState.activeSession?.status === "failed" && <div className="failure-actions"><span className="bad">{visibleState.activeSession.failure_phase}: {visibleState.activeSession.error_message}</span><button className="secondary-button" onClick={()=>void api.retryEditSession(taskId,visibleState.activeSession!.id,visibleState.activeSession!.failure_phase).then(setActiveSession)}>技术重试</button><button className="secondary-button" onClick={()=>void api.cloneEditSession(taskId,visibleState.activeSession!.id).then(setActiveSession)}>复制草稿修正</button></div>}
+				</aside>
+			</div>
+		</section>
+	);
 }
 
 function ConfirmationField({

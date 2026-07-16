@@ -1115,6 +1115,26 @@ test("Beautify component is task-scoped and never exposes a raw plan editor", ()
   assert.match(detail, /源 PPTX → 输出 PPTX 保真/);
 });
 
+test("Live Preview uses versioned APIs, sandboxed iframe, CAS, and no main-document SVG injection", () => {
+	const preview = appFunctionSource("PreviewPage");
+	assert.match(apiSource, /listArtifactVersions:[\s\S]*?listArtifactsByVersion:[\s\S]*?getSVGBundleByVersion:/);
+	assert.match(apiSource, /saveEditSessionDraft:[\s\S]*?expected_revision:[\s\S]*?applyEditSession:[\s\S]*?expected_draft_sha256/);
+	assert.match(preview, /sandbox="allow-scripts"/);
+	assert.match(preview, /srcDoc=\{previewIframeDocument\(snapshot\)\}/);
+	assert.match(preview, /event\.source !== iframeRef\.current\?\.contentWindow/);
+	assert.match(preview, /message\.session_id !== snapshot\.session_id[\s\S]*?message\.revision !== snapshot\.revision/);
+	assert.match(preview, /beforeunload/);
+	assert.match(preview, /err instanceof APIError && err\.status === 409/);
+	assert.doesNotMatch(preview, /dangerouslySetInnerHTML/);
+	assert.match(appSource, /function newEditClientID\(\)/);
+	assert.match(appSource, /crypto\?\.getRandomValues/);
+	assert.doesNotMatch(preview, /operation_id:\s*crypto\.randomUUID\(\)/);
+	assert.match(preview, /manualEditOperationMatchesBase\(type, value, element\)/);
+	assert.match(preview, /Number\(nextValue\.dx\) === 0 && Number\(nextValue\.dy\) === 0/);
+	assert.match(preview, /async function selectVersion[\s\S]*?api\.listArtifactVersions\(taskId\)[\s\S]*?versions, selectedVersion, activeSession/);
+	assert.match(preview, /session\.status === "failed" && session\.base_publish_version === selectedVersion/);
+});
+
 test("save and check refetch canonical previews while only confirm advances", () => {
   const page = appFunctionSource("TemplateFillPlanPage");
   const save = page.match(/async function savePlan\(\)[\s\S]*?(?=async function checkPlan)/)?.[0] || "";

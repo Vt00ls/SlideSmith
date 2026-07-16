@@ -40,6 +40,14 @@ func (w *TaskWorker) Run(ctx context.Context) error {
 			w.logger.Printf("processed %d queued task(s)", processed)
 			continue
 		}
+		editProcessed, editErr := w.tasks.ProcessQueuedEditSessions(ctx, w.cfg.BatchSize)
+		if editErr != nil {
+			w.logger.Printf("process queued edit sessions: %v", editErr)
+		}
+		if editProcessed > 0 {
+			w.logger.Printf("processed %d queued edit session(s)", editProcessed)
+			continue
+		}
 
 		select {
 		case <-ctx.Done():
