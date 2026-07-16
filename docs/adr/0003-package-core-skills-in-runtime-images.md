@@ -1,0 +1,3 @@
+# Package core skills in immutable runtime images
+
+For the enterprise-intranet first release, each Runtime Release maps to a content-addressed runtime image containing its exact Core Skill instructions, references, scripts, and compatible toolchain. A Task pins that Runtime Release, and the Core Skill is neither mounted from a mutable host path nor copied into the Task Workspace; changing it requires a new image and Runtime Release while existing Tasks retain the prior release. Catalog Templates and large Resource Bundles remain separately versioned, read-only inputs because they change on a different cadence and do not define trusted executable behavior.

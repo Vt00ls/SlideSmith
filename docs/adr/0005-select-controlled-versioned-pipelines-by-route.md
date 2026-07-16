@@ -1,0 +1,3 @@
+# Select controlled versioned pipelines by route
+
+SlideSmith's control plane owns platform-approved, immutable Pipeline Versions, and a Task pins the version selected by its Route before route-specific production begins. Pipeline Versions define Phases, dependencies, Confirmation Gates, contracts, retry policy, and required runtime capabilities; Runtime Releases and Core Skills implement those capabilities but cannot add, remove, or bypass platform controls. The enterprise-intranet first release exposes only built-in Pipeline Definitions rather than arbitrary user- or Skill-defined workflows, preserving auditability and reproducibility while allowing future Routes to evolve without one hard-coded PPT Master state machine.

@@ -1,0 +1,3 @@
+# Version catalog templates and pin their resource bundles
+
+A Catalog Template is a stable catalog identity with immutable Template Versions, and each Template Version references exact immutable Resource Bundle digests rather than floating asset locations. A Task's Template Lock captures the Template Version and all required Resource Bundle digests, so later template or asset releases cannot change an existing Task's production or retries. Large or reusable non-executable assets are distributed as Resource Bundles, while small template-specific assets may remain embedded in the Template Version to avoid unnecessary package fragmentation.
