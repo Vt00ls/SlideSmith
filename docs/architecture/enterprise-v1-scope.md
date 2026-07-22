@@ -127,6 +127,8 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Retaining Checkpoints by recovery reachability and explicit references while allowing distinct Checkpoints to share content-addressed payloads.
 - Recording unresolved cleanup as durable Cleanup Debt with resource identity, retry history, failure evidence, and estimated bytes and inodes.
 - Exporting a disabled User's Personal Workspace through audited break-glass, verifying delivery outside SlideSmith, and requiring a separate administrator intent before purging its retained content.
+- Retaining a 35-day joint PostgreSQL and durable-object point-in-time recovery window in at least one encrypted, immutable, independently controlled backup domain.
+- Removing authorized deleted or purged content from online authority immediately while allowing encrypted, inaccessible bytes to remain in already locked backup copies until the recovery window expires.
 
 ### Out of scope
 
@@ -134,6 +136,8 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Legal hold, records-management, e-discovery, or archival-tier workflows.
 - Keeping sandbox or hidden runtime state as a durable Task record.
 - Treating an export attempt, download start, or failed delivery as authorization to purge a Personal Workspace.
+- Immediate physical erasure of deleted content from already immutable backup copies.
+- Treating disaster-recovery backup as legal archive, records management, or permanent business history.
 
 ## Availability and topology
 
@@ -146,11 +150,19 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Durable Task, Artifact Version, sharing, and usage records outside execution nodes.
 - Persistent PostgreSQL and object storage with backup and recovery exercises.
 - Control-plane services that can be deployed as multiple instances.
+- A joint Recovery Point RPO of at most 15 minutes for PostgreSQL business state and every committed referenced byte, including total production-site loss or compromise.
+- Staged manual recovery: verified Task metadata and Artifact Versions read-only within four hours, and full Source Material, Checkpoint, release/catalog, Runtime Image, mutation, and execution capability within eight hours.
+- Read-only protection when the finalized recovery watermark would exceed the 15-minute RPO.
+- Independent immutable backup authority, separated production and restore credentials, and dual control for restore/decrypt or premature retention changes.
+- Invalidating every pre-incident Share Link and Access Code after restore; an Owner must issue a new Share Link.
+- Monthly sampled and quarterly complete recovery as the target operating drill baseline, with recurring automation allowed to follow the first implementation phase.
 
 ### Out of scope
 
 - Cross-site or cross-region active-active operation.
 - Automatic disaster-recovery failover.
+- Cross-site active standby or a guarantee of transparent recovery without an incident declaration and manual promotion.
+- Mandatory physical offline backup media; independently controlled immutable copies remain required.
 - Live migration of a running Sandbox.
 - Lossless continuation of an in-flight Runtime Run after node failure.
 - A formal availability target of 99.99% or higher.

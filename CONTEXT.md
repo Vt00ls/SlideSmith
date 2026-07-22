@@ -40,6 +40,10 @@ _Avoid_: Execution Data Plane, runtime, worker
 The isolated execution environment that performs Runtime Runs, mutates Task Workspace content, and returns execution evidence without deciding authoritative business state.
 _Avoid_: Platform Control Plane, Task owner, business database
 
+**Recovery Point**:
+A validated joint recovery identity that binds one PostgreSQL point-in-time target to the exact committed durable-object and runtime-package inventories required to restore it.
+_Avoid_: Database snapshot, object-store snapshot, backup job, live replica
+
 ### Usage and quota
 
 **Usage Ledger**:
