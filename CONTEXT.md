@@ -11,8 +11,8 @@ An authenticated person who owns one Personal Workspace and the work created wit
 _Avoid_: Member, tenant user, account
 
 **Personal Workspace**:
-A User's durable private space for creating and managing Tasks and their outputs. Other Users have no implicit access to it.
-_Avoid_: User directory, Task Workspace, Sandbox Workspace
+A User's durable private space for creating and managing Tasks and their outputs. Other Users have no implicit access to it, and its identity is never transferred or reused.
+_Avoid_: User directory, Task Workspace, Sandbox Workspace, transferable workspace
 
 **Platform Administrator**:
 An authenticated operator with platform-wide operational authority but no implicit right to inspect a User's content; exceptional content access requires an explicit audited grant.
@@ -25,6 +25,10 @@ _Avoid_: Public link, Task share, workspace invitation
 **Access Code**:
 A separate secret required to use a Share Link.
 _Avoid_: Password, link token, invitation code
+
+**Workspace Export**:
+An audited administrative package delivered outside SlideSmith from one disabled User's Personal Workspace before an independently authorized purge. It does not transfer the Personal Workspace or any Task to another User.
+_Avoid_: Workspace transfer, Artifact Version, backup
 
 ### Platform boundaries
 

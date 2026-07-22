@@ -1,6 +1,6 @@
 # Task Workspace Lifecycle
 
-This document records the C04 decisions confirmed during the enterprise-platform architecture grilling. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0015](../adr/0015-manage-task-workspace-state-through-an-opaque-lifecycle-seam.md) records the durable lifecycle seam, and [ADR 0016](../adr/0016-hard-cut-over-legacy-execution-state.md) records the hard cutover. This document deliberately fixes module authority and invariants without designing every method in the interface.
+This document records the C04 decisions confirmed during the enterprise-platform architecture grilling. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0015](../adr/0015-manage-task-workspace-state-through-an-opaque-lifecycle-seam.md) records the durable lifecycle seam, [ADR 0016](../adr/0016-hard-cut-over-legacy-execution-state.md) records the hard cutover, and [durable-object-storage.md](./durable-object-storage.md) defines the shared verified-content mechanism used by C04. This document deliberately fixes module authority and invariants without designing every method in the interface.
 
 ## Module and external seam
 
@@ -62,6 +62,7 @@ sequenceDiagram
 - A Phase Run cannot commit successfully until Checkpoint metadata and all referenced content are durable in a node-independent store. Missing content, failed acknowledgement, or digest mismatch fails closed.
 - C04 owns integrity, reference, deduplication, retention, and reclamation semantics. Database, object-storage, and filesystem implementations sit behind internal adapters and do not enlarge the external interface.
 - Checkpoints remain while reachable from the current recovery lineage or an explicit reference. Artifact Versions remain independent, long-lived business publications.
+- C04 uses the shared `Durable Object` module for opaque content identities, verification receipts, typed references, and lease-based materialization. That internal mechanism does not transfer Checkpoint lifecycle authority to the storage module.
 
 ## Manual edit and publication
 

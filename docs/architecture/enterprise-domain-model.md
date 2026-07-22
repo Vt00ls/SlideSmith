@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, and [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
 
 ## Ownership and publication
 
@@ -10,15 +10,18 @@ flowchart TD
     PersonalWorkspace -->|owns| Task
     PersonalWorkspace -->|owns| UsageLedger[Usage Ledger]
     PersonalWorkspace -->|owns| QuotaReservation[Quota Reservation]
+    Task -->|owns| SourceMaterial[Source Material]
     Task -->|publishes| ArtifactVersion[Artifact Version]
     ArtifactVersion -->|contains| Artifact
     ArtifactVersion -->|may expose through| ShareLink[Share Link]
     ShareLink -->|requires| AccessCode[Access Code]
-    PlatformAdministrator[Platform Administrator] -. audited break-glass only .-> PersonalWorkspace
+    PlatformAdministrator[Platform Administrator] -. audited Workspace Export .-> PersonalWorkspace
 ```
 
 - A Share Link grants no access to its Task or Personal Workspace.
-- Moving a Task does not rewrite historical Usage Ledger ownership.
+- A Personal Workspace or Task is never transferred to another User. Audited Workspace Export and a separate purge are the only disabled-User offboarding path.
+- Workspace Export or purge does not rewrite historical Usage Ledger ownership.
+- Source Material is a Task-owned durable input, not an unpublished Artifact.
 - Artifact Versions are immutable publication sets; edits publish child versions.
 
 ## Pipeline and execution
@@ -72,6 +75,27 @@ flowchart LR
 - Checkpoint content becomes authoritative only after node-independent durable acknowledgement; missing content or digest mismatch fails closed.
 - Physical materialization can expire and be rebuilt on any eligible execution node. Cleanup failures become persistent, retriable Cleanup Debt rather than untracked directories.
 
+## Durable objects and materialization
+
+```mermaid
+flowchart LR
+    Business[Source, publication,<br/>catalog, and C04 modules]
+    Object[Durable Object<br/>deep module]
+    Registry[(PostgreSQL<br/>intents, references, receipts)]
+    Bytes[(Immutable object-store bytes)]
+    Cache[Verified disposable<br/>node cache]
+
+    Business -->|opaque content intent| Object
+    Object --> Registry
+    Object --> Bytes
+    Object -->|lease-based acquire| Cache
+```
+
+- PostgreSQL is authoritative for semantic metadata, typed references, activation, retention intent, and verification receipts; the durable store carries the actual immutable bytes. Neither side is sufficient alone.
+- Business identity remains separate from opaque content identity and digest. User content deduplicates only within its Personal Workspace policy domain.
+- Cross-store writes use durable intents, strict verification, a PostgreSQL activation transaction, and idempotent reconciliation. Missing or mismatched bytes fail closed.
+- Execution nodes materialize through leases and verified digest caches. Host paths, mounts, object keys, vendors, and credentials stay inside adapters.
+
 ## Runtime and design packages
 
 ```mermaid
@@ -89,6 +113,7 @@ flowchart TD
 
 - Core Skills ship inside content-addressed Runtime Images for the first release.
 - Catalog Templates and large non-executable Resource Bundles are separately versioned, read-only packages.
+- Runtime Images remain in an OCI registry; Template Versions and Resource Bundles use immutable object-store package payloads behind the durable-object seam.
 - No Task references a floating `latest` runtime, template, or resource package.
 
 ## Authority seam
@@ -98,7 +123,7 @@ flowchart TD
 | Users, Personal Workspaces, and access | Sandboxed process execution |
 | Tasks, Route and Pipeline locks | Task Workspace materialization and byte mutation |
 | Phase Run, Runtime Run, Checkpoint metadata, and commit authority | Runtime status and evidence emission |
-| Runtime and Template locks | Temporary logs and outputs |
+| Runtime and Template locks, durable-object registry and references | Temporary logs and outputs |
 | Artifact Version metadata and sharing | Runtime Views, Checkpoint content, expiry, and cleanup |
 | Usage Ledger and Quota Reservation | Measured usage receipts |
 

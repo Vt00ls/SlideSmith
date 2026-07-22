@@ -11,7 +11,7 @@ This document records confirmed delivery boundaries for SlideSmith's first enter
 - Read-only sharing of one Artifact Version through a revocable Share Link protected by a separate Access Code.
 - Mandatory Share Link expiry with a platform default and an administrator-configured maximum lifetime.
 - Owner revocation and Access Code rotation, rate-limited verification, and access auditing without storing the plaintext code.
-- Administrative recovery or transfer of retained work after a User is disabled.
+- Administrative recovery or audited Workspace Export followed by an independently authorized purge after a User is disabled.
 
 ### Out of scope
 
@@ -19,6 +19,7 @@ This document records confirmed delivery boundaries for SlideSmith's first enter
 - Projects as containers between Personal Workspace and Task.
 - Shared or team Workspaces.
 - Workspace invitations, collaborative editing, and team RBAC.
+- Personal Workspace or Task ownership transfer between Users.
 - Permanent Share Links or a guarantee that recipients cannot redistribute downloaded files.
 
 ## Authentication
@@ -27,7 +28,7 @@ This document records confirmed delivery boundaries for SlideSmith's first enter
 
 - Integrating with the existing internal centralized sign-in service.
 - Mapping a stable external identity to one SlideSmith User and Personal Workspace.
-- Retaining a disabled User's Tasks and Artifact Versions for administrative recovery or transfer.
+- Retaining a disabled User's Tasks and Artifact Versions for administrative recovery or Workspace Export until an explicit purge is authorized.
 - Allowing Share Link and Access Code access to one Artifact Version without an authenticated workspace session.
 
 ### Out of scope
@@ -43,7 +44,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 
 ### In scope
 
-- One minimal Platform Administrator role for User activation, deactivation, recovery, and authorized transfer of retained work.
+- One minimal Platform Administrator role for User activation, deactivation, recovery, audited Workspace Export, and explicit purge of retained work.
 - Publishing Runtime Releases, Pipeline Versions, Template Versions, and Resource Bundles.
 - Viewing system health, failure diagnostics, storage state, and aggregated usage metadata.
 - Triggering cleanup, recovery, and safe rescheduling operations.
@@ -55,6 +56,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Implicit administrator access to Source Material, Decks, or other User content.
 - Department administrators, Project administrators, delegated Workspace administration, or multi-level RBAC.
 - Unlogged support impersonation or content inspection.
+- Reassigning a Personal Workspace or Task to another User.
 
 ## Runtime and catalog extensibility
 
@@ -124,12 +126,14 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Capturing only declared recoverable Task-owned mutable state in Checkpoints; Runtime Releases, Template Versions, Resource Bundles, Source Material, shared caches, sessions, and failed residue stay outside.
 - Retaining Checkpoints by recovery reachability and explicit references while allowing distinct Checkpoints to share content-addressed payloads.
 - Recording unresolved cleanup as durable Cleanup Debt with resource identity, retry history, failure evidence, and estimated bytes and inodes.
+- Exporting a disabled User's Personal Workspace through audited break-glass, verifying delivery outside SlideSmith, and requiring a separate administrator intent before purging its retained content.
 
 ### Out of scope
 
 - Automatic expiration of valid Artifact Versions in the first release.
 - Legal hold, records-management, e-discovery, or archival-tier workflows.
 - Keeping sandbox or hidden runtime state as a durable Task record.
+- Treating an export attempt, download start, or failed delivery as authorization to purge a Personal Workspace.
 
 ## Availability and topology
 
