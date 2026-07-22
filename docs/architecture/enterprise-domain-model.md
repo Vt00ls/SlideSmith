@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
 
 ## Ownership and publication
 
@@ -49,6 +49,35 @@ flowchart TD
 - Runtime Runs share explicit Task Workspace state through isolated Runtime Views, never hidden sandbox state.
 - Each Runtime Run uses a fresh lease; infrastructure may reuse a fully reset physical sandbox under a new lease.
 - Every successful Phase Run binds its validated contract, authoritative Task Workspace Revision, and a distinct durable Checkpoint identity.
+
+## Task Orchestration
+
+```mermaid
+flowchart LR
+    Inputs["User intent, work availability,<br/>Runtime/C04/publication evidence"]
+    Orchestration["Task Orchestration<br/>command-decision seam"]
+    State[("Task revision,<br/>locks and Phase Run history")]
+    Outbox["Idempotent enactment outbox"]
+    Runtime["Runtime Execution"]
+    Lifecycle["Task Workspace Lifecycle"]
+    Publication["Artifact Publication"]
+
+    Inputs --> Orchestration
+    State --> Orchestration
+    Orchestration --> State
+    Orchestration --> Outbox
+    Outbox --> Runtime
+    Outbox --> Lifecycle
+    Outbox --> Publication
+    Runtime -->|typed evidence| Orchestration
+    Lifecycle -->|fenced evidence| Orchestration
+    Publication -->|activation evidence| Orchestration
+```
+
+- One authenticated or evidence-bearing `Decide` operation is the mutation seam for Task, Generation Pipeline, Confirmation Gate, Phase Run, retry, cancellation, recovery, and manual-edit progression.
+- Task status is a coarse projection. The pinned Pipeline Version and Phase Run outcomes define route-specific progress; status constants and workers do not define workflow order.
+- Accepted decisions and their enactments commit atomically. Claim loss or acknowledgement loss causes idempotent redelivery and reconciliation, not a new Phase Run.
+- Events, audit records, and metrics are projections of accepted decisions. External events are not appended as authority before authorization and optimistic-concurrency validation.
 
 ## Task Workspace lifecycle
 
@@ -121,8 +150,8 @@ flowchart TD
 | Platform Control Plane | Execution Data Plane |
 | --- | --- |
 | Users, Personal Workspaces, and access | Sandboxed process execution |
-| Tasks, Route and Pipeline locks | Task Workspace materialization and byte mutation |
-| Phase Run, Runtime Run, Checkpoint metadata, and commit authority | Runtime status and evidence emission |
+| Task Orchestration decisions, Task revision, Route and Pipeline locks | Task Workspace materialization and byte mutation |
+| Phase Run outcome, Runtime Run relationship, Checkpoint metadata, and commit authority | Runtime status and evidence emission |
 | Runtime and Template locks, durable-object registry and references | Temporary logs and outputs |
 | Artifact Version metadata and sharing | Runtime Views, Checkpoint content, expiry, and cleanup |
 | Usage Ledger and Quota Reservation | Measured usage receipts |
