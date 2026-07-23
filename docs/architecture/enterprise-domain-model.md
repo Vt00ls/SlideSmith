@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) records owner, Share Link, and break-glass authority, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md) records queue, Personal Workspace fairness, Resource Class, and Admission Grant authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam, and [observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md) records authoritative audit, correlation, telemetry, alerting, retention, and Cleanup Debt boundaries.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) records owner, Share Link, and break-glass authority, [workspace-export-and-purge.md](./workspace-export-and-purge.md) records disabled-User export, external delivery proof, irreversible purge, tombstone and suppression authority, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md) records queue, Personal Workspace fairness, Resource Class, and Admission Grant authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam, and [observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md) records authoritative audit, correlation, telemetry, alerting, retention, and Cleanup Debt boundaries.
 
 The one-time legacy ownership, business-record, run-history, publication,
 catalog, freeze, validation, rollback, and cleanup conversion is governed by
@@ -20,11 +20,21 @@ flowchart TD
     ArtifactVersion -->|may expose through| ShareLink[Share Link]
     ShareLink -->|requires| AccessCode[Access Code]
     PlatformAdministrator[Platform Administrator] -. audited Workspace Export .-> PersonalWorkspace
+    PersonalWorkspace -->|terminal purge creates| WorkspaceTombstone[Workspace Tombstone]
+    PurgeFence[Purge Fence] -->|suppresses recovery of| PersonalWorkspace
 ```
 
 - A Share Link grants no access to its Task or Personal Workspace.
 - A Personal Workspace or Task is never transferred to another User. Audited Workspace Export and a separate purge are the only disabled-User offboarding path.
 - Workspace Export or purge does not rewrite historical Usage Ledger ownership.
+- Disable has no automatic purge timer. Export requires complete canonical
+  coverage and an independently verified external receipt; purge requires two
+  administrators, 24-hour cooling-off, final reauthentication and current
+  eligibility.
+- The independent Purge Fence is irreversible. It prevents old Recovery Points
+  from restoring content authority, while a content-free Workspace Tombstone,
+  Usage history and audit remain. The external archive remains outside
+  SlideSmith purge.
 - Source Material is a Task-owned durable input, not an unpublished Artifact.
 - Artifact Versions are immutable publication sets; edits publish child versions.
 
@@ -297,6 +307,7 @@ flowchart LR
 | Platform Control Plane | Execution Data Plane |
 | --- | --- |
 | Users, Personal Workspaces, mutually exclusive principals, Sharing, BreakGlass Grants, and access audit | Sandboxed process execution |
+| Workspace Export and Purge operations, delivery evidence, Purge Fence relationship, tombstone and recovery suppression | External archive transport, export staging and physical cleanup adapters |
 | Task Orchestration decisions, Task revision, Route, and Execution Lock | Task Workspace materialization and byte mutation |
 | Phase Run outcome and Runtime Run relationship | Agent and Tool capability execution on attested Execution Nodes |
 | Scheduler Work Items, Personal Workspace fairness, Delivery Claims, Resource Classes, concurrency policy, placement, and Admission Grants | Worker delivery, node-local capacity enforcement, and raw readiness observations |

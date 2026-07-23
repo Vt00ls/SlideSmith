@@ -1,6 +1,6 @@
 # Durable Object Storage
 
-This document records the durable-object decisions confirmed while resolving GitHub issue 21. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0017](../adr/0017-manage-durable-bytes-through-an-opaque-object-seam.md) records the object seam, [ADR 0018](../adr/0018-export-and-purge-disabled-user-workspaces.md) records the no-transfer rule, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) defines the owner, Share Link, and break-glass authorization paths, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package lifecycle and Template Lock references, and [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) remains authoritative for C04 lifecycle semantics.
+This document records the durable-object decisions confirmed while resolving GitHub issue 21. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0017](../adr/0017-manage-durable-bytes-through-an-opaque-object-seam.md) records the object seam, [ADR 0018](../adr/0018-export-and-purge-disabled-user-workspaces.md) records the no-transfer rule, [workspace-export-and-purge.md](./workspace-export-and-purge.md) defines complete export coverage, external delivery proof, irreversible fencing and Workspace-wide reference release, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) defines the owner, Share Link, and break-glass authorization paths, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package lifecycle and Template Lock references, and [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) remains authoritative for C04 lifecycle semantics.
 
 The design deliberately fixes authority, invariants, and test seams without choosing an S3-compatible vendor, object-key layout, SDK, schema, or final language-level method names.
 
@@ -189,7 +189,15 @@ SlideSmith does not transfer Tasks or Personal Workspaces between Users. An admi
 1. Audited break-glass creates a deterministic Workspace Export manifest and an expiring archive staging payload. The manifest enumerates included Tasks, Source Material, Artifact Versions, relevant metadata, every payload digest and size, and explicit exclusions. Export completes only after an external administrative archive returns a verified delivery receipt bound to the manifest digest.
 2. A separately authorized purge revalidates the Personal Workspace generation and completed export evidence before detaching retained content references. Export failure, response start, partial delivery, or missing receipt leaves the Workspace unchanged.
 
-The export archive is neither an Artifact Version nor a backup and is not retained inside SlideSmith after successful delivery or expiry. The Personal Workspace identity is never reassigned or reused. After purge, the platform retains only the Workspace tombstone, export manifest digest, external delivery receipt, Usage Ledger history required by policy, and authoritative audit facts.
+The export archive is neither an Artifact Version nor a backup and is not retained inside SlideSmith after successful delivery or expiry. The Personal Workspace identity is never reassigned or reused. After purge, the platform retains only the Workspace Tombstone, content-free manifest/archive roots, Export Delivery Receipt, Purge Fence and suppression evidence, Usage Ledger history required by policy, authoritative audit facts, and unresolved Cleanup Debt.
+
+The complete include/exclude matrix, deterministic ZIP64 representation,
+receipt contract, 24-hour cooling-off, eligibility gate, irreversible
+linearization, cascade and recovery semantics are defined in
+[Workspace Export and Purge](./workspace-export-and-purge.md). `Release` still
+means typed reference transition rather than physical deletion; the existing
+seven-day primary grace, exact-generation reclamation and Cleanup Debt rules
+apply after the final Workspace references detach.
 
 ## Highest-level tests and replacement
 

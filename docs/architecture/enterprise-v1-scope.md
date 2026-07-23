@@ -6,6 +6,11 @@ The complete record-by-record hard-cutover, ownership backfill, validation,
 rollback, and Cleanup Debt contract is recorded in
 [legacy-business-migration-and-compatibility.md](./legacy-business-migration-and-compatibility.md).
 
+The complete disabled-User access, canonical export, external delivery,
+dual-approval purge, irreversible fence, cascade, retention and recovery
+contract is recorded in
+[workspace-export-and-purge.md](./workspace-export-and-purge.md).
+
 ## Ownership and collaboration
 
 ### In scope
@@ -16,7 +21,10 @@ rollback, and Cleanup Debt contract is recorded in
 - Mandatory Share Link expiry with a seven-day default, a thirty-day platform hard maximum, and an administrator-configured maximum that may only be shorter.
 - No in-place lifetime extension: an Owner may shorten or revoke a grant, while a later expiry requires a new Share Link.
 - Owner revocation and Access Code rotation, generation-bound Verification Sessions, rate-limited verification, and access auditing without storing recoverable plaintext link or code secrets.
-- Administrative recovery or audited Workspace Export followed by an independently authorized purge after a User is disabled.
+- Administrative recovery or a complete audited Workspace Export followed by
+  an independently dual-authorized purge after a User is disabled. Disable has
+  no automatic purge timer; purge has a non-bypassable 24-hour cooling-off and
+  an irreversible independent Purge Fence.
 
 ### Out of scope
 
@@ -26,6 +34,8 @@ rollback, and Cleanup Debt contract is recorded in
 - Workspace invitations, collaborative editing, and team RBAC.
 - Personal Workspace or Task ownership transfer between Users.
 - Permanent Share Links or a guarantee that recipients cannot redistribute downloaded files.
+- Reactivating or reusing a purged User, Personal Workspace, or external-
+  identity mapping in enterprise V1.
 
 ## Authentication
 
@@ -50,6 +60,9 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 ### In scope
 
 - One minimal Platform Administrator role for User activation, deactivation, recovery, audited Workspace Export, and explicit purge of retained work.
+- Two distinct active Platform Administrators for purge request and approval,
+  requester reauthentication after a 24-hour cooling-off period, and no
+  emergency or self-approval bypass.
 - Publishing Runtime Releases and Pipeline Versions independently; approving exact compatible pairs; controlling activation, rollout, deprecation, and revocation; and publishing Catalog Templates, Template Versions, and Resource Bundles through audited manifest/CLI/CI intents.
 - Viewing system health, failure diagnostics, storage state, and aggregated usage metadata.
 - Triggering cleanup, recovery, and safe rescheduling operations.
@@ -61,6 +74,8 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 
 - Implicit administrator access to Source Material, Decks, or other User content.
 - Administrator self-approval, Owner impersonation, or a BreakGlass Grant that permits mutation, manual edit, Share Link management, arbitrary Workspace browsing, or purge.
+- Platform Administrator override of known or uncertain external legal,
+  investigation, audit, records, or preservation obligations.
 - Department administrators, Project administrators, delegated Workspace administration, or multi-level RBAC.
 - Unlogged support impersonation or content inspection.
 - Reassigning a Personal Workspace or Task to another User.
@@ -152,7 +167,17 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Capturing only declared recoverable Task-owned mutable state in Checkpoints; Runtime Releases, Template Versions, Resource Bundles, Source Material, shared caches, sessions, and failed residue stay outside.
 - Retaining Checkpoints by recovery reachability and explicit references while allowing distinct Checkpoints to share content-addressed payloads.
 - Recording unresolved cleanup as durable Cleanup Debt with resource identity, retry history, failure evidence, and estimated bytes and inodes.
-- Exporting a disabled User's Personal Workspace through audited break-glass, verifying delivery outside SlideSmith, and requiring a separate administrator intent before purging its retained content.
+- Retaining a disabled Personal Workspace indefinitely until reactivation or an
+  explicit purge; disable alone never starts automatic deletion.
+- Exporting a disabled User's complete retained Workspace through one-shot,
+  dual-approved audited break-glass, verifying a signed canonical manifest and
+  authenticated Export Delivery Receipt outside SlideSmith, and requiring a
+  separately dual-approved purge intent, 24-hour cooling-off, final
+  reauthentication and current eligibility checks.
+- Activating a generation-bound Purge Fence in an independent immutable
+  suppression authority as the irreversible deletion point, and retaining a
+  content-free Workspace Tombstone, export/purge evidence, Usage Ledger
+  history, recovery suppression and authoritative audit afterward.
 - Retaining a 35-day joint PostgreSQL and durable-object point-in-time recovery window in at least one encrypted, immutable, independently controlled backup domain.
 - Removing authorized deleted or purged content from online authority immediately while allowing encrypted, inaccessible bytes to remain in already locked backup copies until the recovery window expires.
 - Retaining exact Pipeline and Runtime manifests, OCI images, supplementary packages, and compatibility evidence while an Execution Lock, active rollout, integrity incident, or retained Recovery Point references them.
@@ -162,10 +187,15 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 
 - Automatic expiration of valid Artifact Versions in the first release.
 - Legal hold, records-management, e-discovery, or archival-tier workflows.
+- Automatic purge after User disable, emergency purge bypass, incomplete-
+  export override, or administrator adjudication of external preservation
+  policy. Known or uncertain preservation need blocks purge.
 - Keeping sandbox or hidden runtime state as a durable Task record.
 - Treating an export attempt, download start, or failed delivery as authorization to purge a Personal Workspace.
 - Immediate physical erasure of deleted content from already immutable backup copies.
 - Treating disaster-recovery backup as legal archive, records management, or permanent business history.
+- Treating SlideSmith purge as deletion of the external administrative archive
+  or bytes already disclosed to a recipient.
 
 ## Observability and authoritative audit
 

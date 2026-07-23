@@ -30,6 +30,18 @@ _Avoid_: Password, link token, invitation code
 An audited administrative package delivered outside SlideSmith from one disabled User's Personal Workspace before an independently authorized purge. It does not transfer the Personal Workspace or any Task to another User.
 _Avoid_: Workspace transfer, Artifact Version, backup
 
+**Export Delivery Receipt**:
+Authenticated evidence from an allowlisted external administrative archive that it durably received and independently verified the exact Workspace Export manifest and archive bytes. An upload attempt, response start, callback, or partial delivery is not a receipt.
+_Avoid_: Upload response, download acknowledgement, purge approval
+
+**Purge Fence**:
+The generation-bound fact activated in an independent immutable suppression authority that makes a confirmed Personal Workspace purge irreversible and prevents any older database or Recovery Point from restoring its content authority.
+_Avoid_: Purge request, deletion job, backup expiry
+
+**Workspace Tombstone**:
+The content-free, terminal record that preserves a purged User and Personal Workspace's non-reused identities, generations, export and purge evidence roots, and recovery suppression without retaining their Tasks or content.
+_Avoid_: Disabled Workspace, Workspace backup, recoverable User
+
 ### Platform boundaries
 
 **Platform Control Plane**:

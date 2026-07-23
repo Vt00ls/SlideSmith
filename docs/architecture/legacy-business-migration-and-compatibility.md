@@ -18,6 +18,11 @@ records the durable migration choice, and the
 [observability, audit, and Cleanup Debt](./observability-audit-and-cleanup-debt.md)
 contracts remain authoritative for their respective seams.
 
+The [Workspace Export and Purge](./workspace-export-and-purge.md) contract
+governs disabled-User offboarding after target cutover. A legacy cutover pin
+that would retain purged bytes beyond the normal Recovery Point window blocks
+purge until the pin is released.
+
 The design fixes migration authority, ownership backfill, record disposition,
 historical representation, batching, freeze, activation, validation, rollback,
 and cleanup boundaries. It deliberately does not define a schema, migration

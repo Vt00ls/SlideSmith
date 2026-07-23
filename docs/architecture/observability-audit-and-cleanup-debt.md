@@ -17,7 +17,10 @@ defines queue and capacity facts,
 [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
 defines provider and usage facts, and
 [content-authorization-and-sharing.md](./content-authorization-and-sharing.md)
-defines mandatory access audit.
+defines mandatory access audit, and
+[workspace-export-and-purge.md](./workspace-export-and-purge.md) defines
+export/purge operation, receipt, Purge Fence, progress, retention and terminal
+suppression facts.
 
 The design fixes authority, correlation and propagation, minimum signals and
 alerts, Cleanup Debt observability, cardinality, redaction, access, retention,
@@ -671,8 +674,9 @@ Stable downstream inputs are:
 - issue 17 receives the correlation graph, the hard-cutover deletion test, and
   the prohibition on fabricating audit or Cleanup Debt from legacy events,
   paths, sessions, or logs;
-- issue 25 receives mandatory export/purge audit, protected diagnostics,
-  telemetry expiry, retained authoritative audit, Cleanup Debt, and deletion
+- [Workspace Export and Purge](./workspace-export-and-purge.md) consumes
+  mandatory export/purge audit, protected diagnostics, telemetry expiry,
+  retained authoritative audit, Cleanup Debt, irreversible-fence and deletion
   evidence boundaries;
 - the first Task Orchestration, Scheduler, Runtime Execution, C04, Durable
   Object, Gateway, Usage, Sharing, release, catalog, and recovery
