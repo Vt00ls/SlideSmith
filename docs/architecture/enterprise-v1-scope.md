@@ -141,6 +141,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Revoking Share Links when their Artifact Version is deleted or becomes unavailable.
 - Terminally invalidating a Personal Workspace's Share Links on User disable or identity rebind, and requiring new grants after reactivation.
 - Automatically releasing Sandbox Leases and cleaning sandbox state, Runtime Run temporary directories, expired Task Workspaces, disposable Checkpoints, caches, and incomplete publication residue.
+- Retaining authoritative Scheduler Work Item dispositions, Scheduling Policy and Resource Class versions, Admission Grant evidence roots, unresolved dead-letter state, redrive history, and mandatory scheduling audit in Platform PostgreSQL.
 - Recovering required mutable execution state from validated Checkpoints rather than treating a live Task Workspace as permanent storage.
 - Configurable cleanup policies with observable cleanup failures and retriable Cleanup Debt.
 - Treating Task Workspace as one logical identity whose node-local materialization is disposable and reconstructable.
@@ -169,6 +170,12 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - One enterprise site or data-center deployment.
 - Independently restartable control-plane, worker, and execution services.
 - Horizontal scaling of workers and Agent Compose execution nodes.
+- PostgreSQL-authoritative Scheduler Work Items with at-least-once delivery and queue brokers or notifications as replaceable projections.
+- Equal-weight Personal Workspace fairness with bounded platform-assigned priority, aging, and a reserved safety-control lane.
+- Layered site, Personal Workspace, capability, Resource Class, and Execution Node concurrency admission.
+- Immutable Resource Classes covering enforceable CPU, memory, PIDs, ephemeral bytes and inodes, accelerators, capability, Execution Policy, platform, and network requirements.
+- Fenced Delivery Claims and Admission Grants, stale-completion rejection, bounded retry, dead-letter, and audited immutable redrive.
+- One-node serial acceptance and multi-node production through the same Scheduler, Runtime Execution, node-fact, Sandbox Lease, and capacity-release interfaces.
 - Recovery from worker, sandbox, or execution-node failure by retrying from validated Checkpoints.
 - Durable Task, Artifact Version, sharing, and usage records outside execution nodes.
 - Persistent PostgreSQL and object storage with backup and recovery exercises.
@@ -189,6 +196,8 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Mandatory physical offline backup media; independently controlled immutable copies remain required.
 - Live migration of a running Sandbox.
 - Lossless continuation of an in-flight Runtime Run after node failure.
+- Lossless workload preemption, User-selected scheduling priority, or administrator priority boosts that bypass another Personal Workspace's fair turn.
+- Inferring production capacity from worker count, process state, Agent Compose stats, or unconfigured host resources.
 - A formal availability target of 99.99% or higher.
 - Global scheduling or multi-region data replication.
 

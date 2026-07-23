@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) records owner, Share Link, and break-glass authority, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) records owner, Share Link, and break-glass authority, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md) records queue, Personal Workspace fairness, Resource Class, and Admission Grant authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
 
 ## Ownership and publication
 
@@ -108,6 +108,28 @@ flowchart LR
 - Agent and Tool Workers share one lifecycle and evidence protocol. Internal model and tool calls stay inside one Runtime Run unless the pinned Pipeline declares separate capability invocations.
 - Production execution treats guest code and supplied content as hostile. An exact Execution Node and driver configuration must prove its Execution Policy before admission; no driver is trusted by name.
 - Runtime success is an execution fact only. Platform validation, C04 commit, and Artifact publication remain independent authorities.
+
+## Scheduling and capacity admission
+
+~~~mermaid
+flowchart LR
+    Orchestration[Task Orchestration] -->|durable enactment| Work[Scheduler Work Item]
+    Work --> Scheduler[Scheduler]
+    Identity[Identity & Ownership] -->|Workspace and machine authority| Scheduler
+    Usage[Usage Accounting] -->|Active Quota Reservation disposition| Scheduler
+    Release[Release Management] -->|exact Resource Class requirement| Scheduler
+    Runtime[Runtime Execution] -->|truthful node and lease facts| Scheduler
+    Scheduler -->|fenced Admission Grant| Runtime
+    Runtime --> Node[Execution Node]
+~~~
+
+- One Scheduler Work Item represents one Task Orchestration enactment operation. It may reference a Phase Run and an existing Runtime Run but never owns their outcome.
+- Platform PostgreSQL is authoritative for enqueue, Personal Workspace fairness, priority and aging, Delivery Claims, Admission Grants, retry, dead-letter, and delivery disposition. Redis, NATS, polling, and notifications are replaceable adapters.
+- Enterprise V1 uses equal-weight Personal Workspace deficit round-robin. Manual edit is Interactive only inside its Workspace; ordinary Task work is Standard, Background work ages, and safety control uses a reserved lane.
+- Every capacity-bearing admission satisfies site, Personal Workspace, exact capability, Resource Class, and Execution Node limits. Runtime Execution supplies node truth and revalidates an Admission Grant before creating a Sandbox Lease.
+- Resource Classes are immutable and exact. Missing, stale, unknown, or unenforced hard-resource facts fail closed; Scheduler cannot weaken a Runtime Binding or Execution Policy to find capacity.
+- Quota-bearing work requires an Active Phase Run Reservation, but observation-mode shortage does not block V1 and Scheduler never owns Ledger or Reservation mutation.
+- Claim loss redelivers the same operation. Runtime or Phase retry remains Task Orchestration authority, and node loss quarantines physical capacity until containment and reset are proved.
 
 ## LLM Gateway and Usage Accounting
 
@@ -240,6 +262,7 @@ flowchart TD
 | Users, Personal Workspaces, mutually exclusive principals, Sharing, BreakGlass Grants, and access audit | Sandboxed process execution |
 | Task Orchestration decisions, Task revision, Route, and Execution Lock | Task Workspace materialization and byte mutation |
 | Phase Run outcome and Runtime Run relationship | Agent and Tool capability execution on attested Execution Nodes |
+| Scheduler Work Items, Personal Workspace fairness, Delivery Claims, Resource Classes, concurrency policy, placement, and Admission Grants | Worker delivery, node-local capacity enforcement, and raw readiness observations |
 | Runtime Execution decisions, Sandbox Leases, fences, and accepted Runtime Evidence | Raw runtime status, process, and adapter evidence emission |
 | Checkpoint metadata and commit authority | Runtime Views, Checkpoint content, expiry, and cleanup |
 | Release Management, Catalog Publication, Execution and Template Locks, durable-object registry, and references | Temporary logs and outputs |

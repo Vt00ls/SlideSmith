@@ -14,15 +14,18 @@ defines Runtime Bindings,
 [catalog-template-publication.md](./catalog-template-publication.md) defines
 Template Lock materialization and catalog safety epochs,
 [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
-defines Gateway Grants, provider egress, Usage Receipts, and settlement, and
+defines Gateway Grants, provider egress, Usage Receipts, and settlement,
+[scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)
+defines Work Items, fairness, Resource Classes, concurrency, placement, and
+Admission Grants, and
 [task-workspace-lifecycle.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/task-workspace-lifecycle.md)
 defines Runtime View and commit authority.
 
 The design fixes authority, interface depth, worker roles, execution and lease
 state, fencing, evidence, security, reconciliation, adapter contracts, and the
 legacy deletion test. It does not define a schema, serialized protocol,
-scheduler fairness algorithm, concrete resource values, LLM ledger, telemetry
-vendor, implementation sequence, or production sandbox product.
+concrete production resource values, LLM ledger, telemetry vendor,
+implementation sequence, or production sandbox product.
 
 ## Decision summary
 
@@ -88,7 +91,7 @@ C04 commit, and Artifact publication remain separate decisions.
 | Runtime Run execution state, deadline, cancellation, terminal outcome, and evidence acceptance | Runtime Execution in Platform PostgreSQL | Owns through its command and reconciliation seam |
 | Sandbox Lease identity, node binding, fence, expiry, revoke, release, and containment evidence | Runtime Execution | Owns the lease lifecycle and enforcement contract |
 | Node readiness, attested capabilities, current lease occupancy, containment and reset facts | Runtime Execution | Supplies truthful capacity facts to scheduling |
-| Queue order, Personal Workspace fairness, resource-class values, concurrency, placement, and admission policy | Scheduler, resolved by issue 20 | Supplies an Admission Grant; cannot mutate a Runtime Run outcome |
+| Queue order, Personal Workspace fairness, Resource Classes, concurrency, placement, and admission policy | [Scheduler](./scheduling-and-capacity-admission.md) | Supplies an Admission Grant; cannot mutate a Runtime Run outcome |
 | Runtime View, Task Workspace bytes, Revision, Checkpoint, commit, discard, and cleanup | C04 | Uses one opaque Runtime View capability; cannot commit it |
 | Immutable bytes and node materialization | Durable Object and C04 | Receives opaque verified capabilities; never receives object-store credentials |
 | User and machine authority | Identity & Ownership | Validates Task, Personal Workspace, generation, purpose, and expiry |
@@ -487,7 +490,9 @@ for hostile code without configuration-specific evidence.
 
 ## Stable downstream inputs and remaining fog
 
-- Issue 20 receives worker class, resource requirements, Execution Policy,
+- The resolved
+  [Scheduler contract](./scheduling-and-capacity-admission.md) receives worker
+  class, resource requirements, Execution Policy,
   truthful node facts, Sandbox Lease, and Admission Grant seams. It owns
   fairness, concurrency, placement, and concrete resource-class policy.
 - The resolved

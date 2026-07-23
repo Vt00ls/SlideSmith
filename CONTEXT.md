@@ -52,6 +52,22 @@ _Avoid_: Worker, Task Workspace, Agent Compose session, business server
 An approved, versioned set of isolation, resource, mount, network, secret, containment, and reset requirements that an Execution Node must prove before it may enact a Runtime Binding.
 _Avoid_: Sandbox driver name, host configuration, feature flag, network default
 
+**Scheduler**:
+The Platform Control Plane deep module that durably orders Task Orchestration enactments, provides equal-weight Personal Workspace fairness, applies priority and aging, enforces layered concurrency and Resource Class policy, places work, and issues fenced Admission Grants.
+_Avoid_: Worker loop, queue broker, Task Orchestration, Runtime Execution, autoscaler
+
+**Scheduler Work Item**:
+A durable delivery and admission record for exactly one Task Orchestration enactment operation, referencing its Phase Run and any existing Runtime Run without owning their outcome. Claim loss may redeliver the same Work Item but never creates a business attempt.
+_Avoid_: Task, Phase Run, Runtime Run, broker message, job
+
+**Resource Class**:
+An immutable, versioned scheduling definition for the exact enforceable CPU, memory, process, ephemeral-byte, inode, accelerator, capability, Execution Policy, platform, and network requirements of capacity-bearing work.
+_Avoid_: Worker type, host size, best-effort request, mutable resource profile
+
+**Admission Grant**:
+A time-bounded, fenced Scheduler decision that reserves global, Personal Workspace, capability, Resource Class, and Execution Node capacity for one exact Scheduler Work Item and node. Runtime Execution must revalidate it before granting a Sandbox Lease.
+_Avoid_: Delivery Claim, Sandbox Lease, Quota Reservation, worker slot
+
 **Recovery Point**:
 A validated joint recovery identity that binds one PostgreSQL point-in-time target to the exact committed durable-object and runtime-package inventories required to restore it.
 _Avoid_: Database snapshot, object-store snapshot, backup job, live replica

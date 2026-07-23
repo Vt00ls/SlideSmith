@@ -11,7 +11,10 @@ reservation boundary,
 [ADR 0024](../adr/0024-centralize-provider-egress-and-usage-settlement.md)
 records the central egress and settlement choice,
 [runtime-execution.md](./runtime-execution.md) defines Runtime Run and fence
-authority, and the
+authority,
+[scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)
+defines quota-bearing admission and the opaque Reservation validation seam,
+and the
 [provider evidence research](./llm-provider-agent-compose-usage-evidence.md)
 defines the native facts and unknowns that this contract must preserve.
 
@@ -550,8 +553,10 @@ Stable downstream inputs are:
 - issue 13 receives Gateway Call, Attempt, Receipt, Ledger, Reservation,
   correction, unknown, late, backlog, integrity, and reconciliation identities
   plus the authoritative-versus-projection line;
-- issue 20 receives `Active` Reservation as a prerequisite for quota-bearing
-  Runtime admission, while Scheduler fairness and placement remain separate;
+- the resolved
+  [Scheduler contract](./scheduling-and-capacity-admission.md) receives Active
+  Reservation as a prerequisite for quota-bearing Runtime admission while
+  fairness and placement remain separate;
 - issue 17 receives the hard-cutover deletion test and the prohibition on
   fabricating legacy usage;
 - Runtime Execution receives the required Gateway-only network and secret seam,

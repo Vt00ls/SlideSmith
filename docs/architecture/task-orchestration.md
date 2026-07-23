@@ -12,6 +12,8 @@ release, compatibility, and Execution Lock authority,
 catalog selection, lifecycle, and Template Lock closure authority,
 [runtime-execution.md](./runtime-execution.md) defines Runtime Run, Sandbox
 Lease, worker, and evidence authority,
+[scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)
+defines Work Item delivery, Personal Workspace fairness, and Admission Grants,
 [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
 defines Phase Run Quota Reservation and provider-usage settlement, and
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 commit
@@ -100,7 +102,7 @@ required a pre-append command gate, which collapses to the chosen design.
 | Runtime View, Task Workspace bytes, Revision, Checkpoint, commit/discard, restore, and cleanup evidence | C04 Task Workspace Lifecycle | Receives opaque intent only; accepted fenced evidence gates mutating Phase success |
 | Artifact Version manifest and activation | Artifact publication | Publication evidence gates the publication Phase |
 | User identity, ownership, confirmation authority, and break-glass scope | Identity & Ownership | Supplies one typed, audited authority path; workers cannot impersonate it |
-| Fairness, queue order, resource admission, and delivery lease | Scheduler / queue decision | May delay or redeliver an enactment; quota-bearing Runtime admission additionally requires an active Phase Run Reservation |
+| Fairness, queue order, resource admission, and Delivery Claim | [Scheduler](./scheduling-and-capacity-admission.md) | May delay or redeliver an enactment; quota-bearing Runtime admission additionally requires an active Phase Run Reservation |
 | Usage Ledger, Quota Reservation, Usage Receipt ingest and reconciliation | Usage Accounting | Receives Phase Run reserve and close intent; Task Orchestration never calls providers or posts usage |
 | Metrics, tracing, logs, and audit projections | Observability and audit adapters | Consume accepted decisions and evidence; never drive state from a log |
 
@@ -386,7 +388,8 @@ Task Workspace Revision, or Checkpoint from ambiguous legacy state.
   closure, compatibility and safety evidence, and typed retention references
   inside the Route transaction. Existing Tasks keep the resulting lock across
   retry, recovery, cancellation, and manual edit.
-- Issue 20 may prioritize and lease durable enactments, but claim ownership,
+- The resolved [Scheduler contract](./scheduling-and-capacity-admission.md) may
+  prioritize and lease durable enactments, but Delivery Claim ownership,
   fairness, capacity admission, and queue delivery cannot mutate Task state.
   Quota-bearing admission requires an active Phase Run Reservation, but the
   Scheduler cannot create, renew, settle, or inspect Ledger entries.

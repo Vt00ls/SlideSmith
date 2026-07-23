@@ -6,6 +6,8 @@
 
 Usage evidence 状态：Issue [#14](https://github.com/Vt00ls/SlideSmith/issues/14) 已完成 [LLM provider 与 Agent Compose usage evidence 事实研究](./llm-provider-agent-compose-usage-evidence.md)，Issue [#12](https://github.com/Vt00ls/SlideSmith/issues/12) 已将其收敛为 [LLM Gateway and Usage Accounting contract](./llm-gateway-and-usage-accounting.md)。Agent Compose v2607.10.0 的公开 run/result contract 不保存 provider usage、provider request ID 或原始终态 evidence；逐 Gateway Attempt receipt 必须由 LLM Gateway 在 provider-native 边界捕获。
 
+Scheduling 状态：Issue [#20](https://github.com/Vt00ls/SlideSmith/issues/20) 已将 resource class、Personal Workspace fairness、layered concurrency、capacity admission、claim/lease、retry 和 dead-letter 收敛为 [Scheduling and Capacity Admission contract](./scheduling-and-capacity-admission.md)。Agent Compose stats 仍只作为 telemetry，不能成为 capacity authority。
+
 研究日期：2026-07-22
 
 上游基线：稳定 release [`v2607.10.0`](https://github.com/chaitin/agent-compose/releases/tag/v2607.10.0)，tag commit [`e14c4dbd5e3b0dec6178073902d67d2765390427`](https://github.com/chaitin/agent-compose/commit/e14c4dbd5e3b0dec6178073902d67d2765390427)
@@ -128,7 +130,7 @@ Agent Compose project `network.mode` 当前只接受 `default`，runtime topolog
 
 `stats` 可报告 CPU percent、memory usage/limit、network、block IO 和 uptime，并用 `unknown`/`unavailable` 表达 driver 不支持的项；它没有 admission、reservation 或 hard limit contract。[CLI stats](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/pages/command-line-manual.md#stats-show-sandbox-resource-stats) `agent-compose.yml` 的 `AgentSpec` 也没有 resource class/CPU/memory/GPU 字段。[compose spec](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/pkg/compose/spec.go#L32-L49)
 
-因此 SlideSmith scheduler/#20 必须拥有 resource class、reservation、node capacity 和 fairness；Execution Node/container runtime 必须拥有 cgroup、pids、ephemeral disk、GPU、egress allowlist/DNS/proxy 和 credential policy。Agent Compose stats 只能作为 telemetry/evidence，不得作为 capacity authority。
+因此 SlideSmith [Scheduler contract](./scheduling-and-capacity-admission.md) 必须拥有 Resource Class、Personal Workspace fairness、layered concurrency、placement 和 Admission Grant；Execution Node/container runtime 必须执行 cgroup、pids、ephemeral disk、GPU、egress allowlist/DNS/proxy 和 credential policy。Agent Compose stats 只能作为 telemetry/evidence，不得作为 capacity authority。
 
 ## 治理、审计和可观测证据
 
@@ -219,7 +221,7 @@ Guest ABI 官方明确没有 ABI version label或 compatibility handshake；runt
 | High | guest root + provider permission bypass + allow-all/default network意味着 Agent Compose 内部 prompt permission 不是安全边界。 | [Guest ABI](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/pages/guest-image-abi.md#31-image-and-user)；[provider behavior](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/design/agent-compose-runtime_contract.md#10-provider-adapter-behavior) | outer sandbox/cgroup/egress/secret/mount hardening；driver threat model。 |
 | High | preview security support未承诺 versioned window。 | [SECURITY.md](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/SECURITY.md#supported-versions) | internal version catalog、vuln monitoring、fast rollback和vendor exit seam。 |
 | Medium | restart统一 fail active run，没有透明恢复；多个 daemon不能共享 root。 | [startup reconciliation](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/pkg/agentcompose/app/background.go#L100-L153)；[workspace concurrency](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/design/agent-compose_design.md#workspace-provisioning-and-resume) | node-local daemon；new Runtime Run retry；durable C04 re-materialization。 |
-| Medium | stats 无 admission/limits；network只支持 default。 | [stats](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/pages/command-line-manual.md#stats-show-sandbox-resource-stats)；[network](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/pages/agent-compose-yaml-manual.md#network) | #20 scheduler/capacity authority和宿主 resource enforcement。 |
+| Medium | stats 无 admission/limits；network只支持 default。 | [stats](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/pages/command-line-manual.md#stats-show-sandbox-resource-stats)；[network](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/pages/agent-compose-yaml-manual.md#network) | 已确认的 [Scheduler contract](./scheduling-and-capacity-admission.md) 和宿主 resource enforcement。 |
 | Medium | run evidence缺少 provider request/usage receipt和 SlideSmith bindings。 | [result contract](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/design/agent-compose-runtime_contract.md#64-stdout-structured-result)；[RunDetail](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/proto/agentcompose/v2/agentcompose.proto#L1119-L1131)；[#14 usage research](./llm-provider-agent-compose-usage-evidence.md) | adapter evidence envelope；LLM Gateway逐 Gateway Attempt捕获原生receipt。 |
 | Medium | AGPLv3 对企业采用构成合规输入。 | [LICENSE](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/LICENSE.txt) | 产品采用前法务/开源合规批准。 |
 
@@ -228,12 +230,12 @@ Guest ABI 官方明确没有 ABI version label或 compatibility handshake；runt
 以下问题没有可靠一手事实可在本研究中自动关闭；它们是后续 decision/spec 输入，不阻塞本文的事实结论：
 
 1. 企业 V1 对 hostile prompt/code 的威胁等级，以及 Docker、BoxLite、Microsandbox 中哪个 driver/host hardening满足该等级。这改变安全姿态，属于 #24 的明确决策。
-2. 最终 execution-node resource class、CPU/memory/pids/ephemeral-disk/GPU、egress和并发值；Agent Compose 不提供这些 business inputs，属于 #20。
+2. 最终 production execution-node 数量与 CPU/memory/pids/ephemeral-disk/GPU、egress 和 site concurrency 数值；Agent Compose 不提供这些 business inputs。#20 已固定 Resource Class 和 layered admission contract，具体数值是 production 必须显式提供、缺失即 fail closed 的 versioned site policy。
 3. 生产 text/image provider、model/version、组织隔离与正式 usage/cost/retention contract尚未选定；当前第三方 OpenAI-compatible endpoint不能继承OpenAI官方契约。#14 已确定 Agent Compose不能补足逐 request usage evidence；#12 已固定 Gateway Receipt和reconciliation interface，具体选型继续作为 versioned provider onboarding与adapter acceptance输入。
 4. 现场实际 daemon/guest image digest、version、compiled driver、auth/TLS状态和 KVM/driver health。当前环境无可连接 daemon；上线前必须用只读 inventory补证。
 5. v2 Connect API 的长期 compatibility/support承诺。官方称 v1 为 stable compatibility API、v2 为 primary project/run path，但 preview policy没有 versioned support window；需要内部 pin + contract suite而非推定兼容。[API boundaries](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/design/agent-compose_design.md#api-boundaries)；[SECURITY.md](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/SECURITY.md#supported-versions)
 6. Agent Compose AGPLv3 在 SlideSmith 的具体部署、修改、分发方式下的义务；只能由法务/开源合规确认。
 
-没有发现需要改写 #16 或 #19 resolution 的事实。研究新增的 fog 都有现有下游归属：Runtime seam/driver/security 归 #24，capacity归 #20；#14 usage事实研究与#12 Gateway/ledger/reconciliation决策已完成；observability归 #13，release pin/compatibility归 #22。
+没有发现需要改写 #16 或 #19 resolution 的事实。研究新增的 fog 都有现有下游归属：Runtime seam/driver/security 已由 #24 收敛，capacity authority、fairness 和 admission 已由 #20 收敛，production 数值留在 versioned site policy；#14 usage事实研究与#12 Gateway/ledger/reconciliation决策已完成；observability归 #13，release pin/compatibility归 #22。
 
 影响 #11 研究完成的 remaining fog：none。
