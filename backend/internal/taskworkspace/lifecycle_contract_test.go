@@ -167,7 +167,7 @@ func TestMaterializeExactReplayReturnsTheOriginalResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay materialization: %v", err)
 	}
-	if second != first {
+	if !reflect.DeepEqual(second, first) {
 		t.Fatal("exact replay did not return the original materialization result")
 	}
 }
@@ -279,7 +279,7 @@ func TestCommitExactReplayReturnsTheOriginalTerminalResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay committed Runtime View: %v", err)
 	}
-	if second != first {
+	if !reflect.DeepEqual(second, first) {
 		t.Fatal("exact replay did not return the original terminal commit result")
 	}
 }
@@ -381,10 +381,6 @@ func TestUnchangedContentCommitCreatesADistinctCheckpoint(t *testing.T) {
 	secondEvidence.ID = "validation-evidence-2"
 	secondEvidence.Digest = secondEvidence.CanonicalDigest()
 	secondRequest := commitRequest(current, secondView, secondManifest, secondEvidence, "commit-2")
-	secondRequest.DurabilityEvidence = []taskworkspace.DurabilityEvidence{
-		durabilityEvidence("content-1", "2"),
-	}
-	secondRequest.Operation.RequestDigest = secondRequest.CanonicalRequestDigest()
 	second, err := lifecycle.CommitRuntimeView(context.Background(), secondRequest)
 	if err != nil {
 		t.Fatalf("commit unchanged state: %v", err)
@@ -501,43 +497,6 @@ func TestCommitFailsClosedUnlessEveryAuthorityAndIntegrityBindingIsExact(t *test
 			},
 		},
 		{
-			name: "missing durability evidence",
-			code: taskworkspace.ErrorIntegrityFailure,
-			edit: func(request *taskworkspace.CommitRuntimeViewRequest) {
-				request.DurabilityEvidence = nil
-				request.Operation.RequestDigest = request.CanonicalRequestDigest()
-			},
-		},
-		{
-			name: "durability not verified",
-			code: taskworkspace.ErrorIntegrityFailure,
-			edit: func(request *taskworkspace.CommitRuntimeViewRequest) {
-				request.DurabilityEvidence[0].Decision = "unverified"
-				request.DurabilityEvidence[0].Digest = request.DurabilityEvidence[0].CanonicalDigest()
-				request.Operation.RequestDigest = request.CanonicalRequestDigest()
-			},
-		},
-		{
-			name: "durability evidence bound to different content",
-			code: taskworkspace.ErrorIntegrityFailure,
-			edit: func(request *taskworkspace.CommitRuntimeViewRequest) {
-				evidence := &request.DurabilityEvidence[0]
-				evidence.ContentID = "content-not-declared"
-				evidence.Digest = evidence.CanonicalDigest()
-				request.Operation.RequestDigest = request.CanonicalRequestDigest()
-			},
-		},
-		{
-			name: "unregistered durability evidence",
-			code: taskworkspace.ErrorIntegrityFailure,
-			edit: func(request *taskworkspace.CommitRuntimeViewRequest) {
-				evidence := &request.DurabilityEvidence[0]
-				evidence.ID = "caller-minted-evidence"
-				evidence.Digest = evidence.CanonicalDigest()
-				request.Operation.RequestDigest = request.CanonicalRequestDigest()
-			},
-		},
-		{
 			name: "duplicate declared member",
 			code: taskworkspace.ErrorIntegrityFailure,
 			edit: func(request *taskworkspace.CommitRuntimeViewRequest) {
@@ -590,6 +549,8 @@ func TestPublicLifecycleContractAndErrorsDoNotExposePhysicalDetails(t *testing.T
 		"bucket",
 		"vendor",
 		"credential",
+		"sdk",
+		"filesystem",
 	}
 	seen := map[reflect.Type]bool{}
 	var inspectType func(reflect.Type)
@@ -618,6 +579,23 @@ func TestPublicLifecycleContractAndErrorsDoNotExposePhysicalDetails(t *testing.T
 	lifecycleType := reflect.TypeOf((*taskworkspace.Lifecycle)(nil)).Elem()
 	for methodIndex := 0; methodIndex < lifecycleType.NumMethod(); methodIndex++ {
 		method := lifecycleType.Method(methodIndex)
+		assertSafeContractName(t, method.Name, banned)
+		for inputIndex := 0; inputIndex < method.Type.NumIn(); inputIndex++ {
+			inspectType(method.Type.In(inputIndex))
+		}
+		for outputIndex := 0; outputIndex < method.Type.NumOut(); outputIndex++ {
+			inspectType(method.Type.Out(outputIndex))
+		}
+	}
+	durableObjectType := reflect.TypeOf((*taskworkspace.DurableObjectPort)(nil)).Elem()
+	if durableObjectType.NumMethod() != 2 {
+		t.Fatal("Durable Object port exposes authority beyond prepare and verification mechanics")
+	}
+	for methodIndex := 0; methodIndex < durableObjectType.NumMethod(); methodIndex++ {
+		method := durableObjectType.Method(methodIndex)
+		if method.Name != "PrepareCheckpoint" && method.Name != "VerifyCheckpoint" {
+			t.Fatal("Durable Object port exposes listing, adoption, retention, release, or business selection authority")
+		}
 		assertSafeContractName(t, method.Name, banned)
 		for inputIndex := 0; inputIndex < method.Type.NumIn(); inputIndex++ {
 			inspectType(method.Type.In(inputIndex))
@@ -678,6 +656,7 @@ func materializeRequest(
 		TaskID:          taskworkspace.TaskID(taskID),
 		TaskWorkspaceID: confirmed.TaskWorkspaceID,
 		RevisionID:      confirmed.CurrentRevisionID,
+		CheckpointID:    confirmed.CurrentCheckpointID,
 		Generation:      confirmed.Generation,
 		Fence:           confirmed.Fence,
 		Operation: taskworkspace.Operation{
@@ -762,7 +741,10 @@ func declaredStateManifest(contentID string) taskworkspace.DeclaredStateManifest
 		Members: []taskworkspace.DeclaredStateMember{
 			{
 				ID:            "state-member-1",
-				ContentID:     taskworkspace.ContentID(contentID),
+				LogicalMember: "state/deck.json",
+				Type:          taskworkspace.StateMemberRegularFile,
+				Mode:          0o600,
+				Class:         taskworkspace.StateMemberTaskOwnedMutable,
 				ContentDigest: contentDigest,
 				Size:          size,
 			},
@@ -774,34 +756,16 @@ func declaredStateManifest(contentID string) taskworkspace.DeclaredStateManifest
 
 func declaredContentFacts(contentID string) (taskworkspace.Digest, uint64) {
 	if contentID == "content-2" {
-		return "sha256:5753e29b83c3bd554f29719bd70b4893cb138e7ec31bcd81a8511c9a42da2a71", 22
+		return "sha256:1dde25249fd4b6cbedb58974a4e89c06c5741fee860b2e7faf35cd9bfd3debaf", 20
 	}
-	return "sha256:eb2c3a2b20a3e33b6e4b5f2f8f15a3a4d2d218db8c20a364be8349960d148545", 21
-}
-
-func durabilityEvidence(contentID, suffix string) taskworkspace.DurabilityEvidence {
-	contentDigest, size := declaredContentFacts(contentID)
-	evidence := taskworkspace.DurabilityEvidence{
-		ID:                    taskworkspace.EvidenceID("durability-evidence-" + contentID + "-" + suffix),
-		DurabilityAuthorityID: "durability-authority-1",
-		ContentID:             taskworkspace.ContentID(contentID),
-		ContentDigest:         contentDigest,
-		Size:                  size,
-		Decision:              taskworkspace.DurabilityVerified,
-	}
-	evidence.Digest = evidence.CanonicalDigest()
-	return evidence
+	return "sha256:c23e70927230be9d39b8237ab27c9a45cec5e1dafac3941a1dabf1df748656ca", 20
 }
 
 func newLifecycle() taskworkspace.Lifecycle {
 	return taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
 		ValidationAuthorityID: "validation-authority-1",
 		DurabilityAuthorityID: "durability-authority-1",
-		VerifiedDurabilityEvidence: []taskworkspace.DurabilityEvidence{
-			durabilityEvidence("content-1", "1"),
-			durabilityEvidence("content-1", "2"),
-			durabilityEvidence("content-2", "1"),
-		},
+		DurableObject:         &happyDurableObject{},
 	})
 }
 
@@ -850,11 +814,6 @@ func commitRequest(
 		Operation: taskworkspace.Operation{
 			ID: taskworkspace.OperationID(operationID),
 		},
-	}
-	if len(manifest.Members) > 0 {
-		request.DurabilityEvidence = []taskworkspace.DurabilityEvidence{
-			durabilityEvidence(string(manifest.Members[0].ContentID), "1"),
-		}
 	}
 	request.Operation.RequestDigest = request.CanonicalRequestDigest()
 	return request

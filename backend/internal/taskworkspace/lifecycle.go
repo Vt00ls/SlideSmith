@@ -82,10 +82,11 @@ func (r ConfirmTaskWorkspaceRequest) CanonicalRequestDigest() Digest {
 }
 
 type ConfirmTaskWorkspaceResult struct {
-	TaskWorkspaceID   TaskWorkspaceID
-	CurrentRevisionID RevisionID
-	Generation        Generation
-	Fence             Fence
+	TaskWorkspaceID     TaskWorkspaceID
+	CurrentRevisionID   RevisionID
+	CurrentCheckpointID CheckpointID
+	Generation          Generation
+	Fence               Fence
 }
 
 type MaterializeRequest struct {
@@ -93,6 +94,7 @@ type MaterializeRequest struct {
 	TaskID          TaskID
 	TaskWorkspaceID TaskWorkspaceID
 	RevisionID      RevisionID
+	CheckpointID    CheckpointID
 	Generation      Generation
 	Fence           Fence
 	Operation       Operation
@@ -105,6 +107,7 @@ func (r MaterializeRequest) CanonicalRequestDigest() Digest {
 		TaskID          TaskID
 		TaskWorkspaceID TaskWorkspaceID
 		RevisionID      RevisionID
+		CheckpointID    CheckpointID
 		Generation      Generation
 		Fence           Fence
 		OperationID     OperationID
@@ -114,6 +117,7 @@ func (r MaterializeRequest) CanonicalRequestDigest() Digest {
 		TaskID:          r.TaskID,
 		TaskWorkspaceID: r.TaskWorkspaceID,
 		RevisionID:      r.RevisionID,
+		CheckpointID:    r.CheckpointID,
 		Generation:      r.Generation,
 		Fence:           r.Fence,
 		OperationID:     r.Operation.ID,
@@ -121,11 +125,16 @@ func (r MaterializeRequest) CanonicalRequestDigest() Digest {
 }
 
 type MaterializeResult struct {
-	MaterializationID MaterializationID
-	TaskWorkspaceID   TaskWorkspaceID
-	RevisionID        RevisionID
-	Generation        Generation
-	Fence             Fence
+	MaterializationID      MaterializationID
+	TaskWorkspaceID        TaskWorkspaceID
+	RevisionID             RevisionID
+	CheckpointID           CheckpointID
+	ManifestDigest         Digest
+	ContentEvidenceRoot    EvidenceRoot
+	DurabilityEvidenceRoot EvidenceRoot
+	CheckpointEvidence     CheckpointEvidence
+	Generation             Generation
+	Fence                  Fence
 }
 
 type OpenRuntimeViewRequest struct {
