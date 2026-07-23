@@ -1,0 +1,3 @@
+# Retain business publications and expire execution state
+
+SlideSmith retains authoritative business records and Artifact Versions by default, while execution data such as sandboxes, temporary run directories, idle Task Workspaces, disposable Checkpoints, caches, and failed publication residue is subject to automatic expiry and garbage collection. Task recovery depends on validated Checkpoints and published inputs rather than live sandbox state, and deleting an Artifact Version revokes its Share Links. This boundary preserves User work while bounding inode and storage growth independently of Task volume.

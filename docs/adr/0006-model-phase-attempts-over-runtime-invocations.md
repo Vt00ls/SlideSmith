@@ -1,0 +1,3 @@
+# Model phase attempts over zero or more runtime invocations
+
+Each Phase Run is one historical attempt to enact a Phase from the Task's pinned Pipeline Version and may own zero or more Runtime Runs, while every Runtime Run belongs to exactly one Phase Run. Runtime Runs perform approved capabilities but do not advance the Generation Pipeline directly; the Phase Run aggregates their evidence, validates the Phase contract, and alone determines whether the attempt succeeded. Phase Runs therefore reference their Pipeline Version and Phase definition key, Runtime Runs reference their Phase Run, and retries create new attempts instead of overwriting prior execution history.

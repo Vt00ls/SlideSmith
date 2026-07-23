@@ -1,0 +1,320 @@
+# Enterprise Platform Domain Model
+
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) records owner, Share Link, and break-glass authority, [workspace-export-and-purge.md](./workspace-export-and-purge.md) records disabled-User export, external delivery proof, irreversible purge, tombstone and suppression authority, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md) records queue, Personal Workspace fairness, Resource Class, and Admission Grant authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam, and [observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md) records authoritative audit, correlation, telemetry, alerting, retention, and Cleanup Debt boundaries.
+
+The one-time legacy ownership, business-record, run-history, publication,
+catalog, freeze, validation, rollback, and cleanup conversion is governed by
+[legacy-business-migration-and-compatibility.md](./legacy-business-migration-and-compatibility.md).
+
+## Ownership and publication
+
+```mermaid
+flowchart TD
+    User -->|owns exactly one| PersonalWorkspace[Personal Workspace]
+    PersonalWorkspace -->|owns| Task
+    PersonalWorkspace -->|owns| UsageLedger[Usage Ledger]
+    PersonalWorkspace -->|owns| QuotaReservation[Quota Reservation]
+    Task -->|owns| SourceMaterial[Source Material]
+    Task -->|publishes| ArtifactVersion[Artifact Version]
+    ArtifactVersion -->|contains| Artifact
+    ArtifactVersion -->|may expose through| ShareLink[Share Link]
+    ShareLink -->|requires| AccessCode[Access Code]
+    PlatformAdministrator[Platform Administrator] -. audited Workspace Export .-> PersonalWorkspace
+    PersonalWorkspace -->|terminal purge creates| WorkspaceTombstone[Workspace Tombstone]
+    PurgeFence[Purge Fence] -->|suppresses recovery of| PersonalWorkspace
+```
+
+- A Share Link grants no access to its Task or Personal Workspace.
+- A Personal Workspace or Task is never transferred to another User. Audited Workspace Export and a separate purge are the only disabled-User offboarding path.
+- Workspace Export or purge does not rewrite historical Usage Ledger ownership.
+- Disable has no automatic purge timer. Export requires complete canonical
+  coverage and an independently verified external receipt; purge requires two
+  administrators, 24-hour cooling-off, final reauthentication and current
+  eligibility.
+- The independent Purge Fence is irreversible. It prevents old Recovery Points
+  from restoring content authority, while a content-free Workspace Tombstone,
+  Usage history and audit remain. The external archive remains outside
+  SlideSmith purge.
+- Source Material is a Task-owned durable input, not an unpublished Artifact.
+- Artifact Versions are immutable publication sets; edits publish child versions.
+
+## Content authorization and sharing
+
+```mermaid
+flowchart LR
+    Owner[WorkspaceOwnerPrincipal]
+    Share[SharePrincipal]
+    BreakGlass[BreakGlassPrincipal]
+    Access[Identity & Ownership<br/>authorization seam]
+    Version[Exact Artifact Version<br/>or content target]
+    Audit[(Mandatory access audit)]
+    Object[Durable Object]
+
+    Owner --> Access
+    Share --> Access
+    BreakGlass --> Access
+    Access --> Version
+    Version --> Audit
+    Audit --> Object
+```
+
+- Every content request selects exactly one authority path. Principals never union owner, share, administrator, or break-glass authority.
+- `AdministratorPrincipal` provides metadata and operational authority only. Actual content inspection requires a dual-controlled, exact-target, time-bounded BreakGlass Grant.
+- A Share Link has a seven-day default and thirty-day hard maximum, requires a separate Access Code, and cannot be extended after issuance. Rotation invalidates all Verification Sessions.
+- User disable or identity rebind, target deletion or unavailability, Workspace purge, and Recovery Epoch advancement terminally invalidate affected Share Grants.
+- All three paths converge only after policy validation and mandatory audit, at the same intent-bound `Durable Object` read-handle seam.
+
+## Pipeline and execution
+
+```mermaid
+flowchart TD
+    Task -->|selects| Route
+    Task -->|owns one immutable| ExecutionLock[Execution Lock]
+    Route -->|determination creates| ExecutionLock
+    ExecutionLock -->|binds| PipelineVersion[Pipeline Version]
+    ExecutionLock -->|binds| RuntimeRelease[Runtime Release]
+    ExecutionLock -->|binds| CompatibilityApproval[Compatibility Approval]
+    CompatibilityApproval -->|approves exact member| PipelineVersion
+    CompatibilityApproval -->|approves exact member| RuntimeRelease
+    PipelineDefinition[Pipeline Definition] -->|publishes| PipelineVersion
+    PipelineVersion -->|defines| Phase
+    Phase -->|attempted as| PhaseRun[Phase Run]
+    PhaseRun -->|owns 0..N| RuntimeRun[Runtime Run]
+    PhaseRun -->|holds at most one| QuotaReservation[Quota Reservation]
+    ExecutionLock -->|derives exact capability| RuntimeBinding[Runtime Binding]
+    RuntimeBinding -->|authorizes| RuntimeRun
+    RuntimeRun -->|acquires 0..1| SandboxLease[Sandbox Lease]
+    RuntimeRun -->|executes on| ExecutionNode[Execution Node]
+    ExecutionPolicy[Execution Policy] -->|must be attested by| ExecutionNode
+    RuntimeRun -->|mutates through| RuntimeView[Runtime View]
+    Task -->|owns one mutable| TaskWorkspace[Task Workspace]
+    TaskWorkspace -->|advances as| WorkspaceRevision[Task Workspace Revision]
+    WorkspaceRevision -->|materializes into| RuntimeView
+    RuntimeView -->|validated commit advances| TaskWorkspace
+    WorkspaceRevision -->|bound to| Checkpoint
+    Checkpoint -->|restores| TaskWorkspace
+```
+
+- Route determination atomically records one Execution Lock before the first consuming Phase Run. Retry, recovery, cancellation, and manual edit preserve it.
+- Ordinary rollout, rollback, and deprecation affect new Tasks only. Revocation is a terminal trust decision that fences existing uncommitted work without rewriting the lock.
+- A Runtime Run cannot advance the Generation Pipeline directly; its Phase Run validates the outcome.
+- Runtime Runs share explicit Task Workspace state through isolated Runtime Views, never hidden sandbox state.
+- Each Runtime Run uses a fresh lease; infrastructure may reuse a fully reset physical sandbox under a new lease.
+- Every successful Phase Run binds its validated contract, authoritative Task Workspace Revision, and a distinct durable Checkpoint identity.
+
+## Runtime Execution
+
+```mermaid
+flowchart LR
+    Orchestration[Task Orchestration] -->|typed start/cancel enactment| Runtime[Runtime Execution]
+    Release[Release Management] -->|exact Runtime Binding| Runtime
+    Scheduler[Scheduler] -->|Admission Grant| Runtime
+    Runtime -->|fenced Execution Capsule| Agent[Agent Worker]
+    Runtime -->|fenced Execution Capsule| Tool[Tool Worker]
+    Runtime -->|acquire isolated Runtime View| Lifecycle[Task Workspace Lifecycle]
+    Agent -->|raw adapter evidence| Runtime
+    Tool -->|raw adapter evidence| Runtime
+    Runtime -->|verified Runtime Evidence| Orchestration
+```
+
+- Runtime Execution owns Runtime Run process state, Sandbox Lease and fence, deadline and cancellation, truthful node execution facts, and verified Runtime Evidence.
+- Task Orchestration creates Runtime Run identity and Phase Run membership. Agent and Tool Workers enact capabilities but cannot create authoritative runs or advance a Phase.
+- Agent and Tool Workers share one lifecycle and evidence protocol. Internal model and tool calls stay inside one Runtime Run unless the pinned Pipeline declares separate capability invocations.
+- Production execution treats guest code and supplied content as hostile. An exact Execution Node and driver configuration must prove its Execution Policy before admission; no driver is trusted by name.
+- Runtime success is an execution fact only. Platform validation, C04 commit, and Artifact publication remain independent authorities.
+
+## Scheduling and capacity admission
+
+~~~mermaid
+flowchart LR
+    Orchestration[Task Orchestration] -->|durable enactment| Work[Scheduler Work Item]
+    Work --> Scheduler[Scheduler]
+    Identity[Identity & Ownership] -->|Workspace and machine authority| Scheduler
+    Usage[Usage Accounting] -->|Active Quota Reservation disposition| Scheduler
+    Release[Release Management] -->|exact Resource Class requirement| Scheduler
+    Runtime[Runtime Execution] -->|truthful node and lease facts| Scheduler
+    Scheduler -->|fenced Admission Grant| Runtime
+    Runtime --> Node[Execution Node]
+~~~
+
+- One Scheduler Work Item represents one Task Orchestration enactment operation. It may reference a Phase Run and an existing Runtime Run but never owns their outcome.
+- Platform PostgreSQL is authoritative for enqueue, Personal Workspace fairness, priority and aging, Delivery Claims, Admission Grants, retry, dead-letter, and delivery disposition. Redis, NATS, polling, and notifications are replaceable adapters.
+- Enterprise V1 uses equal-weight Personal Workspace deficit round-robin. Manual edit is Interactive only inside its Workspace; ordinary Task work is Standard, Background work ages, and safety control uses a reserved lane.
+- Every capacity-bearing admission satisfies site, Personal Workspace, exact capability, Resource Class, and Execution Node limits. Runtime Execution supplies node truth and revalidates an Admission Grant before creating a Sandbox Lease.
+- Resource Classes are immutable and exact. Missing, stale, unknown, or unenforced hard-resource facts fail closed; Scheduler cannot weaken a Runtime Binding or Execution Policy to find capacity.
+- Quota-bearing work requires an Active Phase Run Reservation, but observation-mode shortage does not block V1 and Scheduler never owns Ledger or Reservation mutation.
+- Claim loss redelivers the same operation. Runtime or Phase retry remains Task Orchestration authority, and node loss quarantines physical capacity until containment and reset are proved.
+
+## LLM Gateway and Usage Accounting
+
+```mermaid
+flowchart LR
+    Orchestration[Task Orchestration] -->|acquire and close Phase Run hold| Usage[Usage Accounting]
+    Runtime[Runtime Execution] -->|fenced Gateway Grant| Gateway[LLM Gateway]
+    Gateway -->|one real outbound request| Provider[LLM or image provider]
+    Gateway -->|authenticated Usage Receipt| Usage
+    Usage --> Ledger[Personal Workspace Usage Ledger]
+    Usage --> Reservation[Phase Run Quota Reservation]
+```
+
+- Every production LLM or generative-image provider call crosses the LLM Gateway. Sandboxes and workers receive no provider credential or direct provider egress.
+- One Runtime Run may own several Gateway Calls; every real retry or permitted fallback creates a distinct Gateway Attempt.
+- The Gateway owns provider routing, Attempt facts, native evidence capture, and content-free Usage Receipt issuance. Usage Accounting verifies Receipts and alone owns Ledger posting, correction, Reservation, and reconciliation.
+- Runtime or Phase terminal state does not erase usage from an already accepted Attempt. Missing, delayed, and aggregate-only evidence never becomes zero or fabricated per-Task actual.
+- Enterprise V1 reservations are observational. Quota shortage does not reject a Task, while authorization, integrity, attempt durability, and reservation persistence remain fail-closed gates.
+
+## Task Orchestration
+
+```mermaid
+flowchart LR
+    Inputs["User intent, work availability,<br/>Runtime/C04/publication evidence"]
+    Orchestration["Task Orchestration<br/>command-decision seam"]
+    State[("Task revision,<br/>locks and Phase Run history")]
+    Outbox["Idempotent enactment outbox"]
+    Runtime["Runtime Execution"]
+    Lifecycle["Task Workspace Lifecycle"]
+    Publication["Artifact Publication"]
+
+    Inputs --> Orchestration
+    State --> Orchestration
+    Orchestration --> State
+    Orchestration --> Outbox
+    Outbox --> Runtime
+    Outbox --> Lifecycle
+    Outbox --> Publication
+    Runtime -->|typed evidence| Orchestration
+    Lifecycle -->|fenced evidence| Orchestration
+    Publication -->|activation evidence| Orchestration
+```
+
+- One authenticated or evidence-bearing `Decide` operation is the mutation seam for Task, Generation Pipeline, Confirmation Gate, Phase Run, retry, cancellation, recovery, and manual-edit progression.
+- Task status is a coarse projection. The pinned Pipeline Version and Phase Run outcomes define route-specific progress; status constants and workers do not define workflow order.
+- Accepted decisions and their enactments commit atomically. Claim loss or acknowledgement loss causes idempotent redelivery and reconciliation, not a new Phase Run.
+- Events, audit records, and metrics are projections of accepted decisions. External events are not appended as authority before authorization and optimistic-concurrency validation.
+
+## Task Workspace lifecycle
+
+```mermaid
+flowchart LR
+    CP[Platform Control Plane<br/>authoritative decisions]
+    Life[Task Workspace Lifecycle<br/>deep module]
+    Materialization[Disposable materialization]
+    Durable[(Durable Checkpoint content)]
+    Runtime[Runtime Release]
+    Packages[Template Version<br/>Resource Bundle]
+
+    CP -->|opaque intent and identities| Life
+    Life --> Materialization
+    Life --> Durable
+    Runtime -->|read-only| Materialization
+    Packages -->|read-only| Materialization
+    Life -->|revision and evidence| CP
+```
+
+- The lifecycle interface exposes high-level intent and opaque identities, never host paths, mounts, file operations, storage vendors, buckets, or node details.
+- One authoritative writer advances each Task Workspace; mutating Runtime Runs commit or discard transactional Runtime Views after Phase Run validation.
+- A Checkpoint captures declared recoverable Task-owned mutable state, not a directory snapshot. Immutable runtime and template packages, Source Material, cache, sessions, and failed residue stay outside it.
+- Checkpoint content becomes authoritative only after node-independent durable acknowledgement; missing content or digest mismatch fails closed.
+- Physical materialization can expire and be rebuilt on any eligible execution node. Cleanup failures become persistent, retriable Cleanup Debt rather than untracked directories.
+
+## Durable objects and materialization
+
+```mermaid
+flowchart LR
+    Business[Source, publication,<br/>catalog, and C04 modules]
+    Object[Durable Object<br/>deep module]
+    Registry[(PostgreSQL<br/>intents, references, receipts)]
+    Bytes[(Immutable object-store bytes)]
+    Cache[Verified disposable<br/>node cache]
+
+    Business -->|opaque content intent| Object
+    Object --> Registry
+    Object --> Bytes
+    Object -->|lease-based acquire| Cache
+```
+
+- PostgreSQL is authoritative for semantic metadata, typed references, activation, retention intent, and verification receipts; the durable store carries the actual immutable bytes. Neither side is sufficient alone.
+- Business identity remains separate from opaque content identity and digest. User content deduplicates only within its Personal Workspace policy domain.
+- Cross-store writes use durable intents, strict verification, a PostgreSQL activation transaction, and idempotent reconciliation. Missing or mismatched bytes fail closed.
+- Execution nodes materialize through leases and verified digest caches. Host paths, mounts, object keys, vendors, and credentials stay inside adapters.
+
+## Runtime and design packages
+
+```mermaid
+flowchart TD
+    ReleaseManagement[Release Management] -->|publishes independently| PipelineVersion[Pipeline Version]
+    ReleaseManagement -->|publishes independently| RuntimeRelease[Runtime Release]
+    ReleaseManagement -->|approves exact pair| CompatibilityApproval[Compatibility Approval]
+    Task -->|owns| ExecutionLock[Execution Lock]
+    ExecutionLock -->|binds| PipelineVersion
+    ExecutionLock -->|binds| RuntimeRelease
+    ExecutionLock -->|binds| CompatibilityApproval
+    RuntimeRelease -->|contains| CoreSkill[Core Skill]
+    RuntimeRelease -->|contains| Toolchain
+    RuntimeRelease -->|implements| RuntimeCapability[Pipeline runtime capabilities]
+    CatalogPublication[Catalog Publication] -->|owns stable identity| CatalogTemplate[Catalog Template]
+    CatalogTemplate -->|one current Active| TemplateVersion[Template Version]
+    TemplateVersion -->|exact dependency DAG| ResourceBundle[Resource Bundle]
+    Task -->|records selection in| TemplateLock[Template Lock]
+    TemplateLock -->|pins| TemplateVersion
+    TemplateLock -->|pins transitive closure| ResourceBundle
+```
+
+- Core Skills ship inside content-addressed Runtime Images for the first release.
+- Pipeline Versions and Runtime Releases publish independently and become usable together only through an immutable positive Compatibility Approval.
+- Runtime Execution receives an exact capability-scoped Runtime Binding derived from the Execution Lock, not the complete Pipeline graph or rollout policy.
+- Catalog Publication atomically activates at most one current Template Version per Catalog Template. Ordinary Users select the stable Catalog Template; Task Orchestration records the exact observed version and complete Resource Bundle closure in the Template Lock.
+- Embedded assets share one Template Version lifecycle. Assets requiring independent reuse, distribution, scanning, retention, withdrawal, or licensing use separately published, non-executable Resource Bundles.
+- Approved, Deprecated, and catalog-tombstoned exact versions remain available to existing Template Locks. Disabled content advances a catalog safety epoch and fences uncommitted work.
+- Runtime Images remain in an OCI registry; Template Versions and Resource Bundles use immutable object-store package payloads behind the durable-object seam.
+- No Task references a floating `latest` runtime, template, or resource package.
+
+## Observability, audit, and Cleanup Debt
+
+```mermaid
+flowchart LR
+    Domain["Authoritative domain fact"]
+    Audit["Authoritative audit fact"]
+    Projection["Metrics, traces, logs<br/>dashboards, external audit copy"]
+    Resource["Owning resource module"]
+    Debt["Cleanup Debt"]
+
+    Domain --> Projection
+    Domain --> Audit
+    Audit --> Projection
+    Resource --> Debt
+    Debt --> Projection
+```
+
+- Domain and mandatory audit facts remain in Platform PostgreSQL under their
+  owning modules. Telemetry and external audit delivery are incomplete,
+  expiring projections and never drive business state.
+- Correlation uses typed business, decision, operation, revision, generation,
+  fence, and evidence identities. A trace ID is diagnostic context only.
+- W3C trace context crosses owned transports after validation; business
+  identity and secrets never travel in baggage or to an external provider.
+- Metrics use bounded dimensions without User, Personal Workspace, Task, run,
+  grant, receipt, debt, path, locator, trace, or free-form error labels.
+- Mandatory audit failure blocks the protected operation. Ordinary telemetry
+  or external audit-delivery failure does not roll back a committed fact.
+- Cleanup Debt has one resource owner and remains persistent, retriable, and
+  visible until verified cleanup or an authorized audited resolution.
+- Orphan and integrity scans create evidence for the owning module. They do not
+  authorize adoption, repair, reclamation, or deletion by themselves.
+
+## Authority seam
+
+| Platform Control Plane | Execution Data Plane |
+| --- | --- |
+| Users, Personal Workspaces, mutually exclusive principals, Sharing, BreakGlass Grants, and access audit | Sandboxed process execution |
+| Workspace Export and Purge operations, delivery evidence, Purge Fence relationship, tombstone and recovery suppression | External archive transport, export staging and physical cleanup adapters |
+| Task Orchestration decisions, Task revision, Route, and Execution Lock | Task Workspace materialization and byte mutation |
+| Phase Run outcome and Runtime Run relationship | Agent and Tool capability execution on attested Execution Nodes |
+| Scheduler Work Items, Personal Workspace fairness, Delivery Claims, Resource Classes, concurrency policy, placement, and Admission Grants | Worker delivery, node-local capacity enforcement, and raw readiness observations |
+| Runtime Execution decisions, Sandbox Leases, fences, and accepted Runtime Evidence | Raw runtime status, process, and adapter evidence emission |
+| Checkpoint metadata and commit authority | Runtime Views, Checkpoint content, expiry, and cleanup |
+| Release Management, Catalog Publication, Execution and Template Locks, durable-object registry, and references | Temporary logs and outputs |
+| Artifact Version metadata and sharing | Temporary publication assembly and output proposals |
+| LLM Gateway Calls, Attempts, Usage Receipts, Usage Ledger and Quota Reservation | Provider execution and native usage evidence |
+
+Execution output becomes authoritative only after the Platform Control Plane validates and records it.

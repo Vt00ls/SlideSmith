@@ -1,0 +1,3 @@
+# Reserve quota at phase run boundaries
+
+A Personal Workspace owns each Quota Reservation, and one reservation covers the estimated maximum consumption of all Runtime Runs belonging to a single Phase Run. The reservation is acquired before runtime scheduling, actual consumption is settled into the Usage Ledger, and unused capacity is released or expires; retries create new Phase Runs and reservations rather than reusing stale holds. This boundary prevents concurrent oversubscription without holding a Task-wide budget across long Confirmation Gates or fragmenting guarantees across individual Runtime Runs.

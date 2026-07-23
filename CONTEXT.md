@@ -1,0 +1,291 @@
+# SlideSmith Presentation Production
+
+SlideSmith turns source material and presentation design constraints into editable, validated slide decks. This context defines the language used to describe deck composition and the route-specific lifecycle that produces it.
+
+## Language
+
+### Platform ownership and sharing
+
+**User**:
+An authenticated person who owns one Personal Workspace and the work created within it.
+_Avoid_: Member, tenant user, account
+
+**Personal Workspace**:
+A User's durable private space for creating and managing Tasks and their outputs. Other Users have no implicit access to it, and its identity is never transferred or reused.
+_Avoid_: User directory, Task Workspace, Sandbox Workspace, transferable workspace
+
+**Platform Administrator**:
+An authenticated operator with platform-wide operational authority but no implicit right to inspect a User's content; exceptional content access requires an explicit audited grant.
+_Avoid_: Workspace owner, tenant administrator, member
+
+**Share Link**:
+A revocable, time-bounded grant that exposes one published Artifact Version without granting access to its owning Task or Personal Workspace.
+_Avoid_: Public link, Task share, workspace invitation
+
+**Access Code**:
+A separate secret required to use a Share Link.
+_Avoid_: Password, link token, invitation code
+
+**Workspace Export**:
+An audited administrative package delivered outside SlideSmith from one disabled User's Personal Workspace before an independently authorized purge. It does not transfer the Personal Workspace or any Task to another User.
+_Avoid_: Workspace transfer, Artifact Version, backup
+
+**Export Delivery Receipt**:
+Authenticated evidence from an allowlisted external administrative archive that it durably received and independently verified the exact Workspace Export manifest and archive bytes. An upload attempt, response start, callback, or partial delivery is not a receipt.
+_Avoid_: Upload response, download acknowledgement, purge approval
+
+**Purge Fence**:
+The generation-bound fact activated in an independent immutable suppression authority that makes a confirmed Personal Workspace purge irreversible and prevents any older database or Recovery Point from restoring its content authority.
+_Avoid_: Purge request, deletion job, backup expiry
+
+**Workspace Tombstone**:
+The content-free, terminal record that preserves a purged User and Personal Workspace's non-reused identities, generations, export and purge evidence roots, and recovery suppression without retaining their Tasks or content.
+_Avoid_: Disabled Workspace, Workspace backup, recoverable User
+
+### Platform boundaries
+
+**Platform Control Plane**:
+The authoritative owner of identity, access, Task orchestration, release identities, Execution Locks, publication metadata, sharing, and usage records.
+_Avoid_: Execution Data Plane, runtime, worker
+
+**Execution Data Plane**:
+The isolated execution environment that performs Runtime Runs, mutates Task Workspace content, and returns execution evidence without deciding authoritative business state.
+_Avoid_: Platform Control Plane, Task owner, business database
+
+**LLM Gateway**:
+The Platform-controlled provider egress module through which every production LLM and generative-image call is authorized, attempted, correlated, evidenced, and converted into a content-free Usage Receipt.
+_Avoid_: Provider proxy, Agent Compose LLM facade, sandbox credential broker, Usage Ledger
+
+**Execution Node**:
+An owned compute node whose attested capabilities may host one or more independently fenced Sandbox Leases. Node availability, local paths, and resident sandbox state are never Task or recovery authority.
+_Avoid_: Worker, Task Workspace, Agent Compose session, business server
+
+**Execution Policy**:
+An approved, versioned set of isolation, resource, mount, network, secret, containment, and reset requirements that an Execution Node must prove before it may enact a Runtime Binding.
+_Avoid_: Sandbox driver name, host configuration, feature flag, network default
+
+**Scheduler**:
+The Platform Control Plane deep module that durably orders Task Orchestration enactments, provides equal-weight Personal Workspace fairness, applies priority and aging, enforces layered concurrency and Resource Class policy, places work, and issues fenced Admission Grants.
+_Avoid_: Worker loop, queue broker, Task Orchestration, Runtime Execution, autoscaler
+
+**Scheduler Work Item**:
+A durable delivery and admission record for exactly one Task Orchestration enactment operation, referencing its Phase Run and any existing Runtime Run without owning their outcome. Claim loss may redeliver the same Work Item but never creates a business attempt.
+_Avoid_: Task, Phase Run, Runtime Run, broker message, job
+
+**Resource Class**:
+An immutable, versioned scheduling definition for the exact enforceable CPU, memory, process, ephemeral-byte, inode, accelerator, capability, Execution Policy, platform, and network requirements of capacity-bearing work.
+_Avoid_: Worker type, host size, best-effort request, mutable resource profile
+
+**Admission Grant**:
+A time-bounded, fenced Scheduler decision that reserves global, Personal Workspace, capability, Resource Class, and Execution Node capacity for one exact Scheduler Work Item and node. Runtime Execution must revalidate it before granting a Sandbox Lease.
+_Avoid_: Delivery Claim, Sandbox Lease, Quota Reservation, worker slot
+
+**Recovery Point**:
+A validated joint recovery identity that binds one PostgreSQL point-in-time target to the exact committed durable-object and runtime-package inventories required to restore it.
+_Avoid_: Database snapshot, object-store snapshot, backup job, live replica
+
+### Usage and quota
+
+**Usage Accounting**:
+The Platform Control Plane deep module that verifies Usage Receipts and authoritatively owns Usage Ledger posting, Quota Reservation decisions, append-only correction, and reconciliation.
+_Avoid_: LLM Gateway, provider billing system, usage dashboard, Runtime Execution
+
+**Gateway Call**:
+One logical LLM or generative-image provider invocation made for a Runtime Run through the LLM Gateway. A Gateway Call may require several Gateway Attempts without treating them as one provider consumption event.
+_Avoid_: Runtime Run, agent turn, provider request, Usage Receipt
+
+**Gateway Attempt**:
+One real outbound provider request belonging to a Gateway Call. Every retry or permitted provider fallback creates a new Gateway Attempt because it may create new consumption.
+_Avoid_: Gateway Call, Runtime Run attempt, provider-internal retry
+
+**Usage Receipt**:
+An authenticated, content-free evidence envelope issued by the LLM Gateway for one Gateway Attempt, preserving provider-native usage or explicit unknown, estimated, not-applicable, or proven-no-send state until Usage Accounting verifies it.
+_Avoid_: Usage Ledger entry, provider response body, Runtime Evidence, billing record
+
+**Usage Ledger**:
+The append-only record of measured consumption and corrective adjustments owned by one Personal Workspace, with entries attributed to their originating Task, Phase Run, and Runtime Run. Moving work never rewrites its historical usage ownership.
+_Avoid_: Task usage counter, quota balance, billing estimate
+
+**Quota Reservation**:
+A time-bounded hold against one Personal Workspace's available quota, associated with a single Phase Run and settled against its actual Usage Ledger entries. Closing or expiry never treats unresolved usage as zero, and late entries remain attributable without reviving the hold.
+_Avoid_: Usage entry, quota limit, Sandbox Lease
+
+### Work and outputs
+
+**Task**:
+A single request within a Personal Workspace to create, restyle, or fill one Deck. It owns the intent, inputs, confirmations, production route, and resulting artifacts as one lifecycle.
+_Avoid_: Project, job, run
+
+**Task Workspace**:
+A Task's sole logical identity for mutable working state, reused across its Phases; its physical materialization may expire and be rebuilt from a Checkpoint. It is neither a User ownership boundary nor a durable Task output.
+_Avoid_: Personal Workspace, Execution Workspace, Sandbox Workspace, run snapshot
+
+**Task Workspace Revision**:
+An authoritative immutable identity for the Task Workspace state produced by one validated mutation. Revisions order recoverable state without exposing how or where its bytes are materialized.
+_Avoid_: Checkpoint, directory version, run snapshot
+
+**Runtime View**:
+An isolated, disposable view through which one Runtime Run proposes mutations from a Task Workspace Revision. Its changes are not authoritative unless validation succeeds and the view is committed.
+_Avoid_: Task Workspace, Sandbox Workspace, session directory
+
+**Checkpoint**:
+An immutable recovery record created for every successful Phase Run and other validated Task Workspace commit, binding a Task Workspace Revision to only the declared recoverable Task-owned state. Different Checkpoints may share deduplicated content but remain distinct recovery identities.
+_Avoid_: Artifact Version, workspace backup, directory snapshot, autosave
+
+**Cleanup Debt**:
+A persistent obligation representing execution data that should have been reclaimed but was not. It remains retriable and observable until cleanup succeeds or an authorized decision resolves it.
+_Avoid_: Cleanup marker, log-only cleanup failure, failed residue
+
+**Source Material**:
+User-provided information that supplies the meaning and content of a Deck independently of its visual structure.
+_Avoid_: Template, asset, prompt
+
+**Deck**:
+An ordered collection of Slides intended to be delivered and presented as one coherent whole.
+_Avoid_: Presentation file, PPT, project
+
+**Artifact**:
+A durable file or piece of evidence published as a member of one Artifact Version, such as a Deck, preview, plan, or validation report.
+_Avoid_: Artifact Version, temporary file, workspace file
+
+**Artifact Version**:
+An immutable published manifest of related Artifacts owned by one Task, retained and shared independently of later versions while preserving its lineage from any parent version.
+_Avoid_: Artifact, current output, single-file version
+
+### Runtime and packages
+
+**Runtime Release**:
+An immutable, approved combination of a Core Skill, executor contract, and toolchain that a Task pins so production and retries retain the same behavior.
+_Avoid_: Runtime image, deployment, latest runtime
+
+**Compatibility Approval**:
+An immutable positive proof that one exact Pipeline Version and one exact Runtime Release satisfy their declared capability contracts.
+_Avoid_: Version range, runtime negotiation, compatibility guess
+
+**Execution Lock**:
+A Task's immutable record, created when its Route is determined, that binds the exact Pipeline Version, Runtime Release, and Compatibility Approval used for production and every later retry, recovery, or manual edit.
+_Avoid_: Runner profile, latest release, deployment snapshot
+
+**Runtime Binding**:
+An intent-bound authorization derived from one Execution Lock that permits one Runtime Run to invoke one exact runtime capability under a specific evidence contract, safety epoch, platform image set, and Execution Policy.
+_Avoid_: Execution Lock, runtime negotiation, image tag, worker configuration
+
+**Runtime Evidence**:
+The normalized, verified record of one Runtime Run's execution, bound to its operation, Runtime Binding, immutable inputs, Execution Node, Sandbox Lease, fence, output manifest, and terminal outcome. It is input to Phase validation, not proof that the Phase succeeded.
+_Avoid_: Validation evidence, raw runtime output, log, Agent Compose response
+
+**Core Skill**:
+The versioned instructions, references, and executable production logic that define how the runtime performs presentation work. It belongs to a Runtime Release rather than to a Task's inputs or outputs.
+_Avoid_: Catalog Template, Resource Bundle, prompt
+
+### Templates and composition
+
+**Catalog Template**:
+A stable, non-reused catalog identity for a reusable design offering that supplies visual identity and structural guidance through one current Active Template Version while retaining its earlier Template Versions for existing locks and history.
+_Avoid_: Template Version, Fill Template, Source Deck
+
+**Template Version**:
+An immutable published revision of a Catalog Template whose canonical manifest binds its design definition, embedded assets, exact Resource Bundle dependencies, compatibility, and package integrity.
+_Avoid_: Catalog Template, current template, Fill Template
+
+**Resource Bundle**:
+An immutable published revision of a non-executable visual-asset collection used by exact Template Version references when the assets require independent distribution, reuse, scanning, retention, withdrawal, or license management.
+_Avoid_: Resource, Core Skill, Artifact
+
+**Template Lock**:
+The immutable Task record created when its Generation Route is accepted, binding the exact Template Version manifest and package plus the complete Resource Bundle dependency closure and digests so the same design inputs govern production, retries, recovery, and manual edit.
+_Avoid_: Template selection, Catalog Template, latest version
+
+**Fill Template**:
+An uploaded editable Deck whose existing Slides are candidates for reuse with new content in the Template Fill Route. It is Source Material, not a selected Catalog Template.
+_Avoid_: Template, Catalog Template, layout
+
+**Slide Library**:
+A structured view of the Slides available in a source Deck for selection, planning, and mapping into an output Deck.
+_Avoid_: Template catalog, output Deck
+
+**Slide**:
+A content-bearing visual unit within a Deck that owns a composition of Elements. A Slide's identity is local to its Deck and distinct from the position it occupies in another Deck.
+_Avoid_: Page when referring to the content-bearing unit, screen
+
+**Page Position**:
+The ordinal slot a Slide occupies in a specific Deck, allowing a source Slide to map to a different position in an output Deck.
+_Avoid_: Slide ID, Slide
+
+**Element**:
+An addressable content object placed on a Slide, such as a text block, image, table, chart, shape, or formula. An Element may refer to a Resource but remains part of the Slide's composition.
+_Avoid_: Resource, template, slide
+
+**Resource**:
+A source or generated asset that one or more Elements may use, such as an image, icon, or chart data. A Resource is not an Element until it is placed into a Slide composition.
+_Avoid_: Element, Artifact
+
+**Design Specification**:
+The approved description of the intended Deck structure, Slide roles, content allocation, and visual constraints that guides realization of the output Deck.
+_Avoid_: Template, implementation plan
+
+**Fill Plan**:
+The approved mapping from target content and story order to source Slides and their Page Positions in the output Deck.
+_Avoid_: Design Specification, Slide Library
+
+### Production flow
+
+**Route**:
+The production strategy selected for a Task from its intent and Source Material. A Route selects the approved Pipeline Version used to create the Task's Generation Pipeline.
+_Avoid_: URL route, runner profile
+
+**Generation Route**:
+The Route that creates a new Deck from Source Material under the guidance of a Catalog Template and Design Specification.
+_Avoid_: Main route, default route
+
+**Beautify Route**:
+The Route that redesigns an existing source Deck while preserving its frozen visible content and Slide count.
+_Avoid_: Generation Route, Template Fill Route
+
+**Template Fill Route**:
+The Route that creates an output Deck by selecting, ordering, and filling Slides from a Fill Template with new Source Material.
+_Avoid_: Generation Route, Beautify Route
+
+**Pipeline Definition**:
+A platform-approved, versioned blueprint for a Route's Phases, dependencies, Confirmation Gates, contracts, retry rules, and required runtime capabilities.
+_Avoid_: Core Skill, Runtime Release, workflow script
+
+**Pipeline Version**:
+An immutable approved revision of a Pipeline Definition that a Task pins once its Route is determined.
+_Avoid_: Current pipeline, latest pipeline, Generation Pipeline
+
+**Generation Pipeline**:
+The Task-specific enactment of a pinned Pipeline Version that transforms its inputs into a validated, published Deck through Phases and Confirmation Gates.
+_Avoid_: Rendering Pipeline, workflow when referring to the whole lifecycle
+
+**Phase**:
+A bounded step in a Generation Pipeline that consumes established Task state and produces a new outcome, decision, or Artifact.
+_Avoid_: Task, Route, status
+
+**Phase Run**:
+One attempt by a Task to enact a Phase from its pinned Pipeline Version, aggregating execution and validation evidence into a single outcome without overwriting earlier attempts.
+_Avoid_: Phase, Runtime Run, Task status
+
+**Runtime Run**:
+One invocation of an approved runtime capability that belongs to exactly one Phase Run. A mutating Runtime Run operates through one isolated Runtime View, while a Phase Run may require no Runtime Runs or coordinate several before determining its outcome.
+_Avoid_: Phase Run, Task, Sandbox Lease
+
+**Agent Worker**:
+An owned executor that enacts an approved agent capability for one Runtime Run under its Runtime Binding and Sandbox Lease. Its model calls and internal tool calls remain part of that Runtime Run unless the Pipeline requests a separate capability invocation.
+_Avoid_: Task worker, Task Orchestration, agent authority, Phase validator
+
+**Tool Worker**:
+An owned executor that enacts an approved deterministic or constrained tool capability for one Runtime Run under the same worker protocol, Runtime Binding, and Sandbox Lease rules as an Agent Worker.
+_Avoid_: Arbitrary shell, Platform validator, Task worker, tool authority
+
+**Sandbox Lease**:
+A time-bounded exclusive grant allowing one Runtime Run to use a sandboxed execution environment. It carries no Task state beyond the lease; durable mutable execution state remains in the Task Workspace.
+_Avoid_: Sandbox Workspace, Task Workspace, Runtime Run
+
+**Confirmation Gate**:
+A point in the Generation Pipeline where user approval is required before later Phases may proceed.
+_Avoid_: Phase completion, automatic validation
+
+**Rendering**:
+The activity that realizes approved Slide definitions and Element placements as concrete visual slide output. Rendering is part of some Routes, not a synonym for the complete Generation Pipeline.
+_Avoid_: Generation Pipeline, export, validation

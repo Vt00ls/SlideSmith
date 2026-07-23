@@ -1,0 +1,3 @@
+# Keep business authority in the platform control plane
+
+SlideSmith is the Platform Control Plane and sole authority for Users, Personal Workspaces, Tasks, Pipeline and Runtime Release locks, run state, Artifact Version metadata, Share Links, and usage records; Agent Compose is an Execution Data Plane that manages sandboxed execution and Task Workspace bytes. Execution evidence, outputs, and usage receipts become authoritative only after SlideSmith validates and records them, so execution cleanup or failure cannot erase business history and the runtime cannot bypass access, publication, or accounting policy.
