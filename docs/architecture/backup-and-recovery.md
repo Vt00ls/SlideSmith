@@ -1,6 +1,6 @@
 # Backup and Recovery
 
-This document records the backup and recovery decisions confirmed while resolving GitHub issue 16. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0019](../adr/0019-bind-recovery-to-joint-database-and-object-points.md) records the joint recovery decision, [durable-object-storage.md](./durable-object-storage.md) defines verified content, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) defines release, compatibility, revocation, and Execution Lock recovery requirements, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package, Template Lock, and disable recovery requirements, and [enterprise-v1-scope.md](./enterprise-v1-scope.md) defines the delivery boundary.
+This document records the backup and recovery decisions confirmed while resolving GitHub issue 16. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0019](../adr/0019-bind-recovery-to-joint-database-and-object-points.md) records the joint recovery decision, [durable-object-storage.md](./durable-object-storage.md) defines verified content, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) defines release, compatibility, revocation, and Execution Lock recovery requirements, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package, Template Lock, and disable recovery requirements, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) defines provider-attempt, receipt, ledger, and reservation recovery requirements, and [enterprise-v1-scope.md](./enterprise-v1-scope.md) defines the delivery boundary.
 
 The design fixes recovery authority, RPO/RTO, consistency, retention, security, drills, and cutover gates without selecting a PostgreSQL backup product, object-store vendor, KMS, schema, SDK, or deployment size.
 
@@ -10,7 +10,7 @@ PostgreSQL business state and every durable byte referenced by that state form o
 
 | Recovery class | Required state | RPO | RTO |
 | --- | --- | --- | --- |
-| Business-publication set | PostgreSQL authoritative records, ownership and suppression facts, Task metadata, Artifact Versions, and their exact members | At most 15 minutes | Read-only access within four hours |
+| Business-publication set | PostgreSQL authoritative records, ownership and suppression facts, Task metadata, Artifact Versions and their exact members, Usage Ledgers, Gateway evidence roots, Usage Receipts, corrections, and Quota Reservation history | At most 15 minutes | Read-only access within four hours |
 | Full business set | The publication set plus Source Material, Checkpoints, Execution Locks, Template Locks, approved release and catalog manifests, Compatibility Approvals, exact catalog package closures, scan/license evidence, lifecycle, revocation and disable inventories, required OCI Runtime Images and supplementary packages, and all mutation and execution dependencies | At most 15 minutes | Full operation within eight hours |
 | Rebuildable execution material | Runtime Views, sandboxes, sessions, local materializations, caches, queue projections, and failed residue | No backup guarantee | Rebuilt on demand; no RTO |
 
@@ -132,6 +132,7 @@ Internal verification may expose progress by reference class, but an official RT
 - Execution Locks and Compatibility Approvals restore as immutable historical facts. Before Runtime admission, the restore reconciles the independent immutable audit domain's current revocation inventory over the selected point; an older database or package copy cannot reactivate a revoked Pipeline Version, Runtime Release, or Compatibility Approval.
 - A missing exact release dependency blocks `FullReady`. Recovery never substitutes a newer Pipeline Version, Runtime Release, image, package, or compatibility result.
 - Template Locks restore as immutable historical facts with their exact Template Version and Resource Bundle closure. Before Task recovery or Runtime admission, restore reconciles the independent current catalog-disable inventory; an older database cannot reactivate Disabled content. Missing catalog dependencies block `FullReady` and are never replaced by the current Active Template Version.
+- Gateway Calls, Attempts, Usage Receipts, Usage Ledger entries, Quota Reservations, corrections, and unresolved discrepancies restore as authoritative history. Restore advances Gateway and authorization generations, invalidates old Gateway Grants, marks non-terminal provider work ambiguous, and reconciles rather than replaying provider creates. Late provider evidence may append after restore when its original authority and correlation verify.
 
 Reconciliation is scoped and resumable. One failed object cannot be silently ignored, and a successful object is not recopied on every retry when its immutable receipt remains valid.
 

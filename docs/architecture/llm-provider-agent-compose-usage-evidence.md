@@ -4,7 +4,7 @@
 
 研究日期：2026-07-23
 
-下游：Issue [#12](https://github.com/Vt00ls/SlideSmith/issues/12) 的 Gateway、usage receipt、Usage Ledger 与 Quota Reservation 架构决策
+下游：Issue [#12](https://github.com/Vt00ls/SlideSmith/issues/12) 已将这些事实收敛为 [LLM Gateway and Usage Accounting contract](./llm-gateway-and-usage-accounting.md)
 
 ## 结论
 
@@ -185,6 +185,6 @@ OpenAI `x-request-id` 与 `X-Client-Request-Id` 的正式边界见 [API overview
 6. built-in tool调用的逐工具计量/费用、货币cost、折扣/价格版本没有出现在 Responses逐请求 Usage schema；#12若需要cost而非resource usage，仍需独立的官方billing/cost contract研究或明确只记resource facts。
 7. provider内部retry、路由和计量修正通常不可见；除非最终选定provider提供正式attempt/correction evidence，Gateway不能拆分。
 8. `store`、ZDR/MAM、prompt-cache retention、data residency和raw evidence保留策略依赖最终组织合同/合规配置，当前仓库不能证明。
-9. 对 aggregate-only discrepancy是否采用独立credential/project隔离以提高归因精度，以及保留为unresolved还是走人工correction，属于 #12需决定的policy，不是provider事实。
+9. Aggregate-only discrepancy的归因精度取决于credential/project等正式隔离维度；#12已决定只有唯一reconciliation scope才能自动correction，否则保持unresolved，人工correction必须reason-bound并审计。
 
-这些 unknowns 不阻塞 #12 开始 grilling：它们已经有明确的 authority、配置或验收归属，并且事实边界要求 #12 保留 unknown/reconciliation 状态。
+这些 unknowns 已由 [LLM Gateway and Usage Accounting contract](./llm-gateway-and-usage-accounting.md) 收敛为明确的authority、versioned provider onboarding、adapter acceptance或reconciliation输入；它们不再构成未决architecture fog。

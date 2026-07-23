@@ -40,6 +40,10 @@ _Avoid_: Execution Data Plane, runtime, worker
 The isolated execution environment that performs Runtime Runs, mutates Task Workspace content, and returns execution evidence without deciding authoritative business state.
 _Avoid_: Platform Control Plane, Task owner, business database
 
+**LLM Gateway**:
+The Platform-controlled provider egress module through which every production LLM and generative-image call is authorized, attempted, correlated, evidenced, and converted into a content-free Usage Receipt.
+_Avoid_: Provider proxy, Agent Compose LLM facade, sandbox credential broker, Usage Ledger
+
 **Execution Node**:
 An owned compute node whose attested capabilities may host one or more independently fenced Sandbox Leases. Node availability, local paths, and resident sandbox state are never Task or recovery authority.
 _Avoid_: Worker, Task Workspace, Agent Compose session, business server
@@ -54,12 +58,28 @@ _Avoid_: Database snapshot, object-store snapshot, backup job, live replica
 
 ### Usage and quota
 
+**Usage Accounting**:
+The Platform Control Plane deep module that verifies Usage Receipts and authoritatively owns Usage Ledger posting, Quota Reservation decisions, append-only correction, and reconciliation.
+_Avoid_: LLM Gateway, provider billing system, usage dashboard, Runtime Execution
+
+**Gateway Call**:
+One logical LLM or generative-image provider invocation made for a Runtime Run through the LLM Gateway. A Gateway Call may require several Gateway Attempts without treating them as one provider consumption event.
+_Avoid_: Runtime Run, agent turn, provider request, Usage Receipt
+
+**Gateway Attempt**:
+One real outbound provider request belonging to a Gateway Call. Every retry or permitted provider fallback creates a new Gateway Attempt because it may create new consumption.
+_Avoid_: Gateway Call, Runtime Run attempt, provider-internal retry
+
+**Usage Receipt**:
+An authenticated, content-free evidence envelope issued by the LLM Gateway for one Gateway Attempt, preserving provider-native usage or explicit unknown, estimated, not-applicable, or proven-no-send state until Usage Accounting verifies it.
+_Avoid_: Usage Ledger entry, provider response body, Runtime Evidence, billing record
+
 **Usage Ledger**:
 The append-only record of measured consumption and corrective adjustments owned by one Personal Workspace, with entries attributed to their originating Task, Phase Run, and Runtime Run. Moving work never rewrites its historical usage ownership.
 _Avoid_: Task usage counter, quota balance, billing estimate
 
 **Quota Reservation**:
-A time-bounded hold against one Personal Workspace's available quota, associated with a single Phase Run and settled against its actual Usage Ledger entries when the attempt ends.
+A time-bounded hold against one Personal Workspace's available quota, associated with a single Phase Run and settled against its actual Usage Ledger entries. Closing or expiry never treats unresolved usage as zero, and late entries remain attributable without reviving the hold.
 _Avoid_: Usage entry, quota limit, Sandbox Lease
 
 ### Work and outputs

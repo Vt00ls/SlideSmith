@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
 
 ## Ownership and publication
 
@@ -82,6 +82,24 @@ flowchart LR
 - Agent and Tool Workers share one lifecycle and evidence protocol. Internal model and tool calls stay inside one Runtime Run unless the pinned Pipeline declares separate capability invocations.
 - Production execution treats guest code and supplied content as hostile. An exact Execution Node and driver configuration must prove its Execution Policy before admission; no driver is trusted by name.
 - Runtime success is an execution fact only. Platform validation, C04 commit, and Artifact publication remain independent authorities.
+
+## LLM Gateway and Usage Accounting
+
+```mermaid
+flowchart LR
+    Orchestration[Task Orchestration] -->|acquire and close Phase Run hold| Usage[Usage Accounting]
+    Runtime[Runtime Execution] -->|fenced Gateway Grant| Gateway[LLM Gateway]
+    Gateway -->|one real outbound request| Provider[LLM or image provider]
+    Gateway -->|authenticated Usage Receipt| Usage
+    Usage --> Ledger[Personal Workspace Usage Ledger]
+    Usage --> Reservation[Phase Run Quota Reservation]
+```
+
+- Every production LLM or generative-image provider call crosses the LLM Gateway. Sandboxes and workers receive no provider credential or direct provider egress.
+- One Runtime Run may own several Gateway Calls; every real retry or permitted fallback creates a distinct Gateway Attempt.
+- The Gateway owns provider routing, Attempt facts, native evidence capture, and content-free Usage Receipt issuance. Usage Accounting verifies Receipts and alone owns Ledger posting, correction, Reservation, and reconciliation.
+- Runtime or Phase terminal state does not erase usage from an already accepted Attempt. Missing, delayed, and aggregate-only evidence never becomes zero or fabricated per-Task actual.
+- Enterprise V1 reservations are observational. Quota shortage does not reject a Task, while authorization, integrity, attempt durability, and reservation persistence remain fail-closed gates.
 
 ## Task Orchestration
 
@@ -200,6 +218,6 @@ flowchart TD
 | Checkpoint metadata and commit authority | Runtime Views, Checkpoint content, expiry, and cleanup |
 | Release Management, Catalog Publication, Execution and Template Locks, durable-object registry, and references | Temporary logs and outputs |
 | Artifact Version metadata and sharing | Temporary publication assembly and output proposals |
-| Usage Ledger and Quota Reservation | Measured usage receipts |
+| LLM Gateway Calls, Attempts, Usage Receipts, Usage Ledger and Quota Reservation | Provider execution and native usage evidence |
 
 Execution output becomes authoritative only after the Platform Control Plane validates and records it.

@@ -115,22 +115,25 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 
 ### In scope
 
+- Routing every production LLM and generative-image provider call through the Platform-controlled LLM Gateway without giving sandboxes, Agent Compose, Agent Workers, or Tool Workers provider credentials or direct provider egress.
+- Recording every real provider retry or fallback as a distinct Gateway Attempt and issuing authenticated, content-free Usage Receipts with explicit provider-reported, estimated, unknown, not-applicable, or proven-no-send evidence state.
 - Capturing measured usage when the provider and runtime supply it.
 - Attributing usage to Personal Workspace, Task, Phase Run, and Runtime Run.
-- Retaining append-only usage history and presenting usage totals.
-- Preserving the Quota Reservation domain boundary for later enforcement.
+- Retaining append-only usage history, offsetting corrections, late evidence, and unresolved reconciliation state while presenting actual, estimated, and unknown totals separately.
+- Preserving the Phase Run-scoped Quota Reservation domain boundary in observation mode for later enforcement.
 
 ### Out of scope
 
 - Blocking task execution based on quota.
 - Enforcing real token, image, compute, or monetary limits.
 - Billing, payment, invoicing, or departmental chargeback.
+- Treating missing usage as zero, allocating shared provider aggregate discrepancies proportionally to Tasks, or deriving authoritative usage from Agent Compose results, logs, traces, or Runtime outcome.
 
 ## Data retention
 
 ### In scope
 
-- Persisting Task metadata, Artifact Versions, Share Link configuration, Usage Ledger entries, Execution Locks, Template Locks, Compatibility Approvals, release and catalog lifecycle, safety, withdrawal, tombstone, and audit history as business records.
+- Persisting Task metadata, Artifact Versions, Share Link configuration, Gateway Call and Attempt evidence roots, Usage Receipts, Usage Ledger entries, Quota Reservations, corrections, Execution Locks, Template Locks, Compatibility Approvals, release and catalog lifecycle, safety, withdrawal, tombstone, and audit history as business records.
 - Retaining Artifact Versions until an authorized User explicitly deletes them or a future administrator retention policy applies.
 - Revoking Share Links when their Artifact Version is deleted or becomes unavailable.
 - Automatically releasing Sandbox Leases and cleaning sandbox state, Runtime Run temporary directories, expired Task Workspaces, disposable Checkpoints, caches, and incomplete publication residue.

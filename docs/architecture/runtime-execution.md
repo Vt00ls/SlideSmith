@@ -12,7 +12,9 @@ defines Phase Run and Runtime Run membership authority,
 [runtime-and-pipeline-releases.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/runtime-and-pipeline-releases.md)
 defines Runtime Bindings,
 [catalog-template-publication.md](./catalog-template-publication.md) defines
-Template Lock materialization and catalog safety epochs, and
+Template Lock materialization and catalog safety epochs,
+[llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
+defines Gateway Grants, provider egress, Usage Receipts, and settlement, and
 [task-workspace-lifecycle.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/task-workspace-lifecycle.md)
 defines Runtime View and commit authority.
 
@@ -91,7 +93,7 @@ C04 commit, and Artifact publication remain separate decisions.
 | Immutable bytes and node materialization | Durable Object and C04 | Receives opaque verified capabilities; never receives object-store credentials |
 | User and machine authority | Identity & Ownership | Validates Task, Personal Workspace, generation, purpose, and expiry |
 | Phase validation | Platform validator | Consumes output proposal and Runtime Evidence independently of the worker |
-| Usage receipt verification and ledger settlement | LLM Gateway and Usage, resolved by issue 12 | Correlates receipt references; does not invent or settle usage |
+| Provider egress, Usage Receipt issuance, ledger settlement and Quota Reservation | LLM Gateway and Usage Accounting | Correlates Gateway Grants and receipt references; Runtime Execution does not call providers directly, invent usage, or settle it |
 | Logs, metrics, traces, and external audit projections | Observability, resolved by issue 13 | Projects authoritative identities and facts; never drives state |
 
 Runtime Execution owns truthful execution capacity facts and lease enforcement;
@@ -134,6 +136,8 @@ A start intent binds at least:
   Runtime View capability;
 - resource-class requirement, Execution Policy, deadline, cancellation policy,
   secret and network-policy references, and non-authoritative trace context.
+- an active Phase Run Quota Reservation and an opaque Gateway policy reference
+  whenever the capability may use an LLM or generative-image provider.
 
 It never carries a shell command, host path, mount, object key, bucket,
 registry locator, provider credential, Agent Compose project or session path,
@@ -152,7 +156,7 @@ execution retry requires Task Orchestration to create a new Runtime Run.
 | Capability | Executes an approved agent capability, including model interaction and bundled internal tools | Executes a declared deterministic or constrained tool capability from the Runtime Release |
 | Invocation | Intent or prompt plus immutable inputs | Capability key plus typed parameters and immutable inputs |
 | Entrypoint | Resolved privately from the exact Runtime Binding | Resolved privately from the exact Runtime Binding; never arbitrary caller shell |
-| Model usage | May produce multiple gateway or provider receipt references | None by default; approved provider use still crosses the controlled network and usage seam |
+| Model usage | May produce several Gateway Calls, each with one or more Gateway Attempts and Usage Receipt references | None by default; approved provider use still crosses the LLM Gateway and usage seam |
 | Output | Untrusted proposal under the declared output contract | Untrusted proposal under the declared output contract |
 | Business authority | None | None |
 
@@ -259,8 +263,8 @@ Production security requirements are:
 - treat guest code, agent actions, tool subprocesses, prompts, and supplied
   content as hostile relative to the host and every other Personal Workspace;
 - use default-deny network policy and enable only destinations and protocols
-  explicitly authorized by the Runtime Binding and Execution Policy; issue 12
-  may further require all provider access to use the central Gateway;
+  explicitly authorized by the Runtime Binding and Execution Policy; all LLM
+  and generative-image provider access must use the central LLM Gateway;
 - inject secrets through a node secret broker as short-lived, purpose-bound
   capabilities tied to Runtime Run, lease, node, fence, and expiry;
 - prevent secrets from entering Task Workspace state, Checkpoints, outputs,
@@ -338,7 +342,8 @@ Trust is layered:
    provider evidence.
 5. Phase validation evidence is produced independently by the Platform
    validator; a worker cannot attest its own Phase success.
-6. Usage receipts become Usage Ledger facts only through the issue 12
+6. Usage Receipts become Usage Ledger facts only through the
+   [LLM Gateway and Usage Accounting](./llm-gateway-and-usage-accounting.md)
    verification and settlement seam. The
    [issue 14 provider evidence research](./llm-provider-agent-compose-usage-evidence.md)
    requires provider-native capture per outbound attempt; missing evidence is
@@ -485,17 +490,18 @@ for hostile code without configuration-specific evidence.
 - Issue 20 receives worker class, resource requirements, Execution Policy,
   truthful node facts, Sandbox Lease, and Admission Grant seams. It owns
   fairness, concurrency, placement, and concrete resource-class policy.
-- Issue 12 receives Runtime Run and operation correlation, network and secret
-  seams, usage receipt references, and the resolved
-  [issue 14 provider evidence constraints](./llm-provider-agent-compose-usage-evidence.md).
-  It owns Gateway, receipt verification, Usage Ledger, and Quota Reservation
-  decisions.
+- The resolved
+  [LLM Gateway and Usage Accounting contract](./llm-gateway-and-usage-accounting.md)
+  consumes Runtime Run and operation correlation, network and secret seams,
+  active Phase Run Reservations, and Usage Receipt references. It requires
+  Gateway-only provider egress and accepts legitimate late usage independently
+  of the Runtime fence.
 - Issue 17 receives the target Runtime Run relationships, terminal, fence, and
   evidence model plus the complete deletion test.
 - Issue 13 receives Runtime Run, lease, node, operation, fence, error, and
   cleanup correlation and the authoritative-versus-projection boundary.
 - Issue 14 has established the provider and Agent Compose usage evidence facts;
-  its remaining provider-selection and SLA unknowns are explicit issue 12
+  its remaining provider-selection and SLA unknowns are explicit Gateway
   onboarding, reconciliation, and fail-closed acceptance inputs rather than a
   Runtime Execution contract blocker.
 
@@ -504,7 +510,7 @@ Superseded decisions: none.
 New decision-only tickets: none.
 
 Remaining fog affecting the first Runtime Execution specification: none.
-Concrete driver product, resource values, fairness algorithm, usage settlement,
+Concrete driver product, resource values, fairness algorithm, provider route,
 telemetry vendor, schema, and serialized method names belong to named
 downstream decisions, adapter acceptance, or implementation specifications and
 do not reopen this module.

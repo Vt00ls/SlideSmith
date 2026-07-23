@@ -11,7 +11,9 @@ release, compatibility, and Execution Lock authority,
 [catalog-template-publication.md](./catalog-template-publication.md) defines
 catalog selection, lifecycle, and Template Lock closure authority,
 [runtime-execution.md](./runtime-execution.md) defines Runtime Run, Sandbox
-Lease, worker, and evidence authority, and
+Lease, worker, and evidence authority,
+[llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
+defines Phase Run Quota Reservation and provider-usage settlement, and
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 commit
 semantics.
 
@@ -98,7 +100,8 @@ required a pre-append command gate, which collapses to the chosen design.
 | Runtime View, Task Workspace bytes, Revision, Checkpoint, commit/discard, restore, and cleanup evidence | C04 Task Workspace Lifecycle | Receives opaque intent only; accepted fenced evidence gates mutating Phase success |
 | Artifact Version manifest and activation | Artifact publication | Publication evidence gates the publication Phase |
 | User identity, ownership, confirmation authority, and break-glass scope | Identity & Ownership | Supplies one typed, audited authority path; workers cannot impersonate it |
-| Fairness, queue order, resource admission, and delivery lease | Scheduler / queue decision | May delay or redeliver an enactment; does not change Task state |
+| Fairness, queue order, resource admission, and delivery lease | Scheduler / queue decision | May delay or redeliver an enactment; quota-bearing Runtime admission additionally requires an active Phase Run Reservation |
+| Usage Ledger, Quota Reservation, Usage Receipt ingest and reconciliation | Usage Accounting | Receives Phase Run reserve and close intent; Task Orchestration never calls providers or posts usage |
 | Metrics, tracing, logs, and audit projections | Observability and audit adapters | Consume accepted decisions and evidence; never drive state from a log |
 
 Task Orchestration owns sequencing, not implementation mechanics. Its adapters
@@ -175,7 +178,11 @@ without changing this seam.
 2. Work availability causes `Decide` to select the current Phase from that
    pinned graph, create one new Phase Run attempt, and persist the required
    enactment in the same transaction.
-3. A worker claims the enactment through a delivery adapter. The claim is not a
+3. If the Phase may schedule quota-bearing Runtime work, Usage Accounting must
+   activate the Phase Run's Quota Reservation before Scheduler Admission or a
+   Gateway Grant becomes eligible. Enterprise V1 observes rather than enforces
+   quota shortage, but missing or invalid reservation evidence fails closed.
+4. A worker claims the enactment through a delivery adapter. The claim is not a
    Phase outcome and does not become Task authority.
 
 ### Runtime, validation, and commit
@@ -198,6 +205,12 @@ without changing this seam.
 Publication follows the same pattern: a publication Phase may own zero Runtime
 Runs and succeeds only from Artifact Version activation evidence returned by
 the publication authority.
+
+When a Phase Run becomes terminal, Task Orchestration sends an idempotent close
+intent to Usage Accounting. Closing fences new Gateway Calls for that Phase but
+does not wait synchronously for every provider Receipt or reject legitimate
+late usage. Reservation settlement and reconciliation remain Usage Accounting
+authority and never reopen the Phase outcome.
 
 ### Confirmation Gate
 
@@ -375,6 +388,12 @@ Task Workspace Revision, or Checkpoint from ambiguous legacy state.
   retry, recovery, cancellation, and manual edit.
 - Issue 20 may prioritize and lease durable enactments, but claim ownership,
   fairness, capacity admission, and queue delivery cannot mutate Task state.
+  Quota-bearing admission requires an active Phase Run Reservation, but the
+  Scheduler cannot create, renew, settle, or inspect Ledger entries.
+- The resolved [LLM Gateway and Usage Accounting contract](./llm-gateway-and-usage-accounting.md)
+  receives idempotent Phase Run reserve and close intents. Task Orchestration
+  never calls a provider, verifies a Usage Receipt, appends Ledger entries, or
+  treats late usage as a Phase outcome.
 - Issue 17 maps legacy records to the Task revision, Execution Lock, Template
   Lock, Phase Run attempts, 0..N Runtime Run relationships, and non-executable
   historical evidence without restoring path authority. A legacy template lock
