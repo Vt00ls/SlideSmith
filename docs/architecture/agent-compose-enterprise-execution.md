@@ -4,6 +4,8 @@
 
 下游状态：Issue [#24](https://github.com/Vt00ls/SlideSmith/issues/24) 已据此确定 [Runtime Execution architecture contract](./runtime-execution.md)：生产 Agent/Tool 执行按 hostile execution 对待，具体 driver/host 配置必须通过威胁建模与加固验收；Agent Compose 保持可替换 adapter，不获得业务、workspace 或 lease authority。
 
+Usage evidence 状态：Issue [#14](https://github.com/Vt00ls/SlideSmith/issues/14) 已完成 [LLM provider 与 Agent Compose usage evidence 事实研究](./llm-provider-agent-compose-usage-evidence.md)。Agent Compose v2607.10.0 的公开 run/result contract 不保存 provider usage、provider request ID 或原始终态 evidence；逐 attempt receipt 必须由 #12 的 Gateway 在 provider-native 边界捕获。
+
 研究日期：2026-07-22
 
 上游基线：稳定 release [`v2607.10.0`](https://github.com/chaitin/agent-compose/releases/tag/v2607.10.0)，tag commit [`e14c4dbd5e3b0dec6178073902d67d2765390427`](https://github.com/chaitin/agent-compose/commit/e14c4dbd5e3b0dec6178073902d67d2765390427)
@@ -201,7 +203,7 @@ Guest ABI 官方明确没有 ABI version label或 compatibility handshake；runt
 6. **crash/retry**：daemon/node interruption使当前 Runtime Run failed/unknown；同一 Phase Run可创建新的 Runtime Run，禁止从 session/path推断恢复。ack loss 重放同一 stable request identity；payload mismatch fail closed。
 7. **隔离**：默认 Docker driver也必须有 outer cgroup/pids/disk/egress/credential controls；guest root和 provider permission bypass要求 sandbox是唯一安全边界。driver选择和 hostile-code posture 属于明确的安全决策。
 8. **多节点**：每节点独立 daemon/root；scheduler owns placement/capacity。禁止 shared Agent Compose root；节点恢复从 SlideSmith durable object/C04 materialize，而非 Agent Compose session replication。
-9. **证据**：将 raw Agent Compose detail/events/log offsets/stats封装进 SlideSmith typed evidence并签入 audit projection；provider usage/request receipt缺口由 #14/#12 处理。
+9. **证据**：将 raw Agent Compose detail/events/log offsets/stats封装进 SlideSmith typed evidence并签入 audit projection；这些 adapter facts 不包含原始 provider usage/request receipt，也不能替代 #12 在 provider-native 边界捕获的逐 attempt evidence。
 10. **版本**：daemon/guest/runtime全部按 approved digest pin；admission 比对 version/compiled driver和实际 readiness；升级必须跑 adapter contract、failure injection、cancel race、restart和cleanup tests。
 
 ## 风险登记
@@ -218,7 +220,7 @@ Guest ABI 官方明确没有 ABI version label或 compatibility handshake；runt
 | High | preview security support未承诺 versioned window。 | [SECURITY.md](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/SECURITY.md#supported-versions) | internal version catalog、vuln monitoring、fast rollback和vendor exit seam。 |
 | Medium | restart统一 fail active run，没有透明恢复；多个 daemon不能共享 root。 | [startup reconciliation](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/pkg/agentcompose/app/background.go#L100-L153)；[workspace concurrency](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/design/agent-compose_design.md#workspace-provisioning-and-resume) | node-local daemon；new Runtime Run retry；durable C04 re-materialization。 |
 | Medium | stats 无 admission/limits；network只支持 default。 | [stats](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/pages/command-line-manual.md#stats-show-sandbox-resource-stats)；[network](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/pages/agent-compose-yaml-manual.md#network) | #20 scheduler/capacity authority和宿主 resource enforcement。 |
-| Medium | run evidence缺少 provider request/usage receipt和 SlideSmith bindings。 | [result contract](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/design/agent-compose-runtime_contract.md#64-stdout-structured-result)；[RunDetail](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/proto/agentcompose/v2/agentcompose.proto#L1119-L1131) | adapter evidence envelope；#14/#12 补 usage receipt。 |
+| Medium | run evidence缺少 provider request/usage receipt和 SlideSmith bindings。 | [result contract](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/design/agent-compose-runtime_contract.md#64-stdout-structured-result)；[RunDetail](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/proto/agentcompose/v2/agentcompose.proto#L1119-L1131)；[#14 usage research](./llm-provider-agent-compose-usage-evidence.md) | adapter evidence envelope；#12 Gateway逐 attempt捕获原生receipt。 |
 | Medium | AGPLv3 对企业采用构成合规输入。 | [LICENSE](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/LICENSE.txt) | 产品采用前法务/开源合规批准。 |
 
 ## 未决问题
@@ -227,11 +229,11 @@ Guest ABI 官方明确没有 ABI version label或 compatibility handshake；runt
 
 1. 企业 V1 对 hostile prompt/code 的威胁等级，以及 Docker、BoxLite、Microsandbox 中哪个 driver/host hardening满足该等级。这改变安全姿态，属于 #24 的明确决策。
 2. 最终 execution-node resource class、CPU/memory/pids/ephemeral-disk/GPU、egress和并发值；Agent Compose 不提供这些 business inputs，属于 #20。
-3. provider request id、token usage、cost 和可信 receipt 的实际 provider/Agent Compose 可用度；由 #14/#12 决定。
+3. 生产 text/image provider、model/version、组织隔离与正式 usage/cost/retention contract尚未选定；当前第三方 OpenAI-compatible endpoint不能继承OpenAI官方契约。#14 已确定 Agent Compose不能补足逐 request usage evidence，剩余选型、Gateway receipt和reconciliation policy归 #12。
 4. 现场实际 daemon/guest image digest、version、compiled driver、auth/TLS状态和 KVM/driver health。当前环境无可连接 daemon；上线前必须用只读 inventory补证。
 5. v2 Connect API 的长期 compatibility/support承诺。官方称 v1 为 stable compatibility API、v2 为 primary project/run path，但 preview policy没有 versioned support window；需要内部 pin + contract suite而非推定兼容。[API boundaries](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/docs/design/agent-compose_design.md#api-boundaries)；[SECURITY.md](https://github.com/chaitin/agent-compose/blob/e14c4dbd5e3b0dec6178073902d67d2765390427/SECURITY.md#supported-versions)
 6. Agent Compose AGPLv3 在 SlideSmith 的具体部署、修改、分发方式下的义务；只能由法务/开源合规确认。
 
-没有发现需要改写 #16 或 #19 resolution 的事实。研究新增的 fog 都有现有下游归属：Runtime seam/driver/security 归 #24，capacity归 #20，usage归 #14/#12，observability归 #13，release pin/compatibility归 #22。
+没有发现需要改写 #16 或 #19 resolution 的事实。研究新增的 fog 都有现有下游归属：Runtime seam/driver/security 归 #24，capacity归 #20；#14 usage事实研究已完成，Gateway/ledger/reconciliation决策归 #12；observability归 #13，release pin/compatibility归 #22。
 
 影响 #11 研究完成的 remaining fog：none。

@@ -333,11 +333,16 @@ Trust is layered:
 3. Guest, agent, and tool outputs remain untrusted proposals until independent
    Platform validation.
 4. Agent Compose raw detail, stdout, events, stats, callbacks, and external IDs
-   remain adapter evidence.
+   remain adapter evidence. Its v2607.10.0 public run/result contract does not
+   preserve provider usage, provider request IDs, or the original terminal
+   provider evidence.
 5. Phase validation evidence is produced independently by the Platform
    validator; a worker cannot attest its own Phase success.
 6. Usage receipts become Usage Ledger facts only through the issue 12
-   verification and settlement seam. Missing evidence is never zero usage.
+   verification and settlement seam. The
+   [issue 14 provider evidence research](./llm-provider-agent-compose-usage-evidence.md)
+   requires provider-native capture per outbound attempt; missing evidence is
+   never zero usage and may arrive after Runtime Run terminal state.
 7. Logs, traces, and metrics are incomplete or expiring projections and cannot
    drive a state transition.
 
@@ -481,14 +486,18 @@ for hostile code without configuration-specific evidence.
   truthful node facts, Sandbox Lease, and Admission Grant seams. It owns
   fairness, concurrency, placement, and concrete resource-class policy.
 - Issue 12 receives Runtime Run and operation correlation, network and secret
-  seams, and usage receipt references. It owns Gateway, receipt verification,
-  Usage Ledger, and Quota Reservation decisions.
+  seams, usage receipt references, and the resolved
+  [issue 14 provider evidence constraints](./llm-provider-agent-compose-usage-evidence.md).
+  It owns Gateway, receipt verification, Usage Ledger, and Quota Reservation
+  decisions.
 - Issue 17 receives the target Runtime Run relationships, terminal, fence, and
   evidence model plus the complete deletion test.
 - Issue 13 receives Runtime Run, lease, node, operation, fence, error, and
   cleanup correlation and the authoritative-versus-projection boundary.
-- Issue 14 continues to establish provider usage facts without blocking this
-  module contract.
+- Issue 14 has established the provider and Agent Compose usage evidence facts;
+  its remaining provider-selection and SLA unknowns are explicit issue 12
+  onboarding, reconciliation, and fail-closed acceptance inputs rather than a
+  Runtime Execution contract blocker.
 
 Superseded decisions: none.
 
