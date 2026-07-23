@@ -12,7 +12,9 @@ Runtime Run, and enactment authority,
 [runtime-execution.md](./runtime-execution.md) defines Sandbox Lease, fence,
 node-fact, and capacity-release authority, and
 [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
-defines the Quota Reservation prerequisite.
+defines the Quota Reservation prerequisite, and
+[observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md)
+defines correlation, signal, alert, audit, and retention contracts.
 
 The design fixes authority, work granularity, fairness, priorities, aging,
 layered concurrency, Resource Classes, capacity admission, backpressure,
@@ -78,7 +80,7 @@ This is not cross-site or global scheduling.
 | Quota Reservation, Usage Ledger and enforcement disposition | Usage Accounting | Scheduler validates an opaque Reservation; it cannot inspect or mutate the Ledger |
 | Runtime View, Revision, Checkpoint and cleanup | Task Workspace Lifecycle | Capacity release cannot imply C04 commit or cleanup |
 | Broker delivery, poll cursor, worker local state and Agent Compose stats | Adapter projection | Never authoritative |
-| Metrics, traces, logs and external audit projection | Observability, resolved by issue 13 | Consume facts without driving scheduling state |
+| Metrics, traces, logs and external audit projection | [Observability and audit](./observability-audit-and-cleanup-debt.md) | Consume facts without driving scheduling state |
 
 ## Scheduler Work Item
 
@@ -497,7 +499,8 @@ execution history. An unresolved dead-letter cannot be reclaimed.
 
 High-frequency heartbeat and renewal detail may be compacted only after a
 terminal disposition into authenticated first, last, count, reason, and
-evidence-root summaries under the retention policy resolved by issue 13.
+evidence-root summaries under the
+[observability retention policy](./observability-audit-and-cleanup-debt.md).
 Compaction never removes a current claim, grant, unresolved dead-letter, stale
 evidence conflict, or capacity-reconciliation obligation.
 
@@ -525,9 +528,10 @@ identity, digest, policy version, operation, Workspace and run binding, lease
 and fence. A broker scan, process list, Agent Compose database, log, metric, or
 host directory cannot invent queued, accepted, released, or successful state.
 
-## Operational evidence supplied to issue 13
+## Operational evidence projected through observability
 
-The observability contract receives:
+The [observability contract](./observability-audit-and-cleanup-debt.md)
+receives:
 
 - queue depth, serialized bytes, oldest eligible age, priority class, pool,
   saturation watermark and rejection category;
@@ -637,8 +641,9 @@ facade around the legacy worker loops.
 
 ## Stable downstream inputs and remaining fog
 
-- Issue 13 receives the signal catalog and authoritative-versus-projection
-  boundary described above.
+- The [observability and audit contract](./observability-audit-and-cleanup-debt.md)
+  receives the signal catalog and authoritative-versus-projection boundary
+  described above.
 - Issue 17 receives the scheduler deletion test and the prohibition on
   converting legacy claims, sessions, paths, or queue state.
 - Runtime Execution receives exact Admission Grant, class, node, grant

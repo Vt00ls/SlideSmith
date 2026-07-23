@@ -19,7 +19,9 @@ defines Gateway Grants, provider egress, Usage Receipts, and settlement,
 defines Work Items, fairness, Resource Classes, concurrency, placement, and
 Admission Grants, and
 [task-workspace-lifecycle.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/task-workspace-lifecycle.md)
-defines Runtime View and commit authority.
+defines Runtime View and commit authority, and
+[observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md)
+defines correlation, telemetry, audit, alert, and retention contracts.
 
 The design fixes authority, interface depth, worker roles, execution and lease
 state, fencing, evidence, security, reconciliation, adapter contracts, and the
@@ -97,7 +99,7 @@ C04 commit, and Artifact publication remain separate decisions.
 | User and machine authority | Identity & Ownership | Validates Task, Personal Workspace, generation, purpose, and expiry |
 | Phase validation | Platform validator | Consumes output proposal and Runtime Evidence independently of the worker |
 | Provider egress, Usage Receipt issuance, ledger settlement and Quota Reservation | LLM Gateway and Usage Accounting | Correlates Gateway Grants and receipt references; Runtime Execution does not call providers directly, invent usage, or settle it |
-| Logs, metrics, traces, and external audit projections | Observability, resolved by issue 13 | Projects authoritative identities and facts; never drives state |
+| Logs, metrics, traces, and external audit projections | [Observability and audit](./observability-audit-and-cleanup-debt.md) | Projects authoritative identities and facts; never drives state |
 
 Runtime Execution owns truthful execution capacity facts and lease enforcement;
 the Scheduler owns policy and admission. An unavailable or incompatible node
@@ -379,7 +381,8 @@ than duplicate debt in both modules.
 Runtime Run identities, terminal outcomes, lease and fence history, evidence
 roots, and Phase Run relationships remain authoritative history. Raw logs,
 transcripts, temporary output, node databases, sandboxes, and caches are
-expiring execution material under the policies resolved by issue 13.
+expiring execution material under the
+[observability and retention contract](./observability-audit-and-cleanup-debt.md).
 
 Backup retains authoritative Runtime Run and evidence metadata and necessary
 opaque references. It does not back up or restore a live sandbox, Agent Compose
@@ -503,8 +506,9 @@ for hostile code without configuration-specific evidence.
   of the Runtime fence.
 - Issue 17 receives the target Runtime Run relationships, terminal, fence, and
   evidence model plus the complete deletion test.
-- Issue 13 receives Runtime Run, lease, node, operation, fence, error, and
-  cleanup correlation and the authoritative-versus-projection boundary.
+- The [observability and audit contract](./observability-audit-and-cleanup-debt.md)
+  consumes Runtime Run, lease, node, operation, fence, error, and cleanup
+  correlation under the authoritative-versus-projection boundary.
 - Issue 14 has established the provider and Agent Compose usage evidence facts;
   its remaining provider-selection and SLA unknowns are explicit Gateway
   onboarding, reconciliation, and fail-closed acceptance inputs rather than a

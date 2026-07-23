@@ -17,7 +17,9 @@ defines Work Item delivery, Personal Workspace fairness, and Admission Grants,
 [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
 defines Phase Run Quota Reservation and provider-usage settlement, and
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 commit
-semantics.
+semantics, and
+[observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md)
+defines correlation, audit, projection, alert, and retention contracts.
 
 The decision fixes authority, state and failure semantics, seam placement, and
 downstream contracts. It does not define a schema, serialized API, queue
@@ -301,8 +303,9 @@ linearization point.
   row alone.
 - Metrics, traces, and logs project decision ID, Task revision, Phase Run,
   Runtime Run, enactment, adapter, retry, cancellation, and reconciliation
-  identities without becoming a second state machine. Issue 13 sets final
-  telemetry and audit contracts.
+  identities without becoming a second state machine. The
+  [observability and audit contract](./observability-audit-and-cleanup-debt.md)
+  sets final telemetry and audit semantics.
 - Repair is evidence-based. Reconciliation may restore a missing projection or
   redeliver an outbox record from an accepted decision, but cannot invent Phase
   success, adopt an orphan Runtime result, modify an expected digest, or scan a
@@ -401,9 +404,9 @@ Task Workspace Revision, or Checkpoint from ambiguous legacy state.
   Lock, Phase Run attempts, 0..N Runtime Run relationships, and non-executable
   historical evidence without restoring path authority. A legacy template lock
   converts only from exact frozen bytes and a fully proved target closure.
-- Issue 13 consumes decision, revision, run, enactment, fence, retry,
-  cancellation, reconciliation, and typed failure identities as observable
-  projections.
+- The [observability and audit contract](./observability-audit-and-cleanup-debt.md)
+  consumes decision, revision, run, enactment, fence, retry, cancellation,
+  reconciliation, and typed failure identities as observable projections.
 - The first implementation SPECs can treat `Decide` plus the in-memory
   state-transition harness as the authoritative module seam and keep HTTP,
   worker/queue, Runtime, C04, publication, and persistence behind adapters.

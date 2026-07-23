@@ -287,7 +287,7 @@ Stable downstream inputs are:
 - the resolved [Runtime Execution contract](./runtime-execution.md) receives exact Runtime Bindings, capability and image digests, executor requirements, safety epochs, and evidence bindings; Runtime Execution never chooses a release;
 - the resolved [Scheduler contract](./scheduling-and-capacity-admission.md) schedules only onto nodes satisfying the binding and cannot use capacity fallback to rewrite an Execution Lock;
 - issue 17 never fabricates an Execution Lock from legacy environment, profile, tag, path, session, or recent-run evidence;
-- issue 13 consumes publication, compatibility, pin, rollout, revocation, repair, reclamation, and Cleanup Debt facts;
+- the [observability and audit contract](./observability-audit-and-cleanup-debt.md) consumes publication, compatibility, pin, rollout, revocation, repair, reclamation, and Cleanup Debt facts;
 - Backup & Recovery includes Execution Locks and required OCI and package inventories in the joint point;
 - issue 23 may reuse candidate, approval, activation, retention, and audit patterns while keeping Template Lock authority separate.
 

@@ -163,6 +163,45 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Immediate physical erasure of deleted content from already immutable backup copies.
 - Treating disaster-recovery backup as legal archive, records management, or permanent business history.
 
+## Observability and authoritative audit
+
+### In scope
+
+- Keeping authoritative domain facts and mandatory audit facts in Platform
+  PostgreSQL under their owning Platform Control Plane modules while treating
+  metrics, traces, structured logs, dashboards, and external audit delivery as
+  incomplete, expiring projections.
+- Correlating User, Personal Workspace, Task, Phase Run, Runtime Run, Sandbox
+  Lease, Checkpoint, Artifact Version, Scheduler, Gateway, and Cleanup Debt
+  through typed authoritative identities, revisions, generations, fences, and
+  evidence rather than depending on a trace ID.
+- Propagating sanitized W3C trace context across owned HTTP, queue, remote
+  adapter, Runtime, Tool, Agent, and Gateway seams without putting business
+  identity, content, or secrets in baggage.
+- Mandatory fail-closed audit for content access, break-glass, release and
+  catalog publication, scheduling policy administration, usage correction,
+  recovery control, purge, and authorized cleanup exceptions.
+- Bounded-cardinality metrics, deny-by-default structured telemetry, protected
+  diagnostics, explicit unknown/stale state, minimum integrity/security alerts,
+  and short telemetry retention independent of business-record retention.
+- Persistent, retriable Cleanup Debt with one resource owner, opaque resource
+  identity, retry and failure evidence, estimated bytes and inodes, age,
+  fencing, blockers, and audited resolution.
+- Detecting missing/corrupt referenced content and orphan candidates through
+  authoritative inventory reconciliation without using telemetry or storage
+  listings as deletion authority.
+
+### Out of scope
+
+- Selecting a telemetry, audit, collector, dashboard, or alert-management
+  vendor.
+- Treating logs, traces, metrics, dashboards, external audit copies, provider
+  aggregates, process state, paths, or inventory scans as business authority.
+- Unbounded high-cardinality metric labels, content-bearing telemetry, or
+  propagation of User and Workspace identity to providers.
+- Legal hold, e-discovery, a general User audit-search product, or a new
+  externally visible availability or latency SLO.
+
 ## Availability and topology
 
 ### In scope

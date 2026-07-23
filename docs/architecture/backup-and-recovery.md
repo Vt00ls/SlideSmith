@@ -227,7 +227,7 @@ Stable downstream inputs are:
 - issue 17 uses pinned pre/post points, whole-set rollback, cutover freeze, and the recovery gates;
 - issue 25 treats purged backup bytes as inaccessible residue for at most the 35-day window and requires tombstone application on restore;
 - issue 15 treats every pre-incident Share Link and Access Code as invalid after recovery;
-- issue 13 consumes watermark age, backup lag, recovery mode, integrity incident, drill result, and Cleanup Debt evidence;
+- the [observability and audit contract](./observability-audit-and-cleanup-debt.md) consumes watermark age, backup lag, recovery mode, integrity incident, drill result, and Cleanup Debt evidence;
 - release and catalog decisions include Execution Locks, Template Locks, Compatibility Approvals, lifecycle, current revocation and disable inventories, exact Pipeline, Runtime, OCI and catalog dependencies, and catalog scan/license evidence in the joint inventory and full-recovery gate.
 
 Remaining fog affecting the first implementation specification: none. Vendor selection, final schema and method names, locator layout, SDK, and absolute deployment size remain adapter or specification inputs.

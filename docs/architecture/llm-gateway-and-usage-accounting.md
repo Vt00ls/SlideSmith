@@ -16,7 +16,9 @@ authority,
 defines quota-bearing admission and the opaque Reservation validation seam,
 and the
 [provider evidence research](./llm-provider-agent-compose-usage-evidence.md)
-defines the native facts and unknowns that this contract must preserve.
+defines the native facts and unknowns that this contract must preserve, and
+[observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md)
+defines correlation, signals, redaction, alert, and retention contracts.
 
 The design fixes authority, interface depth, provider egress, request identity,
 receipt trust, append-only settlement, reservation ordering, late and failed
@@ -80,7 +82,7 @@ receipt durability, and reservation persistence remain fail-closed gates.
 | Provider execution and native usage report | Provider adapter and provider | External evidence only; becomes Platform usage after Gateway capture and Usage Accounting verification |
 | Receipt ingest, Usage Ledger, Quota Reservation, correction and reconciliation | Usage Accounting | Owns authoritative usage and reservation decisions in Platform PostgreSQL |
 | Totals and operational views | Usage query projection | Rebuildable from authoritative records; never a mutation authority |
-| Metrics, traces, logs and external audit projection | Observability, resolved by issue 13 | Consume authoritative identities and decisions; cannot settle usage |
+| Metrics, traces, logs and external audit projection | [Observability and audit](./observability-audit-and-cleanup-debt.md) | Consume authoritative identities and decisions; cannot settle usage |
 
 The Gateway Attempt journal is not a second Usage Ledger. It owns provider
 egress and observation facts. Usage Accounting alone owns authoritative
@@ -550,9 +552,10 @@ aggregate reports authoritative.
 
 Stable downstream inputs are:
 
-- issue 13 receives Gateway Call, Attempt, Receipt, Ledger, Reservation,
-  correction, unknown, late, backlog, integrity, and reconciliation identities
-  plus the authoritative-versus-projection line;
+- the [observability and audit contract](./observability-audit-and-cleanup-debt.md)
+  receives Gateway Call, Attempt, Receipt, Ledger, Reservation, correction,
+  unknown, late, backlog, integrity, and reconciliation identities plus the
+  authoritative-versus-projection line;
 - the resolved
   [Scheduler contract](./scheduling-and-capacity-admission.md) receives Active
   Reservation as a prerequisite for quota-bearing Runtime admission while

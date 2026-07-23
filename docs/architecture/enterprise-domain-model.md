@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) records owner, Share Link, and break-glass authority, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md) records queue, Personal Workspace fairness, Resource Class, and Admission Grant authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) records owner, Share Link, and break-glass authority, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md) records queue, Personal Workspace fairness, Resource Class, and Admission Grant authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam, and [observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md) records authoritative audit, correlation, telemetry, alerting, retention, and Cleanup Debt boundaries.
 
 ## Ownership and publication
 
@@ -254,6 +254,39 @@ flowchart TD
 - Approved, Deprecated, and catalog-tombstoned exact versions remain available to existing Template Locks. Disabled content advances a catalog safety epoch and fences uncommitted work.
 - Runtime Images remain in an OCI registry; Template Versions and Resource Bundles use immutable object-store package payloads behind the durable-object seam.
 - No Task references a floating `latest` runtime, template, or resource package.
+
+## Observability, audit, and Cleanup Debt
+
+```mermaid
+flowchart LR
+    Domain["Authoritative domain fact"]
+    Audit["Authoritative audit fact"]
+    Projection["Metrics, traces, logs<br/>dashboards, external audit copy"]
+    Resource["Owning resource module"]
+    Debt["Cleanup Debt"]
+
+    Domain --> Projection
+    Domain --> Audit
+    Audit --> Projection
+    Resource --> Debt
+    Debt --> Projection
+```
+
+- Domain and mandatory audit facts remain in Platform PostgreSQL under their
+  owning modules. Telemetry and external audit delivery are incomplete,
+  expiring projections and never drive business state.
+- Correlation uses typed business, decision, operation, revision, generation,
+  fence, and evidence identities. A trace ID is diagnostic context only.
+- W3C trace context crosses owned transports after validation; business
+  identity and secrets never travel in baggage or to an external provider.
+- Metrics use bounded dimensions without User, Personal Workspace, Task, run,
+  grant, receipt, debt, path, locator, trace, or free-form error labels.
+- Mandatory audit failure blocks the protected operation. Ordinary telemetry
+  or external audit-delivery failure does not roll back a committed fact.
+- Cleanup Debt has one resource owner and remains persistent, retriable, and
+  visible until verified cleanup or an authorized audited resolution.
+- Orphan and integrity scans create evidence for the owning module. They do not
+  authorize adoption, repair, reclamation, or deletion by themselves.
 
 ## Authority seam
 
