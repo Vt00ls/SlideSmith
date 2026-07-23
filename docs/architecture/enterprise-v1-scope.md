@@ -45,7 +45,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 ### In scope
 
 - One minimal Platform Administrator role for User activation, deactivation, recovery, audited Workspace Export, and explicit purge of retained work.
-- Publishing Runtime Releases, Pipeline Versions, Template Versions, and Resource Bundles.
+- Publishing Runtime Releases and Pipeline Versions independently; approving exact compatible pairs; controlling activation, rollout, deprecation, and revocation; and publishing Template Versions and Resource Bundles.
 - Viewing system health, failure diagnostics, storage state, and aggregated usage metadata.
 - Triggering cleanup, recovery, and safe rescheduling operations.
 - Managing platform feature flags and revoking abnormal Share Links.
@@ -63,7 +63,10 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 ### In scope
 
 - Packaging each approved Core Skill inside a content-addressed Runtime Image and publishing it as a Runtime Release.
-- Shipping platform-approved, built-in Pipeline Versions.
+- Shipping platform-approved, built-in Pipeline Versions independently of Runtime Releases.
+- Requiring an immutable positive Compatibility Approval before one exact Pipeline Version and Runtime Release pair can serve a Task.
+- Atomically recording one immutable Execution Lock when a Task's Route is determined; retry, recovery, cancellation, and post-publication manual edit preserve that lock.
+- Applying ordinary rollout, rollback, deactivation, and deprecation only to new Tasks while reserving terminal revocation for security, integrity, authorization, or platform-control failures that must fence existing uncommitted work.
 - Publishing Catalog Templates, Template Versions, and Resource Bundles through an administrator-controlled versioned release process.
 - Allowing ordinary Users to select approved Catalog Templates.
 - Allowing a User to upload a Fill Template as Source Material for one Task.
@@ -76,6 +79,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Treating a User's Fill Template as a public Catalog Template.
 - An online template editor or self-service template publication workflow.
 - A complete administrator catalog-management portal.
+- Floating `latest`, semver-only compatibility, automatic in-place Task release upgrades, or repinning an existing Task during ordinary rollback.
 
 ## User workflows
 
@@ -116,7 +120,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 
 ### In scope
 
-- Persisting Task metadata, Artifact Versions, Share Link configuration, Usage Ledger entries, and all release locks as business records.
+- Persisting Task metadata, Artifact Versions, Share Link configuration, Usage Ledger entries, Execution Locks, Compatibility Approvals, and release lifecycle and revocation history as business records.
 - Retaining Artifact Versions until an authorized User explicitly deletes them or a future administrator retention policy applies.
 - Revoking Share Links when their Artifact Version is deleted or becomes unavailable.
 - Automatically releasing Sandbox Leases and cleaning sandbox state, Runtime Run temporary directories, expired Task Workspaces, disposable Checkpoints, caches, and incomplete publication residue.
@@ -129,6 +133,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Exporting a disabled User's Personal Workspace through audited break-glass, verifying delivery outside SlideSmith, and requiring a separate administrator intent before purging its retained content.
 - Retaining a 35-day joint PostgreSQL and durable-object point-in-time recovery window in at least one encrypted, immutable, independently controlled backup domain.
 - Removing authorized deleted or purged content from online authority immediately while allowing encrypted, inaccessible bytes to remain in already locked backup copies until the recovery window expires.
+- Retaining exact Pipeline and Runtime manifests, OCI images, supplementary packages, and compatibility evidence while an Execution Lock, active rollout, integrity incident, or retained Recovery Point references them.
 
 ### Out of scope
 
@@ -151,7 +156,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Persistent PostgreSQL and object storage with backup and recovery exercises.
 - Control-plane services that can be deployed as multiple instances.
 - A joint Recovery Point RPO of at most 15 minutes for PostgreSQL business state and every committed referenced byte, including total production-site loss or compromise.
-- Staged manual recovery: verified Task metadata and Artifact Versions read-only within four hours, and full Source Material, Checkpoint, release/catalog, Runtime Image, mutation, and execution capability within eight hours.
+- Staged manual recovery: verified Task metadata and Artifact Versions read-only within four hours, and full Source Material, Checkpoint, Execution Lock, compatibility/revocation, release/catalog package, exact Runtime Image, mutation, and execution capability within eight hours.
 - Read-only protection when the finalized recovery watermark would exceed the 15-minute RPO.
 - Independent immutable backup authority, separated production and restore credentials, and dual control for restore/decrypt or premature retention changes.
 - Invalidating every pre-incident Share Link and Access Code after restore; an Owner must issue a new Share Link.
@@ -175,7 +180,8 @@ A single-server deployment is acceptable for development and acceptance testing,
 ### In scope
 
 - A hard cutover with no migration of legacy Task Workspace, Agent Compose session, cache, or failed-residue directories.
-- Preserving Task metadata, Source Material, Artifact Versions and Artifacts, release and template locks, and Phase Run and Runtime Run history.
+- Preserving Task metadata, Source Material, Artifact Versions and Artifacts, Execution Locks, Template Locks, and Phase Run and Runtime Run history.
+- Mapping legacy work to an Execution Lock only from exact trusted release evidence; never inferring one from a Runner Profile, environment, mutable tag, path, session, capability snapshot, or recent Runtime Run.
 - Terminating old non-terminal Tasks as non-recoverable and requiring a new Task to continue from retained inputs or publications.
 - Deleting legacy execution data and recording every failed deletion as Cleanup Debt.
 - Using a production remote-but-owned transport adapter and node-independent durable Checkpoint content so workers do not share or learn host workspace paths.

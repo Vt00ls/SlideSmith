@@ -33,7 +33,7 @@ _Avoid_: Workspace transfer, Artifact Version, backup
 ### Platform boundaries
 
 **Platform Control Plane**:
-The authoritative owner of identity, access, Task orchestration, release locks, publication metadata, sharing, and usage records.
+The authoritative owner of identity, access, Task orchestration, release identities, Execution Locks, publication metadata, sharing, and usage records.
 _Avoid_: Execution Data Plane, runtime, worker
 
 **Execution Data Plane**:
@@ -101,6 +101,14 @@ _Avoid_: Artifact, current output, single-file version
 **Runtime Release**:
 An immutable, approved combination of a Core Skill, executor contract, and toolchain that a Task pins so production and retries retain the same behavior.
 _Avoid_: Runtime image, deployment, latest runtime
+
+**Compatibility Approval**:
+An immutable positive proof that one exact Pipeline Version and one exact Runtime Release satisfy their declared capability contracts.
+_Avoid_: Version range, runtime negotiation, compatibility guess
+
+**Execution Lock**:
+A Task's immutable record, created when its Route is determined, that binds the exact Pipeline Version, Runtime Release, and Compatibility Approval used for production and every later retry, recovery, or manual edit.
+_Avoid_: Runner profile, latest release, deployment snapshot
 
 **Core Skill**:
 The versioned instructions, references, and executable production logic that define how the runtime performs presentation work. It belongs to a Runtime Release rather than to a Task's inputs or outputs.

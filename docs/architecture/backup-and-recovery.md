@@ -1,6 +1,6 @@
 # Backup and Recovery
 
-This document records the backup and recovery decisions confirmed while resolving GitHub issue 16. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0019](../adr/0019-bind-recovery-to-joint-database-and-object-points.md) records the joint recovery decision, [durable-object-storage.md](./durable-object-storage.md) defines verified content, and [enterprise-v1-scope.md](./enterprise-v1-scope.md) defines the delivery boundary.
+This document records the backup and recovery decisions confirmed while resolving GitHub issue 16. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0019](../adr/0019-bind-recovery-to-joint-database-and-object-points.md) records the joint recovery decision, [durable-object-storage.md](./durable-object-storage.md) defines verified content, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) defines release, compatibility, revocation, and Execution Lock recovery requirements, and [enterprise-v1-scope.md](./enterprise-v1-scope.md) defines the delivery boundary.
 
 The design fixes recovery authority, RPO/RTO, consistency, retention, security, drills, and cutover gates without selecting a PostgreSQL backup product, object-store vendor, KMS, schema, SDK, or deployment size.
 
@@ -11,7 +11,7 @@ PostgreSQL business state and every durable byte referenced by that state form o
 | Recovery class | Required state | RPO | RTO |
 | --- | --- | --- | --- |
 | Business-publication set | PostgreSQL authoritative records, ownership and suppression facts, Task metadata, Artifact Versions, and their exact members | At most 15 minutes | Read-only access within four hours |
-| Full business set | The publication set plus Source Material, Checkpoints, release and catalog locks and packages, required Runtime Images, and all mutation and execution dependencies | At most 15 minutes | Full operation within eight hours |
+| Full business set | The publication set plus Source Material, Checkpoints, Execution Locks, Template Locks, approved release manifests, Compatibility Approvals, lifecycle and revocation inventories, exact Pipeline and catalog packages, required OCI Runtime Images and supplementary packages, and all mutation and execution dependencies | At most 15 minutes | Full operation within eight hours |
 | Rebuildable execution material | Runtime Views, sandboxes, sessions, local materializations, caches, queue projections, and failed residue | No backup guarantee | Rebuilt on demand; no RTO |
 
 RPO applies to sudden loss or compromise of the entire production site. RTO begins when the incident is formally declared and ends only when the corresponding promotion gate passes. A running process or reachable database does not constitute recovery.
@@ -47,7 +47,7 @@ PostgreSQL and object storage do not need a distributed transaction or coordinat
 1. The PostgreSQL adapter continuously archives WAL and periodically produces encrypted base backups. The default maximum base-backup interval is seven days, but an adapter must shorten it whenever required to meet the eight-hour full RTO.
 2. The Durable Object backup adapter copies each committed immutable generation into the independent domain and verifies digest, size, policy domain, and immutable generation. Success produces a `BackupObjectReceipt`.
 3. At a transaction-consistent PostgreSQL snapshot and target LSN, the module exports the committed-reference inventory. The inventory, rather than object-store listing, defines the recovery set.
-4. The candidate waits for complete base/WAL coverage, all referenced object receipts, required OCI inventory, manifest chunks, suppression facts, and key-version evidence.
+4. The candidate waits for complete base/WAL coverage, all referenced object receipts, the exact Pipeline, Runtime, compatibility, package, OCI, lifecycle, and revocation inventories required by every retained Execution Lock and rollout or rollback pin, manifest chunks, suppression facts, and key-version evidence.
 5. The module builds and authenticates a canonical Recovery Manifest and writes it to the independent immutable repository.
 6. Locking that manifest is the Recovery Point linearization point. A PostgreSQL mirror record may be reconciled idempotently if the response is lost after the external lock succeeds.
 
@@ -61,7 +61,8 @@ A canonical Recovery Manifest binds at least:
 - PostgreSQL cluster identity, timeline, target LSN, base backup, WAL coverage, and schema/application compatibility;
 - committed-reference inventory root plus counts and bytes by reference class and policy domain;
 - `ContentID`, digest algorithm, digest, size, immutable generation, reference class, and backup receipt roots;
-- OCI inventory digest and required image digests;
+- release inventory root covering Execution Locks, exact Pipeline Version and Runtime Release manifests, Compatibility Approvals, lifecycle state, rollout and rollback pins, and revocations;
+- OCI and package inventory roots plus every required image and supplementary-package digest;
 - deletion, purge, and recovery-suppression inventory root;
 - encryption and signing key versions;
 - adapter and recovery-tool versions;
@@ -77,7 +78,7 @@ Backup lag produces an early warning before the hard boundary. No later than the
 
 - reject Task mutation and new mutation-bearing Phase Runs;
 - prevent Phase Run commit and Artifact Version publication;
-- prevent release or catalog activation, deletion, and purge;
+- prevent release or catalog activation, rollout-policy mutation, deletion, and purge;
 - allow a Runtime Run to terminate or retain non-authoritative evidence, but never commit its proposal;
 - keep incomplete uploads inaccessible as staging for later reconciliation;
 - continue authorized reads of already verified content.
@@ -111,7 +112,7 @@ stateDiagram-v2
 2. `TargetSelected`: select the newest finalized Recovery Point by default. Selecting an older point intentionally accepts additional data loss and requires separate incident-specific human approval.
 3. `KeysAuthorized`: activate dormant restore and decryption capabilities through dual control.
 4. `DatabaseRestored`: recover base backup and WAL to the exact target, then verify cluster identity, schema, constraints, manifest root, and application compatibility.
-5. `ObjectsReconciled`: restore and verify the exact committed object and OCI inventories.
+5. `ObjectsReconciled`: restore and verify the exact committed object, Pipeline package, Runtime supplementary-package, and OCI inventories, then reconcile the current independent revocation inventory.
 6. `ReadOnlyReady`: after the complete first-stage gate passes, allow reauthenticated Owners to browse Task metadata and read Artifact Versions.
 7. `FullReady`: after the complete full-business set and write path are verified, create a fresh joint Recovery Point and then re-enable mutation and execution.
 8. `Closed`: seal timelines, counts, differences, approvals, drill or incident evidence, and follow-up actions.
@@ -128,6 +129,8 @@ Internal verification may expose progress by reference class, but an official RT
 - Multiple exact physical generations may remain verified replicas. Only a receipt-bound generation can be selected; unrelated duplicates are handled as orphan evidence.
 - Unactivated staging, expired leases, local cache, quarantine bytes, and pending deletion are not business recovery payloads. Their restored PostgreSQL intents, incidents, or Cleanup Debt are reconciled without activating their bytes.
 - Cleanup Debt, integrity incidents, audit facts, and suppression tombstones are PostgreSQL-authoritative recovery records even when the related disposable bytes are absent.
+- Execution Locks and Compatibility Approvals restore as immutable historical facts. Before Runtime admission, the restore reconciles the independent immutable audit domain's current revocation inventory over the selected point; an older database or package copy cannot reactivate a revoked Pipeline Version, Runtime Release, or Compatibility Approval.
+- A missing exact release dependency blocks `FullReady`. Recovery never substitutes a newer Pipeline Version, Runtime Release, image, package, or compatibility result.
 
 Reconciliation is scoped and resumable. One failed object cannot be silently ignored, and a successful object is not recopied on every retry when its immutable receipt remains valid.
 
@@ -155,7 +158,7 @@ V1 does not introduce per-Personal Workspace application-level keys. Key identif
 
 ## Retention, deletion, and reclamation
 
-The normal joint PITR window is 35 days. A Recovery Point can expire only when no point in the window or protected cutover pin needs its PostgreSQL base/WAL, object copy, OCI artifact, manifest chunk, or key-version evidence.
+The normal joint PITR window is 35 days. A Recovery Point can expire only when no point in the window or protected cutover pin needs its PostgreSQL base/WAL, object copy, exact Pipeline or Runtime package, OCI artifact, compatibility or revocation evidence, manifest chunk, or key-version evidence.
 
 Authorized deletion and Personal Workspace purge remove online references immediately and record recovery-suppression facts. Existing immutable backup media is not rewritten. Encrypted deleted bytes can remain inaccessible until the 35-day window expires, after which lifecycle deletion may remove them when no retained point or pin needs them. V1 purge therefore does not promise immediate physical erasure from historical backup copies.
 
@@ -203,10 +206,10 @@ The highest-level scenario suite covers:
 
 - continuous candidate creation, response loss around manifest lock, duplicate finalization, and watermark recovery;
 - admission fencing exactly at backup lag and safe return from read-only;
-- PostgreSQL PITR paired only with its manifest-bound object and OCI inventories;
+- PostgreSQL PITR paired only with its manifest-bound object, exact release/package, Compatibility Approval, revocation, and OCI inventories;
 - fresh-environment restore through both promotion gates and fresh post-restore backup;
 - partial, missing, corrupt, duplicate, and orphan objects; WAL gaps; key unavailability; interrupted copy; and stale restore writers;
-- deleted and purged content suppression, Share Link invalidation, disabled Users, and break-glass separation;
+- deleted and purged content suppression, Share Link invalidation, revocation non-resurrection, disabled Users, and break-glass separation;
 - retention expiry, shared-copy retention, protected cutover pins, primary reclaim grace, and Cleanup Debt;
 - production-scale RPO/RTO and capacity acceptance.
 
@@ -222,6 +225,6 @@ Stable downstream inputs are:
 - issue 25 treats purged backup bytes as inaccessible residue for at most the 35-day window and requires tombstone application on restore;
 - issue 15 treats every pre-incident Share Link and Access Code as invalid after recovery;
 - issue 13 consumes watermark age, backup lag, recovery mode, integrity incident, drill result, and Cleanup Debt evidence;
-- release and catalog decisions include locked Runtime Images and packages in the joint inventory and full-recovery gate.
+- release and catalog decisions include Execution Locks, Compatibility Approvals, lifecycle and current revocation inventories, and exact Pipeline, Runtime, OCI, and catalog dependencies in the joint inventory and full-recovery gate.
 
 Remaining fog affecting the first implementation specification: none. Vendor selection, final schema and method names, locator layout, SDK, and absolute deployment size remain adapter or specification inputs.

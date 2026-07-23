@@ -67,7 +67,7 @@ Deduplication is policy-scoped. User content uses its Personal Workspace as the 
 | Artifact Version member | C05; immutable Artifact identity and location-independent Artifact Version membership | Retained with its Artifact Version; explicit version deletion or Workspace purge revokes Share Links and detaches member references |
 | Template Version package | Catalog publication; canonical package manifest and package content | Retained while the version is published or deprecated or any Task Template Lock depends on it |
 | Resource Bundle | Catalog publication; immutable bundle manifest and package content | Retained while any Template Version, Task lock, or applicable license policy depends on it |
-| Runtime Release supplementary package | Release publication | Retained while the Runtime Release or any Task release lock depends on it |
+| Runtime Release supplementary package | Release Management | Retained while the Runtime Release or any Execution Lock depends on it |
 | Runtime Image | Runtime Release metadata pins an immutable OCI digest | The container registry remains the byte carrier and has a separate adapter, inventory, and backup seam |
 | Checkpoint content | C04; Checkpoint content graph and explicit typed payload references | Retained by current recovery reachability, explicit references, and C04 policy |
 | Workspace Export archive | Audited export intent and expiring staging lease | Removed after verified external delivery or intent expiry; SlideSmith retains only manifest digest, receipt, tombstone, and audit facts |

@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
 
 ## Ownership and publication
 
@@ -29,7 +29,13 @@ flowchart TD
 ```mermaid
 flowchart TD
     Task -->|selects| Route
-    Route -->|pins| PipelineVersion[Pipeline Version]
+    Task -->|owns one immutable| ExecutionLock[Execution Lock]
+    Route -->|determination creates| ExecutionLock
+    ExecutionLock -->|binds| PipelineVersion[Pipeline Version]
+    ExecutionLock -->|binds| RuntimeRelease[Runtime Release]
+    ExecutionLock -->|binds| CompatibilityApproval[Compatibility Approval]
+    CompatibilityApproval -->|approves exact member| PipelineVersion
+    CompatibilityApproval -->|approves exact member| RuntimeRelease
     PipelineDefinition[Pipeline Definition] -->|publishes| PipelineVersion
     PipelineVersion -->|defines| Phase
     Phase -->|attempted as| PhaseRun[Phase Run]
@@ -45,6 +51,8 @@ flowchart TD
     Checkpoint -->|restores| TaskWorkspace
 ```
 
+- Route determination atomically records one Execution Lock before the first consuming Phase Run. Retry, recovery, cancellation, and manual edit preserve it.
+- Ordinary rollout, rollback, and deprecation affect new Tasks only. Revocation is a terminal trust decision that fences existing uncommitted work without rewriting the lock.
 - A Runtime Run cannot advance the Generation Pipeline directly; its Phase Run validates the outcome.
 - Runtime Runs share explicit Task Workspace state through isolated Runtime Views, never hidden sandbox state.
 - Each Runtime Run uses a fresh lease; infrastructure may reuse a fully reset physical sandbox under a new lease.
@@ -129,7 +137,13 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Task -->|pins| RuntimeRelease[Runtime Release]
+    ReleaseManagement[Release Management] -->|publishes independently| PipelineVersion[Pipeline Version]
+    ReleaseManagement -->|publishes independently| RuntimeRelease[Runtime Release]
+    ReleaseManagement -->|approves exact pair| CompatibilityApproval[Compatibility Approval]
+    Task -->|owns| ExecutionLock[Execution Lock]
+    ExecutionLock -->|binds| PipelineVersion
+    ExecutionLock -->|binds| RuntimeRelease
+    ExecutionLock -->|binds| CompatibilityApproval
     RuntimeRelease -->|contains| CoreSkill[Core Skill]
     RuntimeRelease -->|contains| Toolchain
     RuntimeRelease -->|implements| RuntimeCapability[Pipeline runtime capabilities]
@@ -141,6 +155,8 @@ flowchart TD
 ```
 
 - Core Skills ship inside content-addressed Runtime Images for the first release.
+- Pipeline Versions and Runtime Releases publish independently and become usable together only through an immutable positive Compatibility Approval.
+- Runtime Execution receives an exact capability-scoped Runtime Binding derived from the Execution Lock, not the complete Pipeline graph or rollout policy.
 - Catalog Templates and large non-executable Resource Bundles are separately versioned, read-only packages.
 - Runtime Images remain in an OCI registry; Template Versions and Resource Bundles use immutable object-store package payloads behind the durable-object seam.
 - No Task references a floating `latest` runtime, template, or resource package.
@@ -150,9 +166,9 @@ flowchart TD
 | Platform Control Plane | Execution Data Plane |
 | --- | --- |
 | Users, Personal Workspaces, and access | Sandboxed process execution |
-| Task Orchestration decisions, Task revision, Route and Pipeline locks | Task Workspace materialization and byte mutation |
+| Task Orchestration decisions, Task revision, Route, and Execution Lock | Task Workspace materialization and byte mutation |
 | Phase Run outcome, Runtime Run relationship, Checkpoint metadata, and commit authority | Runtime status and evidence emission |
-| Runtime and Template locks, durable-object registry and references | Temporary logs and outputs |
+| Release Management, Template Locks, durable-object registry, and references | Temporary logs and outputs |
 | Artifact Version metadata and sharing | Runtime Views, Checkpoint content, expiry, and cleanup |
 | Usage Ledger and Quota Reservation | Measured usage receipts |
 
