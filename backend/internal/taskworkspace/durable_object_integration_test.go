@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -13,13 +14,14 @@ import (
 )
 
 type integrityDurableObjectDouble struct {
-	mu       sync.Mutex
-	nextID   uint64
-	sources  map[taskworkspace.Digest][]byte
-	contents map[string]*integrityContent
-	byID     map[taskworkspace.ContentID]*integrityContent
-	repairs  map[taskworkspace.ContentID][]byte
-	orphans  [][]byte
+	mu                     sync.Mutex
+	nextID                 uint64
+	sources                map[taskworkspace.Digest][]byte
+	contents               map[string]*integrityContent
+	byID                   map[taskworkspace.ContentID]*integrityContent
+	repairs                map[taskworkspace.ContentID][]byte
+	orphans                [][]byte
+	prepareReceiptOverride *taskworkspace.DurabilityReceipt
 }
 
 func TestOrphanObservationCannotBecomeCheckpointOrRepairAuthority(t *testing.T) {
@@ -145,6 +147,99 @@ func TestExactRepairPreservesCheckpointContentAndPolicyFacts(t *testing.T) {
 	}
 }
 
+func TestCommitRejectsReceiptFromSupersededGenerationOfSharedContent(t *testing.T) {
+	durable := newIntegrityDurableObjectDouble()
+	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
+		ValidationAuthorityID: "validation-authority-1",
+		DurabilityAuthorityID: "durability-authority-1",
+		DurableObject:         durable,
+	})
+	_, first := commitTaskContent(t, lifecycle, "policy-domain-1", "task-1", "one")
+	member := first.CheckpointEvidence.ContentReferences[0]
+	staleReceipt := first.CheckpointEvidence.DurabilityReceipts[1]
+	durable.damage(member.ContentID, []byte("corrupt-state"))
+	durable.setRepair(member.ContentID, []byte("task-owned-state-one"))
+	current, err := lifecycle.ConfirmTaskWorkspace(
+		context.Background(),
+		confirmRequest("policy-domain-1", "task-1", "confirm-current"),
+	)
+	if err != nil {
+		t.Fatalf("confirm current Task Workspace: %v", err)
+	}
+	if _, err := lifecycle.Materialize(
+		context.Background(),
+		materializeRequest("policy-domain-1", "task-1", current, "materialize-repaired"),
+	); err != nil {
+		t.Fatalf("materialize exactly repaired Checkpoint: %v", err)
+	}
+	durable.setPrepareReceiptOverride(staleReceipt)
+
+	confirmed, err := lifecycle.ConfirmTaskWorkspace(
+		context.Background(),
+		confirmRequest("policy-domain-1", "task-2", "confirm-two"),
+	)
+	if err != nil {
+		t.Fatalf("confirm second Task Workspace: %v", err)
+	}
+	materialized, err := lifecycle.Materialize(
+		context.Background(),
+		materializeRequest("policy-domain-1", "task-2", confirmed, "materialize-two"),
+	)
+	if err != nil {
+		t.Fatalf("materialize second Task Workspace: %v", err)
+	}
+	view, err := lifecycle.OpenRuntimeView(
+		context.Background(),
+		openRuntimeViewRequest(
+			"policy-domain-1", "task-2", confirmed, materialized,
+			"phase-run-two", "runtime-run-two", "sandbox-lease-two", "open-view-two",
+		),
+	)
+	if err != nil {
+		t.Fatalf("open second Runtime View: %v", err)
+	}
+	manifest := declaredStateManifest("content-1")
+	validation := taskworkspace.ValidationEvidence{
+		ID:                    "validation-evidence-two",
+		ValidationAuthorityID: "validation-authority-1",
+		PolicyDomainID:        "policy-domain-1",
+		TaskID:                "task-2",
+		TaskWorkspaceID:       confirmed.TaskWorkspaceID,
+		RuntimeViewID:         view.RuntimeViewID,
+		BaseRevisionID:        confirmed.CurrentRevisionID,
+		PhaseRunID:            view.PhaseRunID,
+		RuntimeRunID:          view.RuntimeRunID,
+		ManifestDigest:        manifest.Digest,
+		Generation:            confirmed.Generation,
+		Fence:                 confirmed.Fence,
+		Decision:              taskworkspace.ValidationAccepted,
+	}
+	validation.Digest = validation.CanonicalDigest()
+	request := taskworkspace.CommitRuntimeViewRequest{
+		PolicyDomainID:          "policy-domain-1",
+		TaskID:                  "task-2",
+		TaskWorkspaceID:         confirmed.TaskWorkspaceID,
+		RuntimeViewID:           view.RuntimeViewID,
+		BaseRevisionID:          confirmed.CurrentRevisionID,
+		ExpectedCurrentRevision: confirmed.CurrentRevisionID,
+		Generation:              confirmed.Generation,
+		Fence:                   confirmed.Fence,
+		ValidationEvidence:      validation,
+		DeclaredStateManifest:   manifest,
+		Operation:               taskworkspace.Operation{ID: "commit-two"},
+	}
+	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+
+	result, err := lifecycle.CommitRuntimeView(context.Background(), request)
+	var lifecycleError *taskworkspace.Error
+	if !errors.As(err, &lifecycleError) || lifecycleError.Code != taskworkspace.ErrorIntegrityFailure {
+		t.Fatalf("commit error = %T/%v, want typed integrity failure", err, err)
+	}
+	if result.CheckpointID != "" || result.RevisionID != "" {
+		t.Fatal("superseded receipt returned Checkpoint or Revision authority")
+	}
+}
+
 func TestDifferentByteRepairIsRejectedWithoutRewritingAuthoritativeFacts(t *testing.T) {
 	durable := newIntegrityDurableObjectDouble()
 	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
@@ -242,11 +337,19 @@ func (d *integrityDurableObjectDouble) PrepareCheckpoint(
 		manifestContent.size,
 	)
 	contents = append([]*integrityContent{manifestContent}, contents...)
+	receipts := uniqueIntegrityReceipts(contents)
+	if d.prepareReceiptOverride != nil {
+		for index := range receipts {
+			if receipts[index].ContentID == d.prepareReceiptOverride.ContentID {
+				receipts[index] = *d.prepareReceiptOverride
+			}
+		}
+	}
 	return taskworkspace.VerifiedCheckpointContent{
 		Manifest:           manifest,
 		ManifestReference:  manifestReference,
 		ContentReferences:  contentReferences,
-		DurabilityReceipts: uniqueIntegrityReceipts(contents),
+		DurabilityReceipts: receipts,
 	}, nil
 }
 
@@ -358,6 +461,12 @@ func (d *integrityDurableObjectDouble) observeOrphan(payload []byte) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.orphans = append(d.orphans, append([]byte(nil), payload...))
+}
+
+func (d *integrityDurableObjectDouble) setPrepareReceiptOverride(receipt taskworkspace.DurabilityReceipt) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.prepareReceiptOverride = &receipt
 }
 
 func uniqueIntegrityReceipts(contents []*integrityContent) []taskworkspace.DurabilityReceipt {

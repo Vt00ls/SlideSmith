@@ -31,6 +31,7 @@ type inMemory struct {
 	contentReferences     map[ContentReferenceID]ContentReference
 	contentFacts          map[ContentID]durableContentFact
 	durabilityReceipts    map[DurabilityReceiptID]DurabilityReceipt
+	supersededReceipts    map[DurabilityReceiptID]struct{}
 }
 
 type durableContentFact struct {
@@ -113,6 +114,7 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 		contentReferences:     make(map[ContentReferenceID]ContentReference),
 		contentFacts:          make(map[ContentID]durableContentFact),
 		durabilityReceipts:    make(map[DurabilityReceiptID]DurabilityReceipt),
+		supersededReceipts:    make(map[DurabilityReceiptID]struct{}),
 	}
 	return memory
 }
@@ -415,7 +417,7 @@ func (m *inMemory) reverifyCheckpointEvidence(
 		!sameCheckpointManifest(verified.Manifest, expected.Manifest) ||
 		verified.ManifestReference != expected.ManifestReference ||
 		!sameContentReferences(verified.ContentReferences, expected.ContentReferences) ||
-		!receiptsRespectKnownIdentity(expected.DurabilityReceipts, verified.DurabilityReceipts) {
+		!m.receiptsRespectKnownIdentity(expected.DurabilityReceipts, verified.DurabilityReceipts) {
 		return CheckpointEvidence{}, false
 	}
 	contentRoot, durabilityRoot, durable := m.durableContentRoots(verified)
@@ -557,6 +559,9 @@ func (m *inMemory) durableEvidenceIdentitiesAreConsistent(content VerifiedCheckp
 		}
 	}
 	for _, receipt := range content.DurabilityReceipts {
+		if _, stale := m.supersededReceipts[receipt.ID]; stale {
+			return false
+		}
 		if prior, exists := m.durabilityReceipts[receipt.ID]; exists && prior != receipt {
 			return false
 		}
@@ -594,7 +599,7 @@ func sameContentReferences(left, right []ContentReference) bool {
 	return true
 }
 
-func receiptsRespectKnownIdentity(expected, verified []DurabilityReceipt) bool {
+func (m *inMemory) receiptsRespectKnownIdentity(expected, verified []DurabilityReceipt) bool {
 	knownByID := make(map[DurabilityReceiptID]DurabilityReceipt, len(expected))
 	knownByContent := make(map[ContentID]DurabilityReceipt, len(expected))
 	for _, receipt := range expected {
@@ -602,6 +607,9 @@ func receiptsRespectKnownIdentity(expected, verified []DurabilityReceipt) bool {
 		knownByContent[receipt.ContentID] = receipt
 	}
 	for _, receipt := range verified {
+		if _, stale := m.supersededReceipts[receipt.ID]; stale {
+			return false
+		}
 		if prior, exists := knownByID[receipt.ID]; exists && prior != receipt {
 			return false
 		}
@@ -609,12 +617,23 @@ func receiptsRespectKnownIdentity(expected, verified []DurabilityReceipt) bool {
 		if !exists {
 			return false
 		}
-		if receipt.ID != prior.ID &&
-			(receipt.DurabilityGenerationID == prior.DurabilityGenerationID || !receipt.VerifiedAt.After(prior.VerifiedAt)) {
+		if receipt.ID != prior.ID && receipt.DurabilityGenerationID == prior.DurabilityGenerationID {
 			return false
 		}
 	}
 	return true
+}
+
+func (m *inMemory) recordSupersededReceipts(expected, verified []DurabilityReceipt) {
+	verifiedByContent := make(map[ContentID]DurabilityReceipt, len(verified))
+	for _, receipt := range verified {
+		verifiedByContent[receipt.ContentID] = receipt
+	}
+	for _, receipt := range expected {
+		if current, exists := verifiedByContent[receipt.ContentID]; exists && current.ID != receipt.ID {
+			m.supersededReceipts[receipt.ID] = struct{}{}
+		}
+	}
 }
 
 func verifiedCheckpointContent(evidence CheckpointEvidence) VerifiedCheckpointContent {
@@ -916,6 +935,7 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 			recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, MaterializeResult{}, err)
 			return MaterializeResult{}, err
 		}
+		m.recordSupersededReceipts(checkpoint.evidence.DurabilityReceipts, checkpointEvidence.DurabilityReceipts)
 		checkpoint.evidence = cloneCheckpointEvidence(checkpointEvidence)
 		m.checkpoints[checkpointID] = checkpoint
 		m.recordDurableEvidenceIdentities(verifiedCheckpointContent(checkpointEvidence))
