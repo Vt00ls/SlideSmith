@@ -9,13 +9,17 @@ import (
 )
 
 type InMemoryConfig struct {
-	ValidationAuthorityID ValidationAuthorityID
+	ValidationAuthorityID      ValidationAuthorityID
+	DurabilityAuthorityID      DurabilityAuthorityID
+	VerifiedDurabilityEvidence []DurabilityEvidence
 }
 
 type inMemory struct {
 	mu                    sync.Mutex
 	nextID                uint64
 	validationAuthorityID ValidationAuthorityID
+	durabilityAuthorityID DurabilityAuthorityID
+	durabilityEvidence    map[EvidenceID]DurabilityEvidence
 	workspaces            map[TaskID]workspaceBinding
 	materializations      map[MaterializationID]materializationBinding
 	views                 map[RuntimeViewID]runtimeViewBinding
@@ -82,8 +86,10 @@ type operationRecord struct {
 }
 
 func NewInMemory(config InMemoryConfig) Lifecycle {
-	return &inMemory{
+	memory := &inMemory{
 		validationAuthorityID: config.ValidationAuthorityID,
+		durabilityAuthorityID: config.DurabilityAuthorityID,
+		durabilityEvidence:    make(map[EvidenceID]DurabilityEvidence),
 		workspaces:            make(map[TaskID]workspaceBinding),
 		materializations:      make(map[MaterializationID]materializationBinding),
 		views:                 make(map[RuntimeViewID]runtimeViewBinding),
@@ -91,6 +97,21 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 		checkpoints:           make(map[CheckpointID]checkpointRecord),
 		operations:            make(map[operationScope]operationRecord),
 	}
+	duplicates := make(map[EvidenceID]bool)
+	for _, evidence := range config.VerifiedDurabilityEvidence {
+		if !durabilityEvidenceIsCanonical(evidence) || evidence.DurabilityAuthorityID != config.DurabilityAuthorityID {
+			continue
+		}
+		if _, exists := memory.durabilityEvidence[evidence.ID]; exists {
+			delete(memory.durabilityEvidence, evidence.ID)
+			duplicates[evidence.ID] = true
+			continue
+		}
+		if !duplicates[evidence.ID] {
+			memory.durabilityEvidence[evidence.ID] = evidence
+		}
+	}
+	return memory
 }
 
 func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewRequest) (OpenRuntimeViewResult, error) {
@@ -188,7 +209,11 @@ func (m *inMemory) CommitRuntimeView(_ context.Context, request CommitRuntimeVie
 	if !m.validationEvidenceMatches(request.ValidationEvidence, request, view) {
 		return fail(ErrorIntegrityFailure)
 	}
-	contentRoot, durabilityRoot, ok := validateDeclaredStateManifest(request.DeclaredStateManifest)
+	contentRoot, ok := validateDeclaredStateManifest(request.DeclaredStateManifest)
+	if !ok {
+		return fail(ErrorIntegrityFailure)
+	}
+	durabilityRoot, ok := m.verifyDurabilityEvidence(request.DeclaredStateManifest, request.DurabilityEvidence)
 	if !ok {
 		return fail(ErrorIntegrityFailure)
 	}
@@ -205,6 +230,8 @@ func (m *inMemory) CommitRuntimeView(_ context.Context, request CommitRuntimeVie
 		workspace.currentRevisionID = resultingRevision
 		workspace.currentManifest = request.DeclaredStateManifest.Digest
 		m.workspaces[request.TaskID] = workspace
+	} else {
+		predecessor = m.revisions[resultingRevision].predecessor
 	}
 	checkpointID := CheckpointID(m.nextOpaqueID("checkpoint"))
 	m.checkpoints[checkpointID] = checkpointRecord{
@@ -250,26 +277,26 @@ func (m *inMemory) validationEvidenceMatches(
 		evidence.Generation == request.Generation && evidence.Fence == request.Fence
 }
 
-func validateDeclaredStateManifest(manifest DeclaredStateManifest) (EvidenceRoot, EvidenceRoot, bool) {
+func validateDeclaredStateManifest(manifest DeclaredStateManifest) (EvidenceRoot, bool) {
 	if !validDigest(manifest.Digest) || manifest.Digest != manifest.CanonicalDigest() {
-		return "", "", false
+		return "", false
 	}
 	members := manifest.canonicalValue().Members
-	seen := make(map[StateMemberID]struct{}, len(members))
+	seenMembers := make(map[StateMemberID]struct{}, len(members))
+	seenContent := make(map[ContentID]contentFact, len(members))
 	for _, member := range members {
-		if member.ID == "" || member.ContentID == "" || !validDigest(member.ContentDigest) ||
-			member.DurabilityEvidence.ID == "" || !validDigest(member.DurabilityEvidence.Digest) ||
-			member.DurabilityEvidence.Digest != member.DurabilityEvidence.CanonicalDigest() ||
-			member.DurabilityEvidence.ContentID != member.ContentID ||
-			member.DurabilityEvidence.ContentDigest != member.ContentDigest ||
-			member.DurabilityEvidence.Size != member.Size ||
-			member.DurabilityEvidence.Decision != DurabilityVerified {
-			return "", "", false
+		if member.ID == "" || member.ContentID == "" || !validDigest(member.ContentDigest) {
+			return "", false
 		}
-		if _, duplicate := seen[member.ID]; duplicate {
-			return "", "", false
+		if _, duplicate := seenMembers[member.ID]; duplicate {
+			return "", false
 		}
-		seen[member.ID] = struct{}{}
+		seenMembers[member.ID] = struct{}{}
+		fact := contentFact{contentDigest: member.ContentDigest, size: member.Size}
+		if existing, duplicate := seenContent[member.ContentID]; duplicate && existing != fact {
+			return "", false
+		}
+		seenContent[member.ContentID] = fact
 	}
 	contentRoot := canonicalDigest(struct {
 		Members []struct {
@@ -279,10 +306,58 @@ func validateDeclaredStateManifest(manifest DeclaredStateManifest) (EvidenceRoot
 			Size          uint64
 		}
 	}{Members: contentFacts(members)})
-	durabilityRoot := canonicalDigest(struct {
+	return EvidenceRoot(contentRoot), true
+}
+
+type contentFact struct {
+	contentDigest Digest
+	size          uint64
+}
+
+func (m *inMemory) verifyDurabilityEvidence(
+	manifest DeclaredStateManifest,
+	evidence []DurabilityEvidence,
+) (EvidenceRoot, bool) {
+	required := make(map[ContentID]contentFact, len(manifest.Members))
+	for _, member := range manifest.Members {
+		required[member.ContentID] = contentFact{contentDigest: member.ContentDigest, size: member.Size}
+	}
+	if len(evidence) != len(required) {
+		return "", false
+	}
+	seenEvidence := make(map[EvidenceID]struct{}, len(evidence))
+	seenContent := make(map[ContentID]struct{}, len(evidence))
+	for _, receipt := range evidence {
+		if !durabilityEvidenceIsCanonical(receipt) || receipt.DurabilityAuthorityID != m.durabilityAuthorityID {
+			return "", false
+		}
+		registered, ok := m.durabilityEvidence[receipt.ID]
+		if !ok || registered != receipt {
+			return "", false
+		}
+		fact, ok := required[receipt.ContentID]
+		if !ok || fact.contentDigest != receipt.ContentDigest || fact.size != receipt.Size {
+			return "", false
+		}
+		if _, duplicate := seenEvidence[receipt.ID]; duplicate {
+			return "", false
+		}
+		if _, duplicate := seenContent[receipt.ContentID]; duplicate {
+			return "", false
+		}
+		seenEvidence[receipt.ID] = struct{}{}
+		seenContent[receipt.ContentID] = struct{}{}
+	}
+	root := canonicalDigest(struct {
 		Evidence []DurabilityEvidence
-	}{Evidence: durabilityFacts(members)})
-	return EvidenceRoot(contentRoot), EvidenceRoot(durabilityRoot), true
+	}{Evidence: canonicalDurabilityEvidence(evidence)})
+	return EvidenceRoot(root), true
+}
+
+func durabilityEvidenceIsCanonical(evidence DurabilityEvidence) bool {
+	return evidence.ID != "" && evidence.DurabilityAuthorityID != "" && evidence.ContentID != "" &&
+		validDigest(evidence.ContentDigest) && evidence.Decision == DurabilityVerified &&
+		validDigest(evidence.Digest) && evidence.Digest == evidence.CanonicalDigest()
 }
 
 func contentFacts(members []DeclaredStateMember) []struct {
@@ -304,14 +379,6 @@ func contentFacts(members []DeclaredStateMember) []struct {
 			ContentDigest Digest
 			Size          uint64
 		}{member.ID, member.ContentID, member.ContentDigest, member.Size}
-	}
-	return facts
-}
-
-func durabilityFacts(members []DeclaredStateMember) []DurabilityEvidence {
-	facts := make([]DurabilityEvidence, len(members))
-	for i, member := range members {
-		facts[i] = member.DurabilityEvidence
 	}
 	return facts
 }

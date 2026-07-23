@@ -3,13 +3,14 @@ package taskworkspace
 import "sort"
 
 type (
-	CheckpointID       string
-	StateMemberID      string
-	ContentID          string
-	EvidenceID         string
-	EvidenceRoot       string
-	ValidationDecision string
-	DurabilityDecision string
+	CheckpointID          string
+	StateMemberID         string
+	ContentID             string
+	EvidenceID            string
+	EvidenceRoot          string
+	DurabilityAuthorityID string
+	ValidationDecision    string
+	DurabilityDecision    string
 )
 
 const (
@@ -18,36 +19,38 @@ const (
 )
 
 type DurabilityEvidence struct {
-	ID            EvidenceID
-	Digest        Digest
-	ContentID     ContentID
-	ContentDigest Digest
-	Size          uint64
-	Decision      DurabilityDecision
+	ID                    EvidenceID
+	Digest                Digest
+	DurabilityAuthorityID DurabilityAuthorityID
+	ContentID             ContentID
+	ContentDigest         Digest
+	Size                  uint64
+	Decision              DurabilityDecision
 }
 
 func (e DurabilityEvidence) CanonicalDigest() Digest {
 	return canonicalDigest(struct {
-		ID            EvidenceID
-		ContentID     ContentID
-		ContentDigest Digest
-		Size          uint64
-		Decision      DurabilityDecision
+		ID                    EvidenceID
+		DurabilityAuthorityID DurabilityAuthorityID
+		ContentID             ContentID
+		ContentDigest         Digest
+		Size                  uint64
+		Decision              DurabilityDecision
 	}{
-		ID:            e.ID,
-		ContentID:     e.ContentID,
-		ContentDigest: e.ContentDigest,
-		Size:          e.Size,
-		Decision:      e.Decision,
+		ID:                    e.ID,
+		DurabilityAuthorityID: e.DurabilityAuthorityID,
+		ContentID:             e.ContentID,
+		ContentDigest:         e.ContentDigest,
+		Size:                  e.Size,
+		Decision:              e.Decision,
 	})
 }
 
 type DeclaredStateMember struct {
-	ID                 StateMemberID
-	ContentID          ContentID
-	ContentDigest      Digest
-	Size               uint64
-	DurabilityEvidence DurabilityEvidence
+	ID            StateMemberID
+	ContentID     ContentID
+	ContentDigest Digest
+	Size          uint64
 }
 
 type DeclaredStateManifest struct {
@@ -133,6 +136,7 @@ type CommitRuntimeViewRequest struct {
 	Fence                   Fence
 	ValidationEvidence      ValidationEvidence
 	DeclaredStateManifest   DeclaredStateManifest
+	DurabilityEvidence      []DurabilityEvidence
 	Operation               Operation
 }
 
@@ -149,6 +153,7 @@ func (r CommitRuntimeViewRequest) CanonicalRequestDigest() Digest {
 		Fence                   Fence
 		ValidationEvidence      ValidationEvidence
 		DeclaredStateManifest   declaredStateManifestCanonical
+		DurabilityEvidence      []DurabilityEvidence
 		OperationID             OperationID
 	}{
 		Kind:                    "commit_runtime_view",
@@ -162,8 +167,17 @@ func (r CommitRuntimeViewRequest) CanonicalRequestDigest() Digest {
 		Fence:                   r.Fence,
 		ValidationEvidence:      r.ValidationEvidence,
 		DeclaredStateManifest:   r.DeclaredStateManifest.canonicalValue(),
+		DurabilityEvidence:      canonicalDurabilityEvidence(r.DurabilityEvidence),
 		OperationID:             r.Operation.ID,
 	})
+}
+
+func canonicalDurabilityEvidence(evidence []DurabilityEvidence) []DurabilityEvidence {
+	canonical := append([]DurabilityEvidence(nil), evidence...)
+	sort.Slice(canonical, func(i, j int) bool {
+		return canonical[i].ID < canonical[j].ID
+	})
+	return canonical
 }
 
 type CommitRuntimeViewResult struct {

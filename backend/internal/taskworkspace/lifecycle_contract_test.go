@@ -376,12 +376,16 @@ func TestUnchangedContentCommitCreatesADistinctCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open second Runtime View: %v", err)
 	}
-	secondEvidence := acceptedValidationEvidence(current, secondView, manifest)
+	secondManifest := declaredStateManifest("content-1")
+	secondEvidence := acceptedValidationEvidence(current, secondView, secondManifest)
 	secondEvidence.ID = "validation-evidence-2"
 	secondEvidence.Digest = secondEvidence.CanonicalDigest()
-	second, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest(
-		current, secondView, manifest, secondEvidence, "commit-2",
-	))
+	secondRequest := commitRequest(current, secondView, secondManifest, secondEvidence, "commit-2")
+	secondRequest.DurabilityEvidence = []taskworkspace.DurabilityEvidence{
+		durabilityEvidence("content-1", "2"),
+	}
+	secondRequest.Operation.RequestDigest = secondRequest.CanonicalRequestDigest()
+	second, err := lifecycle.CommitRuntimeView(context.Background(), secondRequest)
 	if err != nil {
 		t.Fatalf("commit unchanged state: %v", err)
 	}
@@ -391,6 +395,9 @@ func TestUnchangedContentCommitCreatesADistinctCheckpoint(t *testing.T) {
 	}
 	if second.CheckpointID == "" || second.CheckpointID == first.CheckpointID {
 		t.Fatal("unchanged-content commit did not create a distinct Checkpoint")
+	}
+	if second.PredecessorRevisionID == second.RevisionID {
+		t.Fatal("unchanged-content commit reported a self-predecessor")
 	}
 }
 
@@ -494,13 +501,19 @@ func TestCommitFailsClosedUnlessEveryAuthorityAndIntegrityBindingIsExact(t *test
 			},
 		},
 		{
+			name: "missing durability evidence",
+			code: taskworkspace.ErrorIntegrityFailure,
+			edit: func(request *taskworkspace.CommitRuntimeViewRequest) {
+				request.DurabilityEvidence = nil
+				request.Operation.RequestDigest = request.CanonicalRequestDigest()
+			},
+		},
+		{
 			name: "durability not verified",
 			code: taskworkspace.ErrorIntegrityFailure,
 			edit: func(request *taskworkspace.CommitRuntimeViewRequest) {
-				request.DeclaredStateManifest.Members[0].DurabilityEvidence.Decision = "unverified"
-				request.DeclaredStateManifest.Digest = request.DeclaredStateManifest.CanonicalDigest()
-				request.ValidationEvidence.ManifestDigest = request.DeclaredStateManifest.Digest
-				request.ValidationEvidence.Digest = request.ValidationEvidence.CanonicalDigest()
+				request.DurabilityEvidence[0].Decision = "unverified"
+				request.DurabilityEvidence[0].Digest = request.DurabilityEvidence[0].CanonicalDigest()
 				request.Operation.RequestDigest = request.CanonicalRequestDigest()
 			},
 		},
@@ -508,12 +521,19 @@ func TestCommitFailsClosedUnlessEveryAuthorityAndIntegrityBindingIsExact(t *test
 			name: "durability evidence bound to different content",
 			code: taskworkspace.ErrorIntegrityFailure,
 			edit: func(request *taskworkspace.CommitRuntimeViewRequest) {
-				evidence := &request.DeclaredStateManifest.Members[0].DurabilityEvidence
+				evidence := &request.DurabilityEvidence[0]
 				evidence.ContentID = "content-not-declared"
 				evidence.Digest = evidence.CanonicalDigest()
-				request.DeclaredStateManifest.Digest = request.DeclaredStateManifest.CanonicalDigest()
-				request.ValidationEvidence.ManifestDigest = request.DeclaredStateManifest.Digest
-				request.ValidationEvidence.Digest = request.ValidationEvidence.CanonicalDigest()
+				request.Operation.RequestDigest = request.CanonicalRequestDigest()
+			},
+		},
+		{
+			name: "unregistered durability evidence",
+			code: taskworkspace.ErrorIntegrityFailure,
+			edit: func(request *taskworkspace.CommitRuntimeViewRequest) {
+				evidence := &request.DurabilityEvidence[0]
+				evidence.ID = "caller-minted-evidence"
+				evidence.Digest = evidence.CanonicalDigest()
 				request.Operation.RequestDigest = request.CanonicalRequestDigest()
 			},
 		},
@@ -674,9 +694,7 @@ func materializedTask(t *testing.T) (
 	taskworkspace.MaterializeResult,
 ) {
 	t.Helper()
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-	})
+	lifecycle := newLifecycle()
 	confirmed, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
 		"policy-domain-1", "task-1", "confirm-1",
 	))
@@ -739,26 +757,52 @@ func openedRuntimeView(
 }
 
 func declaredStateManifest(contentID string) taskworkspace.DeclaredStateManifest {
+	contentDigest, size := declaredContentFacts(contentID)
 	manifest := taskworkspace.DeclaredStateManifest{
 		Members: []taskworkspace.DeclaredStateMember{
 			{
 				ID:            "state-member-1",
 				ContentID:     taskworkspace.ContentID(contentID),
-				ContentDigest: "sha256:eb2c3a2b20a3e33b6e4b5f2f8f15a3a4d2d218db8c20a364be8349960d148545",
-				Size:          21,
-				DurabilityEvidence: taskworkspace.DurabilityEvidence{
-					ID:            "durability-evidence-1",
-					ContentID:     taskworkspace.ContentID(contentID),
-					ContentDigest: "sha256:eb2c3a2b20a3e33b6e4b5f2f8f15a3a4d2d218db8c20a364be8349960d148545",
-					Size:          21,
-					Decision:      taskworkspace.DurabilityVerified,
-				},
+				ContentDigest: contentDigest,
+				Size:          size,
 			},
 		},
 	}
-	manifest.Members[0].DurabilityEvidence.Digest = manifest.Members[0].DurabilityEvidence.CanonicalDigest()
 	manifest.Digest = manifest.CanonicalDigest()
 	return manifest
+}
+
+func declaredContentFacts(contentID string) (taskworkspace.Digest, uint64) {
+	if contentID == "content-2" {
+		return "sha256:5753e29b83c3bd554f29719bd70b4893cb138e7ec31bcd81a8511c9a42da2a71", 22
+	}
+	return "sha256:eb2c3a2b20a3e33b6e4b5f2f8f15a3a4d2d218db8c20a364be8349960d148545", 21
+}
+
+func durabilityEvidence(contentID, suffix string) taskworkspace.DurabilityEvidence {
+	contentDigest, size := declaredContentFacts(contentID)
+	evidence := taskworkspace.DurabilityEvidence{
+		ID:                    taskworkspace.EvidenceID("durability-evidence-" + contentID + "-" + suffix),
+		DurabilityAuthorityID: "durability-authority-1",
+		ContentID:             taskworkspace.ContentID(contentID),
+		ContentDigest:         contentDigest,
+		Size:                  size,
+		Decision:              taskworkspace.DurabilityVerified,
+	}
+	evidence.Digest = evidence.CanonicalDigest()
+	return evidence
+}
+
+func newLifecycle() taskworkspace.Lifecycle {
+	return taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
+		ValidationAuthorityID: "validation-authority-1",
+		DurabilityAuthorityID: "durability-authority-1",
+		VerifiedDurabilityEvidence: []taskworkspace.DurabilityEvidence{
+			durabilityEvidence("content-1", "1"),
+			durabilityEvidence("content-1", "2"),
+			durabilityEvidence("content-2", "1"),
+		},
+	})
 }
 
 func acceptedValidationEvidence(
@@ -806,6 +850,11 @@ func commitRequest(
 		Operation: taskworkspace.Operation{
 			ID: taskworkspace.OperationID(operationID),
 		},
+	}
+	if len(manifest.Members) > 0 {
+		request.DurabilityEvidence = []taskworkspace.DurabilityEvidence{
+			durabilityEvidence(string(manifest.Members[0].ContentID), "1"),
+		}
 	}
 	request.Operation.RequestDigest = request.CanonicalRequestDigest()
 	return request
