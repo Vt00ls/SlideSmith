@@ -203,24 +203,8 @@ func (d *integrityDurableObjectDouble) PrepareCheckpoint(
 	if digestBytes(request.CanonicalManifest) != request.Manifest.Digest {
 		return taskworkspace.VerifiedCheckpointContent{}, fmt.Errorf("manifest integrity failure")
 	}
-	manifestContent := d.prepareContent(
-		request.PolicyDomainID,
-		request.Manifest.Digest,
-		uint64(len(request.CanonicalManifest)),
-		request.CanonicalManifest,
-	)
-	manifestReference := durableReference(
-		d.nextOpaque("reference"),
-		taskworkspace.CheckpointManifestReference,
-		request,
-		"",
-		"",
-		string(manifestContent.id),
-		manifestContent.digest,
-		manifestContent.size,
-	)
 	contentReferences := make([]taskworkspace.ContentReference, 0, len(request.Manifest.Members))
-	contents := []*integrityContent{manifestContent}
+	contents := make([]*integrityContent, 0, len(request.Manifest.Members)+1)
 	for _, member := range request.Manifest.Members {
 		payload, exists := d.sources[member.ContentDigest]
 		if !exists || digestBytes(payload) != member.ContentDigest || uint64(len(payload)) != member.Size {
@@ -239,7 +223,27 @@ func (d *integrityDurableObjectDouble) PrepareCheckpoint(
 		))
 		contents = append(contents, content)
 	}
+	manifest := checkpointManifestFromDeclared(request.Manifest, contentReferences)
+	manifestBytes := manifest.CanonicalBytes()
+	manifestContent := d.prepareContent(
+		request.PolicyDomainID,
+		manifest.Digest,
+		uint64(len(manifestBytes)),
+		manifestBytes,
+	)
+	manifestReference := durableReference(
+		d.nextOpaque("reference"),
+		taskworkspace.CheckpointManifestReference,
+		request,
+		"",
+		"",
+		string(manifestContent.id),
+		manifestContent.digest,
+		manifestContent.size,
+	)
+	contents = append([]*integrityContent{manifestContent}, contents...)
 	return taskworkspace.VerifiedCheckpointContent{
+		Manifest:           manifest,
 		ManifestReference:  manifestReference,
 		ContentReferences:  contentReferences,
 		DurabilityReceipts: uniqueIntegrityReceipts(contents),
@@ -275,6 +279,7 @@ func (d *integrityDurableObjectDouble) VerifyCheckpoint(
 		contents = append(contents, content)
 	}
 	return taskworkspace.VerifiedCheckpointContent{
+		Manifest:           request.Manifest,
 		ManifestReference:  request.Expected.ManifestReference,
 		ContentReferences:  append([]taskworkspace.ContentReference(nil), request.Expected.ContentReferences...),
 		DurabilityReceipts: uniqueIntegrityReceipts(contents),
@@ -310,6 +315,7 @@ func (d *integrityDurableObjectDouble) issueReceipt(content *integrityContent) t
 		ID:                     taskworkspace.DurabilityReceiptID(d.nextOpaque("receipt")),
 		DurabilityAuthorityID:  "durability-authority-1",
 		DurableWriteID:         taskworkspace.DurableWriteID(d.nextOpaque("durable-write")),
+		DurabilityAdapterID:    "durability-adapter-1",
 		PolicyDomainID:         content.domain,
 		ContentID:              content.id,
 		ContentDigest:          content.digest,

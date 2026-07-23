@@ -143,6 +143,13 @@ func TestCommitFailsClosedForUnverifiedOrIncompletelyBoundDurableContent(t *test
 			},
 		},
 		{
+			name: "canonical manifest omits member content identity",
+			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
+				content.Manifest.Members[0].ContentID = ""
+				content.Manifest.Digest = content.Manifest.CanonicalDigest()
+			},
+		},
+		{
 			name: "manifest size mismatch",
 			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
 				content.ManifestReference.Size++
@@ -221,6 +228,13 @@ func TestCommitFailsClosedForUnverifiedOrIncompletelyBoundDurableContent(t *test
 			name: "receipt without verification method",
 			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
 				content.DurabilityReceipts[1].VerificationMethod = ""
+				content.DurabilityReceipts[1].EvidenceDigest = content.DurabilityReceipts[1].CanonicalDigest()
+			},
+		},
+		{
+			name: "receipt without opaque adapter identity",
+			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
+				content.DurabilityReceipts[1].DurabilityAdapterID = ""
 				content.DurabilityReceipts[1].EvidenceDigest = content.DurabilityReceipts[1].CanonicalDigest()
 			},
 		},
@@ -388,6 +402,13 @@ func TestMaterializeFailsClosedWhenCheckpointContentCannotBeReverified(t *testin
 			},
 		},
 		{
+			name: "canonical manifest changed after commit",
+			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
+				content.Manifest.Members[0].ContentID = "content-not-authoritative"
+				content.Manifest.Digest = content.Manifest.CanonicalDigest()
+			},
+		},
+		{
 			name: "size mismatch",
 			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
 				content.ContentReferences[0].Size++
@@ -415,9 +436,9 @@ func TestMaterializeFailsClosedWhenCheckpointContentCannotBeReverified(t *testin
 			},
 		},
 		{
-			name: "stale receipt",
+			name: "receipt for stale immutable generation",
 			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
-				content.DurabilityReceipts[1].Decision = "stale"
+				content.DurabilityReceipts[1].DurabilityGenerationID = "durability-generation-stale"
 				content.DurabilityReceipts[1].EvidenceDigest = content.DurabilityReceipts[1].CanonicalDigest()
 			},
 		},
@@ -469,6 +490,66 @@ func TestMaterializeFailsClosedWhenCheckpointContentCannotBeReverified(t *testin
 				}
 			}
 		})
+	}
+}
+
+func TestMaterializeRejectsAReceiptFromTheGenerationBeforeExactRepair(t *testing.T) {
+	durable := &happyDurableObject{}
+	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
+		ValidationAuthorityID: "validation-authority-1",
+		DurabilityAuthorityID: "durability-authority-1",
+		DurableObject:         durable,
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
+	)
+	manifest := declaredStateManifest("content-1")
+	validation := acceptedValidationEvidence(confirmed, view, manifest)
+	committed, err := lifecycle.CommitRuntimeView(
+		context.Background(),
+		commitRequest(confirmed, view, manifest, validation, "commit-1"),
+	)
+	if err != nil {
+		t.Fatalf("commit Checkpoint: %v", err)
+	}
+	staleReceipt := committed.CheckpointEvidence.DurabilityReceipts[1]
+	current, err := lifecycle.ConfirmTaskWorkspace(
+		context.Background(),
+		confirmRequest("policy-domain-1", "task-1", "confirm-2"),
+	)
+	if err != nil {
+		t.Fatalf("confirm current Task Workspace: %v", err)
+	}
+
+	durable.verifyMutate = func(content *taskworkspace.VerifiedCheckpointContent) {
+		repaired := content.DurabilityReceipts[1]
+		repaired.ID = "receipt-member-repaired"
+		repaired.DurableWriteID = "durable-write-member-repaired"
+		repaired.DurabilityGenerationID = "durability-generation-repaired"
+		repaired.VerifiedAt = repaired.VerifiedAt.Add(time.Minute)
+		repaired.EvidenceDigest = repaired.CanonicalDigest()
+		content.DurabilityReceipts[1] = repaired
+	}
+	if _, err := lifecycle.Materialize(
+		context.Background(),
+		materializeRequest("policy-domain-1", "task-1", current, "materialize-repaired"),
+	); err != nil {
+		t.Fatalf("materialize exactly repaired Checkpoint: %v", err)
+	}
+
+	durable.verifyMutate = func(content *taskworkspace.VerifiedCheckpointContent) {
+		content.DurabilityReceipts[1] = staleReceipt
+	}
+	result, err := lifecycle.Materialize(
+		context.Background(),
+		materializeRequest("policy-domain-1", "task-1", current, "materialize-stale-generation"),
+	)
+	var lifecycleError *taskworkspace.Error
+	if !errors.As(err, &lifecycleError) || lifecycleError.Code != taskworkspace.ErrorIntegrityFailure {
+		t.Fatalf("materialize error = %T/%v, want typed integrity failure", err, err)
+	}
+	if result.MaterializationID != "" || result.CheckpointID != "" {
+		t.Fatal("stale pre-repair receipt returned materialization or Checkpoint authority")
 	}
 }
 
@@ -535,16 +616,22 @@ func TestCommitBuildsCheckpointFromTrustedDurableObjectEvidence(t *testing.T) {
 	}
 	if committed.CheckpointEvidence.IntegrityEvidence.CheckpointID != committed.CheckpointID ||
 		committed.CheckpointEvidence.IntegrityEvidence.RevisionID != committed.RevisionID ||
-		committed.CheckpointEvidence.IntegrityEvidence.ManifestDigest != manifest.Digest ||
+		committed.CheckpointEvidence.IntegrityEvidence.ManifestDigest != committed.CheckpointEvidence.Manifest.Digest ||
 		committed.CheckpointEvidence.IntegrityEvidence.ValidationEvidenceID != validation.ID {
 		t.Fatal("Checkpoint integrity evidence is not bound to the resulting Checkpoint, Revision, manifest, and validation evidence")
 	}
 	manifestReference := committed.CheckpointEvidence.ManifestReference
 	memberReference := committed.CheckpointEvidence.ContentReferences[0]
-	if !reflect.DeepEqual(committed.CheckpointEvidence.Manifest, manifest) ||
+	checkpointManifest := committed.CheckpointEvidence.Manifest
+	if checkpointManifest.DeclaredStateDigest != manifest.Digest ||
+		checkpointManifest.Digest != checkpointManifest.CanonicalDigest() ||
+		len(checkpointManifest.Members) != 1 ||
+		checkpointManifest.Members[0].ContentID != memberReference.ContentID ||
+		checkpointManifest.Members[0].ContentDigest != manifest.Members[0].ContentDigest ||
+		manifestReference.ContentDigest != checkpointManifest.Digest ||
+		manifestReference.Size != uint64(len(checkpointManifest.CanonicalBytes())) ||
 		manifestReference.Type != taskworkspace.CheckpointManifestReference ||
 		manifestReference.CheckpointID != committed.CheckpointID || manifestReference.RevisionID != committed.RevisionID ||
-		manifestReference.ContentDigest != manifest.Digest ||
 		memberReference.Type != taskworkspace.CheckpointMemberReference ||
 		memberReference.CheckpointID != committed.CheckpointID || memberReference.RevisionID != committed.RevisionID ||
 		memberReference.PolicyDomainID != request.PolicyDomainID || memberReference.TaskID != request.TaskID ||
@@ -556,7 +643,7 @@ func TestCommitBuildsCheckpointFromTrustedDurableObjectEvidence(t *testing.T) {
 		t.Fatal("resulting Checkpoint is not completely bound to its canonical manifest, typed references, content facts, and evidence roots")
 	}
 	for _, receipt := range committed.CheckpointEvidence.DurabilityReceipts {
-		if receipt.DurableWriteID == "" || receipt.DurabilityGenerationID == "" ||
+		if receipt.DurableWriteID == "" || receipt.DurabilityAdapterID == "" || receipt.DurabilityGenerationID == "" ||
 			receipt.VerificationMethod == "" || receipt.VerifiedAt.IsZero() {
 			t.Fatal("Durable Object returned a non-strict durability receipt")
 		}
@@ -608,6 +695,201 @@ func TestCheckpointCommitAndMaterializeExactReplayDoNotRepeatDurableObjectWork(t
 	}
 }
 
+func TestCheckpointEvidenceReturnedByLifecycleCannotMutateAuthorityOrReplay(t *testing.T) {
+	durable := &happyDurableObject{}
+	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
+		ValidationAuthorityID: "validation-authority-1",
+		DurabilityAuthorityID: "durability-authority-1",
+		DurableObject:         durable,
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
+	)
+	manifest := declaredStateManifest("content-1")
+	validation := acceptedValidationEvidence(confirmed, view, manifest)
+	commit := commitRequest(confirmed, view, manifest, validation, "commit-1")
+	committed, err := lifecycle.CommitRuntimeView(context.Background(), commit)
+	if err != nil {
+		t.Fatalf("commit Checkpoint: %v", err)
+	}
+	originalLogicalMember := committed.CheckpointEvidence.Manifest.Members[0].LogicalMember
+	originalContentReference := committed.CheckpointEvidence.ContentReferences[0]
+	originalReceipt := committed.CheckpointEvidence.DurabilityReceipts[0]
+
+	committed.CheckpointEvidence.Manifest.Members[0].LogicalMember = "caller-mutated"
+	committed.CheckpointEvidence.ContentReferences[0].ContentDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	committed.CheckpointEvidence.DurabilityReceipts[0].Decision = "caller-mutated"
+
+	replayedCommit, err := lifecycle.CommitRuntimeView(context.Background(), commit)
+	if err != nil {
+		t.Fatalf("replay Checkpoint commit: %v", err)
+	}
+	if replayedCommit.CheckpointEvidence.Manifest.Members[0].LogicalMember != originalLogicalMember ||
+		replayedCommit.CheckpointEvidence.ContentReferences[0] != originalContentReference ||
+		replayedCommit.CheckpointEvidence.DurabilityReceipts[0] != originalReceipt {
+		t.Fatal("caller mutation changed the authoritative exact-replay result")
+	}
+
+	current, err := lifecycle.ConfirmTaskWorkspace(
+		context.Background(),
+		confirmRequest("policy-domain-1", "task-1", "confirm-2"),
+	)
+	if err != nil {
+		t.Fatalf("confirm current Task Workspace: %v", err)
+	}
+	materialize := materializeRequest("policy-domain-1", "task-1", current, "materialize-2")
+	materialized, err := lifecycle.Materialize(context.Background(), materialize)
+	if err != nil {
+		t.Fatalf("materialize after mutating returned evidence: %v", err)
+	}
+	originalMaterializedMember := materialized.CheckpointEvidence.Manifest.Members[0]
+	originalMaterializedReference := materialized.CheckpointEvidence.ContentReferences[0]
+	originalMaterializedReceipt := materialized.CheckpointEvidence.DurabilityReceipts[0]
+	materialized.CheckpointEvidence.Manifest.Members[0].LogicalMember = "caller-mutated-again"
+	materialized.CheckpointEvidence.ContentReferences[0].Size++
+	materialized.CheckpointEvidence.DurabilityReceipts[0].DurabilityGenerationID = "caller-mutated"
+
+	replayedMaterialization, err := lifecycle.Materialize(context.Background(), materialize)
+	if err != nil {
+		t.Fatalf("replay Checkpoint materialization: %v", err)
+	}
+	if replayedMaterialization.CheckpointEvidence.Manifest.Members[0] != originalMaterializedMember ||
+		replayedMaterialization.CheckpointEvidence.ContentReferences[0] != originalMaterializedReference ||
+		replayedMaterialization.CheckpointEvidence.DurabilityReceipts[0] != originalMaterializedReceipt {
+		t.Fatal("caller mutation changed the authoritative materialization replay")
+	}
+}
+
+func TestLifecycleErrorReturnedByCommitCannotMutateExactReplay(t *testing.T) {
+	durable := &happyDurableObject{prepareError: errors.New("durable fault")}
+	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
+		ValidationAuthorityID: "validation-authority-1",
+		DurabilityAuthorityID: "durability-authority-1",
+		DurableObject:         durable,
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
+	)
+	manifest := declaredStateManifest("content-1")
+	validation := acceptedValidationEvidence(confirmed, view, manifest)
+	request := commitRequest(confirmed, view, manifest, validation, "commit-1")
+	_, err := lifecycle.CommitRuntimeView(context.Background(), request)
+	var lifecycleError *taskworkspace.Error
+	if !errors.As(err, &lifecycleError) || lifecycleError.Code != taskworkspace.ErrorIntegrityFailure {
+		t.Fatalf("commit error = %T/%v, want typed integrity failure", err, err)
+	}
+	lifecycleError.Code = taskworkspace.ErrorInvalidIntent
+
+	_, replayErr := lifecycle.CommitRuntimeView(context.Background(), request)
+	var replayLifecycleError *taskworkspace.Error
+	if !errors.As(replayErr, &replayLifecycleError) || replayLifecycleError.Code != taskworkspace.ErrorIntegrityFailure {
+		t.Fatalf("replay error = %T/%v, want original typed integrity failure", replayErr, replayErr)
+	}
+	if durable.prepared != 1 {
+		t.Fatal("exact failure replay repeated Durable Object preparation")
+	}
+}
+
+func TestCommitRejectsDurableEvidenceIdentityRebindingAcrossCheckpoints(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*taskworkspace.VerifiedCheckpointContent, int)
+	}{
+		{
+			name: "typed content reference identity",
+			mutate: func() func(*taskworkspace.VerifiedCheckpointContent, int) {
+				var first taskworkspace.ContentReferenceID
+				return func(content *taskworkspace.VerifiedCheckpointContent, prepared int) {
+					if prepared == 1 {
+						first = content.ContentReferences[0].ID
+						return
+					}
+					content.ContentReferences[0].ID = first
+					content.ContentReferences[0].EvidenceDigest = content.ContentReferences[0].CanonicalDigest()
+				}
+			}(),
+		},
+		{
+			name: "content identity facts",
+			mutate: func() func(*taskworkspace.VerifiedCheckpointContent, int) {
+				var first taskworkspace.ContentID
+				return func(content *taskworkspace.VerifiedCheckpointContent, prepared int) {
+					if prepared == 1 {
+						first = content.ContentReferences[0].ContentID
+						return
+					}
+					content.ContentReferences[0].ContentID = first
+					content.ContentReferences[0].EvidenceDigest = content.ContentReferences[0].CanonicalDigest()
+					content.DurabilityReceipts[1].ContentID = first
+					content.DurabilityReceipts[1].EvidenceDigest = content.DurabilityReceipts[1].CanonicalDigest()
+				}
+			}(),
+		},
+		{
+			name: "durability receipt identity",
+			mutate: func() func(*taskworkspace.VerifiedCheckpointContent, int) {
+				var first taskworkspace.DurabilityReceiptID
+				return func(content *taskworkspace.VerifiedCheckpointContent, prepared int) {
+					if prepared == 1 {
+						first = content.DurabilityReceipts[1].ID
+						return
+					}
+					content.DurabilityReceipts[1].ID = first
+					content.DurabilityReceipts[1].EvidenceDigest = content.DurabilityReceipts[1].CanonicalDigest()
+				}
+			}(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			durable := &happyDurableObject{}
+			durable.mutate = func(content *taskworkspace.VerifiedCheckpointContent) {
+				test.mutate(content, durable.prepared)
+			}
+			lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
+				ValidationAuthorityID: "validation-authority-1",
+				DurabilityAuthorityID: "durability-authority-1",
+				DurableObject:         durable,
+			})
+			firstConfirmed, firstView := openRuntimeViewWithLifecycle(
+				t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
+			)
+			firstManifest := declaredStateManifest("content-1")
+			firstValidation := acceptedValidationEvidence(firstConfirmed, firstView, firstManifest)
+			if _, err := lifecycle.CommitRuntimeView(
+				context.Background(),
+				commitRequest(firstConfirmed, firstView, firstManifest, firstValidation, "commit-1"),
+			); err != nil {
+				t.Fatalf("commit first Checkpoint: %v", err)
+			}
+
+			secondConfirmed, secondView := openRuntimeViewWithLifecycle(
+				t, lifecycle, "task-2", "confirm-2", "materialize-2", "open-view-2",
+			)
+			secondManifest := declaredStateManifest("content-2")
+			secondValidation := acceptedValidationEvidence(secondConfirmed, secondView, secondManifest)
+			secondValidation.ID = "validation-evidence-2"
+			secondValidation.TaskID = "task-2"
+			secondValidation.Digest = secondValidation.CanonicalDigest()
+			secondCommit := commitRequest(secondConfirmed, secondView, secondManifest, secondValidation, "commit-2")
+			secondCommit.TaskID = "task-2"
+			secondCommit.Operation.RequestDigest = secondCommit.CanonicalRequestDigest()
+			result, err := lifecycle.CommitRuntimeView(
+				context.Background(),
+				secondCommit,
+			)
+			var lifecycleError *taskworkspace.Error
+			if !errors.As(err, &lifecycleError) || lifecycleError.Code != taskworkspace.ErrorIntegrityFailure {
+				t.Fatalf("commit error = %T/%v, want typed integrity failure", err, err)
+			}
+			if result.CheckpointID != "" || result.RevisionID != "" {
+				t.Fatal("identity rebinding returned Checkpoint or Revision authority")
+			}
+		})
+	}
+}
+
 type happyDurableObject struct {
 	prepared     int
 	verified     int
@@ -625,33 +907,35 @@ func (d *happyDurableObject) PrepareCheckpoint(
 	if d.prepareError != nil {
 		return taskworkspace.VerifiedCheckpointContent{}, d.prepareError
 	}
-	manifestReference := durableReference(
-		"reference-manifest-1",
-		taskworkspace.CheckpointManifestReference,
-		request,
-		"",
-		"",
-		"content-manifest-1",
-		request.Manifest.Digest,
-		uint64(len(request.CanonicalManifest)),
-	)
 	member := request.Manifest.Members[0]
 	memberReference := durableReference(
-		"reference-member-1",
+		"reference-member-"+string(request.CheckpointID),
 		taskworkspace.CheckpointMemberReference,
 		request,
 		member.ID,
 		member.LogicalMember,
-		"content-member-1",
+		"content-member-"+string(request.CheckpointID),
 		member.ContentDigest,
 		member.Size,
 	)
+	manifest := checkpointManifestFromDeclared(request.Manifest, []taskworkspace.ContentReference{memberReference})
+	manifestReference := durableReference(
+		"reference-manifest-"+string(request.CheckpointID),
+		taskworkspace.CheckpointManifestReference,
+		request,
+		"",
+		"",
+		"content-manifest-"+string(request.CheckpointID),
+		manifest.Digest,
+		uint64(len(manifest.CanonicalBytes())),
+	)
 	content := taskworkspace.VerifiedCheckpointContent{
+		Manifest:          manifest,
 		ManifestReference: manifestReference,
 		ContentReferences: []taskworkspace.ContentReference{memberReference},
 		DurabilityReceipts: []taskworkspace.DurabilityReceipt{
-			durableReceipt("receipt-manifest-1", manifestReference),
-			durableReceipt("receipt-member-1", memberReference),
+			durableReceipt("receipt-manifest-"+string(request.CheckpointID), manifestReference),
+			durableReceipt("receipt-member-"+string(request.CheckpointID), memberReference),
 		},
 	}
 	if d.mutate != nil {
@@ -673,6 +957,34 @@ func (d *happyDurableObject) VerifyCheckpoint(
 		d.verifyMutate(&content)
 	}
 	return content, nil
+}
+
+func checkpointManifestFromDeclared(
+	declared taskworkspace.DeclaredStateManifest,
+	references []taskworkspace.ContentReference,
+) taskworkspace.CheckpointManifest {
+	referencesByMember := make(map[taskworkspace.StateMemberID]taskworkspace.ContentReference, len(references))
+	for _, reference := range references {
+		referencesByMember[reference.StateMemberID] = reference
+	}
+	manifest := taskworkspace.CheckpointManifest{
+		DeclaredStateDigest: declared.Digest,
+		Members:             make([]taskworkspace.CheckpointManifestMember, len(declared.Members)),
+	}
+	for index, member := range declared.Members {
+		manifest.Members[index] = taskworkspace.CheckpointManifestMember{
+			ID:            member.ID,
+			LogicalMember: member.LogicalMember,
+			Type:          member.Type,
+			Mode:          member.Mode,
+			Class:         member.Class,
+			ContentID:     referencesByMember[member.ID].ContentID,
+			ContentDigest: member.ContentDigest,
+			Size:          member.Size,
+		}
+	}
+	manifest.Digest = manifest.CanonicalDigest()
+	return manifest
 }
 
 func durableReference(
@@ -709,6 +1021,7 @@ func durableReceipt(id string, reference taskworkspace.ContentReference) taskwor
 		ID:                     taskworkspace.DurabilityReceiptID(id),
 		DurabilityAuthorityID:  "durability-authority-1",
 		DurableWriteID:         taskworkspace.DurableWriteID("durable-write-" + id),
+		DurabilityAdapterID:    "durability-adapter-1",
 		PolicyDomainID:         reference.PolicyDomainID,
 		ContentID:              reference.ContentID,
 		ContentDigest:          reference.ContentDigest,

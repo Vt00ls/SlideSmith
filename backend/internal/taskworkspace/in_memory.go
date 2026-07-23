@@ -28,6 +28,15 @@ type inMemory struct {
 	revisions             map[RevisionID]revisionRecord
 	checkpoints           map[CheckpointID]checkpointRecord
 	operations            map[operationScope]operationRecord
+	contentReferences     map[ContentReferenceID]ContentReference
+	contentFacts          map[ContentID]durableContentFact
+	durabilityReceipts    map[DurabilityReceiptID]DurabilityReceipt
+}
+
+type durableContentFact struct {
+	policyDomainID PolicyDomainID
+	contentDigest  Digest
+	size           uint64
 }
 
 type workspaceBinding struct {
@@ -101,6 +110,9 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 		revisions:             make(map[RevisionID]revisionRecord),
 		checkpoints:           make(map[CheckpointID]checkpointRecord),
 		operations:            make(map[operationScope]operationRecord),
+		contentReferences:     make(map[ContentReferenceID]ContentReference),
+		contentFacts:          make(map[ContentID]durableContentFact),
+		durabilityReceipts:    make(map[DurabilityReceiptID]DurabilityReceipt),
 	}
 	return memory
 }
@@ -264,8 +276,9 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		revisionID:      resultingRevision,
 		manifestDigest:  request.DeclaredStateManifest.Digest,
 		operationID:     request.Operation.ID,
-		evidence:        checkpointEvidence,
+		evidence:        cloneCheckpointEvidence(checkpointEvidence),
 	}
+	m.recordDurableEvidenceIdentities(verifiedCheckpointContent(checkpointEvidence))
 	view.terminal = true
 	m.views[request.RuntimeViewID] = view
 
@@ -311,7 +324,8 @@ func (m *inMemory) bindCheckpointEvidence(
 	prepared VerifiedCheckpointContent,
 ) (CheckpointEvidence, EvidenceRoot, EvidenceRoot, bool) {
 	manifestReference := prepared.ManifestReference
-	if !contentReferenceIsCanonical(manifestReference) ||
+	if !checkpointManifestMatchesDeclaration(prepared.Manifest, request.DeclaredStateManifest) ||
+		!contentReferenceIsCanonical(manifestReference) ||
 		!contentReferenceMatchesCheckpoint(
 			manifestReference,
 			CheckpointManifestReference,
@@ -320,8 +334,8 @@ func (m *inMemory) bindCheckpointEvidence(
 			checkpointID,
 		) ||
 		manifestReference.StateMemberID != "" || manifestReference.LogicalMember != "" ||
-		manifestReference.ContentDigest != request.DeclaredStateManifest.Digest ||
-		manifestReference.Size != uint64(len(request.DeclaredStateManifest.CanonicalBytes())) {
+		manifestReference.ContentDigest != prepared.Manifest.Digest ||
+		manifestReference.Size != uint64(len(prepared.Manifest.CanonicalBytes())) {
 		return CheckpointEvidence{}, "", "", false
 	}
 
@@ -332,11 +346,17 @@ func (m *inMemory) bindCheckpointEvidence(
 	for _, member := range request.DeclaredStateManifest.Members {
 		members[member.ID] = member
 	}
+	manifestMembers := make(map[StateMemberID]CheckpointManifestMember, len(prepared.Manifest.Members))
+	for _, member := range prepared.Manifest.Members {
+		manifestMembers[member.ID] = member
+	}
 	seenReferences := map[ContentReferenceID]struct{}{manifestReference.ID: {}}
 	seenMembers := make(map[StateMemberID]struct{}, len(prepared.ContentReferences))
 	for _, reference := range prepared.ContentReferences {
 		member, exists := members[reference.StateMemberID]
+		manifestMember, manifestMemberExists := manifestMembers[reference.StateMemberID]
 		if !exists || !contentReferenceIsCanonical(reference) ||
+			!manifestMemberExists ||
 			!contentReferenceMatchesCheckpoint(
 				reference,
 				CheckpointMemberReference,
@@ -344,7 +364,7 @@ func (m *inMemory) bindCheckpointEvidence(
 				revisionID,
 				checkpointID,
 			) ||
-			reference.LogicalMember != member.LogicalMember ||
+			reference.LogicalMember != member.LogicalMember || reference.ContentID != manifestMember.ContentID ||
 			reference.ContentDigest != member.ContentDigest || reference.Size != member.Size {
 			return CheckpointEvidence{}, "", "", false
 		}
@@ -362,29 +382,20 @@ func (m *inMemory) bindCheckpointEvidence(
 	if !durable {
 		return CheckpointEvidence{}, "", "", false
 	}
-	integrity := CheckpointIntegrityEvidence{
-		ID:                       CheckpointIntegrityID(m.nextOpaqueID("checkpoint-integrity")),
+	integrity := m.newCheckpointIntegrityEvidence(CheckpointIntegrityEvidence{
 		DurabilityAuthorityID:    m.durabilityAuthorityID,
 		PolicyDomainID:           request.PolicyDomainID,
 		TaskID:                   request.TaskID,
 		TaskWorkspaceID:          request.TaskWorkspaceID,
 		RevisionID:               revisionID,
 		CheckpointID:             checkpointID,
-		ManifestDigest:           request.DeclaredStateManifest.Digest,
+		ManifestDigest:           prepared.Manifest.Digest,
 		ManifestContentID:        manifestReference.ContentID,
 		ValidationEvidenceID:     request.ValidationEvidence.ID,
 		ValidationEvidenceDigest: request.ValidationEvidence.Digest,
-		ContentEvidenceRoot:      contentRoot,
-		DurabilityEvidenceRoot:   durabilityRoot,
-		OperationID:              request.Operation.ID,
-		RequestDigest:            request.Operation.RequestDigest,
-		Generation:               request.Generation,
-		Fence:                    request.Fence,
-		Decision:                 CheckpointIntegrityVerified,
-	}
-	integrity.Digest = integrity.CanonicalDigest()
+	}, request.Operation, request.Generation, request.Fence, contentRoot, durabilityRoot)
 	evidence := CheckpointEvidence{
-		Manifest:           cloneDeclaredStateManifest(request.DeclaredStateManifest),
+		Manifest:           cloneCheckpointManifest(prepared.Manifest),
 		ManifestReference:  manifestReference,
 		ContentReferences:  append([]ContentReference(nil), prepared.ContentReferences...),
 		DurabilityReceipts: append([]DurabilityReceipt(nil), prepared.DurabilityReceipts...),
@@ -401,8 +412,10 @@ func (m *inMemory) reverifyCheckpointEvidence(
 	if expected.Manifest.Digest == "" || expected.Manifest.Digest != expected.Manifest.CanonicalDigest() ||
 		expected.IntegrityEvidence.Digest != expected.IntegrityEvidence.CanonicalDigest() ||
 		expected.IntegrityEvidence.Decision != CheckpointIntegrityVerified ||
+		!sameCheckpointManifest(verified.Manifest, expected.Manifest) ||
 		verified.ManifestReference != expected.ManifestReference ||
-		!sameContentReferences(verified.ContentReferences, expected.ContentReferences) {
+		!sameContentReferences(verified.ContentReferences, expected.ContentReferences) ||
+		!receiptsRespectKnownIdentity(expected.DurabilityReceipts, verified.DurabilityReceipts) {
 		return CheckpointEvidence{}, false
 	}
 	contentRoot, durabilityRoot, durable := m.durableContentRoots(verified)
@@ -417,29 +430,16 @@ func (m *inMemory) reverifyCheckpointEvidence(
 		prior.DurabilityAuthorityID != m.durabilityAuthorityID {
 		return CheckpointEvidence{}, false
 	}
-	integrity := CheckpointIntegrityEvidence{
-		ID:                       CheckpointIntegrityID(m.nextOpaqueID("checkpoint-integrity")),
-		DurabilityAuthorityID:    prior.DurabilityAuthorityID,
-		PolicyDomainID:           prior.PolicyDomainID,
-		TaskID:                   prior.TaskID,
-		TaskWorkspaceID:          prior.TaskWorkspaceID,
-		RevisionID:               prior.RevisionID,
-		CheckpointID:             prior.CheckpointID,
-		ManifestDigest:           prior.ManifestDigest,
-		ManifestContentID:        prior.ManifestContentID,
-		ValidationEvidenceID:     prior.ValidationEvidenceID,
-		ValidationEvidenceDigest: prior.ValidationEvidenceDigest,
-		ContentEvidenceRoot:      contentRoot,
-		DurabilityEvidenceRoot:   durabilityRoot,
-		OperationID:              request.Operation.ID,
-		RequestDigest:            request.Operation.RequestDigest,
-		Generation:               request.Generation,
-		Fence:                    request.Fence,
-		Decision:                 CheckpointIntegrityVerified,
-	}
-	integrity.Digest = integrity.CanonicalDigest()
+	integrity := m.newCheckpointIntegrityEvidence(
+		prior,
+		request.Operation,
+		request.Generation,
+		request.Fence,
+		contentRoot,
+		durabilityRoot,
+	)
 	return CheckpointEvidence{
-		Manifest:           cloneDeclaredStateManifest(expected.Manifest),
+		Manifest:           cloneCheckpointManifest(expected.Manifest),
 		ManifestReference:  verified.ManifestReference,
 		ContentReferences:  append([]ContentReference(nil), verified.ContentReferences...),
 		DurabilityReceipts: append([]DurabilityReceipt(nil), verified.DurabilityReceipts...),
@@ -447,16 +447,47 @@ func (m *inMemory) reverifyCheckpointEvidence(
 	}, true
 }
 
+func (m *inMemory) newCheckpointIntegrityEvidence(
+	base CheckpointIntegrityEvidence,
+	operation Operation,
+	generation Generation,
+	fence Fence,
+	contentRoot EvidenceRoot,
+	durabilityRoot EvidenceRoot,
+) CheckpointIntegrityEvidence {
+	base.ID = CheckpointIntegrityID(m.nextOpaqueID("checkpoint-integrity"))
+	base.Digest = ""
+	base.ContentEvidenceRoot = contentRoot
+	base.DurabilityEvidenceRoot = durabilityRoot
+	base.OperationID = operation.ID
+	base.RequestDigest = operation.RequestDigest
+	base.Generation = generation
+	base.Fence = fence
+	base.Decision = CheckpointIntegrityVerified
+	base.Digest = base.CanonicalDigest()
+	return base
+}
+
+func sameCheckpointManifest(left, right CheckpointManifest) bool {
+	if left.Digest != right.Digest || left.DeclaredStateDigest != right.DeclaredStateDigest ||
+		len(left.Members) != len(right.Members) {
+		return false
+	}
+	leftMembers := left.canonicalValue().Members
+	rightMembers := right.canonicalValue().Members
+	for index := range leftMembers {
+		if leftMembers[index] != rightMembers[index] {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *inMemory) durableContentRoots(
 	content VerifiedCheckpointContent,
 ) (EvidenceRoot, EvidenceRoot, bool) {
-	type durableFact struct {
-		policyDomainID PolicyDomainID
-		contentDigest  Digest
-		size           uint64
-	}
 	references := canonicalContentReferences(content.ManifestReference, content.ContentReferences)
-	requiredReceipts := make(map[ContentID]durableFact, len(references))
+	requiredReceipts := make(map[ContentID]durableContentFact, len(references))
 	seenReferenceIDs := make(map[ContentReferenceID]struct{}, len(references))
 	for _, reference := range references {
 		if !contentReferenceIsCanonical(reference) {
@@ -466,7 +497,7 @@ func (m *inMemory) durableContentRoots(
 			return "", "", false
 		}
 		seenReferenceIDs[reference.ID] = struct{}{}
-		fact := durableFact{
+		fact := durableContentFact{
 			policyDomainID: reference.PolicyDomainID,
 			contentDigest:  reference.ContentDigest,
 			size:           reference.Size,
@@ -498,6 +529,9 @@ func (m *inMemory) durableContentRoots(
 		seenReceiptIDs[receipt.ID] = struct{}{}
 		seenReceiptContent[receipt.ContentID] = struct{}{}
 	}
+	if !m.durableEvidenceIdentitiesAreConsistent(content) {
+		return "", "", false
+	}
 	receipts := canonicalDurabilityReceipts(content.DurabilityReceipts)
 	contentRoot := EvidenceRoot(canonicalDigest(struct {
 		References []ContentReference
@@ -506,6 +540,42 @@ func (m *inMemory) durableContentRoots(
 		Receipts []DurabilityReceipt
 	}{Receipts: receipts}))
 	return contentRoot, durabilityRoot, true
+}
+
+func (m *inMemory) durableEvidenceIdentitiesAreConsistent(content VerifiedCheckpointContent) bool {
+	for _, reference := range canonicalContentReferences(content.ManifestReference, content.ContentReferences) {
+		if prior, exists := m.contentReferences[reference.ID]; exists && prior != reference {
+			return false
+		}
+		fact := durableContentFact{
+			policyDomainID: reference.PolicyDomainID,
+			contentDigest:  reference.ContentDigest,
+			size:           reference.Size,
+		}
+		if prior, exists := m.contentFacts[reference.ContentID]; exists && prior != fact {
+			return false
+		}
+	}
+	for _, receipt := range content.DurabilityReceipts {
+		if prior, exists := m.durabilityReceipts[receipt.ID]; exists && prior != receipt {
+			return false
+		}
+	}
+	return true
+}
+
+func (m *inMemory) recordDurableEvidenceIdentities(content VerifiedCheckpointContent) {
+	for _, reference := range canonicalContentReferences(content.ManifestReference, content.ContentReferences) {
+		m.contentReferences[reference.ID] = reference
+		m.contentFacts[reference.ContentID] = durableContentFact{
+			policyDomainID: reference.PolicyDomainID,
+			contentDigest:  reference.ContentDigest,
+			size:           reference.Size,
+		}
+	}
+	for _, receipt := range content.DurabilityReceipts {
+		m.durabilityReceipts[receipt.ID] = receipt
+	}
 }
 
 func sameContentReferences(left, right []ContentReference) bool {
@@ -524,8 +594,32 @@ func sameContentReferences(left, right []ContentReference) bool {
 	return true
 }
 
+func receiptsRespectKnownIdentity(expected, verified []DurabilityReceipt) bool {
+	knownByID := make(map[DurabilityReceiptID]DurabilityReceipt, len(expected))
+	knownByContent := make(map[ContentID]DurabilityReceipt, len(expected))
+	for _, receipt := range expected {
+		knownByID[receipt.ID] = receipt
+		knownByContent[receipt.ContentID] = receipt
+	}
+	for _, receipt := range verified {
+		if prior, exists := knownByID[receipt.ID]; exists && prior != receipt {
+			return false
+		}
+		prior, exists := knownByContent[receipt.ContentID]
+		if !exists {
+			return false
+		}
+		if receipt.ID != prior.ID &&
+			(receipt.DurabilityGenerationID == prior.DurabilityGenerationID || !receipt.VerifiedAt.After(prior.VerifiedAt)) {
+			return false
+		}
+	}
+	return true
+}
+
 func verifiedCheckpointContent(evidence CheckpointEvidence) VerifiedCheckpointContent {
 	return VerifiedCheckpointContent{
+		Manifest:           cloneCheckpointManifest(evidence.Manifest),
 		ManifestReference:  evidence.ManifestReference,
 		ContentReferences:  append([]ContentReference(nil), evidence.ContentReferences...),
 		DurabilityReceipts: append([]DurabilityReceipt(nil), evidence.DurabilityReceipts...),
@@ -552,7 +646,7 @@ func contentReferenceIsCanonical(reference ContentReference) bool {
 
 func durabilityReceiptIsCanonical(receipt DurabilityReceipt) bool {
 	return receipt.ID != "" && receipt.DurabilityAuthorityID != "" && receipt.DurableWriteID != "" &&
-		receipt.PolicyDomainID != "" && receipt.ContentID != "" && validDigest(receipt.ContentDigest) &&
+		receipt.DurabilityAdapterID != "" && receipt.PolicyDomainID != "" && receipt.ContentID != "" && validDigest(receipt.ContentDigest) &&
 		receipt.DurabilityGenerationID != "" &&
 		(receipt.VerificationMethod == VerificationEndToEndChecksum ||
 			receipt.VerificationMethod == VerificationIndependentReadback) &&
@@ -564,6 +658,63 @@ func cloneDeclaredStateManifest(manifest DeclaredStateManifest) DeclaredStateMan
 	clone := manifest
 	clone.Members = append([]DeclaredStateMember(nil), manifest.Members...)
 	return clone
+}
+
+func cloneCheckpointManifest(manifest CheckpointManifest) CheckpointManifest {
+	clone := manifest
+	clone.Members = append([]CheckpointManifestMember(nil), manifest.Members...)
+	return clone
+}
+
+func cloneCheckpointEvidence(evidence CheckpointEvidence) CheckpointEvidence {
+	clone := evidence
+	clone.Manifest = cloneCheckpointManifest(evidence.Manifest)
+	clone.ContentReferences = append([]ContentReference(nil), evidence.ContentReferences...)
+	clone.DurabilityReceipts = append([]DurabilityReceipt(nil), evidence.DurabilityReceipts...)
+	return clone
+}
+
+func checkpointManifestMatchesDeclaration(manifest CheckpointManifest, declared DeclaredStateManifest) bool {
+	if !validDigest(manifest.Digest) || manifest.Digest != manifest.CanonicalDigest() ||
+		manifest.DeclaredStateDigest != declared.Digest || len(manifest.Members) != len(declared.Members) {
+		return false
+	}
+	declaredByID := make(map[StateMemberID]DeclaredStateMember, len(declared.Members))
+	for _, member := range declared.Members {
+		declaredByID[member.ID] = member
+	}
+	seenMembers := make(map[StateMemberID]struct{}, len(manifest.Members))
+	seenLogicalMembers := make(map[LogicalMember]struct{}, len(manifest.Members))
+	for _, member := range manifest.Members {
+		declaredMember, exists := declaredByID[member.ID]
+		if !exists || member.ContentID == "" || member.LogicalMember != declaredMember.LogicalMember ||
+			member.Type != declaredMember.Type || member.Mode != declaredMember.Mode || member.Class != declaredMember.Class ||
+			member.ContentDigest != declaredMember.ContentDigest || member.Size != declaredMember.Size {
+			return false
+		}
+		if _, duplicate := seenMembers[member.ID]; duplicate {
+			return false
+		}
+		seenMembers[member.ID] = struct{}{}
+		if _, duplicate := seenLogicalMembers[member.LogicalMember]; duplicate {
+			return false
+		}
+		seenLogicalMembers[member.LogicalMember] = struct{}{}
+	}
+	return true
+}
+
+func cloneOperationResult[T any](value T) T {
+	switch result := any(value).(type) {
+	case CommitRuntimeViewResult:
+		result.CheckpointEvidence = cloneCheckpointEvidence(result.CheckpointEvidence)
+		return any(result).(T)
+	case MaterializeResult:
+		result.CheckpointEvidence = cloneCheckpointEvidence(result.CheckpointEvidence)
+		return any(result).(T)
+	default:
+		return value
+	}
 }
 
 func validateDeclaredStateManifest(manifest DeclaredStateManifest) (EvidenceRoot, bool) {
@@ -746,7 +897,7 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 			TaskWorkspaceID:   request.TaskWorkspaceID,
 			RevisionID:        request.RevisionID,
 			CheckpointID:      checkpointID,
-			Manifest:          cloneDeclaredStateManifest(checkpoint.evidence.Manifest),
+			Manifest:          cloneCheckpointManifest(checkpoint.evidence.Manifest),
 			CanonicalManifest: checkpoint.evidence.Manifest.CanonicalBytes(),
 			Expected:          verifiedCheckpointContent(checkpoint.evidence),
 			Generation:        request.Generation,
@@ -765,8 +916,9 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 			recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, MaterializeResult{}, err)
 			return MaterializeResult{}, err
 		}
-		checkpoint.evidence = checkpointEvidence
+		checkpoint.evidence = cloneCheckpointEvidence(checkpointEvidence)
 		m.checkpoints[checkpointID] = checkpoint
+		m.recordDurableEvidenceIdentities(verifiedCheckpointContent(checkpointEvidence))
 	}
 
 	identity := MaterializationID(m.nextOpaqueID("materialization"))
@@ -784,7 +936,7 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 		TaskWorkspaceID:        request.TaskWorkspaceID,
 		RevisionID:             request.RevisionID,
 		CheckpointID:           checkpointID,
-		ManifestDigest:         checkpointEvidence.Manifest.Digest,
+		ManifestDigest:         workspace.currentManifest,
 		ContentEvidenceRoot:    checkpointEvidence.IntegrityEvidence.ContentEvidenceRoot,
 		DurabilityEvidenceRoot: checkpointEvidence.IntegrityEvidence.DurabilityEvidenceRoot,
 		CheckpointEvidence:     checkpointEvidence,
@@ -833,9 +985,9 @@ func replayOperation[T any](
 		return zero, true, &Error{Code: ErrorIntegrityConflict}
 	}
 	if record.err != nil {
-		return result, true, record.err
+		return cloneOperationResult(result), true, cloneLifecycleError(record.err)
 	}
-	return result, true, nil
+	return cloneOperationResult(result), true, nil
 }
 
 func recordOperation[T any](
@@ -852,7 +1004,15 @@ func recordOperation[T any](
 		operationID:    operation.ID,
 	}] = operationRecord{
 		requestDigest: operation.RequestDigest,
-		result:        result,
-		err:           err,
+		result:        cloneOperationResult(result),
+		err:           cloneLifecycleError(err),
 	}
+}
+
+func cloneLifecycleError(err *Error) *Error {
+	if err == nil {
+		return nil
+	}
+	clone := *err
+	return &clone
 }

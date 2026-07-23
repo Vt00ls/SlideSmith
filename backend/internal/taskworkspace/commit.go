@@ -63,6 +63,58 @@ type declaredStateManifestCanonical struct {
 	Members []DeclaredStateMember
 }
 
+// CheckpointManifest is the canonical immutable manifest accepted from the
+// trusted Durable Object port after it has assigned opaque content identities.
+// DeclaredStateManifest remains the caller's semantic declaration and cannot
+// carry or mint ContentIDs.
+type CheckpointManifest struct {
+	Digest              Digest
+	DeclaredStateDigest Digest
+	Members             []CheckpointManifestMember
+}
+
+type CheckpointManifestMember struct {
+	ID            StateMemberID
+	LogicalMember LogicalMember
+	Type          StateMemberType
+	Mode          uint32
+	Class         StateMemberClass
+	ContentID     ContentID
+	ContentDigest Digest
+	Size          uint64
+}
+
+func (m CheckpointManifest) CanonicalDigest() Digest {
+	return canonicalDigest(m.canonicalValue())
+}
+
+func (m CheckpointManifest) CanonicalBytes() []byte {
+	encoded, err := json.Marshal(m.canonicalValue())
+	if err != nil {
+		panic(err)
+	}
+	return encoded
+}
+
+func (m CheckpointManifest) canonicalValue() checkpointManifestCanonical {
+	members := append([]CheckpointManifestMember(nil), m.Members...)
+	sort.Slice(members, func(i, j int) bool {
+		if members[i].LogicalMember == members[j].LogicalMember {
+			return members[i].ID < members[j].ID
+		}
+		return members[i].LogicalMember < members[j].LogicalMember
+	})
+	return checkpointManifestCanonical{
+		DeclaredStateDigest: m.DeclaredStateDigest,
+		Members:             members,
+	}
+}
+
+type checkpointManifestCanonical struct {
+	DeclaredStateDigest Digest
+	Members             []CheckpointManifestMember
+}
+
 type ValidationAuthorityID string
 
 type ValidationEvidence struct {

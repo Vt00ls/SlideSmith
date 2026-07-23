@@ -14,6 +14,7 @@ type (
 	ContentReferenceType     string
 	DurabilityReceiptID      string
 	DurableWriteID           string
+	DurabilityAdapterID      string
 	DurabilityGenerationID   string
 	VerificationMethod       string
 	CheckpointIntegrityID    string
@@ -76,7 +77,7 @@ type VerifyCheckpointContentRequest struct {
 	TaskWorkspaceID   TaskWorkspaceID
 	RevisionID        RevisionID
 	CheckpointID      CheckpointID
-	Manifest          DeclaredStateManifest
+	Manifest          CheckpointManifest
 	CanonicalManifest []byte
 	Expected          VerifiedCheckpointContent
 	Generation        Generation
@@ -137,6 +138,7 @@ type DurabilityReceipt struct {
 	ID                     DurabilityReceiptID
 	DurabilityAuthorityID  DurabilityAuthorityID
 	DurableWriteID         DurableWriteID
+	DurabilityAdapterID    DurabilityAdapterID
 	PolicyDomainID         PolicyDomainID
 	ContentID              ContentID
 	ContentDigest          Digest
@@ -153,6 +155,7 @@ func (r DurabilityReceipt) CanonicalDigest() Digest {
 		ID                     DurabilityReceiptID
 		DurabilityAuthorityID  DurabilityAuthorityID
 		DurableWriteID         DurableWriteID
+		DurabilityAdapterID    DurabilityAdapterID
 		PolicyDomainID         PolicyDomainID
 		ContentID              ContentID
 		ContentDigest          Digest
@@ -165,6 +168,7 @@ func (r DurabilityReceipt) CanonicalDigest() Digest {
 		ID:                     r.ID,
 		DurabilityAuthorityID:  r.DurabilityAuthorityID,
 		DurableWriteID:         r.DurableWriteID,
+		DurabilityAdapterID:    r.DurabilityAdapterID,
 		PolicyDomainID:         r.PolicyDomainID,
 		ContentID:              r.ContentID,
 		ContentDigest:          r.ContentDigest,
@@ -177,6 +181,7 @@ func (r DurabilityReceipt) CanonicalDigest() Digest {
 }
 
 type VerifiedCheckpointContent struct {
+	Manifest           CheckpointManifest
 	ManifestReference  ContentReference
 	ContentReferences  []ContentReference
 	DurabilityReceipts []DurabilityReceipt
@@ -247,7 +252,7 @@ func (e CheckpointIntegrityEvidence) CanonicalDigest() Digest {
 }
 
 type CheckpointEvidence struct {
-	Manifest           DeclaredStateManifest
+	Manifest           CheckpointManifest
 	ManifestReference  ContentReference
 	ContentReferences  []ContentReference
 	DurabilityReceipts []DurabilityReceipt
