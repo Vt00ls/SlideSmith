@@ -7,7 +7,9 @@ This document records the Task Orchestration decisions resolved in
 records the interface choice, [enterprise-v1-scope.md](./enterprise-v1-scope.md)
 defines the delivery boundary,
 [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) defines
-release, compatibility, and Execution Lock authority, and
+release, compatibility, and Execution Lock authority,
+[runtime-execution.md](./runtime-execution.md) defines Runtime Run, Sandbox
+Lease, worker, and evidence authority, and
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 commit
 semantics.
 
@@ -170,9 +172,9 @@ without changing this seam.
 
 ### Runtime, validation, and commit
 
-1. Runtime Execution creates or updates Runtime Runs under the Phase Run and
-   returns evidence bound to Task, Phase Run, Runtime Run, attempt, capability,
-   and fencing identity.
+1. Runtime Execution updates execution state for Runtime Runs already created
+   under the Phase Run and returns evidence bound to Task, Phase Run, Runtime
+   Run, attempt, capability, and fencing identity.
 2. `Decide` records accepted Runtime evidence but does not advance the Phase.
    A Phase Run can coordinate zero, one, or several Runtime Runs.
 3. The platform validator evaluates the complete Phase contract. Failed
@@ -353,10 +355,11 @@ Task Workspace Revision, or Checkpoint from ambiguous legacy state.
   Pipeline Version carries Route Phase graphs, Confirmation Gates, contracts,
   retry eligibility, required capabilities, and the manual-edit entry point
   consumed here.
-- Issue 24 receives idempotent Runtime enactments bound to Task, Phase Run,
-  Runtime Run, an exact capability-scoped Runtime Binding, immutable inputs,
-  safety epoch, and fences; it returns typed evidence and never chooses a
-  release, Phase outcome, or the next Phase.
+- The resolved [Runtime Execution contract](./runtime-execution.md) receives
+  idempotent enactments bound to Task, Phase Run, Runtime Run, an exact
+  capability-scoped Runtime Binding, immutable inputs, safety epoch, and
+  fences; it returns typed Runtime Evidence and never chooses a release, Phase
+  outcome, or the next Phase.
 - Issue 20 may prioritize and lease durable enactments, but claim ownership,
   fairness, capacity admission, and queue delivery cannot mutate Task state.
 - Issue 17 maps legacy records to the Task revision, Execution Lock, Template Lock, Phase Run

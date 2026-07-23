@@ -1,6 +1,6 @@
 # Runtime and Pipeline Release Management
 
-This document records the release, compatibility, and Task-lock decisions confirmed while resolving [GitHub issue 22](https://github.com/Vt00ls/SlideSmith/issues/22). [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0003](../adr/0003-package-core-skills-in-runtime-images.md) fixes Core Skill packaging, [ADR 0005](../adr/0005-select-controlled-versioned-pipelines-by-route.md) fixes Pipeline Version ownership, [ADR 0021](../adr/0021-pin-compatible-pipeline-and-runtime-releases-together.md) records the paired-lock decision, and [task-orchestration.md](./task-orchestration.md) defines Task transition authority.
+This document records the release, compatibility, and Task-lock decisions confirmed while resolving [GitHub issue 22](https://github.com/Vt00ls/SlideSmith/issues/22). [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0003](../adr/0003-package-core-skills-in-runtime-images.md) fixes Core Skill packaging, [ADR 0005](../adr/0005-select-controlled-versioned-pipelines-by-route.md) fixes Pipeline Version ownership, [ADR 0021](../adr/0021-pin-compatible-pipeline-and-runtime-releases-together.md) records the paired-lock decision, [task-orchestration.md](./task-orchestration.md) defines Task transition authority, and [runtime-execution.md](./runtime-execution.md) defines how each resulting Runtime Binding is admitted, executed, fenced, and evidenced.
 
 The design fixes authority, identities, manifests, lifecycle, compatibility, pinning, revocation, retention, repair, recovery, and test seams. It does not select a registry vendor, signing product, CI system, schema, serialized protocol, rollout algorithm, administrator UI, or implementation sequence.
 
@@ -284,13 +284,13 @@ Rejected alternatives include floating `latest` or mutable tags, semver-only run
 
 Stable downstream inputs are:
 
-- issue 24 receives exact Runtime Bindings, capability and image digests, executor requirements, safety epochs, and evidence bindings; Runtime Execution never chooses a release;
+- the resolved [Runtime Execution contract](./runtime-execution.md) receives exact Runtime Bindings, capability and image digests, executor requirements, safety epochs, and evidence bindings; Runtime Execution never chooses a release;
 - issue 20 schedules only onto nodes satisfying the binding and cannot use capacity fallback to rewrite an Execution Lock;
 - issue 17 never fabricates an Execution Lock from legacy environment, profile, tag, path, session, or recent-run evidence;
 - issue 13 consumes publication, compatibility, pin, rollout, revocation, repair, reclamation, and Cleanup Debt facts;
 - Backup & Recovery includes Execution Locks and required OCI and package inventories in the joint point;
 - issue 23 may reuse candidate, approval, activation, retention, and audit patterns while keeping Template Lock authority separate.
 
-The Agent Compose driver threat model, execution-node resource values, provider usage receipts, telemetry backend, vendor choices, schema, serialized method names, rollout algorithm, CI implementation, and administrator UI remain in their named downstream decisions or implementation design. They do not reopen this module interface.
+Concrete Runtime Execution driver acceptance, execution-node resource values, provider usage receipts, telemetry backend, vendor choices, schema, serialized method names, rollout algorithm, CI implementation, and administrator UI remain in their named downstream decisions, adapter acceptance, or implementation design. They do not reopen this module interface.
 
 Remaining fog affecting the first Runtime and Pipeline release implementation specification: none.

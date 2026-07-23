@@ -40,6 +40,14 @@ _Avoid_: Execution Data Plane, runtime, worker
 The isolated execution environment that performs Runtime Runs, mutates Task Workspace content, and returns execution evidence without deciding authoritative business state.
 _Avoid_: Platform Control Plane, Task owner, business database
 
+**Execution Node**:
+An owned compute node whose attested capabilities may host one or more independently fenced Sandbox Leases. Node availability, local paths, and resident sandbox state are never Task or recovery authority.
+_Avoid_: Worker, Task Workspace, Agent Compose session, business server
+
+**Execution Policy**:
+An approved, versioned set of isolation, resource, mount, network, secret, containment, and reset requirements that an Execution Node must prove before it may enact a Runtime Binding.
+_Avoid_: Sandbox driver name, host configuration, feature flag, network default
+
 **Recovery Point**:
 A validated joint recovery identity that binds one PostgreSQL point-in-time target to the exact committed durable-object and runtime-package inventories required to restore it.
 _Avoid_: Database snapshot, object-store snapshot, backup job, live replica
@@ -109,6 +117,14 @@ _Avoid_: Version range, runtime negotiation, compatibility guess
 **Execution Lock**:
 A Task's immutable record, created when its Route is determined, that binds the exact Pipeline Version, Runtime Release, and Compatibility Approval used for production and every later retry, recovery, or manual edit.
 _Avoid_: Runner profile, latest release, deployment snapshot
+
+**Runtime Binding**:
+An intent-bound authorization derived from one Execution Lock that permits one Runtime Run to invoke one exact runtime capability under a specific evidence contract, safety epoch, platform image set, and Execution Policy.
+_Avoid_: Execution Lock, runtime negotiation, image tag, worker configuration
+
+**Runtime Evidence**:
+The normalized, verified record of one Runtime Run's execution, bound to its operation, Runtime Binding, immutable inputs, Execution Node, Sandbox Lease, fence, output manifest, and terminal outcome. It is input to Phase validation, not proof that the Phase succeeded.
+_Avoid_: Validation evidence, raw runtime output, log, Agent Compose response
 
 **Core Skill**:
 The versioned instructions, references, and executable production logic that define how the runtime performs presentation work. It belongs to a Runtime Release rather than to a Task's inputs or outputs.
@@ -205,6 +221,14 @@ _Avoid_: Phase, Runtime Run, Task status
 **Runtime Run**:
 One invocation of an approved runtime capability that belongs to exactly one Phase Run. A mutating Runtime Run operates through one isolated Runtime View, while a Phase Run may require no Runtime Runs or coordinate several before determining its outcome.
 _Avoid_: Phase Run, Task, Sandbox Lease
+
+**Agent Worker**:
+An owned executor that enacts an approved agent capability for one Runtime Run under its Runtime Binding and Sandbox Lease. Its model calls and internal tool calls remain part of that Runtime Run unless the Pipeline requests a separate capability invocation.
+_Avoid_: Task worker, Task Orchestration, agent authority, Phase validator
+
+**Tool Worker**:
+An owned executor that enacts an approved deterministic or constrained tool capability for one Runtime Run under the same worker protocol, Runtime Binding, and Sandbox Lease rules as an Agent Worker.
+_Avoid_: Arbitrary shell, Platform validator, Task worker, tool authority
 
 **Sandbox Lease**:
 A time-bounded exclusive grant allowing one Runtime Run to use a sandboxed execution environment. It carries no Task state beyond the lease; durable mutable execution state remains in the Task Workspace.

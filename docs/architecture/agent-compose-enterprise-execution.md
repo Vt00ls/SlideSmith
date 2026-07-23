@@ -2,6 +2,8 @@
 
 状态：Issue [#11](https://github.com/Vt00ls/SlideSmith/issues/11) 的研究事实权威与后续架构输入
 
+下游状态：Issue [#24](https://github.com/Vt00ls/SlideSmith/issues/24) 已据此确定 [Runtime Execution architecture contract](./runtime-execution.md)：生产 Agent/Tool 执行按 hostile execution 对待，具体 driver/host 配置必须通过威胁建模与加固验收；Agent Compose 保持可替换 adapter，不获得业务、workspace 或 lease authority。
+
 研究日期：2026-07-22
 
 上游基线：稳定 release [`v2607.10.0`](https://github.com/chaitin/agent-compose/releases/tag/v2607.10.0)，tag commit [`e14c4dbd5e3b0dec6178073902d67d2765390427`](https://github.com/chaitin/agent-compose/commit/e14c4dbd5e3b0dec6178073902d67d2765390427)

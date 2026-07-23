@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
 
 ## Ownership and publication
 
@@ -41,7 +41,11 @@ flowchart TD
     Phase -->|attempted as| PhaseRun[Phase Run]
     PhaseRun -->|owns 0..N| RuntimeRun[Runtime Run]
     PhaseRun -->|holds at most one| QuotaReservation[Quota Reservation]
+    ExecutionLock -->|derives exact capability| RuntimeBinding[Runtime Binding]
+    RuntimeBinding -->|authorizes| RuntimeRun
     RuntimeRun -->|acquires 0..1| SandboxLease[Sandbox Lease]
+    RuntimeRun -->|executes on| ExecutionNode[Execution Node]
+    ExecutionPolicy[Execution Policy] -->|must be attested by| ExecutionNode
     RuntimeRun -->|mutates through| RuntimeView[Runtime View]
     Task -->|owns one mutable| TaskWorkspace[Task Workspace]
     TaskWorkspace -->|advances as| WorkspaceRevision[Task Workspace Revision]
@@ -57,6 +61,27 @@ flowchart TD
 - Runtime Runs share explicit Task Workspace state through isolated Runtime Views, never hidden sandbox state.
 - Each Runtime Run uses a fresh lease; infrastructure may reuse a fully reset physical sandbox under a new lease.
 - Every successful Phase Run binds its validated contract, authoritative Task Workspace Revision, and a distinct durable Checkpoint identity.
+
+## Runtime Execution
+
+```mermaid
+flowchart LR
+    Orchestration[Task Orchestration] -->|typed start/cancel enactment| Runtime[Runtime Execution]
+    Release[Release Management] -->|exact Runtime Binding| Runtime
+    Scheduler[Scheduler] -->|Admission Grant| Runtime
+    Runtime -->|fenced Execution Capsule| Agent[Agent Worker]
+    Runtime -->|fenced Execution Capsule| Tool[Tool Worker]
+    Runtime -->|acquire isolated Runtime View| Lifecycle[Task Workspace Lifecycle]
+    Agent -->|raw adapter evidence| Runtime
+    Tool -->|raw adapter evidence| Runtime
+    Runtime -->|verified Runtime Evidence| Orchestration
+```
+
+- Runtime Execution owns Runtime Run process state, Sandbox Lease and fence, deadline and cancellation, truthful node execution facts, and verified Runtime Evidence.
+- Task Orchestration creates Runtime Run identity and Phase Run membership. Agent and Tool Workers enact capabilities but cannot create authoritative runs or advance a Phase.
+- Agent and Tool Workers share one lifecycle and evidence protocol. Internal model and tool calls stay inside one Runtime Run unless the pinned Pipeline declares separate capability invocations.
+- Production execution treats guest code and supplied content as hostile. An exact Execution Node and driver configuration must prove its Execution Policy before admission; no driver is trusted by name.
+- Runtime success is an execution fact only. Platform validation, C04 commit, and Artifact publication remain independent authorities.
 
 ## Task Orchestration
 
@@ -167,9 +192,11 @@ flowchart TD
 | --- | --- |
 | Users, Personal Workspaces, and access | Sandboxed process execution |
 | Task Orchestration decisions, Task revision, Route, and Execution Lock | Task Workspace materialization and byte mutation |
-| Phase Run outcome, Runtime Run relationship, Checkpoint metadata, and commit authority | Runtime status and evidence emission |
+| Phase Run outcome and Runtime Run relationship | Agent and Tool capability execution on attested Execution Nodes |
+| Runtime Execution decisions, Sandbox Leases, fences, and accepted Runtime Evidence | Raw runtime status, process, and adapter evidence emission |
+| Checkpoint metadata and commit authority | Runtime Views, Checkpoint content, expiry, and cleanup |
 | Release Management, Template Locks, durable-object registry, and references | Temporary logs and outputs |
-| Artifact Version metadata and sharing | Runtime Views, Checkpoint content, expiry, and cleanup |
+| Artifact Version metadata and sharing | Temporary publication assembly and output proposals |
 | Usage Ledger and Quota Reservation | Measured usage receipts |
 
 Execution output becomes authoritative only after the Platform Control Plane validates and records it.

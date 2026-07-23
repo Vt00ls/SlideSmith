@@ -67,6 +67,10 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Requiring an immutable positive Compatibility Approval before one exact Pipeline Version and Runtime Release pair can serve a Task.
 - Atomically recording one immutable Execution Lock when a Task's Route is determined; retry, recovery, cancellation, and post-publication manual edit preserve that lock.
 - Applying ordinary rollout, rollback, deactivation, and deprecation only to new Tasks while reserving terminal revocation for security, integrity, authorization, or platform-control failures that must fence existing uncommitted work.
+- Deriving an exact Runtime Binding for every Runtime Run and executing it through a fenced Sandbox Lease on an attested Execution Node.
+- Supporting Agent Workers and Tool Workers behind one Runtime Execution lifecycle, cancellation, error, and evidence protocol without allowing either worker class to advance a Phase.
+- Treating production Agent and Tool execution as hostile relative to the host and other Personal Workspaces; requiring configuration-specific threat-model and hardening acceptance before an Execution Node can admit work.
+- Supplying verified immutable inputs, isolated Runtime Views, short-lived purpose-bound secrets, and explicit default-deny network grants without exposing host paths or platform credentials to workers.
 - Publishing Catalog Templates, Template Versions, and Resource Bundles through an administrator-controlled versioned release process.
 - Allowing ordinary Users to select approved Catalog Templates.
 - Allowing a User to upload a Fill Template as Source Material for one Task.
@@ -80,6 +84,8 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - An online template editor or self-service template publication workflow.
 - A complete administrator catalog-management portal.
 - Floating `latest`, semver-only compatibility, automatic in-place Task release upgrades, or repinning an existing Task during ordinary rollback.
+- Declaring a sandbox driver safe by product name, using an unreviewed driver or host configuration for production, or treating Agent Compose project, session, sandbox, path, or SQLite state as SlideSmith authority.
+- Arbitrary caller-provided shell execution, worker-created Runtime Runs, or a vendor terminal status that directly advances a Phase.
 
 ## User workflows
 
