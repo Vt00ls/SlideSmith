@@ -2,6 +2,10 @@
 
 This document records confirmed delivery boundaries for SlideSmith's first enterprise-intranet release. It is updated as the architecture review resolves each scope decision.
 
+The complete record-by-record hard-cutover, ownership backfill, validation,
+rollback, and Cleanup Debt contract is recorded in
+[legacy-business-migration-and-compatibility.md](./legacy-business-migration-and-compatibility.md).
+
 ## Ownership and collaboration
 
 ### In scope

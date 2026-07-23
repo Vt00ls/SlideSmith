@@ -2,6 +2,10 @@
 
 This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) records owner, Share Link, and break-glass authority, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md) records queue, Personal Workspace fairness, Resource Class, and Admission Grant authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam, and [observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md) records authoritative audit, correlation, telemetry, alerting, retention, and Cleanup Debt boundaries.
 
+The one-time legacy ownership, business-record, run-history, publication,
+catalog, freeze, validation, rollback, and cleanup conversion is governed by
+[legacy-business-migration-and-compatibility.md](./legacy-business-migration-and-compatibility.md).
+
 ## Ownership and publication
 
 ```mermaid

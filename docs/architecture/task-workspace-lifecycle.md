@@ -2,6 +2,10 @@
 
 This document records the C04 decisions confirmed during the enterprise-platform architecture grilling. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0015](../adr/0015-manage-task-workspace-state-through-an-opaque-lifecycle-seam.md) records the durable lifecycle seam, [ADR 0016](../adr/0016-hard-cut-over-legacy-execution-state.md) records the hard cutover, [runtime-execution.md](./runtime-execution.md) defines C03 Runtime Run, Sandbox Lease, worker, and execution-evidence authority, [durable-object-storage.md](./durable-object-storage.md) defines the shared verified-content mechanism used by C04, and [observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md) defines correlation, projections, alerts, retention, and Cleanup Debt evidence. This document deliberately fixes module authority and invariants without designing every method in the interface.
 
+The record-by-record migration matrix, freeze and cutover sequence, rollback
+boundary, and legacy execution deletion inventory are defined in
+[legacy-business-migration-and-compatibility.md](./legacy-business-migration-and-compatibility.md).
+
 ## Module and external seam
 
 ```mermaid
