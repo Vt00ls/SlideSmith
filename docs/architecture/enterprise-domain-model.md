@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
 
 ## Ownership and publication
 
@@ -172,17 +172,20 @@ flowchart TD
     RuntimeRelease -->|contains| CoreSkill[Core Skill]
     RuntimeRelease -->|contains| Toolchain
     RuntimeRelease -->|implements| RuntimeCapability[Pipeline runtime capabilities]
-    CatalogTemplate[Catalog Template] -->|publishes| TemplateVersion[Template Version]
-    TemplateVersion -->|pins by digest| ResourceBundle[Resource Bundle]
+    CatalogPublication[Catalog Publication] -->|owns stable identity| CatalogTemplate[Catalog Template]
+    CatalogTemplate -->|one current Active| TemplateVersion[Template Version]
+    TemplateVersion -->|exact dependency DAG| ResourceBundle[Resource Bundle]
     Task -->|records selection in| TemplateLock[Template Lock]
     TemplateLock -->|pins| TemplateVersion
-    TemplateLock -->|pins transitive digests| ResourceBundle
+    TemplateLock -->|pins transitive closure| ResourceBundle
 ```
 
 - Core Skills ship inside content-addressed Runtime Images for the first release.
 - Pipeline Versions and Runtime Releases publish independently and become usable together only through an immutable positive Compatibility Approval.
 - Runtime Execution receives an exact capability-scoped Runtime Binding derived from the Execution Lock, not the complete Pipeline graph or rollout policy.
-- Catalog Templates and large non-executable Resource Bundles are separately versioned, read-only packages.
+- Catalog Publication atomically activates at most one current Template Version per Catalog Template. Ordinary Users select the stable Catalog Template; Task Orchestration records the exact observed version and complete Resource Bundle closure in the Template Lock.
+- Embedded assets share one Template Version lifecycle. Assets requiring independent reuse, distribution, scanning, retention, withdrawal, or licensing use separately published, non-executable Resource Bundles.
+- Approved, Deprecated, and catalog-tombstoned exact versions remain available to existing Template Locks. Disabled content advances a catalog safety epoch and fences uncommitted work.
 - Runtime Images remain in an OCI registry; Template Versions and Resource Bundles use immutable object-store package payloads behind the durable-object seam.
 - No Task references a floating `latest` runtime, template, or resource package.
 
@@ -195,7 +198,7 @@ flowchart TD
 | Phase Run outcome and Runtime Run relationship | Agent and Tool capability execution on attested Execution Nodes |
 | Runtime Execution decisions, Sandbox Leases, fences, and accepted Runtime Evidence | Raw runtime status, process, and adapter evidence emission |
 | Checkpoint metadata and commit authority | Runtime Views, Checkpoint content, expiry, and cleanup |
-| Release Management, Template Locks, durable-object registry, and references | Temporary logs and outputs |
+| Release Management, Catalog Publication, Execution and Template Locks, durable-object registry, and references | Temporary logs and outputs |
 | Artifact Version metadata and sharing | Temporary publication assembly and output proposals |
 | Usage Ledger and Quota Reservation | Measured usage receipts |
 

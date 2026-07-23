@@ -45,7 +45,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 ### In scope
 
 - One minimal Platform Administrator role for User activation, deactivation, recovery, audited Workspace Export, and explicit purge of retained work.
-- Publishing Runtime Releases and Pipeline Versions independently; approving exact compatible pairs; controlling activation, rollout, deprecation, and revocation; and publishing Template Versions and Resource Bundles.
+- Publishing Runtime Releases and Pipeline Versions independently; approving exact compatible pairs; controlling activation, rollout, deprecation, and revocation; and publishing Catalog Templates, Template Versions, and Resource Bundles through audited manifest/CLI/CI intents.
 - Viewing system health, failure diagnostics, storage state, and aggregated usage metadata.
 - Triggering cleanup, recovery, and safe rescheduling operations.
 - Managing platform feature flags and revoking abnormal Share Links.
@@ -72,7 +72,10 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Treating production Agent and Tool execution as hostile relative to the host and other Personal Workspaces; requiring configuration-specific threat-model and hardening acceptance before an Execution Node can admit work.
 - Supplying verified immutable inputs, isolated Runtime Views, short-lived purpose-bound secrets, and explicit default-deny network grants without exposing host paths or platform credentials to workers.
 - Publishing Catalog Templates, Template Versions, and Resource Bundles through an administrator-controlled versioned release process.
-- Allowing ordinary Users to select approved Catalog Templates.
+- Maintaining at most one current Active Template Version per Catalog Template for ordinary User selection while retaining exact old packages for existing Template Locks.
+- Atomically recording a Generation Route's immutable Template Lock with its Execution Lock, including the complete Resource Bundle closure; retry, recovery, cancellation, and manual edit preserve it.
+- Applying ordinary catalog activation, rollback, deprecation, and retirement only to new Tasks while using Disabled plus a catalog safety epoch for security, integrity, authorization, license, or platform-control failures that must fence existing uncommitted work.
+- Allowing ordinary Users to select approved Catalog Templates without exposing arbitrary historical versions or a self-service publication interface.
 - Allowing a User to upload a Fill Template as Source Material for one Task.
 - Supporting an initial administrator workflow based on release manifests, CLI tooling, or CI/CD rather than requiring a full management UI.
 
@@ -83,6 +86,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Treating a User's Fill Template as a public Catalog Template.
 - An online template editor or self-service template publication workflow.
 - A complete administrator catalog-management portal.
+- Ordinary User selection among several simultaneous active Template Versions of one Catalog Template.
 - Floating `latest`, semver-only compatibility, automatic in-place Task release upgrades, or repinning an existing Task during ordinary rollback.
 - Declaring a sandbox driver safe by product name, using an unreviewed driver or host configuration for production, or treating Agent Compose project, session, sandbox, path, or SQLite state as SlideSmith authority.
 - Arbitrary caller-provided shell execution, worker-created Runtime Runs, or a vendor terminal status that directly advances a Phase.
@@ -126,7 +130,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 
 ### In scope
 
-- Persisting Task metadata, Artifact Versions, Share Link configuration, Usage Ledger entries, Execution Locks, Compatibility Approvals, and release lifecycle and revocation history as business records.
+- Persisting Task metadata, Artifact Versions, Share Link configuration, Usage Ledger entries, Execution Locks, Template Locks, Compatibility Approvals, release and catalog lifecycle, safety, withdrawal, tombstone, and audit history as business records.
 - Retaining Artifact Versions until an authorized User explicitly deletes them or a future administrator retention policy applies.
 - Revoking Share Links when their Artifact Version is deleted or becomes unavailable.
 - Automatically releasing Sandbox Leases and cleaning sandbox state, Runtime Run temporary directories, expired Task Workspaces, disposable Checkpoints, caches, and incomplete publication residue.
@@ -140,6 +144,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Retaining a 35-day joint PostgreSQL and durable-object point-in-time recovery window in at least one encrypted, immutable, independently controlled backup domain.
 - Removing authorized deleted or purged content from online authority immediately while allowing encrypted, inaccessible bytes to remain in already locked backup copies until the recovery window expires.
 - Retaining exact Pipeline and Runtime manifests, OCI images, supplementary packages, and compatibility evidence while an Execution Lock, active rollout, integrity incident, or retained Recovery Point references them.
+- Retaining exact Template Version and Resource Bundle manifests and packages while Approved, Active, Deprecated, referenced by a Template Lock, required by an incident or license obligation, or included in a retained Recovery Point; ordinary catalog retirement never breaks an old Task.
 
 ### Out of scope
 

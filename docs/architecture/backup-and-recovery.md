@@ -1,6 +1,6 @@
 # Backup and Recovery
 
-This document records the backup and recovery decisions confirmed while resolving GitHub issue 16. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0019](../adr/0019-bind-recovery-to-joint-database-and-object-points.md) records the joint recovery decision, [durable-object-storage.md](./durable-object-storage.md) defines verified content, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) defines release, compatibility, revocation, and Execution Lock recovery requirements, and [enterprise-v1-scope.md](./enterprise-v1-scope.md) defines the delivery boundary.
+This document records the backup and recovery decisions confirmed while resolving GitHub issue 16. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0019](../adr/0019-bind-recovery-to-joint-database-and-object-points.md) records the joint recovery decision, [durable-object-storage.md](./durable-object-storage.md) defines verified content, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) defines release, compatibility, revocation, and Execution Lock recovery requirements, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package, Template Lock, and disable recovery requirements, and [enterprise-v1-scope.md](./enterprise-v1-scope.md) defines the delivery boundary.
 
 The design fixes recovery authority, RPO/RTO, consistency, retention, security, drills, and cutover gates without selecting a PostgreSQL backup product, object-store vendor, KMS, schema, SDK, or deployment size.
 
@@ -11,7 +11,7 @@ PostgreSQL business state and every durable byte referenced by that state form o
 | Recovery class | Required state | RPO | RTO |
 | --- | --- | --- | --- |
 | Business-publication set | PostgreSQL authoritative records, ownership and suppression facts, Task metadata, Artifact Versions, and their exact members | At most 15 minutes | Read-only access within four hours |
-| Full business set | The publication set plus Source Material, Checkpoints, Execution Locks, Template Locks, approved release manifests, Compatibility Approvals, lifecycle and revocation inventories, exact Pipeline and catalog packages, required OCI Runtime Images and supplementary packages, and all mutation and execution dependencies | At most 15 minutes | Full operation within eight hours |
+| Full business set | The publication set plus Source Material, Checkpoints, Execution Locks, Template Locks, approved release and catalog manifests, Compatibility Approvals, exact catalog package closures, scan/license evidence, lifecycle, revocation and disable inventories, required OCI Runtime Images and supplementary packages, and all mutation and execution dependencies | At most 15 minutes | Full operation within eight hours |
 | Rebuildable execution material | Runtime Views, sandboxes, sessions, local materializations, caches, queue projections, and failed residue | No backup guarantee | Rebuilt on demand; no RTO |
 
 RPO applies to sudden loss or compromise of the entire production site. RTO begins when the incident is formally declared and ends only when the corresponding promotion gate passes. A running process or reachable database does not constitute recovery.
@@ -112,7 +112,7 @@ stateDiagram-v2
 2. `TargetSelected`: select the newest finalized Recovery Point by default. Selecting an older point intentionally accepts additional data loss and requires separate incident-specific human approval.
 3. `KeysAuthorized`: activate dormant restore and decryption capabilities through dual control.
 4. `DatabaseRestored`: recover base backup and WAL to the exact target, then verify cluster identity, schema, constraints, manifest root, and application compatibility.
-5. `ObjectsReconciled`: restore and verify the exact committed object, Pipeline package, Runtime supplementary-package, and OCI inventories, then reconcile the current independent revocation inventory.
+5. `ObjectsReconciled`: restore and verify the exact committed object, Pipeline package, Runtime supplementary-package, catalog manifest and package closure, and OCI inventories, then reconcile the current independent release-revocation and catalog-disable inventories.
 6. `ReadOnlyReady`: after the complete first-stage gate passes, allow reauthenticated Owners to browse Task metadata and read Artifact Versions.
 7. `FullReady`: after the complete full-business set and write path are verified, create a fresh joint Recovery Point and then re-enable mutation and execution.
 8. `Closed`: seal timelines, counts, differences, approvals, drill or incident evidence, and follow-up actions.
@@ -131,6 +131,7 @@ Internal verification may expose progress by reference class, but an official RT
 - Cleanup Debt, integrity incidents, audit facts, and suppression tombstones are PostgreSQL-authoritative recovery records even when the related disposable bytes are absent.
 - Execution Locks and Compatibility Approvals restore as immutable historical facts. Before Runtime admission, the restore reconciles the independent immutable audit domain's current revocation inventory over the selected point; an older database or package copy cannot reactivate a revoked Pipeline Version, Runtime Release, or Compatibility Approval.
 - A missing exact release dependency blocks `FullReady`. Recovery never substitutes a newer Pipeline Version, Runtime Release, image, package, or compatibility result.
+- Template Locks restore as immutable historical facts with their exact Template Version and Resource Bundle closure. Before Task recovery or Runtime admission, restore reconciles the independent current catalog-disable inventory; an older database cannot reactivate Disabled content. Missing catalog dependencies block `FullReady` and are never replaced by the current Active Template Version.
 
 Reconciliation is scoped and resumable. One failed object cannot be silently ignored, and a successful object is not recopied on every retry when its immutable receipt remains valid.
 
@@ -225,6 +226,6 @@ Stable downstream inputs are:
 - issue 25 treats purged backup bytes as inaccessible residue for at most the 35-day window and requires tombstone application on restore;
 - issue 15 treats every pre-incident Share Link and Access Code as invalid after recovery;
 - issue 13 consumes watermark age, backup lag, recovery mode, integrity incident, drill result, and Cleanup Debt evidence;
-- release and catalog decisions include Execution Locks, Compatibility Approvals, lifecycle and current revocation inventories, and exact Pipeline, Runtime, OCI, and catalog dependencies in the joint inventory and full-recovery gate.
+- release and catalog decisions include Execution Locks, Template Locks, Compatibility Approvals, lifecycle, current revocation and disable inventories, exact Pipeline, Runtime, OCI and catalog dependencies, and catalog scan/license evidence in the joint inventory and full-recovery gate.
 
 Remaining fog affecting the first implementation specification: none. Vendor selection, final schema and method names, locator layout, SDK, and absolute deployment size remain adapter or specification inputs.

@@ -8,6 +8,8 @@ records the interface choice, [enterprise-v1-scope.md](./enterprise-v1-scope.md)
 defines the delivery boundary,
 [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) defines
 release, compatibility, and Execution Lock authority,
+[catalog-template-publication.md](./catalog-template-publication.md) defines
+catalog selection, lifecycle, and Template Lock closure authority,
 [runtime-execution.md](./runtime-execution.md) defines Runtime Run, Sandbox
 Lease, worker, and evidence authority, and
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 commit
@@ -144,8 +146,13 @@ Route selection is a pre-Pipeline Task decision. The accepted Route transaction
 atomically records the Route and one exact Execution Lock binding its eligible
 Pipeline Version, Runtime Release, and Compatibility Approval before the first
 Phase Run is created. It is not fabricated as a Phase Run that lacks an
-Execution Lock. A separate Template Lock must be exact and durable before its
-first consuming Phase; Task Orchestration never resolves a floating version.
+Execution Lock. For a Generation Route, that same transaction validates the
+User's observed Catalog Template selection and catalog generation, computes the
+exact Template Version and Resource Bundle closure, and records the separate
+Template Lock plus retention references. A stale observed selection conflicts;
+Task Orchestration never resolves a floating version or silently switches the
+User to a newly activated version. Beautify and Template Fill do not consume a
+Catalog Template in enterprise V1.
 
 Pipeline Version data, rather than Task status constants, expresses all three
 Route phase graphs. Confirmation Gates are ordinary Phase definitions whose
@@ -162,8 +169,9 @@ without changing this seam.
 
 1. An authorized start intent resolves a Route through platform policy and
    atomically records the exact Execution Lock selected by Release Management.
-   The separate Template Lock must already be recorded before its first
-   consuming Phase.
+   For a Generation Route it also records the exact Template Lock selected by
+   Catalog Publication before any consuming Phase. A missing lock or incomplete
+   bundle closure fails closed.
 2. Work availability causes `Decide` to select the current Phase from that
    pinned graph, create one new Phase Run attempt, and persist the required
    enactment in the same transaction.
@@ -360,11 +368,17 @@ Task Workspace Revision, or Checkpoint from ambiguous legacy state.
   capability-scoped Runtime Binding, immutable inputs, safety epoch, and
   fences; it returns typed Runtime Evidence and never chooses a release, Phase
   outcome, or the next Phase.
+- The resolved [Catalog Publication contract](./catalog-template-publication.md)
+  supplies observed-selection fencing, the exact Template Version and bundle
+  closure, compatibility and safety evidence, and typed retention references
+  inside the Route transaction. Existing Tasks keep the resulting lock across
+  retry, recovery, cancellation, and manual edit.
 - Issue 20 may prioritize and lease durable enactments, but claim ownership,
   fairness, capacity admission, and queue delivery cannot mutate Task state.
-- Issue 17 maps legacy records to the Task revision, Execution Lock, Template Lock, Phase Run
-  attempts, 0..N Runtime Run relationships, and non-executable historical
-  evidence without restoring path authority.
+- Issue 17 maps legacy records to the Task revision, Execution Lock, Template
+  Lock, Phase Run attempts, 0..N Runtime Run relationships, and non-executable
+  historical evidence without restoring path authority. A legacy template lock
+  converts only from exact frozen bytes and a fully proved target closure.
 - Issue 13 consumes decision, revision, run, enactment, fence, retry,
   cancellation, reconciliation, and typed failure identities as observable
   projections.

@@ -1,6 +1,6 @@
 # Durable Object Storage
 
-This document records the durable-object decisions confirmed while resolving GitHub issue 21. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0017](../adr/0017-manage-durable-bytes-through-an-opaque-object-seam.md) records the object seam, [ADR 0018](../adr/0018-export-and-purge-disabled-user-workspaces.md) records the no-transfer rule, and [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) remains authoritative for C04 lifecycle semantics.
+This document records the durable-object decisions confirmed while resolving GitHub issue 21. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0017](../adr/0017-manage-durable-bytes-through-an-opaque-object-seam.md) records the object seam, [ADR 0018](../adr/0018-export-and-purge-disabled-user-workspaces.md) records the no-transfer rule, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package lifecycle and Template Lock references, and [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) remains authoritative for C04 lifecycle semantics.
 
 The design deliberately fixes authority, invariants, and test seams without choosing an S3-compatible vendor, object-key layout, SDK, schema, or final language-level method names.
 
@@ -65,8 +65,8 @@ Deduplication is policy-scoped. User content uses its Personal Workspace as the 
 | --- | --- | --- |
 | Source Material | Task input module; immutable `SourceMaterialID` references opaque content | Retained with the Task by default; explicit Task or Personal Workspace purge detaches it only after recovery dependencies are removed |
 | Artifact Version member | C05; immutable Artifact identity and location-independent Artifact Version membership | Retained with its Artifact Version; explicit version deletion or Workspace purge revokes Share Links and detaches member references |
-| Template Version package | Catalog publication; canonical package manifest and package content | Retained while the version is published or deprecated or any Task Template Lock depends on it |
-| Resource Bundle | Catalog publication; immutable bundle manifest and package content | Retained while any Template Version, Task lock, or applicable license policy depends on it |
+| Template Version package | Catalog Publication; canonical package manifest and package content | Retained while Approved, Active, Deprecated, or referenced by any Template Lock, incident, license obligation, rollback pin, or Recovery Point |
+| Resource Bundle | Catalog Publication; immutable bundle manifest and package content | Retained while Approved, Active, Deprecated, or referenced by any Template Version, Template Lock, incident, license obligation, rollback pin, or Recovery Point |
 | Runtime Release supplementary package | Release Management | Retained while the Runtime Release or any Execution Lock depends on it |
 | Runtime Image | Runtime Release metadata pins an immutable OCI digest | The container registry remains the byte carrier and has a separate adapter, inventory, and backup seam |
 | Checkpoint content | C04; Checkpoint content graph and explicit typed payload references | Retained by current recovery reachability, explicit references, and C04 policy |
@@ -78,7 +78,7 @@ Source Material is not an Artifact with an empty publication version. Each uploa
 
 An Artifact Version's authoritative manifest is represented by PostgreSQL membership and a canonical digest over stable semantic and content facts. It includes member identity, kind, name, media type, size, and digest, but excludes object keys, prefixes, paths, vendors, and materialization locations. An exported manifest file may provide evidence but cannot reconstruct publication authority.
 
-Template Versions and Resource Bundles use a canonical manifest plus a deterministic immutable package archive as the object-store materialization unit. The manifest lists safe logical paths, file types, sizes, and digests. Independently delivered preview assets may have their own typed references but remain explicit Template Version members. Runtime Images are not repackaged into this byte-stream interface.
+Template Versions and Resource Bundles use a canonical manifest plus a deterministic immutable package archive as the object-store materialization unit. The manifest lists safe logical paths, file types, modes, sizes, digests, and exact package dependencies. Independently delivered preview assets may have their own typed references but remain explicit Template Version members. The complete Template Lock closure creates typed retention references, so catalog retirement cannot reclaim bytes needed by an old Task. Runtime Images are not repackaged into this byte-stream interface.
 
 A Checkpoint uses PostgreSQL-authoritative Checkpoint and Task Workspace Revision metadata, a canonical declared-state manifest, and explicit payload references. The manifest describes recoverable logical paths, file types, modes, sizes, digests, and opaque content identities. It is itself a verified immutable payload. C04 may deduplicate files or chunks, but restore never scans a workspace, session, bucket prefix, or modification time.
 

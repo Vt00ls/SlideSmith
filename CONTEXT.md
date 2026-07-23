@@ -133,19 +133,19 @@ _Avoid_: Catalog Template, Resource Bundle, prompt
 ### Templates and composition
 
 **Catalog Template**:
-A stable catalog identity for a reusable design offering that supplies visual identity and structural guidance through its Template Versions.
+A stable, non-reused catalog identity for a reusable design offering that supplies visual identity and structural guidance through one current Active Template Version while retaining its earlier Template Versions for existing locks and history.
 _Avoid_: Template Version, Fill Template, Source Deck
 
 **Template Version**:
-An immutable published revision of a Catalog Template containing its design definition and exact references to any required Resource Bundles.
+An immutable published revision of a Catalog Template whose canonical manifest binds its design definition, embedded assets, exact Resource Bundle dependencies, compatibility, and package integrity.
 _Avoid_: Catalog Template, current template, Fill Template
 
 **Resource Bundle**:
-An immutable, versioned collection of non-executable visual assets shared by Template Versions when the assets require independent distribution, reuse, retention, or license management.
+An immutable published revision of a non-executable visual-asset collection used by exact Template Version references when the assets require independent distribution, reuse, scanning, retention, withdrawal, or license management.
 _Avoid_: Resource, Core Skill, Artifact
 
 **Template Lock**:
-The immutable record of the Template Version selected for a Task and the exact digests of its required Resource Bundles, ensuring the same design inputs govern production and retries.
+The immutable Task record created when its Generation Route is accepted, binding the exact Template Version manifest and package plus the complete Resource Bundle dependency closure and digests so the same design inputs govern production, retries, recovery, and manual edit.
 _Avoid_: Template selection, Catalog Template, latest version
 
 **Fill Template**:

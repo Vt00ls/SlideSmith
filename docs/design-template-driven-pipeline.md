@@ -1,5 +1,12 @@
 # Template-Driven Pipeline Design
 
+> Historical implementation record: this document describes the path-based
+> milestones that produced the current implementation. The enterprise target
+> authority is now [Catalog Template Publication and Locking](./architecture/catalog-template-publication.md).
+> In particular, `TemplateRegistryEntry`, startup disk sync, host paths, copied
+> Skill trees, and the current JSON lock are migration inputs rather than target
+> publication or recovery authority.
+
 ## Goal
 
 SlideSmith should support a template-driven PPT generation flow. Before generation starts, users can browse visual template cards, inspect previews, refine key options, and then generate a deck from a selected immutable template package.
@@ -21,7 +28,7 @@ The productized flow separates template management from task execution:
 1. Template authors maintain template packages in a dedicated authoring repo.
 2. CI validates template metadata, preview assets, design specs, and renderability.
 3. Validated versions are published to a registry and object storage/CDN.
-4. Runtime reads a selected template version and stores an immutable copy in the task workspace.
+4. Runtime materializes the exact locked packages as verified, read-only inputs outside the Task Workspace and Checkpoint.
 5. Generation phases use the selected template lock instead of discovering templates ad hoc.
 
 ```mermaid
@@ -168,6 +175,12 @@ Implementation note:
 - `GET /api/templates`, `GET /api/templates/:id`, asset serving, and task template locks read registry records first. The task lock uses registry `version`, `checksum`, `status`, previews, and compatibility metadata.
 - Startup sync preserves manually maintained `status` and `version`, so operators can deprecate or disable a template without having it reset by disk discovery.
 - Preview bytes are still served from the local template package. Object storage/CDN publication remains the next productization step once the registry schema is stable.
+
+These notes describe the legacy implementation boundary. Productized
+publication hard-replaces disk synchronization and path-bearing locks with
+immutable manifests, Durable Object references, atomic activation, and an exact
+Template Lock closure; it does not wrap the existing registry as a compatibility
+facade.
 
 ## Open Interaction Issue
 

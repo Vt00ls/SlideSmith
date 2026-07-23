@@ -10,7 +10,9 @@ records the durable module choice,
 [task-orchestration.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/task-orchestration.md)
 defines Phase Run and Runtime Run membership authority,
 [runtime-and-pipeline-releases.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/runtime-and-pipeline-releases.md)
-defines Runtime Bindings, and
+defines Runtime Bindings,
+[catalog-template-publication.md](./catalog-template-publication.md) defines
+Template Lock materialization and catalog safety epochs, and
 [task-workspace-lifecycle.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/task-workspace-lifecycle.md)
 defines Runtime View and commit authority.
 
@@ -60,6 +62,10 @@ C04 commit, and Artifact publication remain separate decisions.
 - Runtime Execution receives only an exact, capability-scoped Runtime Binding.
   It never selects a Pipeline Version, Runtime Release, rollout policy, Phase,
   or fallback release.
+- A Generation Runtime Run receives the exact Template Lock digest, immutable
+  Template Version and Resource Bundle input manifest, and current catalog
+  safety epoch. It never reads the current catalog pointer, selects another
+  version, or accepts a path-bearing fallback.
 - A mutating Runtime Run uses one isolated C04 Runtime View. Its output remains
   a proposal until independent Phase validation succeeds and C04 accepts an
   exact fenced commit.
@@ -76,6 +82,7 @@ C04 commit, and Artifact publication remain separate decisions.
 | --- | --- | --- |
 | Task revision, Phase cursor, Phase Run identity and outcome, Runtime Run membership | Task Orchestration | Receives a durable enactment; returns typed Runtime Evidence |
 | Runtime Binding, exact capability contract, image set, executor requirements, safety epoch | Release Management | Revalidates the intent-bound binding; never selects or changes it |
+| Template Lock, exact package closure, catalog eligibility, and catalog safety epoch | Catalog Publication and Task Orchestration | Revalidates an opaque materialization authorization; never reads catalog listing state or repins |
 | Runtime Run execution state, deadline, cancellation, terminal outcome, and evidence acceptance | Runtime Execution in Platform PostgreSQL | Owns through its command and reconciliation seam |
 | Sandbox Lease identity, node binding, fence, expiry, revoke, release, and containment evidence | Runtime Execution | Owns the lease lifecycle and enforcement contract |
 | Node readiness, attested capabilities, current lease occupancy, containment and reset facts | Runtime Execution | Supplies truthful capacity facts to scheduling |
@@ -119,6 +126,8 @@ A start intent binds at least:
   request digest;
 - the exact Runtime Binding, Execution Lock digest, capability contract,
   allowed platform images, executor contract, and release-safety epoch;
+- the exact Template Lock and closure-root digests when required, verified
+  immutable package-input manifest, and catalog safety epoch;
 - Agent Worker or Tool Worker class;
 - an immutable input manifest, output contract, and evidence contract;
 - read-only or mutating effect; a mutating run also binds one opaque C04
@@ -320,7 +329,7 @@ Trust is layered:
 1. Runtime Execution's PostgreSQL decisions, lease facts, and terminal records
    are authoritative execution facts.
 2. Owned node and adapter evidence becomes trusted Runtime Evidence only after
-   authority, binding, digest, epoch, and fence validation.
+   authority, binding, release and catalog epochs, digest, and fence validation.
 3. Guest, agent, and tool outputs remain untrusted proposals until independent
    Platform validation.
 4. Agent Compose raw detail, stdout, events, stats, callbacks, and external IDs
