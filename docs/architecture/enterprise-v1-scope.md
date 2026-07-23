@@ -9,8 +9,9 @@ This document records confirmed delivery boundaries for SlideSmith's first enter
 - Authenticated Users with one private Personal Workspace each.
 - Tasks and Artifact Versions owned through that Personal Workspace.
 - Read-only sharing of one Artifact Version through a revocable Share Link protected by a separate Access Code.
-- Mandatory Share Link expiry with a platform default and an administrator-configured maximum lifetime.
-- Owner revocation and Access Code rotation, rate-limited verification, and access auditing without storing the plaintext code.
+- Mandatory Share Link expiry with a seven-day default, a thirty-day platform hard maximum, and an administrator-configured maximum that may only be shorter.
+- No in-place lifetime extension: an Owner may shorten or revoke a grant, while a later expiry requires a new Share Link.
+- Owner revocation and Access Code rotation, generation-bound Verification Sessions, rate-limited verification, and access auditing without storing recoverable plaintext link or code secrets.
 - Administrative recovery or audited Workspace Export followed by an independently authorized purge after a User is disabled.
 
 ### Out of scope
@@ -49,11 +50,13 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Viewing system health, failure diagnostics, storage state, and aggregated usage metadata.
 - Triggering cleanup, recovery, and safe rescheduling operations.
 - Managing platform feature flags and revoking abnormal Share Links.
-- Explicit, reason-bound, time-stamped, and audited break-glass access when User content must be inspected for support or recovery.
+- Explicit, reason-bound, time-stamped, exact-target, and audited break-glass access when User content must be inspected for support or recovery.
+- Two distinct active Platform Administrators for break-glass request and approval; active grants default to thirty minutes, cannot exceed sixty minutes, and cannot be renewed.
 
 ### Out of scope
 
 - Implicit administrator access to Source Material, Decks, or other User content.
+- Administrator self-approval, Owner impersonation, or a BreakGlass Grant that permits mutation, manual edit, Share Link management, arbitrary Workspace browsing, or purge.
 - Department administrators, Project administrators, delegated Workspace administration, or multi-level RBAC.
 - Unlogged support impersonation or content inspection.
 - Reassigning a Personal Workspace or Task to another User.
@@ -136,6 +139,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Persisting Task metadata, Artifact Versions, Share Link configuration, Gateway Call and Attempt evidence roots, Usage Receipts, Usage Ledger entries, Quota Reservations, corrections, Execution Locks, Template Locks, Compatibility Approvals, release and catalog lifecycle, safety, withdrawal, tombstone, and audit history as business records.
 - Retaining Artifact Versions until an authorized User explicitly deletes them or a future administrator retention policy applies.
 - Revoking Share Links when their Artifact Version is deleted or becomes unavailable.
+- Terminally invalidating a Personal Workspace's Share Links on User disable or identity rebind, and requiring new grants after reactivation.
 - Automatically releasing Sandbox Leases and cleaning sandbox state, Runtime Run temporary directories, expired Task Workspaces, disposable Checkpoints, caches, and incomplete publication residue.
 - Recovering required mutable execution state from validated Checkpoints rather than treating a live Task Workspace as permanent storage.
 - Configurable cleanup policies with observable cleanup failures and retriable Cleanup Debt.
@@ -174,6 +178,7 @@ Protocol-specific OAuth or OIDC integration details are deferred to implementati
 - Read-only protection when the finalized recovery watermark would exceed the 15-minute RPO.
 - Independent immutable backup authority, separated production and restore credentials, and dual control for restore/decrypt or premature retention changes.
 - Invalidating every pre-incident Share Link and Access Code after restore; an Owner must issue a new Share Link.
+- Advancing a Recovery Epoch so restored Share Grant, Verification Session, and BreakGlass Grant records cannot become valid even when an older database point recorded them as active.
 - Monthly sampled and quarterly complete recovery as the target operating drill baseline, with recurring automation allowed to follow the first implementation phase.
 
 ### Out of scope

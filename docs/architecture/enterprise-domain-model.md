@@ -1,6 +1,6 @@
 # Enterprise Platform Domain Model
 
-This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
+This document is a relationship view of the decisions confirmed during the SlideSmith enterprise-platform architecture review. [CONTEXT.md](../../CONTEXT.md) remains the authoritative glossary, the files in [docs/adr](../adr) record durable decisions, [enterprise-v1-scope.md](./enterprise-v1-scope.md) records first-release delivery boundaries, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) records owner, Share Link, and break-glass authority, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) records release, compatibility, and Execution Lock authority, [catalog-template-publication.md](./catalog-template-publication.md) records catalog lifecycle and Template Lock authority, [task-orchestration.md](./task-orchestration.md) records Task transition authority, [runtime-execution.md](./runtime-execution.md) records Runtime Run and Sandbox Lease execution authority, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) records provider egress and usage settlement authority, [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) records the grilled C04 lifecycle invariants, and [durable-object-storage.md](./durable-object-storage.md) records the shared durable-byte seam.
 
 ## Ownership and publication
 
@@ -23,6 +23,32 @@ flowchart TD
 - Workspace Export or purge does not rewrite historical Usage Ledger ownership.
 - Source Material is a Task-owned durable input, not an unpublished Artifact.
 - Artifact Versions are immutable publication sets; edits publish child versions.
+
+## Content authorization and sharing
+
+```mermaid
+flowchart LR
+    Owner[WorkspaceOwnerPrincipal]
+    Share[SharePrincipal]
+    BreakGlass[BreakGlassPrincipal]
+    Access[Identity & Ownership<br/>authorization seam]
+    Version[Exact Artifact Version<br/>or content target]
+    Audit[(Mandatory access audit)]
+    Object[Durable Object]
+
+    Owner --> Access
+    Share --> Access
+    BreakGlass --> Access
+    Access --> Version
+    Version --> Audit
+    Audit --> Object
+```
+
+- Every content request selects exactly one authority path. Principals never union owner, share, administrator, or break-glass authority.
+- `AdministratorPrincipal` provides metadata and operational authority only. Actual content inspection requires a dual-controlled, exact-target, time-bounded BreakGlass Grant.
+- A Share Link has a seven-day default and thirty-day hard maximum, requires a separate Access Code, and cannot be extended after issuance. Rotation invalidates all Verification Sessions.
+- User disable or identity rebind, target deletion or unavailability, Workspace purge, and Recovery Epoch advancement terminally invalidate affected Share Grants.
+- All three paths converge only after policy validation and mandatory audit, at the same intent-bound `Durable Object` read-handle seam.
 
 ## Pipeline and execution
 
@@ -211,7 +237,7 @@ flowchart TD
 
 | Platform Control Plane | Execution Data Plane |
 | --- | --- |
-| Users, Personal Workspaces, and access | Sandboxed process execution |
+| Users, Personal Workspaces, mutually exclusive principals, Sharing, BreakGlass Grants, and access audit | Sandboxed process execution |
 | Task Orchestration decisions, Task revision, Route, and Execution Lock | Task Workspace materialization and byte mutation |
 | Phase Run outcome and Runtime Run relationship | Agent and Tool capability execution on attested Execution Nodes |
 | Runtime Execution decisions, Sandbox Leases, fences, and accepted Runtime Evidence | Raw runtime status, process, and adapter evidence emission |

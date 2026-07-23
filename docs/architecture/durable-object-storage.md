@@ -1,6 +1,6 @@
 # Durable Object Storage
 
-This document records the durable-object decisions confirmed while resolving GitHub issue 21. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0017](../adr/0017-manage-durable-bytes-through-an-opaque-object-seam.md) records the object seam, [ADR 0018](../adr/0018-export-and-purge-disabled-user-workspaces.md) records the no-transfer rule, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package lifecycle and Template Lock references, and [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) remains authoritative for C04 lifecycle semantics.
+This document records the durable-object decisions confirmed while resolving GitHub issue 21. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0017](../adr/0017-manage-durable-bytes-through-an-opaque-object-seam.md) records the object seam, [ADR 0018](../adr/0018-export-and-purge-disabled-user-workspaces.md) records the no-transfer rule, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) defines the owner, Share Link, and break-glass authorization paths, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package lifecycle and Template Lock references, and [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) remains authoritative for C04 lifecycle semantics.
 
 The design deliberately fixes authority, invariants, and test seams without choosing an S3-compatible vendor, object-key layout, SDK, schema, or final language-level method names.
 
@@ -22,7 +22,7 @@ flowchart LR
     C05[C05 Artifact Publication]
     Catalog[Release and catalog publication]
     C04[C04 Task Workspace Lifecycle]
-    Auth[Identity and Ownership]
+    Auth[Identity and Ownership<br/>Sharing and BreakGlass]
     DO[Durable Object<br/>deep module]
     PG[(Platform PostgreSQL<br/>registry, intents, references, receipts)]
     Store[(Durable object store<br/>immutable bytes)]
@@ -145,6 +145,8 @@ Content access follows one order:
 5. The HTTP or runtime adapter streams or materializes through that handle.
 
 No content handle, path, object key, signed URL, or SDK object exists before authorization. A successfully opened immutable stream whose mandatory audit has committed is not truncated by a later disable or revocation, but every new handle must reauthorize. A future CDN or short-lived signed-delivery implementation must remain an adapter behind the same handle contract.
+
+The [content authorization and sharing contract](./content-authorization-and-sharing.md) fixes the current generations, expiry, rate-limit, dual-control, non-leakage, response, active-content, and cache policy applied before `Open`. Enterprise V1 uses authorization-aware proxy delivery: shared CDN responses, origin-blind signed URLs, and TTL-only authorization caches cannot serve as revocation authority. A byte cache may retain verified immutable payloads, but every new handle and Range request crosses the current authorization fence.
 
 Sandbox processes never receive object-store credentials. An execution-node materializer alone may use a short-lived machine capability bound to the Task, Personal Workspace, ownership generation, Runtime Run or C04 operation, exact content intents, and expiry. Error results are typed and non-leaking: authorization mismatch and inaccessible identity do not reveal cross-Workspace existence; integrity failure, unavailable content, conflict, resource exhaustion, and retryable transport failure remain distinct for authorized internal callers. No error permits an unverified or path-based fallback.
 

@@ -1,6 +1,6 @@
 # Backup and Recovery
 
-This document records the backup and recovery decisions confirmed while resolving GitHub issue 16. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0019](../adr/0019-bind-recovery-to-joint-database-and-object-points.md) records the joint recovery decision, [durable-object-storage.md](./durable-object-storage.md) defines verified content, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) defines release, compatibility, revocation, and Execution Lock recovery requirements, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package, Template Lock, and disable recovery requirements, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) defines provider-attempt, receipt, ledger, and reservation recovery requirements, and [enterprise-v1-scope.md](./enterprise-v1-scope.md) defines the delivery boundary.
+This document records the backup and recovery decisions confirmed while resolving GitHub issue 16. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0019](../adr/0019-bind-recovery-to-joint-database-and-object-points.md) records the joint recovery decision, [durable-object-storage.md](./durable-object-storage.md) defines verified content, [content-authorization-and-sharing.md](./content-authorization-and-sharing.md) defines Share Grant and BreakGlass Grant invalidation, [runtime-and-pipeline-releases.md](./runtime-and-pipeline-releases.md) defines release, compatibility, revocation, and Execution Lock recovery requirements, [catalog-template-publication.md](./catalog-template-publication.md) defines catalog package, Template Lock, and disable recovery requirements, [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md) defines provider-attempt, receipt, ledger, and reservation recovery requirements, and [enterprise-v1-scope.md](./enterprise-v1-scope.md) defines the delivery boundary.
 
 The design fixes recovery authority, RPO/RTO, consistency, retention, security, drills, and cutover gates without selecting a PostgreSQL backup product, object-store vendor, KMS, schema, SDK, or deployment size.
 
@@ -139,7 +139,8 @@ Reconciliation is scoped and resumable. One failed object cannot be silently ign
 ## Authorization and Share Links after restore
 
 - The read-only stage requires a fresh authenticated Owner authority path. Current identity-provider disable state remains fail closed.
-- Every pre-incident Share Link and Access Code remains invalid after restore, even if it was valid at the selected point. An Owner must issue a new Share Link after recovery.
+- Restore advances a Recovery Epoch and owner/administrator authorization generations. Every pre-incident Share Link, Access Code, Verification Session, and BreakGlass Grant remains invalid even if it was active at the selected point.
+- `ReadOnlyReady` permits freshly authenticated Owner reads but no Share Link mutation. An Owner may issue a new Share Link only after `FullReady` enables authoritative mutation.
 - A Platform Administrator receives no implicit content-reading authority from incident or restore status. Human inspection of User content still requires a separate reason-bound, time-stamped, audited break-glass grant.
 - The isolated restore environment cannot issue ordinary User sessions, Share Links, unrestricted object handles, or sandbox credentials before its corresponding promotion gate.
 
