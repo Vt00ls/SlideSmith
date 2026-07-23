@@ -174,61 +174,7 @@ func TestCommitRejectsReceiptFromSupersededGenerationOfSharedContent(t *testing.
 	}
 	durable.setPrepareReceiptOverride(staleReceipt)
 
-	confirmed, err := lifecycle.ConfirmTaskWorkspace(
-		context.Background(),
-		confirmRequest("policy-domain-1", "task-2", "confirm-two"),
-	)
-	if err != nil {
-		t.Fatalf("confirm second Task Workspace: %v", err)
-	}
-	materialized, err := lifecycle.Materialize(
-		context.Background(),
-		materializeRequest("policy-domain-1", "task-2", confirmed, "materialize-two"),
-	)
-	if err != nil {
-		t.Fatalf("materialize second Task Workspace: %v", err)
-	}
-	view, err := lifecycle.OpenRuntimeView(
-		context.Background(),
-		openRuntimeViewRequest(
-			"policy-domain-1", "task-2", confirmed, materialized,
-			"phase-run-two", "runtime-run-two", "sandbox-lease-two", "open-view-two",
-		),
-	)
-	if err != nil {
-		t.Fatalf("open second Runtime View: %v", err)
-	}
-	manifest := declaredStateManifest("content-1")
-	validation := taskworkspace.ValidationEvidence{
-		ID:                    "validation-evidence-two",
-		ValidationAuthorityID: "validation-authority-1",
-		PolicyDomainID:        "policy-domain-1",
-		TaskID:                "task-2",
-		TaskWorkspaceID:       confirmed.TaskWorkspaceID,
-		RuntimeViewID:         view.RuntimeViewID,
-		BaseRevisionID:        confirmed.CurrentRevisionID,
-		PhaseRunID:            view.PhaseRunID,
-		RuntimeRunID:          view.RuntimeRunID,
-		ManifestDigest:        manifest.Digest,
-		Generation:            confirmed.Generation,
-		Fence:                 confirmed.Fence,
-		Decision:              taskworkspace.ValidationAccepted,
-	}
-	validation.Digest = validation.CanonicalDigest()
-	request := taskworkspace.CommitRuntimeViewRequest{
-		PolicyDomainID:          "policy-domain-1",
-		TaskID:                  "task-2",
-		TaskWorkspaceID:         confirmed.TaskWorkspaceID,
-		RuntimeViewID:           view.RuntimeViewID,
-		BaseRevisionID:          confirmed.CurrentRevisionID,
-		ExpectedCurrentRevision: confirmed.CurrentRevisionID,
-		Generation:              confirmed.Generation,
-		Fence:                   confirmed.Fence,
-		ValidationEvidence:      validation,
-		DeclaredStateManifest:   manifest,
-		Operation:               taskworkspace.Operation{ID: "commit-two"},
-	}
-	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	_, request := taskContentCommitRequest(t, lifecycle, "policy-domain-1", "task-2", "two")
 
 	result, err := lifecycle.CommitRuntimeView(context.Background(), request)
 	var lifecycleError *taskworkspace.Error
@@ -530,6 +476,20 @@ func commitTaskContent(
 	policyDomainID, taskID, suffix string,
 ) (taskworkspace.ConfirmTaskWorkspaceResult, taskworkspace.CommitRuntimeViewResult) {
 	t.Helper()
+	confirmed, request := taskContentCommitRequest(t, lifecycle, policyDomainID, taskID, suffix)
+	committed, err := lifecycle.CommitRuntimeView(context.Background(), request)
+	if err != nil {
+		t.Fatalf("commit Task Workspace: %v", err)
+	}
+	return confirmed, committed
+}
+
+func taskContentCommitRequest(
+	t *testing.T,
+	lifecycle taskworkspace.Lifecycle,
+	policyDomainID, taskID, suffix string,
+) (taskworkspace.ConfirmTaskWorkspaceResult, taskworkspace.CommitRuntimeViewRequest) {
+	t.Helper()
 	confirmed, err := lifecycle.ConfirmTaskWorkspace(
 		context.Background(),
 		confirmRequest(policyDomainID, taskID, "confirm-"+suffix),
@@ -593,9 +553,5 @@ func commitTaskContent(
 		},
 	}
 	request.Operation.RequestDigest = request.CanonicalRequestDigest()
-	committed, err := lifecycle.CommitRuntimeView(context.Background(), request)
-	if err != nil {
-		t.Fatalf("commit Task Workspace: %v", err)
-	}
-	return confirmed, committed
+	return confirmed, request
 }
