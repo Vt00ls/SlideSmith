@@ -162,16 +162,22 @@ type operationScope struct {
 }
 
 type operationRecord struct {
-	requestDigest           Digest
-	payload                 operationJournalPayload
-	state                   operationJournalState
-	intentState             OperationIntentState
-	expectedRevisionID      RevisionID
-	generation              Generation
-	fence                   Fence
-	authorityBindingsDigest Digest
-	plannedIDs              map[string]string
-	err                     *Error
+	requestDigest            Digest
+	payload                  operationJournalPayload
+	state                    operationJournalState
+	intentState              OperationIntentState
+	expectedRevisionID       RevisionID
+	generation               Generation
+	fence                    Fence
+	authorityBindingsDigest  Digest
+	plannedIDs               map[string]string
+	plannedRuntimeViewExpiry runtimeViewExpiryDecision
+	err                      *Error
+}
+
+type runtimeViewExpiryDecision struct {
+	policyID  ExpiryPolicyID
+	expiresAt Instant
 }
 
 func NewInMemoryPersistence() *InMemoryPersistence {
@@ -204,11 +210,15 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 		now = func() Instant { return Instant(time.Now().UnixNano()) }
 	}
 	expiryPolicy := config.ExpiryPolicy
+	defaultExpiryLifetime := Duration(24 * time.Hour)
 	if expiryPolicy.ID == "" {
-		expiryPolicy = ExpiryPolicy{
-			ID:                      "default-expiry-policy",
-			MaterializationLifetime: Duration(24 * time.Hour),
-		}
+		expiryPolicy.ID = "default-expiry-policy"
+	}
+	if expiryPolicy.MaterializationLifetime <= 0 {
+		expiryPolicy.MaterializationLifetime = defaultExpiryLifetime
+	}
+	if expiryPolicy.RuntimeViewLifetime <= 0 {
+		expiryPolicy.RuntimeViewLifetime = expiryPolicy.MaterializationLifetime
 	}
 	persistence := config.Persistence
 	if persistence == nil {
@@ -293,10 +303,18 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 	if result, replayed, err := replayOperation[OpenRuntimeViewResult](m.operations, scope, request.Operation); replayed {
 		return result, err
 	}
-	if _, err := ensureOperationIntent(
-		m, scope, request.Operation, request, openRuntimeViewJournalSpec(), nil,
-	); err != nil {
+	var expiryDecision runtimeViewExpiryDecision
+	reserveExpiryDecision := func() {
+		expiryDecision = m.reserveRuntimeViewExpiryDecision(scope)
+	}
+	created, err := ensureOperationIntent(
+		m, scope, request.Operation, request, openRuntimeViewJournalSpec(), reserveExpiryDecision,
+	)
+	if err != nil {
 		return OpenRuntimeViewResult{}, err
+	}
+	if !created {
+		reserveExpiryDecision()
 	}
 	workspace, workspaceOK := m.workspaces[request.TaskID]
 	materialization, materializationOK := m.materializations[request.MaterializationID]
@@ -314,7 +332,7 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 		recordOperation(m.operations, scope, request.Operation, OpenRuntimeViewResult{}, err)
 		return OpenRuntimeViewResult{}, err
 	}
-	if !m.sandboxLeaseAuthorityMatches(request) || request.ExpiresAt <= m.now() {
+	if !m.sandboxLeaseAuthorityMatches(request) || request.ExpiresAt < expiryDecision.expiresAt || expiryDecision.expiresAt <= m.now() {
 		err := &Error{Code: ErrorStaleAuthority}
 		recordOperation(m.operations, scope, request.Operation, OpenRuntimeViewResult{}, err)
 		return OpenRuntimeViewResult{}, err
@@ -340,8 +358,8 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 		runtimeOperationID:     request.RuntimeOperationID,
 		sandboxLeaseAuthority:  request.SandboxLeaseAuthority,
 		effectClass:            request.EffectClass,
-		expiresAt:              request.ExpiresAt,
-		expiryPolicyID:         m.expiryPolicy.ID,
+		expiresAt:              expiryDecision.expiresAt,
+		expiryPolicyID:         expiryDecision.policyID,
 		generation:             request.Generation,
 		fence:                  request.Fence,
 		readOnlyInputs:         cloneReadOnlyInputMaterializations(materialization.readOnlyInputs),
@@ -362,7 +380,7 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 		RuntimeOperationID:      request.RuntimeOperationID,
 		SandboxLeaseAuthority:   request.SandboxLeaseAuthority,
 		EffectClass:             request.EffectClass,
-		ExpiresAt:               request.ExpiresAt,
+		ExpiresAt:               expiryDecision.expiresAt,
 		Generation:              request.Generation,
 		Fence:                   request.Fence,
 		ReadOnlyInputs:          cloneReadOnlyInputMaterializations(materialization.readOnlyInputs),

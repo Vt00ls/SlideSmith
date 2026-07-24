@@ -5,6 +5,7 @@ import "context"
 type ExpiryPolicy struct {
 	ID                      ExpiryPolicyID
 	MaterializationLifetime Duration
+	RuntimeViewLifetime     Duration
 }
 
 type (

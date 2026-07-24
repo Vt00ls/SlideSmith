@@ -518,6 +518,27 @@ func (m *inMemory) operationOpaqueID(
 	return identity
 }
 
+func (m *inMemory) reserveRuntimeViewExpiryDecision(scope operationScope) runtimeViewExpiryDecision {
+	record := m.operations[scope]
+	if record.plannedRuntimeViewExpiry.policyID == "" {
+		record.plannedRuntimeViewExpiry = runtimeViewExpiryDecision{
+			policyID:  m.expiryPolicy.ID,
+			expiresAt: m.now() + Instant(m.expiryPolicy.RuntimeViewLifetime),
+		}
+		record.authorityBindingsDigest = canonicalDigest(struct {
+			ExistingDigest Digest
+			ExpiryPolicyID ExpiryPolicyID
+			ExpiresAt      Instant
+		}{
+			ExistingDigest: record.authorityBindingsDigest,
+			ExpiryPolicyID: record.plannedRuntimeViewExpiry.policyID,
+			ExpiresAt:      record.plannedRuntimeViewExpiry.expiresAt,
+		})
+		m.operations[scope] = record
+	}
+	return record.plannedRuntimeViewExpiry
+}
+
 func confirmIntentMetadata(request ConfirmTaskWorkspaceRequest) operationIntentMetadata {
 	return operationIntentMetadata{
 		generation: 1,

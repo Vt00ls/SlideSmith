@@ -167,6 +167,125 @@ func TestExpiryUsesTheResourceBoundPolicyVersionAfterModulePolicyChange(t *testi
 	}
 }
 
+func TestVersionedPolicyBoundsCallerRuntimeViewDeadline(t *testing.T) {
+	now := taskworkspace.Instant(100)
+	leaseCurrent := true
+	lease := sandboxLeaseAuthority(
+		"policy-domain-1", "task-1", "phase-run-1", "runtime-run-1", "sandbox-lease-1",
+	)
+	config := taskworkspaceTestConfig(&happyDurableObject{})
+	config.Now = func() taskworkspace.Instant { return now }
+	config.ExpiryPolicy = taskworkspace.ExpiryPolicy{
+		ID:                      "expiry-policy-1",
+		MaterializationLifetime: 1_000,
+		RuntimeViewLifetime:     10,
+	}
+	config.CurrentSandboxLeaseAuthority = func(id taskworkspace.SandboxLeaseID) (taskworkspace.SandboxLeaseAuthority, bool) {
+		return lease, leaseCurrent && id == lease.ID
+	}
+	lifecycle := taskworkspace.NewInMemory(config)
+	confirmed, materialized := materializedTaskUsing(t, lifecycle)
+	early := openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-too-early",
+	)
+	early.ExpiresAt = 109
+	early.Operation.RequestDigest = early.CanonicalRequestDigest()
+	_, err := lifecycle.OpenRuntimeView(context.Background(), early)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorStaleAuthority)
+
+	late := openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-too-late",
+	)
+	late.ExpiresAt = 250
+	late.Operation.RequestDigest = late.CanonicalRequestDigest()
+	view, err := lifecycle.OpenRuntimeView(context.Background(), late)
+	if err != nil {
+		t.Fatalf("open policy-bounded Runtime View: %v", err)
+	}
+	if view.ExpiresAt != 110 {
+		t.Fatalf("Runtime View expiry = %d, want policy-derived deadline 110", view.ExpiresAt)
+	}
+	expire := taskworkspace.ExpireRuntimeViewRequest{
+		PolicyDomainID:    "policy-domain-1",
+		TaskID:            "task-1",
+		TaskWorkspaceID:   confirmed.TaskWorkspaceID,
+		RuntimeViewID:     view.RuntimeViewID,
+		MaterializationID: materialized.MaterializationID,
+		BaseRevisionID:    confirmed.CurrentRevisionID,
+		Generation:        confirmed.Generation,
+		Fence:             confirmed.Fence,
+		ExpiryPolicyID:    "expiry-policy-1",
+		Operation:         taskworkspace.Operation{ID: "expire-view-before-policy-deadline"},
+	}
+	expire.Operation.RequestDigest = expire.CanonicalRequestDigest()
+	leaseCurrent = false
+	now = 109
+	_, err = lifecycle.ExpireRuntimeView(context.Background(), expire)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorExpiryBlocked)
+	leaseCurrent = true
+	now = 110
+	expire.Operation.ID = "expire-view-at-policy-deadline-with-active-lease"
+	expire.Operation.RequestDigest = expire.CanonicalRequestDigest()
+	_, err = lifecycle.ExpireRuntimeView(context.Background(), expire)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorExpiryBlocked)
+	leaseCurrent = false
+	expire.Operation.ID = "expire-view-after-lease-release"
+	expire.Operation.RequestDigest = expire.CanonicalRequestDigest()
+	if _, err := lifecycle.ExpireRuntimeView(context.Background(), expire); err != nil {
+		t.Fatalf("expire Runtime View after lease release: %v", err)
+	}
+}
+
+func TestRuntimeViewDeadlineDecisionSurvivesRestartAndPolicyChange(t *testing.T) {
+	now := taskworkspace.Instant(100)
+	persistence := taskworkspace.NewInMemoryPersistence()
+	faultAt := taskworkspace.FaultAfterIntentPersistence
+	config := taskworkspaceTestConfig(&happyDurableObject{})
+	config.Persistence = persistence
+	config.Now = func() taskworkspace.Instant { return now }
+	config.ExpiryPolicy = taskworkspace.ExpiryPolicy{
+		ID:                      "expiry-policy-v1",
+		MaterializationLifetime: 1_000,
+		RuntimeViewLifetime:     10,
+	}
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if event.OperationID == "open-view-under-v1" && event.Point == faultAt {
+			faultAt = ""
+			return errors.New("simulated crash after policy decision persistence")
+		}
+		return nil
+	}
+	lifecycle := taskworkspace.NewInMemory(config)
+	confirmed, materialized := materializedTaskUsing(t, lifecycle)
+	request := openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-under-v1",
+	)
+	request.ExpiresAt = 250
+	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+
+	_, err := lifecycle.OpenRuntimeView(context.Background(), request)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+
+	now = 101
+	restartedConfig := config
+	restartedConfig.ExpiryPolicy = taskworkspace.ExpiryPolicy{
+		ID:                      "expiry-policy-v2",
+		MaterializationLifetime: 1_000,
+		RuntimeViewLifetime:     100,
+	}
+	restarted := taskworkspace.NewInMemory(restartedConfig)
+	view, err := restarted.OpenRuntimeView(context.Background(), request)
+	if err != nil {
+		t.Fatalf("resume Runtime View creation under changed module policy: %v", err)
+	}
+	if view.ExpiresAt != 110 {
+		t.Fatalf("Runtime View expiry = %d, want persisted v1 deadline 110", view.ExpiresAt)
+	}
+}
+
 func TestActiveRuntimeViewLeaseBlocksMaterializationExpiry(t *testing.T) {
 	now := taskworkspace.Instant(100)
 	config := taskworkspaceTestConfig(&happyDurableObject{})
@@ -196,7 +315,11 @@ func TestExpiredRuntimeViewRejectsLateCommitWithoutChangingHistory(t *testing.T)
 	now := taskworkspace.Instant(100)
 	config := taskworkspaceTestConfig(&happyDurableObject{})
 	config.Now = func() taskworkspace.Instant { return now }
-	config.ExpiryPolicy = taskworkspace.ExpiryPolicy{ID: "expiry-policy-1", MaterializationLifetime: 1_000}
+	config.ExpiryPolicy = taskworkspace.ExpiryPolicy{
+		ID:                      "expiry-policy-1",
+		MaterializationLifetime: 1_000,
+		RuntimeViewLifetime:     100,
+	}
 	lifecycle := taskworkspace.NewInMemory(config)
 	confirmed, materialized := materializedTaskUsing(t, lifecycle)
 	view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(

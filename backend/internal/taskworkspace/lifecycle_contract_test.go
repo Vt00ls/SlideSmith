@@ -1202,6 +1202,11 @@ func taskworkspaceTestConfig(durable taskworkspace.DurableObjectPort) taskworksp
 		DurableObject:           durable,
 		SandboxLeaseAuthorityID: "sandbox-lease-authority-1",
 		Now:                     func() taskworkspace.Instant { return 100 },
+		ExpiryPolicy: taskworkspace.ExpiryPolicy{
+			ID:                      "default-expiry-policy",
+			MaterializationLifetime: 1_000,
+			RuntimeViewLifetime:     100,
+		},
 		CurrentSandboxLeaseAuthorities: []taskworkspace.SandboxLeaseAuthority{
 			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-1", "runtime-run-1", "sandbox-lease-1"),
 			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-1", "runtime-run-2", "sandbox-lease-2"),
