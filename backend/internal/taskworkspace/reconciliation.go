@@ -25,6 +25,8 @@ const (
 	FaultAfterResponse                       FaultPoint = "after_response"
 	FaultBeforePhysicalExpiry                FaultPoint = "before_physical_expiry"
 	FaultAfterPhysicalExpiry                 FaultPoint = "after_physical_expiry"
+	FaultBeforeCheckpointReclaim             FaultPoint = "before_checkpoint_reclaim"
+	FaultAfterCheckpointReclaim              FaultPoint = "after_checkpoint_reclaim"
 )
 
 type FaultEvent struct {
@@ -63,24 +65,27 @@ type InspectOperationRequest struct {
 }
 
 type OperationInspection struct {
-	Operation                Operation
-	Disposition              OperationDisposition
-	IntentState              OperationIntentState
-	ExpectedRevisionID       RevisionID
-	Generation               Generation
-	Fence                    Fence
-	AuthorityBindingsDigest  Digest
-	ConfirmTaskWorkspace     *ConfirmTaskWorkspaceResult
-	Materialize              *MaterializeResult
-	OpenRuntimeView          *OpenRuntimeViewResult
-	CommitRuntimeView        *CommitRuntimeViewResult
-	DiscardRuntimeView       *DiscardRuntimeViewResult
-	FenceRuntimeView         *FenceRuntimeViewResult
-	ReconstructTaskWorkspace *ReconstructTaskWorkspaceResult
-	ExpireMaterialization    *ExpireMaterializationResult
-	ExpireRuntimeView        *ExpireRuntimeViewResult
-	RestoreTaskWorkspace     *RestoreTaskWorkspaceResult
-	Error                    *Error
+	Operation                  Operation
+	Disposition                OperationDisposition
+	IntentState                OperationIntentState
+	ExpectedRevisionID         RevisionID
+	Generation                 Generation
+	Fence                      Fence
+	AuthorityBindingsDigest    Digest
+	ConfirmTaskWorkspace       *ConfirmTaskWorkspaceResult
+	Materialize                *MaterializeResult
+	OpenRuntimeView            *OpenRuntimeViewResult
+	CommitRuntimeView          *CommitRuntimeViewResult
+	DiscardRuntimeView         *DiscardRuntimeViewResult
+	FenceRuntimeView           *FenceRuntimeViewResult
+	ReconstructTaskWorkspace   *ReconstructTaskWorkspaceResult
+	ExpireMaterialization      *ExpireMaterializationResult
+	ExpireRuntimeView          *ExpireRuntimeViewResult
+	RestoreTaskWorkspace       *RestoreTaskWorkspaceResult
+	AttachCheckpointRetention  *CheckpointRetention
+	ReleaseCheckpointRetention *CheckpointRetention
+	ReclaimCheckpoint          *CheckpointReclamation
+	Error                      *Error
 }
 
 type ReconcileOperationRequest struct {
@@ -332,6 +337,61 @@ func restoreTaskWorkspaceJournalSpec() operationJournalSpec[RestoreTaskWorkspace
 			inspection.RestoreTaskWorkspace = &result
 		},
 	}
+}
+
+func releaseCheckpointRetentionJournalSpec() operationJournalSpec[ReleaseCheckpointRetentionRequest, CheckpointRetention] {
+	return operationJournalSpec[ReleaseCheckpointRetentionRequest, CheckpointRetention]{
+		cloneRequest: identityClone[ReleaseCheckpointRetentionRequest],
+		cloneResult:  cloneCheckpointRetention,
+		intent:       releaseCheckpointRetentionIntentMetadata,
+		execute: func(ctx context.Context, m *inMemory, request ReleaseCheckpointRetentionRequest) (CheckpointRetention, error) {
+			return m.ReleaseCheckpointRetention(ctx, request)
+		},
+		project: func(inspection *OperationInspection, result CheckpointRetention) {
+			inspection.ReleaseCheckpointRetention = &result
+		},
+	}
+}
+
+func attachCheckpointRetentionJournalSpec() operationJournalSpec[AttachCheckpointRetentionRequest, CheckpointRetention] {
+	return operationJournalSpec[AttachCheckpointRetentionRequest, CheckpointRetention]{
+		cloneRequest: identityClone[AttachCheckpointRetentionRequest],
+		cloneResult:  cloneCheckpointRetention,
+		intent:       attachCheckpointRetentionIntentMetadata,
+		execute: func(ctx context.Context, m *inMemory, request AttachCheckpointRetentionRequest) (CheckpointRetention, error) {
+			return m.AttachCheckpointRetention(ctx, request)
+		},
+		project: func(inspection *OperationInspection, result CheckpointRetention) {
+			inspection.AttachCheckpointRetention = &result
+		},
+	}
+}
+
+func cloneCheckpointRetention(retention CheckpointRetention) CheckpointRetention {
+	retention.Authorities = append([]CheckpointRetentionAuthority(nil), retention.Authorities...)
+	return retention
+}
+
+func reclaimCheckpointJournalSpec() operationJournalSpec[ReclaimCheckpointRequest, CheckpointReclamation] {
+	return operationJournalSpec[ReclaimCheckpointRequest, CheckpointReclamation]{
+		cloneRequest: identityClone[ReclaimCheckpointRequest],
+		cloneResult:  cloneCheckpointReclamation,
+		intent:       reclaimCheckpointIntentMetadata,
+		execute: func(ctx context.Context, m *inMemory, request ReclaimCheckpointRequest) (CheckpointReclamation, error) {
+			return m.ReclaimCheckpoint(ctx, request)
+		},
+		project: func(inspection *OperationInspection, result CheckpointReclamation) {
+			inspection.ReclaimCheckpoint = &result
+		},
+	}
+}
+
+func cloneCheckpointReclamation(reclamation CheckpointReclamation) CheckpointReclamation {
+	reclamation.Evidence.Blockers = append(
+		[]CheckpointReclamationBlocker(nil),
+		reclamation.Evidence.Blockers...,
+	)
+	return reclamation
 }
 
 func (m *inMemory) InspectOperation(
@@ -768,6 +828,70 @@ func restoreTaskWorkspaceIntentMetadata(request RestoreTaskWorkspaceRequest) ope
 			RecoveryIntentID:   intent.ID,
 			TargetRevisionID:   intent.TargetRevisionID,
 			TargetCheckpointID: intent.TargetCheckpointID,
+		}),
+	}
+}
+
+func releaseCheckpointRetentionIntentMetadata(request ReleaseCheckpointRetentionRequest) operationIntentMetadata {
+	return operationIntentMetadata{
+		generation: request.Generation,
+		fence:      request.Fence,
+		authorityBindingsDigest: canonicalDigest(struct {
+			PolicyDomainID              PolicyDomainID
+			TaskID                      TaskID
+			TaskWorkspaceID             TaskWorkspaceID
+			CheckpointID                CheckpointID
+			AuthorityID                 CheckpointRetentionAuthorityID
+			ExpectedRetentionGeneration RetentionGeneration
+		}{
+			PolicyDomainID:              request.PolicyDomainID,
+			TaskID:                      request.TaskID,
+			TaskWorkspaceID:             request.TaskWorkspaceID,
+			CheckpointID:                request.CheckpointID,
+			AuthorityID:                 request.AuthorityID,
+			ExpectedRetentionGeneration: request.ExpectedRetentionGeneration,
+		}),
+	}
+}
+
+func attachCheckpointRetentionIntentMetadata(request AttachCheckpointRetentionRequest) operationIntentMetadata {
+	return operationIntentMetadata{
+		generation: request.Generation,
+		fence:      request.Fence,
+		authorityBindingsDigest: canonicalDigest(struct {
+			PolicyDomainID              PolicyDomainID
+			TaskID                      TaskID
+			TaskWorkspaceID             TaskWorkspaceID
+			CheckpointID                CheckpointID
+			ExpectedRetentionGeneration RetentionGeneration
+			Authority                   CheckpointRetentionAuthority
+		}{
+			PolicyDomainID:              request.PolicyDomainID,
+			TaskID:                      request.TaskID,
+			TaskWorkspaceID:             request.TaskWorkspaceID,
+			CheckpointID:                request.CheckpointID,
+			ExpectedRetentionGeneration: request.ExpectedRetentionGeneration,
+			Authority:                   request.Authority,
+		}),
+	}
+}
+
+func reclaimCheckpointIntentMetadata(request ReclaimCheckpointRequest) operationIntentMetadata {
+	return operationIntentMetadata{
+		generation: request.Generation,
+		fence:      request.Fence,
+		authorityBindingsDigest: canonicalDigest(struct {
+			PolicyDomainID              PolicyDomainID
+			TaskID                      TaskID
+			TaskWorkspaceID             TaskWorkspaceID
+			CheckpointID                CheckpointID
+			ExpectedRetentionGeneration RetentionGeneration
+		}{
+			PolicyDomainID:              request.PolicyDomainID,
+			TaskID:                      request.TaskID,
+			TaskWorkspaceID:             request.TaskWorkspaceID,
+			CheckpointID:                request.CheckpointID,
+			ExpectedRetentionGeneration: request.ExpectedRetentionGeneration,
 		}),
 	}
 }

@@ -25,6 +25,8 @@ type InMemoryConfig struct {
 	FaultHook                      func(FaultEvent) error
 	ResponseDelivery               func(ResponseDeliveryEvent)
 	ExpiryPolicy                   ExpiryPolicy
+	CheckpointRetentionPolicy      CheckpointRetentionPolicy
+	CheckpointReclamation          CheckpointReclamationPort
 	RecoveryAuthorityID            RecoveryAuthorityID
 	CurrentRecoveryIntents         []AuthorizedRecoveryIntent
 	CurrentRecoveryIntent          func(RecoveryIntentID) (AuthorizedRecoveryIntent, bool)
@@ -52,22 +54,24 @@ type InMemoryPersistence struct {
 
 type inMemory struct {
 	*InMemoryPersistence
-	validationAuthorityID   ValidationAuthorityID
-	durabilityAuthorityID   DurabilityAuthorityID
-	durableObject           DurableObjectPort
-	sandboxLeaseAuthorityID SandboxLeaseAuthorityID
-	now                     func() Instant
-	beforeTerminal          func(RuntimeViewTerminalAttempt)
-	faultHook               func(FaultEvent) error
-	responseDelivery        func(ResponseDeliveryEvent)
-	expiryPolicy            ExpiryPolicy
-	recoveryAuthorityID     RecoveryAuthorityID
-	recoveryIntents         map[RecoveryIntentID]AuthorizedRecoveryIntent
-	currentRecoveryIntent   func(RecoveryIntentID) (AuthorizedRecoveryIntent, bool)
-	reconstructionInput     ReconstructionInputPort
-	expiryProtection        ExpiryProtectionPort
-	sandboxLeaseAuthorities map[SandboxLeaseID]SandboxLeaseAuthority
-	currentLeaseAuthority   func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
+	validationAuthorityID     ValidationAuthorityID
+	durabilityAuthorityID     DurabilityAuthorityID
+	durableObject             DurableObjectPort
+	sandboxLeaseAuthorityID   SandboxLeaseAuthorityID
+	now                       func() Instant
+	beforeTerminal            func(RuntimeViewTerminalAttempt)
+	faultHook                 func(FaultEvent) error
+	responseDelivery          func(ResponseDeliveryEvent)
+	expiryPolicy              ExpiryPolicy
+	checkpointRetentionPolicy CheckpointRetentionPolicy
+	checkpointReclamation     CheckpointReclamationPort
+	recoveryAuthorityID       RecoveryAuthorityID
+	recoveryIntents           map[RecoveryIntentID]AuthorizedRecoveryIntent
+	currentRecoveryIntent     func(RecoveryIntentID) (AuthorizedRecoveryIntent, bool)
+	reconstructionInput       ReconstructionInputPort
+	expiryProtection          ExpiryProtectionPort
+	sandboxLeaseAuthorities   map[SandboxLeaseID]SandboxLeaseAuthority
+	currentLeaseAuthority     func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
 }
 
 type durableContentFact struct {
@@ -103,6 +107,7 @@ type checkpointRecord struct {
 	manifestDigest  Digest
 	operationID     OperationID
 	evidence        CheckpointEvidence
+	retention       checkpointRetentionRecord
 }
 
 type materializationBinding struct {
@@ -220,6 +225,13 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 	if expiryPolicy.RuntimeViewLifetime <= 0 {
 		expiryPolicy.RuntimeViewLifetime = expiryPolicy.MaterializationLifetime
 	}
+	checkpointRetentionPolicy := config.CheckpointRetentionPolicy
+	if checkpointRetentionPolicy.ID == "" {
+		checkpointRetentionPolicy.ID = "default-checkpoint-retention-policy"
+	}
+	if checkpointRetentionPolicy.ReclamationGrace <= 0 {
+		checkpointRetentionPolicy.ReclamationGrace = Duration(7 * 24 * time.Hour)
+	}
 	persistence := config.Persistence
 	if persistence == nil {
 		persistence = NewInMemoryPersistence()
@@ -227,21 +239,23 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 		persistence.initialize()
 	}
 	memory := &inMemory{
-		InMemoryPersistence:     persistence,
-		validationAuthorityID:   config.ValidationAuthorityID,
-		durabilityAuthorityID:   config.DurabilityAuthorityID,
-		durableObject:           config.DurableObject,
-		sandboxLeaseAuthorityID: config.SandboxLeaseAuthorityID,
-		now:                     now,
-		beforeTerminal:          config.BeforeRuntimeViewTerminal,
-		faultHook:               config.FaultHook,
-		responseDelivery:        config.ResponseDelivery,
-		expiryPolicy:            expiryPolicy,
-		recoveryAuthorityID:     config.RecoveryAuthorityID,
-		recoveryIntents:         make(map[RecoveryIntentID]AuthorizedRecoveryIntent),
-		reconstructionInput:     config.ReconstructionInput,
-		expiryProtection:        config.ExpiryProtection,
-		sandboxLeaseAuthorities: make(map[SandboxLeaseID]SandboxLeaseAuthority),
+		InMemoryPersistence:       persistence,
+		validationAuthorityID:     config.ValidationAuthorityID,
+		durabilityAuthorityID:     config.DurabilityAuthorityID,
+		durableObject:             config.DurableObject,
+		sandboxLeaseAuthorityID:   config.SandboxLeaseAuthorityID,
+		now:                       now,
+		beforeTerminal:            config.BeforeRuntimeViewTerminal,
+		faultHook:                 config.FaultHook,
+		responseDelivery:          config.ResponseDelivery,
+		expiryPolicy:              expiryPolicy,
+		checkpointRetentionPolicy: checkpointRetentionPolicy,
+		checkpointReclamation:     config.CheckpointReclamation,
+		recoveryAuthorityID:       config.RecoveryAuthorityID,
+		recoveryIntents:           make(map[RecoveryIntentID]AuthorizedRecoveryIntent),
+		reconstructionInput:       config.ReconstructionInput,
+		expiryProtection:          config.ExpiryProtection,
+		sandboxLeaseAuthorities:   make(map[SandboxLeaseID]SandboxLeaseAuthority),
 	}
 	leaseDuplicates := make(map[SandboxLeaseID]bool)
 	for _, authority := range config.CurrentSandboxLeaseAuthorities {
@@ -633,6 +647,20 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		manifestDigest:  trustedRequest.DeclaredStateManifest.Digest,
 		operationID:     request.Operation.ID,
 		evidence:        cloneCheckpointEvidence(checkpointEvidence),
+		retention: checkpointRetentionRecord{
+			generation:           1,
+			generationAtCreation: request.Generation,
+			fenceAtCreation:      workspace.fence,
+			authorities: map[CheckpointRetentionAuthorityID]CheckpointRetentionAuthority{
+				CheckpointRetentionAuthorityID(m.operationOpaqueID(
+					scope,
+					"checkpoint-recovery-lineage-authority",
+					"checkpoint-retention-authority",
+				)): {
+					Kind: CheckpointRecoveryLineageAuthority,
+				},
+			},
+		},
 	}
 	m.recordDurableEvidenceIdentities(verifiedCheckpointContent(checkpointEvidence))
 	view.terminalDecision = runtimeViewCommitted
@@ -1391,7 +1419,17 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 	if checkpointID != "" {
 		checkpoint, exists := m.checkpoints[checkpointID]
 		if !exists || checkpoint.taskWorkspaceID != request.TaskWorkspaceID || checkpoint.revisionID != request.RevisionID ||
-			checkpoint.manifestDigest != workspace.currentManifest || m.durableObject == nil {
+			checkpoint.manifestDigest != workspace.currentManifest {
+			err := &Error{Code: ErrorIntegrityFailure}
+			recordOperation(m.operations, scope, request.Operation, MaterializeResult{}, err)
+			return MaterializeResult{}, err
+		}
+		if !checkpoint.retention.semanticallyRetained(m.now()) {
+			err := &Error{Code: ErrorCheckpointNotRetained}
+			recordOperation(m.operations, scope, request.Operation, MaterializeResult{}, err)
+			return MaterializeResult{}, err
+		}
+		if m.durableObject == nil {
 			err := &Error{Code: ErrorIntegrityFailure}
 			recordOperation(m.operations, scope, request.Operation, MaterializeResult{}, err)
 			return MaterializeResult{}, err
