@@ -26,6 +26,8 @@ type (
 	LeaseGeneration         uint64
 	LeaseFence              uint64
 	Instant                 int64
+	Duration                int64
+	ExpiryPolicyID          string
 )
 
 type RuntimeViewEffectClass string
@@ -96,6 +98,8 @@ const (
 	ErrorStaleAuthority         ErrorCode = "stale_authority"
 	ErrorViewTerminalConflict   ErrorCode = "view_terminal_conflict"
 	ErrorEffectDenied           ErrorCode = "effect_denied"
+	ErrorExpiryBlocked          ErrorCode = "expiry_blocked"
+	ErrorRecoveryReadOnly       ErrorCode = "recovery_read_only"
 	ErrorReconciliationRequired ErrorCode = "reconciliation_required"
 )
 
@@ -117,6 +121,10 @@ func (e *Error) Error() string {
 		return "task workspace lifecycle view is already terminal"
 	case ErrorEffectDenied:
 		return "task workspace lifecycle effect is not permitted"
+	case ErrorExpiryBlocked:
+		return "task workspace lifecycle expiry is blocked"
+	case ErrorRecoveryReadOnly:
+		return "task workspace lifecycle recovery is read-only"
 	case ErrorReconciliationRequired:
 		return "task workspace lifecycle operation requires reconciliation"
 	default:
@@ -254,21 +262,23 @@ func (r OpenRuntimeViewRequest) CanonicalRequestDigest() Digest {
 }
 
 type OpenRuntimeViewResult struct {
-	PolicyDomainID        PolicyDomainID
-	TaskID                TaskID
-	RuntimeViewID         RuntimeViewID
-	TaskWorkspaceID       TaskWorkspaceID
-	MaterializationID     MaterializationID
-	BaseRevisionID        RevisionID
-	PhaseRunID            PhaseRunID
-	RuntimeRunID          RuntimeRunID
-	RuntimeOperationID    OperationID
-	SandboxLeaseAuthority SandboxLeaseAuthority
-	EffectClass           RuntimeViewEffectClass
-	ExpiresAt             Instant
-	Generation            Generation
-	Fence                 Fence
-	Operation             Operation
+	PolicyDomainID          PolicyDomainID
+	TaskID                  TaskID
+	RuntimeViewID           RuntimeViewID
+	TaskWorkspaceID         TaskWorkspaceID
+	MaterializationID       MaterializationID
+	BaseRevisionID          RevisionID
+	PhaseRunID              PhaseRunID
+	RuntimeRunID            RuntimeRunID
+	RuntimeOperationID      OperationID
+	SandboxLeaseAuthority   SandboxLeaseAuthority
+	EffectClass             RuntimeViewEffectClass
+	ExpiresAt               Instant
+	Generation              Generation
+	Fence                   Fence
+	ReadOnlyInputs          []ReadOnlyInputMaterialization
+	SourceArtifactVersionID ArtifactVersionID
+	Operation               Operation
 }
 
 type Lifecycle interface {
@@ -278,6 +288,10 @@ type Lifecycle interface {
 	CommitRuntimeView(context.Context, CommitRuntimeViewRequest) (CommitRuntimeViewResult, error)
 	DiscardRuntimeView(context.Context, DiscardRuntimeViewRequest) (DiscardRuntimeViewResult, error)
 	FenceRuntimeView(context.Context, FenceRuntimeViewRequest) (FenceRuntimeViewResult, error)
+	ExpireMaterialization(context.Context, ExpireMaterializationRequest) (ExpireMaterializationResult, error)
+	ExpireRuntimeView(context.Context, ExpireRuntimeViewRequest) (ExpireRuntimeViewResult, error)
+	RestoreTaskWorkspace(context.Context, RestoreTaskWorkspaceRequest) (RestoreTaskWorkspaceResult, error)
+	ReconstructTaskWorkspace(context.Context, ReconstructTaskWorkspaceRequest) (ReconstructTaskWorkspaceResult, error)
 	InspectOperation(context.Context, InspectOperationRequest) (OperationInspection, error)
 	ReconcileOperation(context.Context, ReconcileOperationRequest) (OperationInspection, error)
 }

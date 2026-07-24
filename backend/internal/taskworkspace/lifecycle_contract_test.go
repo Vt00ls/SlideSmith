@@ -244,7 +244,7 @@ func TestOpenRuntimeViewExactReplayDoesNotCreateAnotherView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("replay Runtime View open: %v", err)
 	}
-	if replayed != first {
+	if !reflect.DeepEqual(replayed, first) {
 		t.Fatal("exact replay did not return the original Runtime View")
 	}
 
@@ -921,6 +921,13 @@ func TestPublicLifecycleContractAndErrorsDoNotExposePhysicalDetails(t *testing.T
 		"credential",
 		"sdk",
 		"filesystem",
+		"directory",
+		"node",
+		"mtime",
+		"latest",
+		"recent",
+		"lastrun",
+		"listing",
 	}
 	seen := map[reflect.Type]bool{}
 	var inspectType func(reflect.Type)
@@ -974,6 +981,23 @@ func TestPublicLifecycleContractAndErrorsDoNotExposePhysicalDetails(t *testing.T
 			inspectType(method.Type.Out(outputIndex))
 		}
 	}
+	reconstructionInputType := reflect.TypeOf((*taskworkspace.ReconstructionInputPort)(nil)).Elem()
+	if reconstructionInputType.NumMethod() != 2 {
+		t.Fatal("reconstruction input port exposes version selection or publication authority")
+	}
+	for methodIndex := 0; methodIndex < reconstructionInputType.NumMethod(); methodIndex++ {
+		method := reconstructionInputType.Method(methodIndex)
+		if method.Name != "VerifyArtifactVersion" && method.Name != "MaterializeReadOnlyInput" {
+			t.Fatal("reconstruction input port exposes authority beyond exact verification and read-only materialization")
+		}
+		assertSafeContractName(t, method.Name, banned)
+		for inputIndex := 0; inputIndex < method.Type.NumIn(); inputIndex++ {
+			inspectType(method.Type.In(inputIndex))
+		}
+		for outputIndex := 0; outputIndex < method.Type.NumOut(); outputIndex++ {
+			inspectType(method.Type.Out(outputIndex))
+		}
+	}
 	inspectType(reflect.TypeOf(taskworkspace.InMemoryConfig{}))
 	inspectType(reflect.TypeOf(taskworkspace.Error{}))
 
@@ -985,6 +1009,8 @@ func TestPublicLifecycleContractAndErrorsDoNotExposePhysicalDetails(t *testing.T
 		taskworkspace.ErrorStaleAuthority,
 		taskworkspace.ErrorViewTerminalConflict,
 		taskworkspace.ErrorEffectDenied,
+		taskworkspace.ErrorExpiryBlocked,
+		taskworkspace.ErrorRecoveryReadOnly,
 		taskworkspace.ErrorReconciliationRequired,
 	} {
 		message := (&taskworkspace.Error{Code: code}).Error()
@@ -1176,6 +1202,11 @@ func taskworkspaceTestConfig(durable taskworkspace.DurableObjectPort) taskworksp
 		DurableObject:           durable,
 		SandboxLeaseAuthorityID: "sandbox-lease-authority-1",
 		Now:                     func() taskworkspace.Instant { return 100 },
+		ExpiryPolicy: taskworkspace.ExpiryPolicy{
+			ID:                      "default-expiry-policy",
+			MaterializationLifetime: 1_000,
+			RuntimeViewLifetime:     100,
+		},
 		CurrentSandboxLeaseAuthorities: []taskworkspace.SandboxLeaseAuthority{
 			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-1", "runtime-run-1", "sandbox-lease-1"),
 			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-1", "runtime-run-2", "sandbox-lease-2"),

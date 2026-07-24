@@ -24,6 +24,12 @@ type InMemoryConfig struct {
 	BeforeRuntimeViewTerminal      func(RuntimeViewTerminalAttempt)
 	FaultHook                      func(FaultEvent) error
 	ResponseDelivery               func(ResponseDeliveryEvent)
+	ExpiryPolicy                   ExpiryPolicy
+	RecoveryAuthorityID            RecoveryAuthorityID
+	CurrentRecoveryIntents         []AuthorizedRecoveryIntent
+	CurrentRecoveryIntent          func(RecoveryIntentID) (AuthorizedRecoveryIntent, bool)
+	ReconstructionInput            ReconstructionInputPort
+	ExpiryProtection               ExpiryProtectionPort
 }
 
 // InMemoryPersistence is an opaque persistence handle for deterministic
@@ -54,6 +60,12 @@ type inMemory struct {
 	beforeTerminal          func(RuntimeViewTerminalAttempt)
 	faultHook               func(FaultEvent) error
 	responseDelivery        func(ResponseDeliveryEvent)
+	expiryPolicy            ExpiryPolicy
+	recoveryAuthorityID     RecoveryAuthorityID
+	recoveryIntents         map[RecoveryIntentID]AuthorizedRecoveryIntent
+	currentRecoveryIntent   func(RecoveryIntentID) (AuthorizedRecoveryIntent, bool)
+	reconstructionInput     ReconstructionInputPort
+	expiryProtection        ExpiryProtectionPort
 	sandboxLeaseAuthorities map[SandboxLeaseID]SandboxLeaseAuthority
 	currentLeaseAuthority   func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
 }
@@ -94,30 +106,44 @@ type checkpointRecord struct {
 }
 
 type materializationBinding struct {
-	policyDomainID  PolicyDomainID
-	taskID          TaskID
-	taskWorkspaceID TaskWorkspaceID
-	revisionID      RevisionID
-	checkpointID    CheckpointID
-	generation      Generation
-	fence           Fence
+	policyDomainID         PolicyDomainID
+	taskID                 TaskID
+	taskWorkspaceID        TaskWorkspaceID
+	revisionID             RevisionID
+	checkpointID           CheckpointID
+	generation             Generation
+	fence                  Fence
+	expiryPolicyID         ExpiryPolicyID
+	expiresAt              Instant
+	readOnlyInputs         []ReadOnlyInputMaterialization
+	artifactVersionID      ArtifactVersionID
+	artifactManifestDigest Digest
+	reconstructionEvidence ArtifactVersionReconstructionEvidence
+	publicationAuthorityID PublicationAuthorityID
 }
 
 type runtimeViewBinding struct {
-	policyDomainID        PolicyDomainID
-	taskID                TaskID
-	taskWorkspaceID       TaskWorkspaceID
-	materializationID     MaterializationID
-	baseRevisionID        RevisionID
-	phaseRunID            PhaseRunID
-	runtimeRunID          RuntimeRunID
-	runtimeOperationID    OperationID
-	sandboxLeaseAuthority SandboxLeaseAuthority
-	effectClass           RuntimeViewEffectClass
-	expiresAt             Instant
-	generation            Generation
-	fence                 Fence
-	terminalDecision      runtimeViewTerminalDecision
+	policyDomainID         PolicyDomainID
+	taskID                 TaskID
+	taskWorkspaceID        TaskWorkspaceID
+	materializationID      MaterializationID
+	baseRevisionID         RevisionID
+	phaseRunID             PhaseRunID
+	runtimeRunID           RuntimeRunID
+	runtimeOperationID     OperationID
+	sandboxLeaseAuthority  SandboxLeaseAuthority
+	effectClass            RuntimeViewEffectClass
+	expiresAt              Instant
+	expiryPolicyID         ExpiryPolicyID
+	generation             Generation
+	fence                  Fence
+	terminalDecision       runtimeViewTerminalDecision
+	expired                bool
+	readOnlyInputs         []ReadOnlyInputMaterialization
+	artifactVersionID      ArtifactVersionID
+	artifactManifestDigest Digest
+	reconstructionEvidence ArtifactVersionReconstructionEvidence
+	publicationAuthorityID PublicationAuthorityID
 }
 
 type runtimeViewTerminalDecision string
@@ -136,16 +162,22 @@ type operationScope struct {
 }
 
 type operationRecord struct {
-	requestDigest           Digest
-	payload                 operationJournalPayload
-	state                   operationJournalState
-	intentState             OperationIntentState
-	expectedRevisionID      RevisionID
-	generation              Generation
-	fence                   Fence
-	authorityBindingsDigest Digest
-	plannedIDs              map[string]string
-	err                     *Error
+	requestDigest            Digest
+	payload                  operationJournalPayload
+	state                    operationJournalState
+	intentState              OperationIntentState
+	expectedRevisionID       RevisionID
+	generation               Generation
+	fence                    Fence
+	authorityBindingsDigest  Digest
+	plannedIDs               map[string]string
+	plannedRuntimeViewExpiry runtimeViewExpiryDecision
+	err                      *Error
+}
+
+type runtimeViewExpiryDecision struct {
+	policyID  ExpiryPolicyID
+	expiresAt Instant
 }
 
 func NewInMemoryPersistence() *InMemoryPersistence {
@@ -177,6 +209,17 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 	if now == nil {
 		now = func() Instant { return Instant(time.Now().UnixNano()) }
 	}
+	expiryPolicy := config.ExpiryPolicy
+	defaultExpiryLifetime := Duration(24 * time.Hour)
+	if expiryPolicy.ID == "" {
+		expiryPolicy.ID = "default-expiry-policy"
+	}
+	if expiryPolicy.MaterializationLifetime <= 0 {
+		expiryPolicy.MaterializationLifetime = defaultExpiryLifetime
+	}
+	if expiryPolicy.RuntimeViewLifetime <= 0 {
+		expiryPolicy.RuntimeViewLifetime = expiryPolicy.MaterializationLifetime
+	}
 	persistence := config.Persistence
 	if persistence == nil {
 		persistence = NewInMemoryPersistence()
@@ -193,6 +236,11 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 		beforeTerminal:          config.BeforeRuntimeViewTerminal,
 		faultHook:               config.FaultHook,
 		responseDelivery:        config.ResponseDelivery,
+		expiryPolicy:            expiryPolicy,
+		recoveryAuthorityID:     config.RecoveryAuthorityID,
+		recoveryIntents:         make(map[RecoveryIntentID]AuthorizedRecoveryIntent),
+		reconstructionInput:     config.ReconstructionInput,
+		expiryProtection:        config.ExpiryProtection,
 		sandboxLeaseAuthorities: make(map[SandboxLeaseID]SandboxLeaseAuthority),
 	}
 	leaseDuplicates := make(map[SandboxLeaseID]bool)
@@ -216,6 +264,27 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 			return authority, ok
 		}
 	}
+	recoveryDuplicates := make(map[RecoveryIntentID]bool)
+	for _, intent := range config.CurrentRecoveryIntents {
+		if !authorizedRecoveryIntentIsCanonical(intent) || intent.RecoveryAuthorityID != config.RecoveryAuthorityID {
+			continue
+		}
+		if _, exists := memory.recoveryIntents[intent.ID]; exists {
+			delete(memory.recoveryIntents, intent.ID)
+			recoveryDuplicates[intent.ID] = true
+			continue
+		}
+		if !recoveryDuplicates[intent.ID] {
+			memory.recoveryIntents[intent.ID] = cloneAuthorizedRecoveryIntent(intent)
+		}
+	}
+	memory.currentRecoveryIntent = config.CurrentRecoveryIntent
+	if memory.currentRecoveryIntent == nil {
+		memory.currentRecoveryIntent = func(id RecoveryIntentID) (AuthorizedRecoveryIntent, bool) {
+			intent, ok := memory.recoveryIntents[id]
+			return cloneAuthorizedRecoveryIntent(intent), ok
+		}
+	}
 	return memory
 }
 
@@ -234,10 +303,18 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 	if result, replayed, err := replayOperation[OpenRuntimeViewResult](m.operations, scope, request.Operation); replayed {
 		return result, err
 	}
-	if _, err := ensureOperationIntent(
-		m, scope, request.Operation, request, openRuntimeViewJournalSpec(), nil,
-	); err != nil {
+	var expiryDecision runtimeViewExpiryDecision
+	reserveExpiryDecision := func() {
+		expiryDecision = m.reserveRuntimeViewExpiryDecision(scope)
+	}
+	created, err := ensureOperationIntent(
+		m, scope, request.Operation, request, openRuntimeViewJournalSpec(), reserveExpiryDecision,
+	)
+	if err != nil {
 		return OpenRuntimeViewResult{}, err
+	}
+	if !created {
+		reserveExpiryDecision()
 	}
 	workspace, workspaceOK := m.workspaces[request.TaskID]
 	materialization, materializationOK := m.materializations[request.MaterializationID]
@@ -255,7 +332,7 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 		recordOperation(m.operations, scope, request.Operation, OpenRuntimeViewResult{}, err)
 		return OpenRuntimeViewResult{}, err
 	}
-	if !m.sandboxLeaseAuthorityMatches(request) || request.ExpiresAt <= m.now() {
+	if !m.sandboxLeaseAuthorityMatches(request) || request.ExpiresAt < expiryDecision.expiresAt || expiryDecision.expiresAt <= m.now() {
 		err := &Error{Code: ErrorStaleAuthority}
 		recordOperation(m.operations, scope, request.Operation, OpenRuntimeViewResult{}, err)
 		return OpenRuntimeViewResult{}, err
@@ -271,36 +348,44 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 	}
 	markOperationReconciliationRequired(m.operations, scope)
 	m.views[identity] = runtimeViewBinding{
-		policyDomainID:        request.PolicyDomainID,
-		taskID:                request.TaskID,
-		taskWorkspaceID:       request.TaskWorkspaceID,
-		materializationID:     request.MaterializationID,
-		baseRevisionID:        request.BaseRevisionID,
-		phaseRunID:            request.PhaseRunID,
-		runtimeRunID:          request.RuntimeRunID,
-		runtimeOperationID:    request.RuntimeOperationID,
-		sandboxLeaseAuthority: request.SandboxLeaseAuthority,
-		effectClass:           request.EffectClass,
-		expiresAt:             request.ExpiresAt,
-		generation:            request.Generation,
-		fence:                 request.Fence,
+		policyDomainID:         request.PolicyDomainID,
+		taskID:                 request.TaskID,
+		taskWorkspaceID:        request.TaskWorkspaceID,
+		materializationID:      request.MaterializationID,
+		baseRevisionID:         request.BaseRevisionID,
+		phaseRunID:             request.PhaseRunID,
+		runtimeRunID:           request.RuntimeRunID,
+		runtimeOperationID:     request.RuntimeOperationID,
+		sandboxLeaseAuthority:  request.SandboxLeaseAuthority,
+		effectClass:            request.EffectClass,
+		expiresAt:              expiryDecision.expiresAt,
+		expiryPolicyID:         expiryDecision.policyID,
+		generation:             request.Generation,
+		fence:                  request.Fence,
+		readOnlyInputs:         cloneReadOnlyInputMaterializations(materialization.readOnlyInputs),
+		artifactVersionID:      materialization.artifactVersionID,
+		artifactManifestDigest: materialization.artifactManifestDigest,
+		reconstructionEvidence: materialization.reconstructionEvidence,
+		publicationAuthorityID: materialization.publicationAuthorityID,
 	}
 	result := OpenRuntimeViewResult{
-		PolicyDomainID:        request.PolicyDomainID,
-		TaskID:                request.TaskID,
-		RuntimeViewID:         identity,
-		TaskWorkspaceID:       request.TaskWorkspaceID,
-		MaterializationID:     request.MaterializationID,
-		BaseRevisionID:        request.BaseRevisionID,
-		PhaseRunID:            request.PhaseRunID,
-		RuntimeRunID:          request.RuntimeRunID,
-		RuntimeOperationID:    request.RuntimeOperationID,
-		SandboxLeaseAuthority: request.SandboxLeaseAuthority,
-		EffectClass:           request.EffectClass,
-		ExpiresAt:             request.ExpiresAt,
-		Generation:            request.Generation,
-		Fence:                 request.Fence,
-		Operation:             request.Operation,
+		PolicyDomainID:          request.PolicyDomainID,
+		TaskID:                  request.TaskID,
+		RuntimeViewID:           identity,
+		TaskWorkspaceID:         request.TaskWorkspaceID,
+		MaterializationID:       request.MaterializationID,
+		BaseRevisionID:          request.BaseRevisionID,
+		PhaseRunID:              request.PhaseRunID,
+		RuntimeRunID:            request.RuntimeRunID,
+		RuntimeOperationID:      request.RuntimeOperationID,
+		SandboxLeaseAuthority:   request.SandboxLeaseAuthority,
+		EffectClass:             request.EffectClass,
+		ExpiresAt:               expiryDecision.expiresAt,
+		Generation:              request.Generation,
+		Fence:                   request.Fence,
+		ReadOnlyInputs:          cloneReadOnlyInputMaterializations(materialization.readOnlyInputs),
+		SourceArtifactVersionID: materialization.artifactVersionID,
+		Operation:               request.Operation,
 	}
 	if err := m.injectFaultEvent(FaultEvent{
 		Point:       FaultAfterRuntimeViewCreation,
@@ -384,6 +469,9 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 	}
 	if view.baseRevisionID != request.BaseRevisionID || view.generation != request.Generation || view.fence != request.Fence ||
 		view.runtimeOperationID != request.RuntimeOperationID || view.sandboxLeaseAuthority != request.SandboxLeaseAuthority {
+		return fail(ErrorStaleAuthority)
+	}
+	if view.expired {
 		return fail(ErrorStaleAuthority)
 	}
 	if view.terminalDecision != runtimeViewNonTerminal {
@@ -549,6 +637,30 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 	m.recordDurableEvidenceIdentities(verifiedCheckpointContent(checkpointEvidence))
 	view.terminalDecision = runtimeViewCommitted
 	m.views[request.RuntimeViewID] = view
+	validatedExportEvidence := ValidatedExportEvidence{}
+	if view.artifactVersionID != "" {
+		validatedExportEvidence = ValidatedExportEvidence{
+			ID:                           ValidatedExportEvidenceID(m.operationOpaqueID(scope, "validated-export", "validated-export-evidence")),
+			PublicationAuthorityID:       view.publicationAuthorityID,
+			PolicyDomainID:               request.PolicyDomainID,
+			TaskID:                       request.TaskID,
+			TaskWorkspaceID:              request.TaskWorkspaceID,
+			SourceArtifactVersionID:      view.artifactVersionID,
+			ReconstructionEvidenceID:     view.reconstructionEvidence.ID,
+			ReconstructionEvidenceDigest: view.reconstructionEvidence.Digest,
+			RevisionID:                   resultingRevision,
+			CheckpointID:                 checkpointID,
+			ManifestDigest:               trustedRequest.DeclaredStateManifest.Digest,
+			ValidationEvidenceID:         request.ValidationEvidence.ID,
+			ValidationEvidenceDigest:     request.ValidationEvidence.Digest,
+			ContentEvidenceRoot:          contentRoot,
+			DurabilityEvidenceRoot:       durabilityRoot,
+			Generation:                   request.Generation,
+			Fence:                        workspace.fence,
+			OperationID:                  request.Operation.ID,
+		}
+		validatedExportEvidence.Digest = validatedExportEvidence.CanonicalDigest()
+	}
 
 	result := CommitRuntimeViewResult{
 		TaskWorkspaceID:          request.TaskWorkspaceID,
@@ -562,6 +674,7 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		ContentEvidenceRoot:      contentRoot,
 		DurabilityEvidenceRoot:   durabilityRoot,
 		CheckpointEvidence:       checkpointEvidence,
+		ValidatedExportEvidence:  validatedExportEvidence,
 		Generation:               request.Generation,
 		PreviousFence:            request.Fence,
 		Fence:                    workspace.fence,
@@ -1328,6 +1441,8 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 		checkpointID:    request.CheckpointID,
 		generation:      request.Generation,
 		fence:           request.Fence,
+		expiryPolicyID:  m.expiryPolicy.ID,
+		expiresAt:       m.now() + Instant(m.expiryPolicy.MaterializationLifetime),
 	}
 	result := MaterializeResult{
 		MaterializationID:      identity,
