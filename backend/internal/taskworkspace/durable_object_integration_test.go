@@ -30,11 +30,7 @@ func TestOrphanObservationCannotBecomeCheckpointOrRepairAuthority(t *testing.T) 
 		contentDigest, _ := declaredContentFacts("content-1")
 		durable.removeSource(contentDigest)
 		durable.observeOrphan([]byte("task-owned-state-one"))
-		lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-			ValidationAuthorityID: "validation-authority-1",
-			DurabilityAuthorityID: "durability-authority-1",
-			DurableObject:         durable,
-		})
+		lifecycle := newLifecycleWithDurableObject(durable)
 		confirmed, view := openRuntimeViewWithLifecycle(
 			t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 		)
@@ -55,11 +51,7 @@ func TestOrphanObservationCannotBecomeCheckpointOrRepairAuthority(t *testing.T) 
 
 	t.Run("repair", func(t *testing.T) {
 		durable := newIntegrityDurableObjectDouble()
-		lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-			ValidationAuthorityID: "validation-authority-1",
-			DurabilityAuthorityID: "durability-authority-1",
-			DurableObject:         durable,
-		})
+		lifecycle := newLifecycleWithDurableObject(durable)
 		_, committed := commitTaskContent(t, lifecycle, "policy-domain-1", "task-1", "one")
 		member := committed.CheckpointEvidence.ContentReferences[0]
 		durable.damage(member.ContentID, []byte("corrupt-state"))
@@ -108,11 +100,7 @@ func newIntegrityDurableObjectDouble() *integrityDurableObjectDouble {
 
 func TestExactRepairPreservesCheckpointContentAndPolicyFacts(t *testing.T) {
 	durable := newIntegrityDurableObjectDouble()
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	_, committed := commitTaskContent(t, lifecycle, "policy-domain-1", "task-1", "one")
 	original := committed.CheckpointEvidence
 	member := original.ContentReferences[0]
@@ -149,11 +137,7 @@ func TestExactRepairPreservesCheckpointContentAndPolicyFacts(t *testing.T) {
 
 func TestCommitRejectsReceiptFromSupersededGenerationOfSharedContent(t *testing.T) {
 	durable := newIntegrityDurableObjectDouble()
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	_, first := commitTaskContent(t, lifecycle, "policy-domain-1", "task-1", "one")
 	member := first.CheckpointEvidence.ContentReferences[0]
 	staleReceipt := first.CheckpointEvidence.DurabilityReceipts[1]
@@ -199,11 +183,7 @@ func TestCommitRejectsReceiptFromSupersededGenerationOfSharedContent(t *testing.
 
 func TestDifferentByteRepairIsRejectedWithoutRewritingAuthoritativeFacts(t *testing.T) {
 	durable := newIntegrityDurableObjectDouble()
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	_, committed := commitTaskContent(t, lifecycle, "policy-domain-1", "task-1", "one")
 	original := committed.CheckpointEvidence
 	member := original.ContentReferences[0]
@@ -485,11 +465,7 @@ func digestBytes(payload []byte) taskworkspace.Digest {
 
 func TestEqualVerifiedPayloadDeduplicatesOnlyInsideOnePolicyDomain(t *testing.T) {
 	durable := newIntegrityDurableObjectDouble()
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 
 	firstWorkspace, first := commitTaskContent(
 		t, lifecycle, "policy-domain-1", "task-1", "one",
@@ -522,11 +498,7 @@ func TestEqualVerifiedPayloadDeduplicatesOnlyInsideOnePolicyDomain(t *testing.T)
 
 func TestCommitRejectsCorruptedDeduplicatedPayload(t *testing.T) {
 	durable := newIntegrityDurableObjectDouble()
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	_, first := commitTaskContent(t, lifecycle, "policy-domain-1", "task-1", "one")
 	durable.damage(first.CheckpointEvidence.ContentReferences[0].ContentID, []byte("corrupt-state"))
 	_, request := taskContentCommitRequest(t, lifecycle, "policy-domain-1", "task-2", "two")
@@ -543,11 +515,7 @@ func TestCommitRejectsCorruptedDeduplicatedPayload(t *testing.T) {
 
 func TestCommitUsesExactRepairReceiptForCorruptedDeduplicatedPayload(t *testing.T) {
 	durable := newIntegrityDurableObjectDouble()
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	_, first := commitTaskContent(t, lifecycle, "policy-domain-1", "task-1", "one")
 	firstMember := first.CheckpointEvidence.ContentReferences[0]
 	firstReceipt := durabilityReceiptForContent(t, first.CheckpointEvidence, firstMember.ContentID)
@@ -632,19 +600,21 @@ func taskContentCommitRequest(
 	}
 	manifest := declaredStateManifest("content-1")
 	validation := taskworkspace.ValidationEvidence{
-		ID:                    taskworkspace.EvidenceID("validation-evidence-" + suffix),
-		ValidationAuthorityID: "validation-authority-1",
-		PolicyDomainID:        taskworkspace.PolicyDomainID(policyDomainID),
-		TaskID:                taskworkspace.TaskID(taskID),
-		TaskWorkspaceID:       confirmed.TaskWorkspaceID,
-		RuntimeViewID:         view.RuntimeViewID,
-		BaseRevisionID:        confirmed.CurrentRevisionID,
-		PhaseRunID:            view.PhaseRunID,
-		RuntimeRunID:          view.RuntimeRunID,
-		ManifestDigest:        manifest.Digest,
-		Generation:            confirmed.Generation,
-		Fence:                 confirmed.Fence,
-		Decision:              taskworkspace.ValidationAccepted,
+		ID:                          taskworkspace.EvidenceID("validation-evidence-" + suffix),
+		ValidationAuthorityID:       "validation-authority-1",
+		PolicyDomainID:              taskworkspace.PolicyDomainID(policyDomainID),
+		TaskID:                      taskworkspace.TaskID(taskID),
+		TaskWorkspaceID:             confirmed.TaskWorkspaceID,
+		RuntimeViewID:               view.RuntimeViewID,
+		BaseRevisionID:              confirmed.CurrentRevisionID,
+		PhaseRunID:                  view.PhaseRunID,
+		RuntimeRunID:                view.RuntimeRunID,
+		RuntimeOperationID:          view.RuntimeOperationID,
+		SandboxLeaseAuthorityDigest: view.SandboxLeaseAuthority.Digest,
+		ManifestDigest:              manifest.Digest,
+		Generation:                  confirmed.Generation,
+		Fence:                       confirmed.Fence,
+		Decision:                    taskworkspace.ValidationAccepted,
 	}
 	validation.Digest = validation.CanonicalDigest()
 	request := taskworkspace.CommitRuntimeViewRequest{
@@ -652,6 +622,8 @@ func taskContentCommitRequest(
 		TaskID:                  taskworkspace.TaskID(taskID),
 		TaskWorkspaceID:         confirmed.TaskWorkspaceID,
 		RuntimeViewID:           view.RuntimeViewID,
+		RuntimeOperationID:      view.RuntimeOperationID,
+		SandboxLeaseAuthority:   view.SandboxLeaseAuthority,
 		BaseRevisionID:          confirmed.CurrentRevisionID,
 		ExpectedCurrentRevision: confirmed.CurrentRevisionID,
 		Generation:              confirmed.Generation,

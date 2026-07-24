@@ -203,6 +203,32 @@ func TestOpenRuntimeViewIsolatesMutatingRuntimeRuns(t *testing.T) {
 	}
 }
 
+func TestOpenRuntimeViewBindsRuntimeAuthorityEffectAndExpiry(t *testing.T) {
+	lifecycle, confirmed, materialized := materializedTask(t)
+	request := openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-1",
+	)
+
+	view, err := lifecycle.OpenRuntimeView(context.Background(), request)
+	if err != nil {
+		t.Fatalf("open Runtime View: %v", err)
+	}
+
+	if view.PolicyDomainID != request.PolicyDomainID || view.TaskID != request.TaskID ||
+		view.TaskWorkspaceID != request.TaskWorkspaceID || view.MaterializationID != request.MaterializationID ||
+		view.BaseRevisionID != request.BaseRevisionID || view.PhaseRunID != request.PhaseRunID ||
+		view.RuntimeRunID != request.RuntimeRunID || view.RuntimeOperationID != request.RuntimeOperationID ||
+		view.SandboxLeaseAuthority != request.SandboxLeaseAuthority ||
+		view.SandboxLeaseAuthority.EvidenceID == "" ||
+		view.EffectClass != taskworkspace.RuntimeViewMutating ||
+		view.ExpiresAt != request.ExpiresAt ||
+		view.Generation != confirmed.Generation || view.Fence != confirmed.Fence ||
+		view.Operation != request.Operation {
+		t.Fatal("Runtime View omitted an exact runtime, lease, effect, expiry, generation, or fence binding")
+	}
+}
+
 func TestOpenRuntimeViewExactReplayDoesNotCreateAnotherView(t *testing.T) {
 	lifecycle, confirmed, materialized := materializedTask(t)
 	request := openRuntimeViewRequest(
@@ -256,13 +282,356 @@ func TestCommitValidatedRuntimeViewProducesRevisionAndCheckpoint(t *testing.T) {
 		committed.ValidationEvidenceID != evidence.ID ||
 		committed.ValidationEvidenceDigest != evidence.Digest ||
 		committed.ContentEvidenceRoot == "" || committed.DurabilityEvidenceRoot == "" ||
-		committed.Generation != confirmed.Generation || committed.Fence != confirmed.Fence {
+		committed.Generation != confirmed.Generation || committed.PreviousFence != confirmed.Fence ||
+		committed.Fence <= committed.PreviousFence {
 		t.Fatal("commit result omitted required lineage, manifest, evidence, generation, or fence bindings")
 	}
 	if committed.Operation.ID != request.Operation.ID ||
 		committed.Operation.RequestDigest != request.Operation.RequestDigest {
 		t.Fatal("commit result omitted the OperationID or canonical request digest")
 	}
+	current, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-after-commit",
+	))
+	if err != nil {
+		t.Fatalf("confirm Task Workspace after commit: %v", err)
+	}
+	if committed.Fence != current.Fence || committed.RevisionID != current.CurrentRevisionID {
+		t.Fatal("commit result did not return the current authoritative Revision and fence")
+	}
+}
+
+func TestReadOnlyRuntimeViewCannotCommitOrAdvanceRevision(t *testing.T) {
+	lifecycle, confirmed, materialized := materializedTask(t)
+	openRequest := openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-1", "runtime-run-read-only", "sandbox-lease-read-only", "open-view-1",
+	)
+	openRequest.EffectClass = taskworkspace.RuntimeViewReadOnly
+	openRequest.Operation.RequestDigest = openRequest.CanonicalRequestDigest()
+	view, err := lifecycle.OpenRuntimeView(context.Background(), openRequest)
+	if err != nil {
+		t.Fatalf("open read-only Runtime View: %v", err)
+	}
+	manifest := declaredStateManifest("content-1")
+	evidence := acceptedValidationEvidence(confirmed, view, manifest)
+
+	result, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest(
+		confirmed, view, manifest, evidence, "commit-read-only",
+	))
+	var lifecycleError *taskworkspace.Error
+	if !errors.As(err, &lifecycleError) || lifecycleError.Code != taskworkspace.ErrorEffectDenied {
+		t.Fatalf("read-only commit error = %T/%v, want typed effect denial", err, err)
+	}
+	if result.RevisionID != "" || result.CheckpointID != "" {
+		t.Fatal("read-only Runtime View returned authoritative mutation identities")
+	}
+
+	current, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-after-read-only",
+	))
+	if err != nil {
+		t.Fatalf("confirm Task Workspace after rejected read-only commit: %v", err)
+	}
+	if current.CurrentRevisionID != confirmed.CurrentRevisionID {
+		t.Fatal("read-only Runtime View advanced the authoritative Revision")
+	}
+}
+
+func TestDiscardDoesNotAdvanceRevisionOrAffectAnotherRuntimeView(t *testing.T) {
+	lifecycle, confirmed, materialized := materializedTask(t)
+	firstView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-1",
+	))
+	if err != nil {
+		t.Fatalf("open first Runtime View: %v", err)
+	}
+	secondView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-2", "runtime-run-2", "sandbox-lease-3", "open-view-2",
+	))
+	if err != nil {
+		t.Fatalf("open second Runtime View: %v", err)
+	}
+
+	discarded, err := lifecycle.DiscardRuntimeView(context.Background(), discardRequest(
+		confirmed, firstView, taskworkspace.RuntimeViewValidationRejected, "discard-view-1",
+	))
+	if err != nil {
+		t.Fatalf("discard first Runtime View: %v", err)
+	}
+	if discarded.CurrentRevisionID != confirmed.CurrentRevisionID ||
+		discarded.RuntimeViewID != firstView.RuntimeViewID {
+		t.Fatal("discard changed authoritative Revision or returned the wrong Runtime View")
+	}
+
+	current, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-after-discard",
+	))
+	if err != nil {
+		t.Fatalf("confirm Task Workspace after discard: %v", err)
+	}
+	if current.CurrentRevisionID != confirmed.CurrentRevisionID {
+		t.Fatal("discard advanced the authoritative Revision")
+	}
+
+	manifest := declaredStateManifest("content-1")
+	evidence := acceptedValidationEvidence(confirmed, secondView, manifest)
+	if _, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest(
+		confirmed, secondView, manifest, evidence, "commit-view-2",
+	)); err != nil {
+		t.Fatalf("commit unaffected Runtime View: %v", err)
+	}
+}
+
+func TestRuntimeFailureCanDiscardAfterSandboxLeaseExpiry(t *testing.T) {
+	now := taskworkspace.Instant(100)
+	lifecycle := newLifecycleWithHarness(func() taskworkspace.Instant { return now }, nil)
+	confirmed, materialized := materializedTaskUsing(t, lifecycle)
+	view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-1",
+	))
+	if err != nil {
+		t.Fatalf("open Runtime View: %v", err)
+	}
+	now = 301
+
+	if _, err := lifecycle.DiscardRuntimeView(context.Background(), discardRequest(
+		confirmed, view, taskworkspace.RuntimeViewRuntimeFailed, "discard-expired-view",
+	)); err != nil {
+		t.Fatalf("discard Runtime-failed view after lease expiry: %v", err)
+	}
+}
+
+func TestCommitAndDiscardUseOneFirstWriterWinsTerminalDecision(t *testing.T) {
+	t.Run("discard linearizes before commit", func(t *testing.T) {
+		commitReached := make(chan struct{}, 1)
+		releaseCommit := make(chan struct{})
+		lifecycle := newLifecycleWithTerminalHook(func(attempt taskworkspace.RuntimeViewTerminalAttempt) {
+			if attempt.OperationID == "commit-1" {
+				commitReached <- struct{}{}
+				<-releaseCommit
+			}
+		})
+		confirmed, materialized := materializedTaskUsing(t, lifecycle)
+		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+			"policy-domain-1", "task-1", confirmed, materialized,
+			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-1",
+		))
+		if err != nil {
+			t.Fatalf("open Runtime View: %v", err)
+		}
+		manifest := declaredStateManifest("content-1")
+		commit := commitRequest(confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest), "commit-1")
+		commitDone := make(chan error, 1)
+		go func() {
+			_, commitErr := lifecycle.CommitRuntimeView(context.Background(), commit)
+			commitDone <- commitErr
+		}()
+		<-commitReached
+
+		discard := discardRequest(confirmed, view, taskworkspace.RuntimeViewValidationRejected, "discard-1")
+		first, err := lifecycle.DiscardRuntimeView(context.Background(), discard)
+		if err != nil {
+			t.Fatalf("discard Runtime View: %v", err)
+		}
+		close(releaseCommit)
+		assertLifecycleErrorCode(t, <-commitDone, taskworkspace.ErrorViewTerminalConflict)
+
+		replayed, err := lifecycle.DiscardRuntimeView(context.Background(), discard)
+		if err != nil {
+			t.Fatalf("replay discard: %v", err)
+		}
+		if !reflect.DeepEqual(replayed, first) {
+			t.Fatal("discard exact replay did not return its original terminal result")
+		}
+	})
+
+	t.Run("commit linearizes before discard", func(t *testing.T) {
+		discardReached := make(chan struct{}, 1)
+		releaseDiscard := make(chan struct{})
+		lifecycle := newLifecycleWithTerminalHook(func(attempt taskworkspace.RuntimeViewTerminalAttempt) {
+			if attempt.OperationID == "discard-1" {
+				discardReached <- struct{}{}
+				<-releaseDiscard
+			}
+		})
+		confirmed, materialized := materializedTaskUsing(t, lifecycle)
+		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+			"policy-domain-1", "task-1", confirmed, materialized,
+			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-1",
+		))
+		if err != nil {
+			t.Fatalf("open Runtime View: %v", err)
+		}
+		discard := discardRequest(confirmed, view, taskworkspace.RuntimeViewRuntimeFailed, "discard-1")
+		discardDone := make(chan error, 1)
+		go func() {
+			_, discardErr := lifecycle.DiscardRuntimeView(context.Background(), discard)
+			discardDone <- discardErr
+		}()
+		<-discardReached
+
+		manifest := declaredStateManifest("content-1")
+		commit := commitRequest(confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest), "commit-1")
+		first, err := lifecycle.CommitRuntimeView(context.Background(), commit)
+		if err != nil {
+			t.Fatalf("commit Runtime View: %v", err)
+		}
+		close(releaseDiscard)
+		assertLifecycleErrorCode(t, <-discardDone, taskworkspace.ErrorViewTerminalConflict)
+
+		replayed, err := lifecycle.CommitRuntimeView(context.Background(), commit)
+		if err != nil {
+			t.Fatalf("replay commit: %v", err)
+		}
+		if !reflect.DeepEqual(replayed, first) {
+			t.Fatal("commit exact replay did not return its original terminal result")
+		}
+	})
+}
+
+func TestConcurrentUnchangedMutatingViewsHaveOneAuthoritativeWinner(t *testing.T) {
+	firstReached := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	lifecycle := newLifecycleWithTerminalHook(func(attempt taskworkspace.RuntimeViewTerminalAttempt) {
+		if attempt.OperationID == "commit-1" {
+			firstReached <- struct{}{}
+			<-releaseFirst
+		}
+	})
+	confirmed, materialized := materializedTaskUsing(t, lifecycle)
+	firstView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-1",
+	))
+	if err != nil {
+		t.Fatalf("open first Runtime View: %v", err)
+	}
+	secondView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+		"policy-domain-1", "task-1", confirmed, materialized,
+		"phase-run-2", "runtime-run-2", "sandbox-lease-3", "open-view-2",
+	))
+	if err != nil {
+		t.Fatalf("open second Runtime View: %v", err)
+	}
+	emptyManifest := taskworkspace.DeclaredStateManifest{}
+	emptyManifest.Digest = emptyManifest.CanonicalDigest()
+	firstEvidence := acceptedValidationEvidence(confirmed, firstView, emptyManifest)
+	secondEvidence := acceptedValidationEvidence(confirmed, secondView, emptyManifest)
+	secondEvidence.ID = "validation-evidence-2"
+	secondEvidence.Digest = secondEvidence.CanonicalDigest()
+	firstCommit := commitRequest(confirmed, firstView, emptyManifest, firstEvidence, "commit-1")
+	secondCommit := commitRequest(confirmed, secondView, emptyManifest, secondEvidence, "commit-2")
+	firstDone := make(chan error, 1)
+	go func() {
+		_, commitErr := lifecycle.CommitRuntimeView(context.Background(), firstCommit)
+		firstDone <- commitErr
+	}()
+	<-firstReached
+
+	winner, err := lifecycle.CommitRuntimeView(context.Background(), secondCommit)
+	if err != nil {
+		t.Fatalf("commit winning Runtime View: %v", err)
+	}
+	close(releaseFirst)
+	assertLifecycleErrorCode(t, <-firstDone, taskworkspace.ErrorStaleAuthority)
+	if winner.RevisionID != confirmed.CurrentRevisionID || winner.CheckpointID == "" {
+		t.Fatal("unchanged winner did not preserve Revision while creating its one Checkpoint")
+	}
+}
+
+func TestCommitAndCancellationFenceOrderAtOneTerminalLinearization(t *testing.T) {
+	t.Run("cancellation fence linearizes before commit", func(t *testing.T) {
+		commitReached := make(chan struct{}, 1)
+		releaseCommit := make(chan struct{})
+		lifecycle := newLifecycleWithTerminalHook(func(attempt taskworkspace.RuntimeViewTerminalAttempt) {
+			if attempt.OperationID == "commit-1" {
+				commitReached <- struct{}{}
+				<-releaseCommit
+			}
+		})
+		confirmed, materialized := materializedTaskUsing(t, lifecycle)
+		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+			"policy-domain-1", "task-1", confirmed, materialized,
+			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-1",
+		))
+		if err != nil {
+			t.Fatalf("open Runtime View: %v", err)
+		}
+		manifest := declaredStateManifest("content-1")
+		commit := commitRequest(confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest), "commit-1")
+		commitDone := make(chan error, 1)
+		go func() {
+			_, commitErr := lifecycle.CommitRuntimeView(context.Background(), commit)
+			commitDone <- commitErr
+		}()
+		<-commitReached
+
+		fence := fenceRequest(confirmed, view, taskworkspace.RuntimeViewCancelled, "fence-1")
+		fenced, err := lifecycle.FenceRuntimeView(context.Background(), fence)
+		if err != nil {
+			t.Fatalf("fence cancelled Runtime View: %v", err)
+		}
+		if fenced.Fence <= confirmed.Fence || fenced.Generation != confirmed.Generation {
+			t.Fatal("cancellation did not advance the fence while preserving generation")
+		}
+		close(releaseCommit)
+		assertLifecycleErrorCode(t, <-commitDone, taskworkspace.ErrorStaleAuthority)
+
+		replayed, err := lifecycle.FenceRuntimeView(context.Background(), fence)
+		if err != nil {
+			t.Fatalf("replay cancellation fence: %v", err)
+		}
+		if replayed != fenced {
+			t.Fatal("fence exact replay did not return its original terminal result")
+		}
+	})
+
+	t.Run("commit linearizes before cancellation fence", func(t *testing.T) {
+		fenceReached := make(chan struct{}, 1)
+		releaseFence := make(chan struct{})
+		lifecycle := newLifecycleWithTerminalHook(func(attempt taskworkspace.RuntimeViewTerminalAttempt) {
+			if attempt.OperationID == "fence-1" {
+				fenceReached <- struct{}{}
+				<-releaseFence
+			}
+		})
+		confirmed, materialized := materializedTaskUsing(t, lifecycle)
+		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+			"policy-domain-1", "task-1", confirmed, materialized,
+			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-view-1",
+		))
+		if err != nil {
+			t.Fatalf("open Runtime View: %v", err)
+		}
+		fence := fenceRequest(confirmed, view, taskworkspace.RuntimeViewCancelled, "fence-1")
+		fenceDone := make(chan error, 1)
+		go func() {
+			_, fenceErr := lifecycle.FenceRuntimeView(context.Background(), fence)
+			fenceDone <- fenceErr
+		}()
+		<-fenceReached
+
+		manifest := declaredStateManifest("content-1")
+		commit := commitRequest(confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest), "commit-1")
+		committed, err := lifecycle.CommitRuntimeView(context.Background(), commit)
+		if err != nil {
+			t.Fatalf("commit Runtime View: %v", err)
+		}
+		close(releaseFence)
+		assertLifecycleErrorCode(t, <-fenceDone, taskworkspace.ErrorViewTerminalConflict)
+
+		replayed, err := lifecycle.CommitRuntimeView(context.Background(), commit)
+		if err != nil {
+			t.Fatalf("replay commit after cancellation race: %v", err)
+		}
+		if !reflect.DeepEqual(replayed, committed) {
+			t.Fatal("pre-fence commit exact replay did not return its existing success")
+		}
+	})
 }
 
 func TestCommitExactReplayReturnsTheOriginalTerminalResult(t *testing.T) {
@@ -295,7 +664,7 @@ func TestCommitAllowsOnlyOneWriterFromTheSameBaseRevision(t *testing.T) {
 	}
 	secondView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
 		"policy-domain-1", "task-1", confirmed, materialized,
-		"phase-run-2", "runtime-run-2", "sandbox-lease-2", "open-view-2",
+		"phase-run-2", "runtime-run-2", "sandbox-lease-3", "open-view-2",
 	))
 	if err != nil {
 		t.Fatalf("open second Runtime View: %v", err)
@@ -371,7 +740,7 @@ func TestUnchangedContentCommitCreatesADistinctCheckpoint(t *testing.T) {
 	}
 	secondView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
 		"policy-domain-1", "task-1", current, materialized,
-		"phase-run-2", "runtime-run-2", "sandbox-lease-2", "open-view-2",
+		"phase-run-2", "runtime-run-2", "sandbox-lease-3", "open-view-2",
 	))
 	if err != nil {
 		t.Fatalf("open second Runtime View: %v", err)
@@ -544,6 +913,7 @@ func TestPublicLifecycleContractAndErrorsDoNotExposePhysicalDetails(t *testing.T
 		"path",
 		"session",
 		"mount",
+		"locator",
 		"objectlocator",
 		"objectkey",
 		"bucket",
@@ -614,6 +984,7 @@ func TestPublicLifecycleContractAndErrorsDoNotExposePhysicalDetails(t *testing.T
 		taskworkspace.ErrorOwnershipDenied,
 		taskworkspace.ErrorStaleAuthority,
 		taskworkspace.ErrorViewTerminalConflict,
+		taskworkspace.ErrorEffectDenied,
 	} {
 		message := (&taskworkspace.Error{Code: code}).Error()
 		for _, term := range banned {
@@ -674,6 +1045,15 @@ func materializedTask(t *testing.T) (
 ) {
 	t.Helper()
 	lifecycle := newLifecycle()
+	confirmed, materialized := materializedTaskUsing(t, lifecycle)
+	return lifecycle, confirmed, materialized
+}
+
+func materializedTaskUsing(
+	t *testing.T,
+	lifecycle taskworkspace.Lifecycle,
+) (taskworkspace.ConfirmTaskWorkspaceResult, taskworkspace.MaterializeResult) {
+	t.Helper()
 	confirmed, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
 		"policy-domain-1", "task-1", "confirm-1",
 	))
@@ -686,7 +1066,7 @@ func materializedTask(t *testing.T) (
 	if err != nil {
 		t.Fatalf("materialize Task Workspace: %v", err)
 	}
-	return lifecycle, confirmed, materialized
+	return confirmed, materialized
 }
 
 func openRuntimeViewRequest(
@@ -696,16 +1076,21 @@ func openRuntimeViewRequest(
 	phaseRunID, runtimeRunID, sandboxLeaseID, operationID string,
 ) taskworkspace.OpenRuntimeViewRequest {
 	request := taskworkspace.OpenRuntimeViewRequest{
-		PolicyDomainID:    taskworkspace.PolicyDomainID(policyDomainID),
-		TaskID:            taskworkspace.TaskID(taskID),
-		TaskWorkspaceID:   confirmed.TaskWorkspaceID,
-		MaterializationID: materialized.MaterializationID,
-		BaseRevisionID:    confirmed.CurrentRevisionID,
-		PhaseRunID:        taskworkspace.PhaseRunID(phaseRunID),
-		RuntimeRunID:      taskworkspace.RuntimeRunID(runtimeRunID),
-		SandboxLeaseID:    taskworkspace.SandboxLeaseID(sandboxLeaseID),
-		Generation:        confirmed.Generation,
-		Fence:             confirmed.Fence,
+		PolicyDomainID:     taskworkspace.PolicyDomainID(policyDomainID),
+		TaskID:             taskworkspace.TaskID(taskID),
+		TaskWorkspaceID:    confirmed.TaskWorkspaceID,
+		MaterializationID:  materialized.MaterializationID,
+		BaseRevisionID:     confirmed.CurrentRevisionID,
+		PhaseRunID:         taskworkspace.PhaseRunID(phaseRunID),
+		RuntimeRunID:       taskworkspace.RuntimeRunID(runtimeRunID),
+		RuntimeOperationID: taskworkspace.OperationID("runtime-operation-" + runtimeRunID),
+		SandboxLeaseAuthority: sandboxLeaseAuthority(
+			policyDomainID, taskID, phaseRunID, runtimeRunID, sandboxLeaseID,
+		),
+		EffectClass: taskworkspace.RuntimeViewMutating,
+		ExpiresAt:   200,
+		Generation:  confirmed.Generation,
+		Fence:       confirmed.Fence,
 		Operation: taskworkspace.Operation{
 			ID: taskworkspace.OperationID(operationID),
 		},
@@ -762,11 +1147,79 @@ func declaredContentFacts(contentID string) (taskworkspace.Digest, uint64) {
 }
 
 func newLifecycle() taskworkspace.Lifecycle {
-	return taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         &happyDurableObject{},
-	})
+	return newLifecycleWithTerminalHook(nil)
+}
+
+func newLifecycleWithTerminalHook(hook func(taskworkspace.RuntimeViewTerminalAttempt)) taskworkspace.Lifecycle {
+	return newLifecycleWithHarness(func() taskworkspace.Instant { return 100 }, hook)
+}
+
+func newLifecycleWithHarness(
+	now func() taskworkspace.Instant,
+	hook func(taskworkspace.RuntimeViewTerminalAttempt),
+) taskworkspace.Lifecycle {
+	config := taskworkspaceTestConfig(&happyDurableObject{})
+	config.Now = now
+	config.BeforeRuntimeViewTerminal = hook
+	return taskworkspace.NewInMemory(config)
+}
+
+func newLifecycleWithDurableObject(durable taskworkspace.DurableObjectPort) taskworkspace.Lifecycle {
+	return taskworkspace.NewInMemory(taskworkspaceTestConfig(durable))
+}
+
+func taskworkspaceTestConfig(durable taskworkspace.DurableObjectPort) taskworkspace.InMemoryConfig {
+	return taskworkspace.InMemoryConfig{
+		ValidationAuthorityID:   "validation-authority-1",
+		DurabilityAuthorityID:   "durability-authority-1",
+		DurableObject:           durable,
+		SandboxLeaseAuthorityID: "sandbox-lease-authority-1",
+		Now:                     func() taskworkspace.Instant { return 100 },
+		CurrentSandboxLeaseAuthorities: []taskworkspace.SandboxLeaseAuthority{
+			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-1", "runtime-run-1", "sandbox-lease-1"),
+			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-1", "runtime-run-2", "sandbox-lease-2"),
+			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-2", "runtime-run-2", "sandbox-lease-3"),
+			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-1", "runtime-run-read-only", "sandbox-lease-read-only"),
+			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-1", "runtime-run-1", "sandbox-lease-task-1"),
+			sandboxLeaseAuthority("policy-domain-1", "task-2", "phase-run-1", "runtime-run-1", "sandbox-lease-task-2"),
+			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-one", "runtime-run-one", "sandbox-lease-one"),
+			sandboxLeaseAuthority("policy-domain-1", "task-2", "phase-run-two", "runtime-run-two", "sandbox-lease-two"),
+			sandboxLeaseAuthority("policy-domain-2", "task-3", "phase-run-three", "runtime-run-three", "sandbox-lease-three"),
+		},
+	}
+}
+
+func assertLifecycleErrorCode(t *testing.T, err error, code taskworkspace.ErrorCode) {
+	t.Helper()
+	var lifecycleError *taskworkspace.Error
+	if !errors.As(err, &lifecycleError) || lifecycleError.Code != code {
+		t.Fatalf("lifecycle error = %T/%v, want code %q", err, err, code)
+	}
+}
+
+func sandboxLeaseAuthority(
+	policyDomainID, taskID, phaseRunID, runtimeRunID, sandboxLeaseID string,
+) taskworkspace.SandboxLeaseAuthority {
+	effectClass := taskworkspace.RuntimeViewMutating
+	if sandboxLeaseID == "sandbox-lease-read-only" {
+		effectClass = taskworkspace.RuntimeViewReadOnly
+	}
+	authority := taskworkspace.SandboxLeaseAuthority{
+		ID:                 taskworkspace.SandboxLeaseID(sandboxLeaseID),
+		EvidenceID:         taskworkspace.EvidenceID("lease-evidence-" + sandboxLeaseID),
+		AuthorityID:        "sandbox-lease-authority-1",
+		PolicyDomainID:     taskworkspace.PolicyDomainID(policyDomainID),
+		TaskID:             taskworkspace.TaskID(taskID),
+		PhaseRunID:         taskworkspace.PhaseRunID(phaseRunID),
+		RuntimeRunID:       taskworkspace.RuntimeRunID(runtimeRunID),
+		RuntimeOperationID: taskworkspace.OperationID("runtime-operation-" + runtimeRunID),
+		EffectClass:        effectClass,
+		LeaseGeneration:    7,
+		LeaseFence:         11,
+		ExpiresAt:          300,
+	}
+	authority.Digest = authority.CanonicalDigest()
+	return authority
 }
 
 func acceptedValidationEvidence(
@@ -775,19 +1228,21 @@ func acceptedValidationEvidence(
 	manifest taskworkspace.DeclaredStateManifest,
 ) taskworkspace.ValidationEvidence {
 	evidence := taskworkspace.ValidationEvidence{
-		ID:                    "validation-evidence-1",
-		ValidationAuthorityID: "validation-authority-1",
-		PolicyDomainID:        "policy-domain-1",
-		TaskID:                "task-1",
-		TaskWorkspaceID:       confirmed.TaskWorkspaceID,
-		RuntimeViewID:         view.RuntimeViewID,
-		BaseRevisionID:        confirmed.CurrentRevisionID,
-		PhaseRunID:            view.PhaseRunID,
-		RuntimeRunID:          view.RuntimeRunID,
-		ManifestDigest:        manifest.Digest,
-		Generation:            confirmed.Generation,
-		Fence:                 confirmed.Fence,
-		Decision:              taskworkspace.ValidationAccepted,
+		ID:                          "validation-evidence-1",
+		ValidationAuthorityID:       "validation-authority-1",
+		PolicyDomainID:              "policy-domain-1",
+		TaskID:                      "task-1",
+		TaskWorkspaceID:             confirmed.TaskWorkspaceID,
+		RuntimeViewID:               view.RuntimeViewID,
+		BaseRevisionID:              confirmed.CurrentRevisionID,
+		PhaseRunID:                  view.PhaseRunID,
+		RuntimeRunID:                view.RuntimeRunID,
+		RuntimeOperationID:          view.RuntimeOperationID,
+		SandboxLeaseAuthorityDigest: view.SandboxLeaseAuthority.Digest,
+		ManifestDigest:              manifest.Digest,
+		Generation:                  confirmed.Generation,
+		Fence:                       confirmed.Fence,
+		Decision:                    taskworkspace.ValidationAccepted,
 	}
 	evidence.Digest = evidence.CanonicalDigest()
 	return evidence
@@ -805,12 +1260,66 @@ func commitRequest(
 		TaskID:                  "task-1",
 		TaskWorkspaceID:         confirmed.TaskWorkspaceID,
 		RuntimeViewID:           view.RuntimeViewID,
+		RuntimeOperationID:      view.RuntimeOperationID,
+		SandboxLeaseAuthority:   view.SandboxLeaseAuthority,
 		BaseRevisionID:          confirmed.CurrentRevisionID,
 		ExpectedCurrentRevision: confirmed.CurrentRevisionID,
 		Generation:              confirmed.Generation,
 		Fence:                   confirmed.Fence,
 		ValidationEvidence:      evidence,
 		DeclaredStateManifest:   manifest,
+		Operation: taskworkspace.Operation{
+			ID: taskworkspace.OperationID(operationID),
+		},
+	}
+	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	return request
+}
+
+func discardRequest(
+	confirmed taskworkspace.ConfirmTaskWorkspaceResult,
+	view taskworkspace.OpenRuntimeViewResult,
+	reason taskworkspace.RuntimeViewDiscardReason,
+	operationID string,
+) taskworkspace.DiscardRuntimeViewRequest {
+	request := taskworkspace.DiscardRuntimeViewRequest{
+		PolicyDomainID:          "policy-domain-1",
+		TaskID:                  "task-1",
+		TaskWorkspaceID:         confirmed.TaskWorkspaceID,
+		RuntimeViewID:           view.RuntimeViewID,
+		RuntimeOperationID:      view.RuntimeOperationID,
+		SandboxLeaseAuthority:   view.SandboxLeaseAuthority,
+		BaseRevisionID:          view.BaseRevisionID,
+		ExpectedCurrentRevision: confirmed.CurrentRevisionID,
+		Generation:              confirmed.Generation,
+		Fence:                   confirmed.Fence,
+		Reason:                  reason,
+		Operation: taskworkspace.Operation{
+			ID: taskworkspace.OperationID(operationID),
+		},
+	}
+	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	return request
+}
+
+func fenceRequest(
+	confirmed taskworkspace.ConfirmTaskWorkspaceResult,
+	view taskworkspace.OpenRuntimeViewResult,
+	reason taskworkspace.RuntimeViewFenceReason,
+	operationID string,
+) taskworkspace.FenceRuntimeViewRequest {
+	request := taskworkspace.FenceRuntimeViewRequest{
+		PolicyDomainID:          "policy-domain-1",
+		TaskID:                  "task-1",
+		TaskWorkspaceID:         confirmed.TaskWorkspaceID,
+		RuntimeViewID:           view.RuntimeViewID,
+		RuntimeOperationID:      view.RuntimeOperationID,
+		SandboxLeaseAuthority:   view.SandboxLeaseAuthority,
+		BaseRevisionID:          view.BaseRevisionID,
+		ExpectedCurrentRevision: confirmed.CurrentRevisionID,
+		Generation:              confirmed.Generation,
+		Fence:                   confirmed.Fence,
+		Reason:                  reason,
 		Operation: taskworkspace.Operation{
 			ID: taskworkspace.OperationID(operationID),
 		},

@@ -9,20 +9,77 @@ import (
 )
 
 type (
-	PolicyDomainID    string
-	TaskID            string
-	TaskWorkspaceID   string
-	RevisionID        string
-	MaterializationID string
-	RuntimeViewID     string
-	PhaseRunID        string
-	RuntimeRunID      string
-	SandboxLeaseID    string
-	OperationID       string
-	Digest            string
-	Generation        uint64
-	Fence             uint64
+	PolicyDomainID          string
+	TaskID                  string
+	TaskWorkspaceID         string
+	RevisionID              string
+	MaterializationID       string
+	RuntimeViewID           string
+	PhaseRunID              string
+	RuntimeRunID            string
+	SandboxLeaseID          string
+	SandboxLeaseAuthorityID string
+	OperationID             string
+	Digest                  string
+	Generation              uint64
+	Fence                   uint64
+	LeaseGeneration         uint64
+	LeaseFence              uint64
+	Instant                 int64
 )
+
+type RuntimeViewEffectClass string
+
+const (
+	RuntimeViewReadOnly RuntimeViewEffectClass = "read_only"
+	RuntimeViewMutating RuntimeViewEffectClass = "mutating"
+)
+
+type SandboxLeaseAuthority struct {
+	ID                 SandboxLeaseID
+	EvidenceID         EvidenceID
+	Digest             Digest
+	AuthorityID        SandboxLeaseAuthorityID
+	PolicyDomainID     PolicyDomainID
+	TaskID             TaskID
+	PhaseRunID         PhaseRunID
+	RuntimeRunID       RuntimeRunID
+	RuntimeOperationID OperationID
+	EffectClass        RuntimeViewEffectClass
+	LeaseGeneration    LeaseGeneration
+	LeaseFence         LeaseFence
+	ExpiresAt          Instant
+}
+
+func (a SandboxLeaseAuthority) CanonicalDigest() Digest {
+	return canonicalDigest(struct {
+		ID                 SandboxLeaseID
+		EvidenceID         EvidenceID
+		AuthorityID        SandboxLeaseAuthorityID
+		PolicyDomainID     PolicyDomainID
+		TaskID             TaskID
+		PhaseRunID         PhaseRunID
+		RuntimeRunID       RuntimeRunID
+		RuntimeOperationID OperationID
+		EffectClass        RuntimeViewEffectClass
+		LeaseGeneration    LeaseGeneration
+		LeaseFence         LeaseFence
+		ExpiresAt          Instant
+	}{
+		ID:                 a.ID,
+		EvidenceID:         a.EvidenceID,
+		AuthorityID:        a.AuthorityID,
+		PolicyDomainID:     a.PolicyDomainID,
+		TaskID:             a.TaskID,
+		PhaseRunID:         a.PhaseRunID,
+		RuntimeRunID:       a.RuntimeRunID,
+		RuntimeOperationID: a.RuntimeOperationID,
+		EffectClass:        a.EffectClass,
+		LeaseGeneration:    a.LeaseGeneration,
+		LeaseFence:         a.LeaseFence,
+		ExpiresAt:          a.ExpiresAt,
+	})
+}
 
 type Operation struct {
 	ID            OperationID
@@ -38,6 +95,7 @@ const (
 	ErrorOwnershipDenied      ErrorCode = "ownership_denied"
 	ErrorStaleAuthority       ErrorCode = "stale_authority"
 	ErrorViewTerminalConflict ErrorCode = "view_terminal_conflict"
+	ErrorEffectDenied         ErrorCode = "effect_denied"
 )
 
 type Error struct {
@@ -56,6 +114,8 @@ func (e *Error) Error() string {
 		return "task workspace lifecycle authority is stale"
 	case ErrorViewTerminalConflict:
 		return "task workspace lifecycle view is already terminal"
+	case ErrorEffectDenied:
+		return "task workspace lifecycle effect is not permitted"
 	default:
 		return "task workspace lifecycle intent is invalid"
 	}
@@ -138,58 +198,74 @@ type MaterializeResult struct {
 }
 
 type OpenRuntimeViewRequest struct {
-	PolicyDomainID    PolicyDomainID
-	TaskID            TaskID
-	TaskWorkspaceID   TaskWorkspaceID
-	MaterializationID MaterializationID
-	BaseRevisionID    RevisionID
-	PhaseRunID        PhaseRunID
-	RuntimeRunID      RuntimeRunID
-	SandboxLeaseID    SandboxLeaseID
-	Generation        Generation
-	Fence             Fence
-	Operation         Operation
+	PolicyDomainID        PolicyDomainID
+	TaskID                TaskID
+	TaskWorkspaceID       TaskWorkspaceID
+	MaterializationID     MaterializationID
+	BaseRevisionID        RevisionID
+	PhaseRunID            PhaseRunID
+	RuntimeRunID          RuntimeRunID
+	RuntimeOperationID    OperationID
+	SandboxLeaseAuthority SandboxLeaseAuthority
+	EffectClass           RuntimeViewEffectClass
+	ExpiresAt             Instant
+	Generation            Generation
+	Fence                 Fence
+	Operation             Operation
 }
 
 func (r OpenRuntimeViewRequest) CanonicalRequestDigest() Digest {
 	return canonicalDigest(struct {
-		Kind              string
-		PolicyDomainID    PolicyDomainID
-		TaskID            TaskID
-		TaskWorkspaceID   TaskWorkspaceID
-		MaterializationID MaterializationID
-		BaseRevisionID    RevisionID
-		PhaseRunID        PhaseRunID
-		RuntimeRunID      RuntimeRunID
-		SandboxLeaseID    SandboxLeaseID
-		Generation        Generation
-		Fence             Fence
-		OperationID       OperationID
+		Kind                  string
+		PolicyDomainID        PolicyDomainID
+		TaskID                TaskID
+		TaskWorkspaceID       TaskWorkspaceID
+		MaterializationID     MaterializationID
+		BaseRevisionID        RevisionID
+		PhaseRunID            PhaseRunID
+		RuntimeRunID          RuntimeRunID
+		RuntimeOperationID    OperationID
+		SandboxLeaseAuthority SandboxLeaseAuthority
+		EffectClass           RuntimeViewEffectClass
+		ExpiresAt             Instant
+		Generation            Generation
+		Fence                 Fence
+		OperationID           OperationID
 	}{
-		Kind:              "open_runtime_view",
-		PolicyDomainID:    r.PolicyDomainID,
-		TaskID:            r.TaskID,
-		TaskWorkspaceID:   r.TaskWorkspaceID,
-		MaterializationID: r.MaterializationID,
-		BaseRevisionID:    r.BaseRevisionID,
-		PhaseRunID:        r.PhaseRunID,
-		RuntimeRunID:      r.RuntimeRunID,
-		SandboxLeaseID:    r.SandboxLeaseID,
-		Generation:        r.Generation,
-		Fence:             r.Fence,
-		OperationID:       r.Operation.ID,
+		Kind:                  "open_runtime_view",
+		PolicyDomainID:        r.PolicyDomainID,
+		TaskID:                r.TaskID,
+		TaskWorkspaceID:       r.TaskWorkspaceID,
+		MaterializationID:     r.MaterializationID,
+		BaseRevisionID:        r.BaseRevisionID,
+		PhaseRunID:            r.PhaseRunID,
+		RuntimeRunID:          r.RuntimeRunID,
+		RuntimeOperationID:    r.RuntimeOperationID,
+		SandboxLeaseAuthority: r.SandboxLeaseAuthority,
+		EffectClass:           r.EffectClass,
+		ExpiresAt:             r.ExpiresAt,
+		Generation:            r.Generation,
+		Fence:                 r.Fence,
+		OperationID:           r.Operation.ID,
 	})
 }
 
 type OpenRuntimeViewResult struct {
-	RuntimeViewID   RuntimeViewID
-	TaskWorkspaceID TaskWorkspaceID
-	BaseRevisionID  RevisionID
-	PhaseRunID      PhaseRunID
-	RuntimeRunID    RuntimeRunID
-	SandboxLeaseID  SandboxLeaseID
-	Generation      Generation
-	Fence           Fence
+	PolicyDomainID        PolicyDomainID
+	TaskID                TaskID
+	RuntimeViewID         RuntimeViewID
+	TaskWorkspaceID       TaskWorkspaceID
+	MaterializationID     MaterializationID
+	BaseRevisionID        RevisionID
+	PhaseRunID            PhaseRunID
+	RuntimeRunID          RuntimeRunID
+	RuntimeOperationID    OperationID
+	SandboxLeaseAuthority SandboxLeaseAuthority
+	EffectClass           RuntimeViewEffectClass
+	ExpiresAt             Instant
+	Generation            Generation
+	Fence                 Fence
+	Operation             Operation
 }
 
 type Lifecycle interface {
@@ -197,6 +273,8 @@ type Lifecycle interface {
 	Materialize(context.Context, MaterializeRequest) (MaterializeResult, error)
 	OpenRuntimeView(context.Context, OpenRuntimeViewRequest) (OpenRuntimeViewResult, error)
 	CommitRuntimeView(context.Context, CommitRuntimeViewRequest) (CommitRuntimeViewResult, error)
+	DiscardRuntimeView(context.Context, DiscardRuntimeViewRequest) (DiscardRuntimeViewResult, error)
+	FenceRuntimeView(context.Context, FenceRuntimeViewRequest) (FenceRuntimeViewResult, error)
 }
 
 func canonicalDigest(value any) Digest {
