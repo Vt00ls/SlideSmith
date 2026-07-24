@@ -97,6 +97,168 @@ func TestFinalSemanticReferenceReleaseImmediatelyRemovesReachabilityAndStartsDef
 
 }
 
+func TestFinalSemanticReleaseRemainsCommittedWhenDurableReferenceReleaseIsAmbiguous(t *testing.T) {
+	now := taskworkspace.Instant(100)
+	persistence := taskworkspace.NewInMemoryPersistence()
+	mechanics := &checkpointReclamationMechanics{
+		present:               true,
+		referenceReleaseError: taskworkspace.ErrDurableObjectResultAmbiguous,
+	}
+	config := taskworkspaceTestConfig(&happyDurableObject{})
+	config.Now = func() taskworkspace.Instant { return now }
+	config.Persistence = persistence
+	config.CheckpointReclamation = mechanics
+	lifecycle, current, committed := supersededCheckpointForRetention(t, config)
+	retention := inspectCheckpointRetention(t, lifecycle, current, committed.CheckpointID)
+	release := taskworkspace.ReleaseCheckpointRetentionRequest{
+		PolicyDomainID:              "policy-domain-1",
+		TaskID:                      "task-1",
+		TaskWorkspaceID:             current.TaskWorkspaceID,
+		CheckpointID:                committed.CheckpointID,
+		AuthorityID:                 retention.Authorities[0].ID,
+		ExpectedRetentionGeneration: retention.RetentionGeneration,
+		Generation:                  current.Generation,
+		Fence:                       current.Fence,
+		Operation:                   taskworkspace.Operation{ID: "release-final-before-ambiguous-mechanics-1"},
+	}
+	release.Operation.RequestDigest = release.CanonicalRequestDigest()
+
+	_, err := lifecycle.ReleaseCheckpointRetention(context.Background(), release)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	committedRelease := inspectCheckpointRetention(t, lifecycle, current, committed.CheckpointID)
+	if committedRelease.Decision != taskworkspace.CheckpointPendingReclaim ||
+		len(committedRelease.Authorities) != 0 || committedRelease.EligibleAt == 0 {
+		t.Fatalf("ambiguous mechanics restored business reachability: %#v", committedRelease)
+	}
+	materialized, err := lifecycle.Materialize(context.Background(), materializeRequest(
+		"policy-domain-1", "task-1", current, "materialize-before-release-reconcile-1",
+	))
+	if err != nil {
+		t.Fatalf("materialize current Checkpoint before release reconciliation: %v", err)
+	}
+	view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+		"policy-domain-1", "task-1", current, materialized,
+		"phase-run-2", "runtime-run-2", "sandbox-lease-3",
+		"open-after-release-ambiguity-1",
+	))
+	if err != nil {
+		t.Fatalf("open Runtime View before release reconciliation: %v", err)
+	}
+	manifest := declaredStateManifest("content-after-release-ambiguity")
+	_, err = lifecycle.CommitRuntimeView(context.Background(), commitRequest(
+		current,
+		view,
+		manifest,
+		acceptedValidationEvidence(current, view, manifest),
+		"commit-after-release-ambiguity-1",
+	))
+	if err != nil {
+		t.Fatalf("advance workspace fence before release reconciliation: %v", err)
+	}
+	advanced, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-after-release-ambiguity-1",
+	))
+	if err != nil {
+		t.Fatalf("confirm advanced workspace fence: %v", err)
+	}
+	if advanced.Fence <= current.Fence {
+		t.Fatalf("workspace fence did not advance: before=%d after=%d", current.Fence, advanced.Fence)
+	}
+
+	mechanics.referenceReleaseError = nil
+	restartedConfig := taskworkspaceTestConfig(&happyDurableObject{})
+	restartedConfig.Now = func() taskworkspace.Instant { return now }
+	restartedConfig.Persistence = persistence
+	restartedConfig.CheckpointReclamation = mechanics
+	restarted := taskworkspace.NewInMemory(restartedConfig)
+	inspection, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: "policy-domain-1",
+		TaskID:         "task-1",
+		OperationID:    release.Operation.ID,
+	})
+	if err != nil {
+		t.Fatalf("reconcile final semantic release: %v", err)
+	}
+	if inspection.Disposition != taskworkspace.OperationTerminal ||
+		inspection.ReleaseCheckpointRetention == nil ||
+		inspection.ReleaseCheckpointRetention.Decision != taskworkspace.CheckpointPendingReclaim ||
+		mechanics.referenceReleases != 2 {
+		t.Fatalf("reconciled release = %#v, durable releases = %d", inspection, mechanics.referenceReleases)
+	}
+}
+
+func TestInventoryScanChecksExactReferencesAcrossThePolicyDomain(t *testing.T) {
+	mechanics := &checkpointReclamationMechanics{present: true}
+	config := taskworkspaceTestConfig(&happyDurableObject{})
+	config.CheckpointReclamation = mechanics
+	lifecycle, observedWorkspace, _ := committedCheckpointForRetention(t, config)
+
+	otherWorkspace, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-2", "confirm-policy-peer-1",
+	))
+	if err != nil {
+		t.Fatalf("confirm policy-domain peer: %v", err)
+	}
+	otherMaterialization, err := lifecycle.Materialize(context.Background(), materializeRequest(
+		"policy-domain-1", "task-2", otherWorkspace, "materialize-policy-peer-1",
+	))
+	if err != nil {
+		t.Fatalf("materialize policy-domain peer: %v", err)
+	}
+	otherView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+		"policy-domain-1", "task-2", otherWorkspace, otherMaterialization,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-task-2",
+		"open-policy-peer-1",
+	))
+	if err != nil {
+		t.Fatalf("open policy-domain peer Runtime View: %v", err)
+	}
+	manifest := declaredStateManifest("content-policy-peer-1")
+	validation := acceptedValidationEvidence(otherWorkspace, otherView, manifest)
+	validation.TaskID = "task-2"
+	validation.Digest = validation.CanonicalDigest()
+	commit := commitRequest(
+		otherWorkspace,
+		otherView,
+		manifest,
+		validation,
+		"commit-policy-peer-1",
+	)
+	commit.TaskID = "task-2"
+	commit.Operation.RequestDigest = commit.CanonicalRequestDigest()
+	otherCheckpoint, err := lifecycle.CommitRuntimeView(context.Background(), commit)
+	if err != nil {
+		t.Fatalf("commit policy-domain peer Checkpoint: %v", err)
+	}
+	mechanics.inventoryResourceID = taskworkspace.InventoryResourceID(
+		otherCheckpoint.CheckpointEvidence.ManifestReference.ContentID,
+	)
+	for _, receipt := range otherCheckpoint.CheckpointEvidence.DurabilityReceipts {
+		if receipt.ContentID == otherCheckpoint.CheckpointEvidence.ManifestReference.ContentID {
+			mechanics.inventoryGenerationID = receipt.DurabilityGenerationID
+			break
+		}
+	}
+	if mechanics.inventoryGenerationID == "" {
+		t.Fatal("policy-domain peer fixture omitted manifest generation")
+	}
+
+	observe := taskworkspace.ObserveCheckpointInventoryRequest{
+		PolicyDomainID:  "policy-domain-1",
+		TaskID:          "task-1",
+		TaskWorkspaceID: observedWorkspace.TaskWorkspaceID,
+		Operation:       taskworkspace.Operation{ID: "observe-policy-domain-shared-generation-1"},
+	}
+	observe.Operation.RequestDigest = observe.CanonicalRequestDigest()
+	observation, err := lifecycle.ObserveCheckpointInventory(context.Background(), observe)
+	if err != nil {
+		t.Fatalf("observe policy-domain inventory: %v", err)
+	}
+	if observation.Kind != taskworkspace.CheckpointInventoryNoCandidate {
+		t.Fatalf("cross-Task referenced generation classified as orphan: %#v", observation)
+	}
+}
+
 func TestReleasedCheckpointCannotBeRestoredDuringPhysicalGrace(t *testing.T) {
 	var recoveryIntent taskworkspace.AuthorizedRecoveryIntent
 	durable := &happyDurableObject{}
@@ -272,9 +434,13 @@ func TestCheckpointReclaimWaitsForGraceThenDeletesExactGenerationsIdempotently(t
 	if err != nil {
 		t.Fatalf("repeat Checkpoint reclaim: %v", err)
 	}
-	if alreadyAbsent.Outcome != taskworkspace.CheckpointAlreadyAbsent || mechanics.calls != 1 ||
+	if alreadyAbsent.Outcome != taskworkspace.CheckpointAlreadyAbsent || mechanics.calls != 2 ||
 		alreadyAbsent.Evidence.Digest == "" || alreadyAbsent.Evidence.Digest != alreadyAbsent.Evidence.CanonicalDigest() {
 		t.Fatalf("repeated reclaim = %#v, mechanics calls = %d", alreadyAbsent, mechanics.calls)
+	}
+	if alreadyAbsent.Evidence.MechanicsEvidenceDigest == "" ||
+		alreadyAbsent.Evidence.PriorEvidenceDigest != reclaimed.Evidence.Digest {
+		t.Fatalf("repeated reclaim lacks current and prior evidence linkage: %#v", alreadyAbsent.Evidence)
 	}
 }
 
@@ -427,10 +593,12 @@ func TestUnknownInventoryAndMechanicsStateCannotAuthorizeReclamation(t *testing.
 
 func TestInventoryScanOnlyProducesNonAuthorizingOrphanCandidateOrExplicitUnknown(t *testing.T) {
 	for _, tt := range []struct {
-		name     string
-		state    taskworkspace.CheckpointInventoryState
-		wantKind taskworkspace.CheckpointInventoryObservationKind
+		name                    string
+		state                   taskworkspace.CheckpointInventoryState
+		authoritativelyRetained bool
+		wantKind                taskworkspace.CheckpointInventoryObservationKind
 	}{
+		{name: "present referenced generation", state: taskworkspace.CheckpointInventoryPresent, authoritativelyRetained: true, wantKind: taskworkspace.CheckpointInventoryNoCandidate},
 		{name: "present unreferenced generation", state: taskworkspace.CheckpointInventoryPresent, wantKind: taskworkspace.CheckpointOrphanCandidate},
 		{name: "unknown inventory", state: taskworkspace.CheckpointInventoryUnknown, wantKind: taskworkspace.CheckpointInventoryUnknownObservation},
 	} {
@@ -439,6 +607,20 @@ func TestInventoryScanOnlyProducesNonAuthorizingOrphanCandidateOrExplicitUnknown
 			config := taskworkspaceTestConfig(&happyDurableObject{})
 			config.CheckpointReclamation = mechanics
 			lifecycle, current, committed := committedCheckpointForRetention(t, config)
+			if tt.authoritativelyRetained {
+				mechanics.inventoryResourceID = taskworkspace.InventoryResourceID(
+					committed.CheckpointEvidence.ManifestReference.ContentID,
+				)
+				for _, receipt := range committed.CheckpointEvidence.DurabilityReceipts {
+					if receipt.ContentID == committed.CheckpointEvidence.ManifestReference.ContentID {
+						mechanics.inventoryGenerationID = receipt.DurabilityGenerationID
+						break
+					}
+				}
+				if mechanics.inventoryGenerationID == "" {
+					t.Fatal("fixture omitted authoritative manifest generation")
+				}
+			}
 			observe := taskworkspace.ObserveCheckpointInventoryRequest{
 				PolicyDomainID:  "policy-domain-1",
 				TaskID:          "task-1",
@@ -803,14 +985,17 @@ func reclaimCheckpointRequest(
 }
 
 type checkpointReclamationMechanics struct {
-	present           bool
-	calls             int
-	requests          []taskworkspace.ReclaimCheckpointContentRequest
-	results           map[taskworkspace.OperationID]taskworkspace.CheckpointContentReclamationEvidence
-	mutate            func(*taskworkspace.CheckpointContentReclamationEvidence)
-	inventoryState    taskworkspace.CheckpointInventoryState
-	referenceReleases int
-	referenceAttaches int
+	present               bool
+	calls                 int
+	requests              []taskworkspace.ReclaimCheckpointContentRequest
+	results               map[taskworkspace.OperationID]taskworkspace.CheckpointContentReclamationEvidence
+	mutate                func(*taskworkspace.CheckpointContentReclamationEvidence)
+	inventoryState        taskworkspace.CheckpointInventoryState
+	inventoryResourceID   taskworkspace.InventoryResourceID
+	inventoryGenerationID taskworkspace.DurabilityGenerationID
+	referenceReleaseError error
+	referenceReleases     int
+	referenceAttaches     int
 }
 
 func (m *checkpointReclamationMechanics) ReleaseCheckpointReferences(
@@ -818,6 +1003,9 @@ func (m *checkpointReclamationMechanics) ReleaseCheckpointReferences(
 	request taskworkspace.CheckpointContentReferenceTransitionRequest,
 ) (taskworkspace.CheckpointContentReferenceTransitionEvidence, error) {
 	m.referenceReleases++
+	if m.referenceReleaseError != nil {
+		return taskworkspace.CheckpointContentReferenceTransitionEvidence{}, m.referenceReleaseError
+	}
 	return checkpointReferenceTransitionEvidence(request, taskworkspace.CheckpointContentReferencesReleased), nil
 }
 
@@ -859,13 +1047,21 @@ func (m *checkpointReclamationMechanics) ObserveCheckpointInventory(
 	if state == "" {
 		state = taskworkspace.CheckpointInventoryPresent
 	}
+	resourceID := m.inventoryResourceID
+	if resourceID == "" {
+		resourceID = "opaque-inventory-resource-1"
+	}
+	generationID := m.inventoryGenerationID
+	if generationID == "" {
+		generationID = "opaque-inventory-generation-1"
+	}
 	evidence := taskworkspace.CheckpointContentInventoryEvidence{
 		ID:              taskworkspace.EvidenceID("inventory-evidence-" + request.Operation.ID),
 		PolicyDomainID:  request.PolicyDomainID,
 		TaskID:          request.TaskID,
 		TaskWorkspaceID: request.TaskWorkspaceID,
-		ResourceID:      "opaque-inventory-resource-1",
-		GenerationID:    "opaque-inventory-generation-1",
+		ResourceID:      resourceID,
+		GenerationID:    generationID,
 		State:           state,
 		OperationID:     request.Operation.ID,
 		ObservedAt:      1,

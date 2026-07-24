@@ -27,6 +27,40 @@ const (
 	CheckpointPhysicallyReclaimed CheckpointRetentionDecision = "reclaimed"
 )
 
+type checkpointRetentionAuthorityDefinition struct {
+	attachable bool
+	expiring   bool
+	blocker    CheckpointReclamationBlocker
+}
+
+var checkpointRetentionAuthorityDefinitions = map[CheckpointRetentionAuthorityKind]checkpointRetentionAuthorityDefinition{
+	CheckpointRecoveryLineageAuthority: {
+		blocker: CheckpointRecoveryLineageBlocker,
+	},
+	CheckpointExplicitReferenceAuthority: {
+		attachable: true,
+		blocker:    CheckpointExplicitReferenceBlocker,
+	},
+	CheckpointCommitLeaseAuthority: {
+		attachable: true,
+		expiring:   true,
+		blocker:    CheckpointCommitLeaseBlocker,
+	},
+	CheckpointRestoreLeaseAuthority: {
+		attachable: true,
+		expiring:   true,
+		blocker:    CheckpointRestoreLeaseBlocker,
+	},
+	CheckpointIntegrityIncidentAuthority: {
+		attachable: true,
+		blocker:    CheckpointIntegrityIncidentBlocker,
+	},
+	CheckpointRecoveryPointPinAuthority: {
+		attachable: true,
+		blocker:    CheckpointRecoveryPointPinBlocker,
+	},
+}
+
 type CheckpointRetentionPolicy struct {
 	ID               CheckpointRetentionPolicyID
 	ReclamationGrace Duration
@@ -60,14 +94,15 @@ type CheckpointRetention struct {
 }
 
 type checkpointRetentionRecord struct {
-	generation           RetentionGeneration
-	generationAtCreation Generation
-	fenceAtCreation      Fence
-	policyID             CheckpointRetentionPolicyID
-	eligibleAt           Instant
-	authorities          map[CheckpointRetentionAuthorityID]CheckpointRetentionAuthority
-	reclaimed            bool
-	reclamationEvidence  CheckpointReclamationEvidence
+	generation                         RetentionGeneration
+	generationAtCreation               Generation
+	fenceAtCreation                    Fence
+	policyID                           CheckpointRetentionPolicyID
+	eligibleAt                         Instant
+	authorities                        map[CheckpointRetentionAuthorityID]CheckpointRetentionAuthority
+	pendingReferenceReleaseOperationID OperationID
+	reclaimed                          bool
+	reclamationEvidence                CheckpointReclamationEvidence
 }
 
 func (r checkpointRetentionRecord) semanticallyRetained(now Instant) bool {
@@ -211,18 +246,27 @@ func (m *inMemory) ReleaseCheckpointRetention(
 		checkpoint.taskWorkspaceID != request.TaskWorkspaceID {
 		return fail(ErrorOwnershipDenied)
 	}
-	if workspace.generation != request.Generation || workspace.fence != request.Fence ||
-		checkpoint.retention.generation != request.ExpectedRetentionGeneration {
+	authority, authorityPresent := checkpoint.retention.authorities[request.AuthorityID]
+	resumingFinalRelease := !authorityPresent &&
+		checkpoint.retention.pendingReferenceReleaseOperationID == request.Operation.ID &&
+		checkpoint.retention.generation == request.ExpectedRetentionGeneration+1 &&
+		checkpoint.retention.eligibleAt != 0 && !checkpoint.retention.semanticallyRetained(m.now())
+	if !resumingFinalRelease &&
+		(workspace.generation != request.Generation || workspace.fence != request.Fence) {
 		return fail(ErrorStaleAuthority)
 	}
-	authority, ok := checkpoint.retention.authorities[request.AuthorityID]
-	if !ok {
+	if !resumingFinalRelease && checkpoint.retention.generation != request.ExpectedRetentionGeneration {
 		return fail(ErrorStaleAuthority)
 	}
-	if authority.Kind == CheckpointRecoveryLineageAuthority && workspace.currentCheckpointID == request.CheckpointID {
+	if !authorityPresent && !resumingFinalRelease {
 		return fail(ErrorStaleAuthority)
 	}
-	finalRelease := !checkpointRetainedWithoutAuthority(checkpoint.retention, request.AuthorityID, m.now())
+	if authorityPresent && authority.Kind == CheckpointRecoveryLineageAuthority &&
+		workspace.currentCheckpointID == request.CheckpointID {
+		return fail(ErrorStaleAuthority)
+	}
+	finalRelease := resumingFinalRelease ||
+		!checkpointRetainedWithoutAuthority(checkpoint.retention, request.AuthorityID, m.now())
 	if finalRelease {
 		if m.checkpointReclamation == nil {
 			return fail(ErrorIntegrityFailure)
@@ -231,47 +275,51 @@ func (m *inMemory) ReleaseCheckpointRetention(
 		if !trusted {
 			return fail(ErrorIntegrityFailure)
 		}
-		markOperationReconciliationRequired(m.operations, scope)
-		evidence, err := m.checkpointReclamation.ReleaseCheckpointReferences(
-			ctx,
-			checkpointContentReferenceTransitionRequest(
-				request.PolicyDomainID,
-				request.TaskID,
-				request.TaskWorkspaceID,
-				request.CheckpointID,
-				checkpoint.revisionID,
-				checkpoint.retention.generation+1,
-				resources,
-				exactGenerationRoot,
-				request.Generation,
-				request.Fence,
-				request.Operation,
-			),
+		transition := checkpointContentReferenceTransitionRequest(
+			request.PolicyDomainID,
+			request.TaskID,
+			request.TaskWorkspaceID,
+			request.CheckpointID,
+			checkpoint.revisionID,
+			request.ExpectedRetentionGeneration+1,
+			resources,
+			exactGenerationRoot,
+			request.Generation,
+			request.Fence,
+			request.Operation,
 		)
+		if !resumingFinalRelease {
+			delete(checkpoint.retention.authorities, request.AuthorityID)
+			checkpoint.retention.generation++
+			checkpoint.retention.policyID = m.checkpointRetentionPolicy.ID
+			checkpoint.retention.eligibleAt = m.now() + Instant(m.checkpointRetentionPolicy.ReclamationGrace)
+			checkpoint.retention.pendingReferenceReleaseOperationID = request.Operation.ID
+			m.releaseCheckpointContentReferences(checkpoint)
+			m.checkpoints[request.CheckpointID] = checkpoint
+		}
+		markOperationReconciliationRequired(m.operations, scope)
+		evidence, err := m.checkpointReclamation.ReleaseCheckpointReferences(ctx, transition)
 		if err != nil {
 			if errors.Is(err, ErrDurableObjectResultAmbiguous) {
 				return CheckpointRetention{}, &Error{Code: ErrorReconciliationRequired}
 			}
-			return fail(ErrorIntegrityFailure)
+			return CheckpointRetention{}, &Error{Code: ErrorIntegrityFailure}
 		}
 		if !checkpointContentReferenceTransitionEvidenceMatches(
 			evidence,
-			request,
-			checkpoint.retention.generation+1,
-			exactGenerationRoot,
+			transition,
 			CheckpointContentReferencesReleased,
 		) {
-			return fail(ErrorIntegrityFailure)
+			return CheckpointRetention{}, &Error{Code: ErrorIntegrityFailure}
 		}
+		checkpoint.retention.pendingReferenceReleaseOperationID = ""
+		m.checkpoints[request.CheckpointID] = checkpoint
 	}
-	delete(checkpoint.retention.authorities, request.AuthorityID)
-	checkpoint.retention.generation++
-	if finalRelease {
-		checkpoint.retention.policyID = m.checkpointRetentionPolicy.ID
-		checkpoint.retention.eligibleAt = m.now() + Instant(m.checkpointRetentionPolicy.ReclamationGrace)
-		m.releaseCheckpointContentReferences(checkpoint)
+	if !finalRelease {
+		delete(checkpoint.retention.authorities, request.AuthorityID)
+		checkpoint.retention.generation++
+		m.checkpoints[request.CheckpointID] = checkpoint
 	}
-	m.checkpoints[request.CheckpointID] = checkpoint
 	result := checkpointRetentionSnapshot(request.CheckpointID, checkpoint, workspace, m.now(), request.Operation)
 	recordOperation(m.operations, scope, request.Operation, result, nil)
 	return deliverOperationResponse(m, request.Operation.ID, result)
@@ -332,23 +380,21 @@ func (m *inMemory) AttachCheckpointRetention(
 			if !trusted {
 				return fail(ErrorIntegrityFailure)
 			}
-			markOperationReconciliationRequired(m.operations, scope)
-			evidence, err := m.checkpointReclamation.AttachCheckpointReferences(
-				ctx,
-				checkpointContentReferenceTransitionRequest(
-					request.PolicyDomainID,
-					request.TaskID,
-					request.TaskWorkspaceID,
-					request.CheckpointID,
-					checkpoint.revisionID,
-					checkpoint.retention.generation+1,
-					resources,
-					exactGenerationRoot,
-					request.Generation,
-					request.Fence,
-					request.Operation,
-				),
+			transition := checkpointContentReferenceTransitionRequest(
+				request.PolicyDomainID,
+				request.TaskID,
+				request.TaskWorkspaceID,
+				request.CheckpointID,
+				checkpoint.revisionID,
+				checkpoint.retention.generation+1,
+				resources,
+				exactGenerationRoot,
+				request.Generation,
+				request.Fence,
+				request.Operation,
 			)
+			markOperationReconciliationRequired(m.operations, scope)
+			evidence, err := m.checkpointReclamation.AttachCheckpointReferences(ctx, transition)
 			if err != nil {
 				if errors.Is(err, ErrDurableObjectResultAmbiguous) {
 					return CheckpointRetention{}, &Error{Code: ErrorReconciliationRequired}
@@ -357,17 +403,7 @@ func (m *inMemory) AttachCheckpointRetention(
 			}
 			if !checkpointContentReferenceTransitionEvidenceMatches(
 				evidence,
-				ReleaseCheckpointRetentionRequest{
-					PolicyDomainID:  request.PolicyDomainID,
-					TaskID:          request.TaskID,
-					TaskWorkspaceID: request.TaskWorkspaceID,
-					CheckpointID:    request.CheckpointID,
-					Generation:      request.Generation,
-					Fence:           request.Fence,
-					Operation:       request.Operation,
-				},
-				checkpoint.retention.generation+1,
-				exactGenerationRoot,
+				transition,
 				CheckpointContentReferencesAttached,
 			) {
 				return fail(ErrorIntegrityFailure)
@@ -375,6 +411,7 @@ func (m *inMemory) AttachCheckpointRetention(
 		}
 		checkpoint.retention.authorities[request.Authority.ID] = request.Authority
 		checkpoint.retention.generation++
+		checkpoint.retention.pendingReferenceReleaseOperationID = ""
 	}
 	checkpoint.retention.policyID = ""
 	checkpoint.retention.eligibleAt = 0
@@ -402,23 +439,22 @@ func validCheckpointRetentionAuthority(authority CheckpointRetentionAuthority, n
 	if authority.ID == "" {
 		return false
 	}
-	switch authority.Kind {
-	case CheckpointExplicitReferenceAuthority, CheckpointIntegrityIncidentAuthority, CheckpointRecoveryPointPinAuthority:
-		return authority.ExpiresAt == 0
-	case CheckpointCommitLeaseAuthority, CheckpointRestoreLeaseAuthority:
-		return authority.ExpiresAt > now
-	default:
+	definition, ok := checkpointRetentionAuthorityDefinitions[authority.Kind]
+	if !ok || !definition.attachable {
 		return false
 	}
+	if definition.expiring {
+		return authority.ExpiresAt > now
+	}
+	return authority.ExpiresAt == 0
 }
 
 func checkpointRetentionAuthorityIsActive(authority CheckpointRetentionAuthority, now Instant) bool {
-	switch authority.Kind {
-	case CheckpointCommitLeaseAuthority, CheckpointRestoreLeaseAuthority:
+	definition, ok := checkpointRetentionAuthorityDefinitions[authority.Kind]
+	if ok && definition.expiring {
 		return authority.ExpiresAt > now
-	default:
-		return true
 	}
+	return true
 }
 
 func (m *inMemory) releaseCheckpointContentReferences(checkpoint checkpointRecord) {

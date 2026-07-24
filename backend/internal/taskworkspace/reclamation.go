@@ -14,6 +14,7 @@ type (
 	CheckpointInventoryObservationKind string
 	InventoryResourceID                string
 	CheckpointContentReferenceState    string
+	checkpointInventoryAuthorityStatus uint8
 )
 
 const (
@@ -48,6 +49,10 @@ const (
 
 	CheckpointContentReferencesAttached CheckpointContentReferenceState = "attached"
 	CheckpointContentReferencesReleased CheckpointContentReferenceState = "released"
+
+	checkpointInventoryAccounted checkpointInventoryAuthorityStatus = iota + 1
+	checkpointInventoryUnreferenced
+	checkpointInventoryAuthorityUnknown
 )
 
 // CheckpointReclamationPort performs only opaque content-reference, lease,
@@ -120,16 +125,14 @@ func checkpointContentReferenceTransitionRequest(
 
 func checkpointContentReferenceTransitionEvidenceMatches(
 	evidence CheckpointContentReferenceTransitionEvidence,
-	request ReleaseCheckpointRetentionRequest,
-	retentionGeneration RetentionGeneration,
-	exactGenerationRoot Digest,
+	request CheckpointContentReferenceTransitionRequest,
 	state CheckpointContentReferenceState,
 ) bool {
 	return evidence.ID != "" && evidence.ObservedAt != 0 && validDigest(evidence.Digest) &&
 		evidence.Digest == evidence.CanonicalDigest() && evidence.PolicyDomainID == request.PolicyDomainID &&
 		evidence.TaskID == request.TaskID && evidence.TaskWorkspaceID == request.TaskWorkspaceID &&
-		evidence.CheckpointID == request.CheckpointID && evidence.RetentionGeneration == retentionGeneration &&
-		evidence.ExactGenerationRoot == exactGenerationRoot && evidence.State == state &&
+		evidence.CheckpointID == request.CheckpointID && evidence.RetentionGeneration == request.RetentionGeneration &&
+		evidence.ExactGenerationRoot == request.ExactGenerationRoot && evidence.State == state &&
 		evidence.Generation == request.Generation && evidence.Fence == request.Fence &&
 		evidence.OperationID == request.Operation.ID
 }
@@ -465,7 +468,12 @@ func (m *inMemory) ObserveCheckpointInventory(
 	kind := CheckpointInventoryNoCandidate
 	switch evidence.State {
 	case CheckpointInventoryPresent:
-		kind = CheckpointOrphanCandidate
+		switch m.checkpointInventoryAuthorityState(evidence) {
+		case checkpointInventoryUnreferenced:
+			kind = CheckpointOrphanCandidate
+		case checkpointInventoryAuthorityUnknown:
+			kind = CheckpointInventoryUnknownObservation
+		}
 	case CheckpointInventoryUnknown:
 		kind = CheckpointInventoryUnknownObservation
 	}
@@ -478,6 +486,50 @@ func (m *inMemory) ObserveCheckpointInventory(
 		ObservedAt:     evidence.ObservedAt,
 		Operation:      request.Operation,
 	}, nil
+}
+
+func (m *inMemory) checkpointInventoryAuthorityState(
+	evidence CheckpointContentInventoryEvidence,
+) checkpointInventoryAuthorityStatus {
+	contentID := ContentID(evidence.ResourceID)
+	for _, checkpoint := range m.checkpoints {
+		if checkpoint.evidence.ManifestReference.PolicyDomainID != evidence.PolicyDomainID {
+			continue
+		}
+		resources, _, trusted := checkpointContentGenerations(checkpoint)
+		if !trusted {
+			return checkpointInventoryAuthorityUnknown
+		}
+		for _, resource := range resources {
+			if resource.ContentID != contentID || resource.GenerationID != evidence.GenerationID {
+				continue
+			}
+			if _, referenced := m.contentReferences[resource.ReferenceID]; referenced ||
+				checkpoint.retention.semanticallyRetained(m.now()) {
+				return checkpointInventoryAccounted
+			}
+		}
+	}
+
+	for _, reference := range m.contentReferences {
+		if reference.PolicyDomainID != evidence.PolicyDomainID || reference.ContentID != contentID {
+			continue
+		}
+		for _, receipt := range m.durabilityReceipts {
+			if receipt.PolicyDomainID == evidence.PolicyDomainID && receipt.ContentID == contentID &&
+				receipt.DurabilityGenerationID == evidence.GenerationID {
+				return checkpointInventoryAccounted
+			}
+		}
+		return checkpointInventoryAuthorityUnknown
+	}
+
+	for scope, operation := range m.operations {
+		if scope.policyDomainID == evidence.PolicyDomainID && operation.state != operationJournalTerminal {
+			return checkpointInventoryAuthorityUnknown
+		}
+	}
+	return checkpointInventoryUnreferenced
 }
 
 func (m *inMemory) ReclaimCheckpoint(
@@ -522,15 +574,6 @@ func (m *inMemory) ReclaimCheckpoint(
 	if !ok {
 		return fail(ErrorIntegrityFailure)
 	}
-	if checkpoint.retention.reclaimed {
-		result := m.checkpointReclamationResult(
-			scope, request, checkpoint, exactGenerationRoot, CheckpointAlreadyAbsent,
-			nil, "", checkpoint.retention.reclamationEvidence.Digest,
-		)
-		recordOperation(m.operations, scope, request.Operation, result, nil)
-		return deliverOperationResponse(m, request.Operation.ID, result)
-	}
-
 	blockers := checkpointRetentionBlockers(checkpoint.retention, m.now())
 	if len(blockers) == 0 && (checkpoint.retention.eligibleAt == 0 || m.now() < checkpoint.retention.eligibleAt) {
 		blockers = append(blockers, CheckpointGraceBlocker)
@@ -590,9 +633,13 @@ func (m *inMemory) ReclaimCheckpoint(
 	if !trusted {
 		return fail(ErrorIntegrityFailure)
 	}
+	priorEvidenceDigest := Digest("")
+	if checkpoint.retention.reclaimed {
+		priorEvidenceDigest = checkpoint.retention.reclamationEvidence.Digest
+	}
 	result := m.checkpointReclamationResult(
 		scope, request, checkpoint, exactGenerationRoot, mechanics.Outcome,
-		mechanicsBlockers, mechanics.Digest, "",
+		mechanicsBlockers, mechanics.Digest, priorEvidenceDigest,
 	)
 	if result.Outcome == CheckpointReclaimed || result.Outcome == CheckpointAlreadyAbsent {
 		checkpoint.retention.reclaimed = true
@@ -656,22 +703,12 @@ func checkpointRetentionBlockers(
 		if !checkpointRetentionAuthorityIsActive(authority, now) {
 			continue
 		}
-		switch authority.Kind {
-		case CheckpointRecoveryLineageAuthority:
-			blockers = append(blockers, CheckpointRecoveryLineageBlocker)
-		case CheckpointExplicitReferenceAuthority:
-			blockers = append(blockers, CheckpointExplicitReferenceBlocker)
-		case CheckpointCommitLeaseAuthority:
-			blockers = append(blockers, CheckpointCommitLeaseBlocker)
-		case CheckpointRestoreLeaseAuthority:
-			blockers = append(blockers, CheckpointRestoreLeaseBlocker)
-		case CheckpointIntegrityIncidentAuthority:
-			blockers = append(blockers, CheckpointIntegrityIncidentBlocker)
-		case CheckpointRecoveryPointPinAuthority:
-			blockers = append(blockers, CheckpointRecoveryPointPinBlocker)
-		default:
+		definition, ok := checkpointRetentionAuthorityDefinitions[authority.Kind]
+		if !ok || definition.blocker == "" {
 			blockers = append(blockers, CheckpointUnknownStateBlocker)
+			continue
 		}
+		blockers = append(blockers, definition.blocker)
 	}
 	return blockers
 }
