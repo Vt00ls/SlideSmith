@@ -7,32 +7,43 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
 type InMemoryConfig struct {
-	ValidationAuthorityID ValidationAuthorityID
-	DurabilityAuthorityID DurabilityAuthorityID
-	DurableObject         DurableObjectPort
+	ValidationAuthorityID          ValidationAuthorityID
+	DurabilityAuthorityID          DurabilityAuthorityID
+	DurableObject                  DurableObjectPort
+	SandboxLeaseAuthorityID        SandboxLeaseAuthorityID
+	CurrentSandboxLeaseAuthorities []SandboxLeaseAuthority
+	CurrentSandboxLeaseAuthority   func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
+	Now                            func() Instant
+	BeforeRuntimeViewTerminal      func(RuntimeViewTerminalAttempt)
 }
 
 type inMemory struct {
-	mu                    sync.Mutex
-	nextID                uint64
-	validationAuthorityID ValidationAuthorityID
-	durabilityAuthorityID DurabilityAuthorityID
-	durableObject         DurableObjectPort
-	workspaces            map[TaskID]workspaceBinding
-	materializations      map[MaterializationID]materializationBinding
-	views                 map[RuntimeViewID]runtimeViewBinding
-	revisions             map[RevisionID]revisionRecord
-	checkpoints           map[CheckpointID]checkpointRecord
-	operations            map[operationScope]operationRecord
-	contentReferences     map[ContentReferenceID]ContentReference
-	contentFacts          map[ContentID]durableContentFact
-	durabilityReceipts    map[DurabilityReceiptID]DurabilityReceipt
-	currentReceipts       map[receiptAuthorityScope]DurabilityReceipt
-	receiptGenerations    map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID
+	mu                      sync.Mutex
+	nextID                  uint64
+	validationAuthorityID   ValidationAuthorityID
+	durabilityAuthorityID   DurabilityAuthorityID
+	durableObject           DurableObjectPort
+	sandboxLeaseAuthorityID SandboxLeaseAuthorityID
+	now                     func() Instant
+	beforeTerminal          func(RuntimeViewTerminalAttempt)
+	sandboxLeaseAuthorities map[SandboxLeaseID]SandboxLeaseAuthority
+	currentLeaseAuthority   func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
+	workspaces              map[TaskID]workspaceBinding
+	materializations        map[MaterializationID]materializationBinding
+	views                   map[RuntimeViewID]runtimeViewBinding
+	revisions               map[RevisionID]revisionRecord
+	checkpoints             map[CheckpointID]checkpointRecord
+	operations              map[operationScope]operationRecord
+	contentReferences       map[ContentReferenceID]ContentReference
+	contentFacts            map[ContentID]durableContentFact
+	durabilityReceipts      map[DurabilityReceiptID]DurabilityReceipt
+	currentReceipts         map[receiptAuthorityScope]DurabilityReceipt
+	receiptGenerations      map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID
 }
 
 type durableContentFact struct {
@@ -81,18 +92,30 @@ type materializationBinding struct {
 }
 
 type runtimeViewBinding struct {
-	policyDomainID    PolicyDomainID
-	taskID            TaskID
-	taskWorkspaceID   TaskWorkspaceID
-	materializationID MaterializationID
-	baseRevisionID    RevisionID
-	phaseRunID        PhaseRunID
-	runtimeRunID      RuntimeRunID
-	sandboxLeaseID    SandboxLeaseID
-	generation        Generation
-	fence             Fence
-	terminal          bool
+	policyDomainID        PolicyDomainID
+	taskID                TaskID
+	taskWorkspaceID       TaskWorkspaceID
+	materializationID     MaterializationID
+	baseRevisionID        RevisionID
+	phaseRunID            PhaseRunID
+	runtimeRunID          RuntimeRunID
+	runtimeOperationID    OperationID
+	sandboxLeaseAuthority SandboxLeaseAuthority
+	effectClass           RuntimeViewEffectClass
+	expiresAt             Instant
+	generation            Generation
+	fence                 Fence
+	terminalDecision      runtimeViewTerminalDecision
 }
+
+type runtimeViewTerminalDecision string
+
+const (
+	runtimeViewNonTerminal runtimeViewTerminalDecision = ""
+	runtimeViewCommitted   runtimeViewTerminalDecision = "committed"
+	runtimeViewDiscarded   runtimeViewTerminalDecision = "discarded"
+	runtimeViewFenced      runtimeViewTerminalDecision = "fenced"
+)
 
 type operationScope struct {
 	policyDomainID PolicyDomainID
@@ -107,21 +130,50 @@ type operationRecord struct {
 }
 
 func NewInMemory(config InMemoryConfig) Lifecycle {
+	now := config.Now
+	if now == nil {
+		now = func() Instant { return Instant(time.Now().UnixNano()) }
+	}
 	memory := &inMemory{
-		validationAuthorityID: config.ValidationAuthorityID,
-		durabilityAuthorityID: config.DurabilityAuthorityID,
-		durableObject:         config.DurableObject,
-		workspaces:            make(map[TaskID]workspaceBinding),
-		materializations:      make(map[MaterializationID]materializationBinding),
-		views:                 make(map[RuntimeViewID]runtimeViewBinding),
-		revisions:             make(map[RevisionID]revisionRecord),
-		checkpoints:           make(map[CheckpointID]checkpointRecord),
-		operations:            make(map[operationScope]operationRecord),
-		contentReferences:     make(map[ContentReferenceID]ContentReference),
-		contentFacts:          make(map[ContentID]durableContentFact),
-		durabilityReceipts:    make(map[DurabilityReceiptID]DurabilityReceipt),
-		currentReceipts:       make(map[receiptAuthorityScope]DurabilityReceipt),
-		receiptGenerations:    make(map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID),
+		validationAuthorityID:   config.ValidationAuthorityID,
+		durabilityAuthorityID:   config.DurabilityAuthorityID,
+		durableObject:           config.DurableObject,
+		sandboxLeaseAuthorityID: config.SandboxLeaseAuthorityID,
+		now:                     now,
+		beforeTerminal:          config.BeforeRuntimeViewTerminal,
+		sandboxLeaseAuthorities: make(map[SandboxLeaseID]SandboxLeaseAuthority),
+		workspaces:              make(map[TaskID]workspaceBinding),
+		materializations:        make(map[MaterializationID]materializationBinding),
+		views:                   make(map[RuntimeViewID]runtimeViewBinding),
+		revisions:               make(map[RevisionID]revisionRecord),
+		checkpoints:             make(map[CheckpointID]checkpointRecord),
+		operations:              make(map[operationScope]operationRecord),
+		contentReferences:       make(map[ContentReferenceID]ContentReference),
+		contentFacts:            make(map[ContentID]durableContentFact),
+		durabilityReceipts:      make(map[DurabilityReceiptID]DurabilityReceipt),
+		currentReceipts:         make(map[receiptAuthorityScope]DurabilityReceipt),
+		receiptGenerations:      make(map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID),
+	}
+	leaseDuplicates := make(map[SandboxLeaseID]bool)
+	for _, authority := range config.CurrentSandboxLeaseAuthorities {
+		if !sandboxLeaseAuthorityIsCanonical(authority) || authority.AuthorityID != config.SandboxLeaseAuthorityID {
+			continue
+		}
+		if _, exists := memory.sandboxLeaseAuthorities[authority.ID]; exists {
+			delete(memory.sandboxLeaseAuthorities, authority.ID)
+			leaseDuplicates[authority.ID] = true
+			continue
+		}
+		if !leaseDuplicates[authority.ID] {
+			memory.sandboxLeaseAuthorities[authority.ID] = authority
+		}
+	}
+	memory.currentLeaseAuthority = config.CurrentSandboxLeaseAuthority
+	if memory.currentLeaseAuthority == nil {
+		memory.currentLeaseAuthority = func(id SandboxLeaseID) (SandboxLeaseAuthority, bool) {
+			authority, ok := memory.sandboxLeaseAuthorities[id]
+			return authority, ok
+		}
 	}
 	return memory
 }
@@ -132,7 +184,8 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 
 	if request.PolicyDomainID == "" || request.TaskID == "" || request.TaskWorkspaceID == "" ||
 		request.MaterializationID == "" || request.BaseRevisionID == "" || request.PhaseRunID == "" ||
-		request.RuntimeRunID == "" || request.SandboxLeaseID == "" || request.Generation == 0 || request.Fence == 0 ||
+		request.RuntimeRunID == "" || request.RuntimeOperationID == "" || request.Generation == 0 || request.Fence == 0 ||
+		(request.EffectClass != RuntimeViewReadOnly && request.EffectClass != RuntimeViewMutating) || request.ExpiresAt == 0 ||
 		request.Operation.ID == "" || request.Operation.RequestDigest != request.CanonicalRequestDigest() {
 		return OpenRuntimeViewResult{}, &Error{Code: ErrorInvalidIntent}
 	}
@@ -155,44 +208,90 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, OpenRuntimeViewResult{}, err)
 		return OpenRuntimeViewResult{}, err
 	}
+	if !m.sandboxLeaseAuthorityMatches(request) || request.ExpiresAt <= m.now() {
+		err := &Error{Code: ErrorStaleAuthority}
+		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, OpenRuntimeViewResult{}, err)
+		return OpenRuntimeViewResult{}, err
+	}
 
 	identity := RuntimeViewID(m.nextOpaqueID("runtime-view"))
 	m.views[identity] = runtimeViewBinding{
-		policyDomainID:    request.PolicyDomainID,
-		taskID:            request.TaskID,
-		taskWorkspaceID:   request.TaskWorkspaceID,
-		materializationID: request.MaterializationID,
-		baseRevisionID:    request.BaseRevisionID,
-		phaseRunID:        request.PhaseRunID,
-		runtimeRunID:      request.RuntimeRunID,
-		sandboxLeaseID:    request.SandboxLeaseID,
-		generation:        request.Generation,
-		fence:             request.Fence,
+		policyDomainID:        request.PolicyDomainID,
+		taskID:                request.TaskID,
+		taskWorkspaceID:       request.TaskWorkspaceID,
+		materializationID:     request.MaterializationID,
+		baseRevisionID:        request.BaseRevisionID,
+		phaseRunID:            request.PhaseRunID,
+		runtimeRunID:          request.RuntimeRunID,
+		runtimeOperationID:    request.RuntimeOperationID,
+		sandboxLeaseAuthority: request.SandboxLeaseAuthority,
+		effectClass:           request.EffectClass,
+		expiresAt:             request.ExpiresAt,
+		generation:            request.Generation,
+		fence:                 request.Fence,
 	}
 	result := OpenRuntimeViewResult{
-		RuntimeViewID:   identity,
-		TaskWorkspaceID: request.TaskWorkspaceID,
-		BaseRevisionID:  request.BaseRevisionID,
-		PhaseRunID:      request.PhaseRunID,
-		RuntimeRunID:    request.RuntimeRunID,
-		SandboxLeaseID:  request.SandboxLeaseID,
-		Generation:      request.Generation,
-		Fence:           request.Fence,
+		PolicyDomainID:        request.PolicyDomainID,
+		TaskID:                request.TaskID,
+		RuntimeViewID:         identity,
+		TaskWorkspaceID:       request.TaskWorkspaceID,
+		MaterializationID:     request.MaterializationID,
+		BaseRevisionID:        request.BaseRevisionID,
+		PhaseRunID:            request.PhaseRunID,
+		RuntimeRunID:          request.RuntimeRunID,
+		RuntimeOperationID:    request.RuntimeOperationID,
+		SandboxLeaseAuthority: request.SandboxLeaseAuthority,
+		EffectClass:           request.EffectClass,
+		ExpiresAt:             request.ExpiresAt,
+		Generation:            request.Generation,
+		Fence:                 request.Fence,
+		Operation:             request.Operation,
 	}
 	recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, result, nil)
 	return result, nil
 }
 
-func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeViewRequest) (CommitRuntimeViewResult, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+func (m *inMemory) sandboxLeaseAuthorityMatches(request OpenRuntimeViewRequest) bool {
+	authority := request.SandboxLeaseAuthority
+	return m.sandboxLeaseAuthorityIsCurrent(authority) &&
+		authority.PolicyDomainID == request.PolicyDomainID &&
+		authority.TaskID == request.TaskID && authority.PhaseRunID == request.PhaseRunID &&
+		authority.RuntimeRunID == request.RuntimeRunID && authority.RuntimeOperationID == request.RuntimeOperationID &&
+		authority.EffectClass == request.EffectClass &&
+		authority.ExpiresAt >= request.ExpiresAt && authority.ExpiresAt > m.now()
+}
 
+func (m *inMemory) sandboxLeaseAuthorityIsCurrent(authority SandboxLeaseAuthority) bool {
+	current, ok := m.currentLeaseAuthority(authority.ID)
+	return ok && current == authority && m.sandboxLeaseAuthorityID != "" &&
+		sandboxLeaseAuthorityIsCanonical(authority) && authority.AuthorityID == m.sandboxLeaseAuthorityID
+}
+
+func sandboxLeaseAuthorityIsCanonical(authority SandboxLeaseAuthority) bool {
+	return authority.ID != "" && authority.EvidenceID != "" && authority.AuthorityID != "" && authority.PolicyDomainID != "" &&
+		authority.TaskID != "" && authority.PhaseRunID != "" && authority.RuntimeRunID != "" &&
+		authority.RuntimeOperationID != "" &&
+		(authority.EffectClass == RuntimeViewReadOnly || authority.EffectClass == RuntimeViewMutating) &&
+		authority.LeaseGeneration != 0 && authority.LeaseFence != 0 &&
+		authority.ExpiresAt != 0 && validDigest(authority.Digest) && authority.Digest == authority.CanonicalDigest()
+}
+
+func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeViewRequest) (CommitRuntimeViewResult, error) {
 	if request.PolicyDomainID == "" || request.TaskID == "" || request.TaskWorkspaceID == "" ||
-		request.RuntimeViewID == "" || request.BaseRevisionID == "" || request.ExpectedCurrentRevision == "" ||
+		request.RuntimeViewID == "" || request.RuntimeOperationID == "" || request.SandboxLeaseAuthority.ID == "" ||
+		request.BaseRevisionID == "" || request.ExpectedCurrentRevision == "" ||
 		request.Generation == 0 || request.Fence == 0 || request.Operation.ID == "" ||
 		request.Operation.RequestDigest != request.CanonicalRequestDigest() {
 		return CommitRuntimeViewResult{}, &Error{Code: ErrorInvalidIntent}
 	}
+	m.beforeRuntimeViewTerminal(RuntimeViewTerminalAttempt{
+		RuntimeViewID: request.RuntimeViewID,
+		OperationID:   request.Operation.ID,
+		Intent:        RuntimeViewCommitIntent,
+	})
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if result, replayed, err := replayOperation[CommitRuntimeViewResult](m.operations, request.PolicyDomainID, request.TaskID, request.Operation); replayed {
 		return result, err
 	}
@@ -211,15 +310,25 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		view.taskWorkspaceID != request.TaskWorkspaceID {
 		return fail(ErrorOwnershipDenied)
 	}
-	if view.baseRevisionID != request.BaseRevisionID || view.generation != request.Generation || view.fence != request.Fence {
+	if view.baseRevisionID != request.BaseRevisionID || view.generation != request.Generation || view.fence != request.Fence ||
+		view.runtimeOperationID != request.RuntimeOperationID || view.sandboxLeaseAuthority != request.SandboxLeaseAuthority {
 		return fail(ErrorStaleAuthority)
 	}
-	if view.terminal {
+	if view.terminalDecision != runtimeViewNonTerminal {
 		return fail(ErrorViewTerminalConflict)
 	}
 	if workspace.currentRevisionID != request.ExpectedCurrentRevision || request.ExpectedCurrentRevision != request.BaseRevisionID ||
 		workspace.generation != request.Generation || workspace.fence != request.Fence {
 		return fail(ErrorStaleAuthority)
+	}
+	if !m.sandboxLeaseAuthorityIsCurrent(view.sandboxLeaseAuthority) {
+		return fail(ErrorStaleAuthority)
+	}
+	if view.expiresAt <= m.now() || view.sandboxLeaseAuthority.ExpiresAt <= m.now() {
+		return fail(ErrorStaleAuthority)
+	}
+	if view.effectClass != RuntimeViewMutating {
+		return fail(ErrorEffectDenied)
 	}
 	if !m.validationEvidenceMatches(trustedRequest.ValidationEvidence, trustedRequest, view) {
 		return fail(ErrorIntegrityFailure)
@@ -270,6 +379,9 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 	} else {
 		return fail(ErrorIntegrityFailure)
 	}
+	if !m.sandboxLeaseAuthorityIsCurrent(view.sandboxLeaseAuthority) {
+		return fail(ErrorStaleAuthority)
+	}
 
 	if changed {
 		m.revisions[resultingRevision] = revisionRecord{
@@ -280,6 +392,7 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		workspace.currentRevisionID = resultingRevision
 		workspace.currentManifest = trustedRequest.DeclaredStateManifest.Digest
 	}
+	workspace.fence++
 	workspace.currentCheckpointID = checkpointID
 	m.workspaces[request.TaskID] = workspace
 	m.checkpoints[checkpointID] = checkpointRecord{
@@ -290,7 +403,7 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		evidence:        cloneCheckpointEvidence(checkpointEvidence),
 	}
 	m.recordDurableEvidenceIdentities(verifiedCheckpointContent(checkpointEvidence))
-	view.terminal = true
+	view.terminalDecision = runtimeViewCommitted
 	m.views[request.RuntimeViewID] = view
 
 	result := CommitRuntimeViewResult{
@@ -306,11 +419,18 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		DurabilityEvidenceRoot:   durabilityRoot,
 		CheckpointEvidence:       checkpointEvidence,
 		Generation:               request.Generation,
-		Fence:                    request.Fence,
+		PreviousFence:            request.Fence,
+		Fence:                    workspace.fence,
 		Operation:                request.Operation,
 	}
 	recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, result, nil)
 	return result, nil
+}
+
+func (m *inMemory) beforeRuntimeViewTerminal(attempt RuntimeViewTerminalAttempt) {
+	if m.beforeTerminal != nil {
+		m.beforeTerminal(attempt)
+	}
 }
 
 func (m *inMemory) validationEvidenceMatches(
@@ -324,7 +444,9 @@ func (m *inMemory) validationEvidenceMatches(
 		evidence.PolicyDomainID == request.PolicyDomainID && evidence.TaskID == request.TaskID &&
 		evidence.TaskWorkspaceID == request.TaskWorkspaceID && evidence.RuntimeViewID == request.RuntimeViewID &&
 		evidence.BaseRevisionID == request.BaseRevisionID && evidence.PhaseRunID == view.phaseRunID &&
-		evidence.RuntimeRunID == view.runtimeRunID && evidence.ManifestDigest == request.DeclaredStateManifest.Digest &&
+		evidence.RuntimeRunID == view.runtimeRunID && evidence.RuntimeOperationID == view.runtimeOperationID &&
+		evidence.SandboxLeaseAuthorityDigest == view.sandboxLeaseAuthority.Digest &&
+		evidence.ManifestDigest == request.DeclaredStateManifest.Digest &&
 		evidence.Generation == request.Generation && evidence.Fence == request.Fence
 }
 

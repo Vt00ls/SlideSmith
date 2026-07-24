@@ -92,11 +92,7 @@ func TestCommitRejectsUnsafeOrExcludedCheckpointMembersBeforeDurablePreparation(
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			durable := &happyDurableObject{}
-			lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-				ValidationAuthorityID: "validation-authority-1",
-				DurabilityAuthorityID: "durability-authority-1",
-				DurableObject:         durable,
-			})
+			lifecycle := newLifecycleWithDurableObject(durable)
 			confirmed, view := openRuntimeViewWithLifecycle(
 				t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 			)
@@ -177,11 +173,7 @@ func TestCommitRejectsDurableObjectMutationOfDeclaredSemanticManifest(t *testing
 					test.mutate(&manifest.Members[0])
 				},
 			}
-			lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-				ValidationAuthorityID: "validation-authority-1",
-				DurabilityAuthorityID: "durability-authority-1",
-				DurableObject:         durable,
-			})
+			lifecycle := newLifecycleWithDurableObject(durable)
 			confirmed, view := openRuntimeViewWithLifecycle(
 				t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 			)
@@ -363,11 +355,7 @@ func TestCommitFailsClosedForUnverifiedOrIncompletelyBoundDurableContent(t *test
 				prepareError: test.prepareError,
 				mutate:       test.mutate,
 			}
-			lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-				ValidationAuthorityID: "validation-authority-1",
-				DurabilityAuthorityID: "durability-authority-1",
-				DurableObject:         durable,
-			})
+			lifecycle := newLifecycleWithDurableObject(durable)
 			confirmed, view := openRuntimeViewWithLifecycle(
 				t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 			)
@@ -396,11 +384,7 @@ func TestCommitFailsClosedForUnverifiedOrIncompletelyBoundDurableContent(t *test
 
 func TestMaterializeReverifiesTheCurrentCheckpointThroughDurableObjectPort(t *testing.T) {
 	durable := &happyDurableObject{}
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	confirmed, view := openRuntimeViewWithLifecycle(
 		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 	)
@@ -442,11 +426,7 @@ func TestMaterializeReverifiesTheCurrentCheckpointThroughDurableObjectPort(t *te
 
 func TestMaterializeRequiresTheExactPlatformReferencedCheckpoint(t *testing.T) {
 	durable := &happyDurableObject{}
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	confirmed, view := openRuntimeViewWithLifecycle(
 		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 	)
@@ -550,11 +530,7 @@ func TestMaterializeFailsClosedWhenCheckpointContentCannotBeReverified(t *testin
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			durable := &happyDurableObject{}
-			lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-				ValidationAuthorityID: "validation-authority-1",
-				DurabilityAuthorityID: "durability-authority-1",
-				DurableObject:         durable,
-			})
+			lifecycle := newLifecycleWithDurableObject(durable)
 			confirmed, view := openRuntimeViewWithLifecycle(
 				t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 			)
@@ -777,10 +753,7 @@ func TestCommitRequestCannotCarryCallerMintedDurabilityEvidence(t *testing.T) {
 }
 
 func TestCommitFailsClosedWithoutATrustedDurableObjectPort(t *testing.T) {
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-	})
+	lifecycle := newLifecycleWithDurableObject(nil)
 	confirmed, view := openRuntimeViewWithLifecycle(
 		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 	)
@@ -802,11 +775,7 @@ func TestCommitFailsClosedWithoutATrustedDurableObjectPort(t *testing.T) {
 
 func TestCommitBuildsCheckpointFromTrustedDurableObjectEvidence(t *testing.T) {
 	durable := &happyDurableObject{}
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	confirmed, view := openRuntimeViewWithLifecycle(t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1")
 	manifest := declaredStateManifest("content-1")
 	validation := acceptedValidationEvidence(confirmed, view, manifest)
@@ -864,11 +833,7 @@ func TestCommitBuildsCheckpointFromTrustedDurableObjectEvidence(t *testing.T) {
 
 func TestCheckpointCommitAndMaterializeExactReplayDoNotRepeatDurableObjectWork(t *testing.T) {
 	durable := &happyDurableObject{}
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	confirmed, view := openRuntimeViewWithLifecycle(
 		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 	)
@@ -909,11 +874,7 @@ func TestCheckpointCommitAndMaterializeExactReplayDoNotRepeatDurableObjectWork(t
 
 func TestCheckpointEvidenceReturnedByLifecycleCannotMutateAuthorityOrReplay(t *testing.T) {
 	durable := &happyDurableObject{}
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	confirmed, view := openRuntimeViewWithLifecycle(
 		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 	)
@@ -974,11 +935,7 @@ func TestCheckpointEvidenceReturnedByLifecycleCannotMutateAuthorityOrReplay(t *t
 
 func TestLifecycleErrorReturnedByCommitCannotMutateExactReplay(t *testing.T) {
 	durable := &happyDurableObject{prepareError: errors.New("durable fault")}
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	confirmed, view := openRuntimeViewWithLifecycle(
 		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 	)
@@ -1059,11 +1016,7 @@ func TestCommitRejectsDurableEvidenceIdentityRebindingAcrossCheckpoints(t *testi
 			durable.mutate = func(content *taskworkspace.VerifiedCheckpointContent) {
 				test.mutate(content, durable.prepared)
 			}
-			lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-				ValidationAuthorityID: "validation-authority-1",
-				DurabilityAuthorityID: "durability-authority-1",
-				DurableObject:         durable,
-			})
+			lifecycle := newLifecycleWithDurableObject(durable)
 			firstConfirmed, firstView := openRuntimeViewWithLifecycle(
 				t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 			)
@@ -1123,18 +1076,21 @@ func (d *happyDurableObject) PrepareCheckpoint(
 	if d.mutateRequest != nil {
 		d.mutateRequest(&request.Manifest)
 	}
-	member := request.Manifest.Members[0]
-	memberReference := durableReference(
-		"reference-member-"+string(request.CheckpointID),
-		taskworkspace.CheckpointMemberReference,
-		request,
-		member.ID,
-		member.LogicalMember,
-		"content-member-"+string(request.CheckpointID),
-		member.ContentDigest,
-		member.Size,
-	)
-	manifest := checkpointManifestFromDeclared(request.Manifest, []taskworkspace.ContentReference{memberReference})
+	var memberReferences []taskworkspace.ContentReference
+	if len(request.Manifest.Members) != 0 {
+		member := request.Manifest.Members[0]
+		memberReferences = append(memberReferences, durableReference(
+			"reference-member-"+string(request.CheckpointID),
+			taskworkspace.CheckpointMemberReference,
+			request,
+			member.ID,
+			member.LogicalMember,
+			"content-member-"+string(request.CheckpointID),
+			member.ContentDigest,
+			member.Size,
+		))
+	}
+	manifest := checkpointManifestFromDeclared(request.Manifest, memberReferences)
 	manifestReference := durableReference(
 		"reference-manifest-"+string(request.CheckpointID),
 		taskworkspace.CheckpointManifestReference,
@@ -1148,11 +1104,15 @@ func (d *happyDurableObject) PrepareCheckpoint(
 	content := taskworkspace.VerifiedCheckpointContent{
 		Manifest:          manifest,
 		ManifestReference: manifestReference,
-		ContentReferences: []taskworkspace.ContentReference{memberReference},
+		ContentReferences: memberReferences,
 		DurabilityReceipts: []taskworkspace.DurabilityReceipt{
 			durableReceipt("receipt-manifest-"+string(request.CheckpointID), manifestReference),
-			durableReceipt("receipt-member-"+string(request.CheckpointID), memberReference),
 		},
+	}
+	for _, reference := range memberReferences {
+		content.DurabilityReceipts = append(content.DurabilityReceipts,
+			durableReceipt("receipt-member-"+string(request.CheckpointID), reference),
+		)
 	}
 	if d.mutate != nil {
 		d.mutate(&content)
@@ -1274,11 +1234,7 @@ func committedCheckpointForReceiptAuthority(
 	durable *happyDurableObject,
 ) (taskworkspace.Lifecycle, taskworkspace.ConfirmTaskWorkspaceResult, taskworkspace.CommitRuntimeViewResult) {
 	t.Helper()
-	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
-		ValidationAuthorityID: "validation-authority-1",
-		DurabilityAuthorityID: "durability-authority-1",
-		DurableObject:         durable,
-	})
+	lifecycle := newLifecycleWithDurableObject(durable)
 	confirmed, view := openRuntimeViewWithLifecycle(
 		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
 	)
@@ -1321,7 +1277,7 @@ func openRuntimeViewWithLifecycle(
 	}
 	view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
 		"policy-domain-1", taskID, confirmed, materialized,
-		"phase-run-1", "runtime-run-1", "sandbox-lease-1", openOperationID,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-"+taskID, openOperationID,
 	))
 	if err != nil {
 		t.Fatalf("open Runtime View: %v", err)

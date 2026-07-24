@@ -118,51 +118,57 @@ type checkpointManifestCanonical struct {
 type ValidationAuthorityID string
 
 type ValidationEvidence struct {
-	ID                    EvidenceID
-	Digest                Digest
-	ValidationAuthorityID ValidationAuthorityID
-	PolicyDomainID        PolicyDomainID
-	TaskID                TaskID
-	TaskWorkspaceID       TaskWorkspaceID
-	RuntimeViewID         RuntimeViewID
-	BaseRevisionID        RevisionID
-	PhaseRunID            PhaseRunID
-	RuntimeRunID          RuntimeRunID
-	ManifestDigest        Digest
-	Generation            Generation
-	Fence                 Fence
-	Decision              ValidationDecision
+	ID                          EvidenceID
+	Digest                      Digest
+	ValidationAuthorityID       ValidationAuthorityID
+	PolicyDomainID              PolicyDomainID
+	TaskID                      TaskID
+	TaskWorkspaceID             TaskWorkspaceID
+	RuntimeViewID               RuntimeViewID
+	BaseRevisionID              RevisionID
+	PhaseRunID                  PhaseRunID
+	RuntimeRunID                RuntimeRunID
+	RuntimeOperationID          OperationID
+	SandboxLeaseAuthorityDigest Digest
+	ManifestDigest              Digest
+	Generation                  Generation
+	Fence                       Fence
+	Decision                    ValidationDecision
 }
 
 func (e ValidationEvidence) CanonicalDigest() Digest {
 	return canonicalDigest(struct {
-		ID                    EvidenceID
-		ValidationAuthorityID ValidationAuthorityID
-		PolicyDomainID        PolicyDomainID
-		TaskID                TaskID
-		TaskWorkspaceID       TaskWorkspaceID
-		RuntimeViewID         RuntimeViewID
-		BaseRevisionID        RevisionID
-		PhaseRunID            PhaseRunID
-		RuntimeRunID          RuntimeRunID
-		ManifestDigest        Digest
-		Generation            Generation
-		Fence                 Fence
-		Decision              ValidationDecision
+		ID                          EvidenceID
+		ValidationAuthorityID       ValidationAuthorityID
+		PolicyDomainID              PolicyDomainID
+		TaskID                      TaskID
+		TaskWorkspaceID             TaskWorkspaceID
+		RuntimeViewID               RuntimeViewID
+		BaseRevisionID              RevisionID
+		PhaseRunID                  PhaseRunID
+		RuntimeRunID                RuntimeRunID
+		RuntimeOperationID          OperationID
+		SandboxLeaseAuthorityDigest Digest
+		ManifestDigest              Digest
+		Generation                  Generation
+		Fence                       Fence
+		Decision                    ValidationDecision
 	}{
-		ID:                    e.ID,
-		ValidationAuthorityID: e.ValidationAuthorityID,
-		PolicyDomainID:        e.PolicyDomainID,
-		TaskID:                e.TaskID,
-		TaskWorkspaceID:       e.TaskWorkspaceID,
-		RuntimeViewID:         e.RuntimeViewID,
-		BaseRevisionID:        e.BaseRevisionID,
-		PhaseRunID:            e.PhaseRunID,
-		RuntimeRunID:          e.RuntimeRunID,
-		ManifestDigest:        e.ManifestDigest,
-		Generation:            e.Generation,
-		Fence:                 e.Fence,
-		Decision:              e.Decision,
+		ID:                          e.ID,
+		ValidationAuthorityID:       e.ValidationAuthorityID,
+		PolicyDomainID:              e.PolicyDomainID,
+		TaskID:                      e.TaskID,
+		TaskWorkspaceID:             e.TaskWorkspaceID,
+		RuntimeViewID:               e.RuntimeViewID,
+		BaseRevisionID:              e.BaseRevisionID,
+		PhaseRunID:                  e.PhaseRunID,
+		RuntimeRunID:                e.RuntimeRunID,
+		RuntimeOperationID:          e.RuntimeOperationID,
+		SandboxLeaseAuthorityDigest: e.SandboxLeaseAuthorityDigest,
+		ManifestDigest:              e.ManifestDigest,
+		Generation:                  e.Generation,
+		Fence:                       e.Fence,
+		Decision:                    e.Decision,
 	})
 }
 
@@ -171,6 +177,8 @@ type CommitRuntimeViewRequest struct {
 	TaskID                  TaskID
 	TaskWorkspaceID         TaskWorkspaceID
 	RuntimeViewID           RuntimeViewID
+	RuntimeOperationID      OperationID
+	SandboxLeaseAuthority   SandboxLeaseAuthority
 	BaseRevisionID          RevisionID
 	ExpectedCurrentRevision RevisionID
 	Generation              Generation
@@ -187,6 +195,8 @@ func (r CommitRuntimeViewRequest) CanonicalRequestDigest() Digest {
 		TaskID                  TaskID
 		TaskWorkspaceID         TaskWorkspaceID
 		RuntimeViewID           RuntimeViewID
+		RuntimeOperationID      OperationID
+		SandboxLeaseAuthority   SandboxLeaseAuthority
 		BaseRevisionID          RevisionID
 		ExpectedCurrentRevision RevisionID
 		Generation              Generation
@@ -200,6 +210,8 @@ func (r CommitRuntimeViewRequest) CanonicalRequestDigest() Digest {
 		TaskID:                  r.TaskID,
 		TaskWorkspaceID:         r.TaskWorkspaceID,
 		RuntimeViewID:           r.RuntimeViewID,
+		RuntimeOperationID:      r.RuntimeOperationID,
+		SandboxLeaseAuthority:   r.SandboxLeaseAuthority,
 		BaseRevisionID:          r.BaseRevisionID,
 		ExpectedCurrentRevision: r.ExpectedCurrentRevision,
 		Generation:              r.Generation,
@@ -223,6 +235,7 @@ type CommitRuntimeViewResult struct {
 	DurabilityEvidenceRoot   EvidenceRoot
 	CheckpointEvidence       CheckpointEvidence
 	Generation               Generation
+	PreviousFence            Fence
 	Fence                    Fence
 	Operation                Operation
 }
