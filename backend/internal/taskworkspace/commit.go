@@ -234,6 +234,7 @@ type CommitRuntimeViewResult struct {
 	ContentEvidenceRoot      EvidenceRoot
 	DurabilityEvidenceRoot   EvidenceRoot
 	CheckpointEvidence       CheckpointEvidence
+	ValidatedExportEvidence  ValidatedExportEvidence
 	Generation               Generation
 	PreviousFence            Fence
 	Fence                    Fence
