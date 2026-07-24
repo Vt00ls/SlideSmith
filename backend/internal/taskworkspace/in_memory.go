@@ -257,9 +257,6 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		if err != nil {
 			return fail(ErrorIntegrityFailure)
 		}
-		if _, stillTrusted := validateDeclaredStateManifest(trustedRequest.DeclaredStateManifest); !stillTrusted {
-			return fail(ErrorIntegrityFailure)
-		}
 		var trusted bool
 		checkpointEvidence, contentRoot, durabilityRoot, trusted = m.bindCheckpointEvidence(
 			trustedRequest,
