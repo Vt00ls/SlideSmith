@@ -3,6 +3,7 @@ package taskworkspace
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -15,35 +16,46 @@ type InMemoryConfig struct {
 	ValidationAuthorityID          ValidationAuthorityID
 	DurabilityAuthorityID          DurabilityAuthorityID
 	DurableObject                  DurableObjectPort
+	Persistence                    *InMemoryPersistence
 	SandboxLeaseAuthorityID        SandboxLeaseAuthorityID
 	CurrentSandboxLeaseAuthorities []SandboxLeaseAuthority
 	CurrentSandboxLeaseAuthority   func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
 	Now                            func() Instant
 	BeforeRuntimeViewTerminal      func(RuntimeViewTerminalAttempt)
+	FaultHook                      func(FaultEvent) error
+	ResponseDelivery               func(ResponseDeliveryEvent)
+}
+
+// InMemoryPersistence is an opaque persistence handle for deterministic
+// restart scenarios. Its journal and lifecycle records remain module-private.
+type InMemoryPersistence struct {
+	mu                 sync.Mutex
+	nextID             uint64
+	workspaces         map[TaskID]workspaceBinding
+	materializations   map[MaterializationID]materializationBinding
+	views              map[RuntimeViewID]runtimeViewBinding
+	revisions          map[RevisionID]revisionRecord
+	checkpoints        map[CheckpointID]checkpointRecord
+	operations         map[operationScope]operationRecord
+	contentReferences  map[ContentReferenceID]ContentReference
+	contentFacts       map[ContentID]durableContentFact
+	durabilityReceipts map[DurabilityReceiptID]DurabilityReceipt
+	currentReceipts    map[receiptAuthorityScope]DurabilityReceipt
+	receiptGenerations map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID
 }
 
 type inMemory struct {
-	mu                      sync.Mutex
-	nextID                  uint64
+	*InMemoryPersistence
 	validationAuthorityID   ValidationAuthorityID
 	durabilityAuthorityID   DurabilityAuthorityID
 	durableObject           DurableObjectPort
 	sandboxLeaseAuthorityID SandboxLeaseAuthorityID
 	now                     func() Instant
 	beforeTerminal          func(RuntimeViewTerminalAttempt)
+	faultHook               func(FaultEvent) error
+	responseDelivery        func(ResponseDeliveryEvent)
 	sandboxLeaseAuthorities map[SandboxLeaseID]SandboxLeaseAuthority
 	currentLeaseAuthority   func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
-	workspaces              map[TaskID]workspaceBinding
-	materializations        map[MaterializationID]materializationBinding
-	views                   map[RuntimeViewID]runtimeViewBinding
-	revisions               map[RevisionID]revisionRecord
-	checkpoints             map[CheckpointID]checkpointRecord
-	operations              map[operationScope]operationRecord
-	contentReferences       map[ContentReferenceID]ContentReference
-	contentFacts            map[ContentID]durableContentFact
-	durabilityReceipts      map[DurabilityReceiptID]DurabilityReceipt
-	currentReceipts         map[receiptAuthorityScope]DurabilityReceipt
-	receiptGenerations      map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID
 }
 
 type durableContentFact struct {
@@ -124,9 +136,40 @@ type operationScope struct {
 }
 
 type operationRecord struct {
-	requestDigest Digest
-	result        any
-	err           *Error
+	requestDigest           Digest
+	payload                 operationJournalPayload
+	state                   operationJournalState
+	intentState             OperationIntentState
+	expectedRevisionID      RevisionID
+	generation              Generation
+	fence                   Fence
+	authorityBindingsDigest Digest
+	plannedIDs              map[string]string
+	err                     *Error
+}
+
+func NewInMemoryPersistence() *InMemoryPersistence {
+	persistence := &InMemoryPersistence{}
+	persistence.initialize()
+	return persistence
+}
+
+func (p *InMemoryPersistence) initialize() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.workspaces == nil {
+		p.workspaces = make(map[TaskID]workspaceBinding)
+		p.materializations = make(map[MaterializationID]materializationBinding)
+		p.views = make(map[RuntimeViewID]runtimeViewBinding)
+		p.revisions = make(map[RevisionID]revisionRecord)
+		p.checkpoints = make(map[CheckpointID]checkpointRecord)
+		p.operations = make(map[operationScope]operationRecord)
+		p.contentReferences = make(map[ContentReferenceID]ContentReference)
+		p.contentFacts = make(map[ContentID]durableContentFact)
+		p.durabilityReceipts = make(map[DurabilityReceiptID]DurabilityReceipt)
+		p.currentReceipts = make(map[receiptAuthorityScope]DurabilityReceipt)
+		p.receiptGenerations = make(map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID)
+	}
 }
 
 func NewInMemory(config InMemoryConfig) Lifecycle {
@@ -134,25 +177,23 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 	if now == nil {
 		now = func() Instant { return Instant(time.Now().UnixNano()) }
 	}
+	persistence := config.Persistence
+	if persistence == nil {
+		persistence = NewInMemoryPersistence()
+	} else {
+		persistence.initialize()
+	}
 	memory := &inMemory{
+		InMemoryPersistence:     persistence,
 		validationAuthorityID:   config.ValidationAuthorityID,
 		durabilityAuthorityID:   config.DurabilityAuthorityID,
 		durableObject:           config.DurableObject,
 		sandboxLeaseAuthorityID: config.SandboxLeaseAuthorityID,
 		now:                     now,
 		beforeTerminal:          config.BeforeRuntimeViewTerminal,
+		faultHook:               config.FaultHook,
+		responseDelivery:        config.ResponseDelivery,
 		sandboxLeaseAuthorities: make(map[SandboxLeaseID]SandboxLeaseAuthority),
-		workspaces:              make(map[TaskID]workspaceBinding),
-		materializations:        make(map[MaterializationID]materializationBinding),
-		views:                   make(map[RuntimeViewID]runtimeViewBinding),
-		revisions:               make(map[RevisionID]revisionRecord),
-		checkpoints:             make(map[CheckpointID]checkpointRecord),
-		operations:              make(map[operationScope]operationRecord),
-		contentReferences:       make(map[ContentReferenceID]ContentReference),
-		contentFacts:            make(map[ContentID]durableContentFact),
-		durabilityReceipts:      make(map[DurabilityReceiptID]DurabilityReceipt),
-		currentReceipts:         make(map[receiptAuthorityScope]DurabilityReceipt),
-		receiptGenerations:      make(map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID),
 	}
 	leaseDuplicates := make(map[SandboxLeaseID]bool)
 	for _, authority := range config.CurrentSandboxLeaseAuthorities {
@@ -189,8 +230,14 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 		request.Operation.ID == "" || request.Operation.RequestDigest != request.CanonicalRequestDigest() {
 		return OpenRuntimeViewResult{}, &Error{Code: ErrorInvalidIntent}
 	}
-	if result, replayed, err := replayOperation[OpenRuntimeViewResult](m.operations, request.PolicyDomainID, request.TaskID, request.Operation); replayed {
+	scope := operationScope{request.PolicyDomainID, request.TaskID, request.Operation.ID}
+	if result, replayed, err := replayOperation[OpenRuntimeViewResult](m.operations, scope, request.Operation); replayed {
 		return result, err
+	}
+	if _, err := ensureOperationIntent(
+		m, scope, request.Operation, request, openRuntimeViewJournalSpec(), nil,
+	); err != nil {
+		return OpenRuntimeViewResult{}, err
 	}
 	workspace, workspaceOK := m.workspaces[request.TaskID]
 	materialization, materializationOK := m.materializations[request.MaterializationID]
@@ -198,23 +245,31 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 		!materializationOK || materialization.policyDomainID != request.PolicyDomainID || materialization.taskID != request.TaskID ||
 		materialization.taskWorkspaceID != request.TaskWorkspaceID {
 		err := &Error{Code: ErrorOwnershipDenied}
-		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, OpenRuntimeViewResult{}, err)
+		recordOperation(m.operations, scope, request.Operation, OpenRuntimeViewResult{}, err)
 		return OpenRuntimeViewResult{}, err
 	}
 	if workspace.currentRevisionID != request.BaseRevisionID || workspace.generation != request.Generation || workspace.fence != request.Fence ||
 		materialization.revisionID != request.BaseRevisionID || materialization.checkpointID != workspace.currentCheckpointID ||
 		materialization.generation != request.Generation || materialization.fence != request.Fence {
 		err := &Error{Code: ErrorStaleAuthority}
-		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, OpenRuntimeViewResult{}, err)
+		recordOperation(m.operations, scope, request.Operation, OpenRuntimeViewResult{}, err)
 		return OpenRuntimeViewResult{}, err
 	}
 	if !m.sandboxLeaseAuthorityMatches(request) || request.ExpiresAt <= m.now() {
 		err := &Error{Code: ErrorStaleAuthority}
-		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, OpenRuntimeViewResult{}, err)
+		recordOperation(m.operations, scope, request.Operation, OpenRuntimeViewResult{}, err)
 		return OpenRuntimeViewResult{}, err
 	}
 
-	identity := RuntimeViewID(m.nextOpaqueID("runtime-view"))
+	identity := RuntimeViewID(m.operationOpaqueID(scope, "runtime-view", "runtime-view"))
+	if err := m.injectFaultEvent(FaultEvent{
+		Point:       FaultBeforeRuntimeViewCreation,
+		OperationID: request.Operation.ID,
+		SubjectID:   string(identity),
+	}); err != nil {
+		return OpenRuntimeViewResult{}, err
+	}
+	markOperationReconciliationRequired(m.operations, scope)
 	m.views[identity] = runtimeViewBinding{
 		policyDomainID:        request.PolicyDomainID,
 		taskID:                request.TaskID,
@@ -247,8 +302,15 @@ func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewReq
 		Fence:                 request.Fence,
 		Operation:             request.Operation,
 	}
-	recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, result, nil)
-	return result, nil
+	if err := m.injectFaultEvent(FaultEvent{
+		Point:       FaultAfterRuntimeViewCreation,
+		OperationID: request.Operation.ID,
+		SubjectID:   string(identity),
+	}); err != nil {
+		return OpenRuntimeViewResult{}, err
+	}
+	recordOperation(m.operations, scope, request.Operation, result, nil)
+	return deliverOperationResponse(m, request.Operation.ID, result)
 }
 
 func (m *inMemory) sandboxLeaseAuthorityMatches(request OpenRuntimeViewRequest) bool {
@@ -292,14 +354,24 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if result, replayed, err := replayOperation[CommitRuntimeViewResult](m.operations, request.PolicyDomainID, request.TaskID, request.Operation); replayed {
+	scope := operationScope{
+		policyDomainID: request.PolicyDomainID,
+		taskID:         request.TaskID,
+		operationID:    request.Operation.ID,
+	}
+	if result, replayed, err := replayOperation[CommitRuntimeViewResult](m.operations, scope, request.Operation); replayed {
 		return result, err
 	}
 	trustedRequest := request
 	trustedRequest.DeclaredStateManifest = cloneDeclaredStateManifest(request.DeclaredStateManifest)
+	if _, err := ensureOperationIntent(
+		m, scope, request.Operation, trustedRequest, commitRuntimeViewJournalSpec(), nil,
+	); err != nil {
+		return CommitRuntimeViewResult{}, err
+	}
 	fail := func(code ErrorCode) (CommitRuntimeViewResult, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, CommitRuntimeViewResult{}, err)
+		recordOperation(m.operations, scope, request.Operation, CommitRuntimeViewResult{}, err)
 		return CommitRuntimeViewResult{}, err
 	}
 
@@ -333,23 +405,71 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 	if !m.validationEvidenceMatches(trustedRequest.ValidationEvidence, trustedRequest, view) {
 		return fail(ErrorIntegrityFailure)
 	}
+	if err := m.injectFault(FaultBeforeDeclaredManifestVerification, request.Operation.ID); err != nil {
+		return CommitRuntimeViewResult{}, err
+	}
 	contentRoot, ok := validateDeclaredStateManifest(trustedRequest.DeclaredStateManifest)
 	if !ok {
 		return fail(ErrorIntegrityFailure)
+	}
+	if err := m.injectFault(FaultAfterDeclaredManifestVerification, request.Operation.ID); err != nil {
+		return CommitRuntimeViewResult{}, err
 	}
 
 	predecessor := workspace.currentRevisionID
 	resultingRevision := predecessor
 	changed := trustedRequest.DeclaredStateManifest.Digest != workspace.currentManifest
 	if changed {
-		resultingRevision = RevisionID(m.nextOpaqueID("revision"))
+		resultingRevision = RevisionID(m.operationOpaqueID(scope, "revision", "revision"))
 	} else {
 		predecessor = m.revisions[resultingRevision].predecessor
 	}
-	checkpointID := CheckpointID(m.nextOpaqueID("checkpoint"))
+	checkpointID := CheckpointID(m.operationOpaqueID(scope, "checkpoint", "checkpoint"))
 	checkpointEvidence := CheckpointEvidence{}
 	var durabilityRoot EvidenceRoot
 	if m.durableObject != nil {
+		expectedPrepares := len(trustedRequest.DeclaredStateManifest.Members) + 1
+		prepareOrdinal := 0
+		prepareStarted := false
+		progress := func(event DurableContentPrepareProgress) error {
+			if event.Ordinal != prepareOrdinal {
+				return &Error{Code: ErrorIntegrityFailure}
+			}
+			switch event.Boundary {
+			case DurableContentPrepareBefore:
+				if prepareStarted || prepareOrdinal >= expectedPrepares {
+					return &Error{Code: ErrorIntegrityFailure}
+				}
+				if err := m.injectFaultEvent(FaultEvent{
+					Point:       FaultBeforeContentPrepare,
+					OperationID: request.Operation.ID,
+					SubjectID:   event.SubjectID,
+					Ordinal:     event.Ordinal,
+				}); err != nil {
+					return err
+				}
+				markOperationReconciliationRequired(m.operations, scope)
+				prepareStarted = true
+				return nil
+			case DurableContentPrepareAfter:
+				if !prepareStarted {
+					return &Error{Code: ErrorIntegrityFailure}
+				}
+				if err := m.injectFaultEvent(FaultEvent{
+					Point:       FaultAfterContentPrepare,
+					OperationID: request.Operation.ID,
+					SubjectID:   event.SubjectID,
+					Ordinal:     event.Ordinal,
+				}); err != nil {
+					return err
+				}
+				prepareStarted = false
+				prepareOrdinal++
+				return nil
+			default:
+				return &Error{Code: ErrorIntegrityFailure}
+			}
+		}
 		prepared, err := m.durableObject.PrepareCheckpoint(ctx, PrepareCheckpointContentRequest{
 			PolicyDomainID:    request.PolicyDomainID,
 			TaskID:            request.TaskID,
@@ -362,25 +482,49 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 			Generation:        request.Generation,
 			Fence:             request.Fence,
 			Operation:         request.Operation,
+			Progress:          progress,
 		})
 		if err != nil {
+			if errors.Is(err, ErrDurableObjectResultAmbiguous) {
+				markOperationReconciliationRequired(m.operations, scope)
+				return CommitRuntimeViewResult{}, &Error{Code: ErrorReconciliationRequired}
+			}
+			var lifecycleError *Error
+			if errors.As(err, &lifecycleError) && lifecycleError.Code == ErrorReconciliationRequired {
+				return CommitRuntimeViewResult{}, lifecycleError
+			}
+			return fail(ErrorIntegrityFailure)
+		}
+		if prepareStarted || prepareOrdinal != expectedPrepares {
 			return fail(ErrorIntegrityFailure)
 		}
 		var trusted bool
-		checkpointEvidence, contentRoot, durabilityRoot, trusted = m.bindCheckpointEvidence(
+		var bindErr error
+		checkpointEvidence, contentRoot, durabilityRoot, trusted, bindErr = m.bindCheckpointEvidence(
 			trustedRequest,
 			resultingRevision,
 			checkpointID,
 			prepared,
 		)
+		if bindErr != nil {
+			return CommitRuntimeViewResult{}, bindErr
+		}
 		if !trusted {
 			return fail(ErrorIntegrityFailure)
 		}
+		markOperationVerified(m.operations, scope)
 	} else {
 		return fail(ErrorIntegrityFailure)
 	}
 	if !m.sandboxLeaseAuthorityIsCurrent(view.sandboxLeaseAuthority) {
 		return fail(ErrorStaleAuthority)
+	}
+	if err := m.injectFaultEvent(FaultEvent{
+		Point:       FaultBeforeAuthoritativeTransaction,
+		OperationID: request.Operation.ID,
+		SubjectID:   string(checkpointID),
+	}); err != nil {
+		return CommitRuntimeViewResult{}, err
 	}
 
 	if changed {
@@ -423,8 +567,15 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		Fence:                    workspace.fence,
 		Operation:                request.Operation,
 	}
-	recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, result, nil)
-	return result, nil
+	recordOperation(m.operations, scope, request.Operation, result, nil)
+	if err := m.injectFaultEvent(FaultEvent{
+		Point:       FaultAfterAuthoritativeTransaction,
+		OperationID: request.Operation.ID,
+		SubjectID:   string(checkpointID),
+	}); err != nil {
+		return CommitRuntimeViewResult{}, err
+	}
+	return deliverOperationResponse(m, request.Operation.ID, result)
 }
 
 func (m *inMemory) beforeRuntimeViewTerminal(attempt RuntimeViewTerminalAttempt) {
@@ -455,7 +606,7 @@ func (m *inMemory) bindCheckpointEvidence(
 	revisionID RevisionID,
 	checkpointID CheckpointID,
 	prepared VerifiedCheckpointContent,
-) (CheckpointEvidence, EvidenceRoot, EvidenceRoot, bool) {
+) (CheckpointEvidence, EvidenceRoot, EvidenceRoot, bool, error) {
 	manifestReference := prepared.ManifestReference
 	if !checkpointManifestMatchesDeclaration(prepared.Manifest, request.DeclaredStateManifest) ||
 		!contentReferenceIsCanonical(manifestReference) ||
@@ -469,11 +620,11 @@ func (m *inMemory) bindCheckpointEvidence(
 		manifestReference.StateMemberID != "" || manifestReference.LogicalMember != "" ||
 		manifestReference.ContentDigest != prepared.Manifest.Digest ||
 		manifestReference.Size != uint64(len(prepared.Manifest.CanonicalBytes())) {
-		return CheckpointEvidence{}, "", "", false
+		return CheckpointEvidence{}, "", "", false, nil
 	}
 
 	if len(prepared.ContentReferences) != len(request.DeclaredStateManifest.Members) {
-		return CheckpointEvidence{}, "", "", false
+		return CheckpointEvidence{}, "", "", false, nil
 	}
 	members := make(map[StateMemberID]DeclaredStateMember, len(request.DeclaredStateManifest.Members))
 	for _, member := range request.DeclaredStateManifest.Members {
@@ -499,21 +650,34 @@ func (m *inMemory) bindCheckpointEvidence(
 			) ||
 			reference.LogicalMember != member.LogicalMember || reference.ContentID != manifestMember.ContentID ||
 			reference.ContentDigest != member.ContentDigest || reference.Size != member.Size {
-			return CheckpointEvidence{}, "", "", false
+			return CheckpointEvidence{}, "", "", false, nil
 		}
 		if _, duplicate := seenReferences[reference.ID]; duplicate {
-			return CheckpointEvidence{}, "", "", false
+			return CheckpointEvidence{}, "", "", false, nil
 		}
 		if _, duplicate := seenMembers[reference.StateMemberID]; duplicate {
-			return CheckpointEvidence{}, "", "", false
+			return CheckpointEvidence{}, "", "", false, nil
 		}
 		seenReferences[reference.ID] = struct{}{}
 		seenMembers[reference.StateMemberID] = struct{}{}
 	}
 
-	contentRoot, durabilityRoot, durable := m.durableContentRoots(prepared)
+	contentRoot, durabilityRoot, durable, err := m.durableContentRoots(
+		prepared,
+		func(point FaultPoint, ordinal int, subjectID string) error {
+			return m.injectFaultEvent(FaultEvent{
+				Point:       point,
+				OperationID: request.Operation.ID,
+				SubjectID:   subjectID,
+				Ordinal:     ordinal,
+			})
+		},
+	)
+	if err != nil {
+		return CheckpointEvidence{}, "", "", false, err
+	}
 	if !durable {
-		return CheckpointEvidence{}, "", "", false
+		return CheckpointEvidence{}, "", "", false, nil
 	}
 	integrity := m.newCheckpointIntegrityEvidence(CheckpointIntegrityEvidence{
 		DurabilityAuthorityID:    m.durabilityAuthorityID,
@@ -534,7 +698,7 @@ func (m *inMemory) bindCheckpointEvidence(
 		DurabilityReceipts: append([]DurabilityReceipt(nil), prepared.DurabilityReceipts...),
 		IntegrityEvidence:  integrity,
 	}
-	return evidence, contentRoot, durabilityRoot, true
+	return evidence, contentRoot, durabilityRoot, true, nil
 }
 
 func (m *inMemory) reverifyCheckpointEvidence(
@@ -551,7 +715,10 @@ func (m *inMemory) reverifyCheckpointEvidence(
 		!m.receiptsRespectKnownIdentity(expected.DurabilityReceipts, verified.DurabilityReceipts) {
 		return CheckpointEvidence{}, false
 	}
-	contentRoot, durabilityRoot, durable := m.durableContentRoots(verified)
+	contentRoot, durabilityRoot, durable, err := m.durableContentRoots(verified, nil)
+	if err != nil {
+		return CheckpointEvidence{}, false
+	}
 	if !durable || contentRoot != expected.IntegrityEvidence.ContentEvidenceRoot {
 		return CheckpointEvidence{}, false
 	}
@@ -588,7 +755,11 @@ func (m *inMemory) newCheckpointIntegrityEvidence(
 	contentRoot EvidenceRoot,
 	durabilityRoot EvidenceRoot,
 ) CheckpointIntegrityEvidence {
-	base.ID = CheckpointIntegrityID(m.nextOpaqueID("checkpoint-integrity"))
+	base.ID = CheckpointIntegrityID(m.operationOpaqueID(
+		operationScope{base.PolicyDomainID, base.TaskID, operation.ID},
+		"checkpoint-integrity:"+string(base.CheckpointID),
+		"checkpoint-integrity",
+	))
 	base.Digest = ""
 	base.ContentEvidenceRoot = contentRoot
 	base.DurabilityEvidenceRoot = durabilityRoot
@@ -618,16 +789,17 @@ func sameCheckpointManifest(left, right CheckpointManifest) bool {
 
 func (m *inMemory) durableContentRoots(
 	content VerifiedCheckpointContent,
-) (EvidenceRoot, EvidenceRoot, bool) {
+	receiptBoundary func(FaultPoint, int, string) error,
+) (EvidenceRoot, EvidenceRoot, bool, error) {
 	references := canonicalContentReferences(content.ManifestReference, content.ContentReferences)
 	requiredReceipts := make(map[ContentID]durableContentFact, len(references))
 	seenReferenceIDs := make(map[ContentReferenceID]struct{}, len(references))
 	for _, reference := range references {
 		if !contentReferenceIsCanonical(reference) {
-			return "", "", false
+			return "", "", false, nil
 		}
 		if _, duplicate := seenReferenceIDs[reference.ID]; duplicate {
-			return "", "", false
+			return "", "", false, nil
 		}
 		seenReferenceIDs[reference.ID] = struct{}{}
 		fact := durableContentFact{
@@ -636,34 +808,44 @@ func (m *inMemory) durableContentRoots(
 			size:           reference.Size,
 		}
 		if existing, duplicate := requiredReceipts[reference.ContentID]; duplicate && existing != fact {
-			return "", "", false
+			return "", "", false, nil
 		}
 		requiredReceipts[reference.ContentID] = fact
 	}
 	if len(content.DurabilityReceipts) != len(requiredReceipts) {
-		return "", "", false
+		return "", "", false, nil
 	}
 	seenReceiptIDs := make(map[DurabilityReceiptID]struct{}, len(content.DurabilityReceipts))
 	seenReceiptContent := make(map[ContentID]struct{}, len(content.DurabilityReceipts))
-	for _, receipt := range content.DurabilityReceipts {
+	for ordinal, receipt := range canonicalDurabilityReceipts(content.DurabilityReceipts) {
+		if receiptBoundary != nil {
+			if err := receiptBoundary(FaultBeforeDurabilityReceiptVerification, ordinal, string(receipt.ID)); err != nil {
+				return "", "", false, err
+			}
+		}
 		fact, required := requiredReceipts[receipt.ContentID]
 		if !required || !durabilityReceiptIsCanonical(receipt) ||
 			receipt.DurabilityAuthorityID != m.durabilityAuthorityID ||
 			receipt.PolicyDomainID != fact.policyDomainID ||
 			receipt.ContentDigest != fact.contentDigest || receipt.Size != fact.size {
-			return "", "", false
+			return "", "", false, nil
 		}
 		if _, duplicate := seenReceiptIDs[receipt.ID]; duplicate {
-			return "", "", false
+			return "", "", false, nil
 		}
 		if _, duplicate := seenReceiptContent[receipt.ContentID]; duplicate {
-			return "", "", false
+			return "", "", false, nil
 		}
 		seenReceiptIDs[receipt.ID] = struct{}{}
 		seenReceiptContent[receipt.ContentID] = struct{}{}
+		if receiptBoundary != nil {
+			if err := receiptBoundary(FaultAfterDurabilityReceiptVerification, ordinal, string(receipt.ID)); err != nil {
+				return "", "", false, err
+			}
+		}
 	}
 	if !m.durableEvidenceIdentitiesAreConsistent(content) {
-		return "", "", false
+		return "", "", false, nil
 	}
 	receipts := canonicalDurabilityReceipts(content.DurabilityReceipts)
 	contentRoot := EvidenceRoot(canonicalDigest(struct {
@@ -672,7 +854,7 @@ func (m *inMemory) durableContentRoots(
 	durabilityRoot := EvidenceRoot(canonicalDigest(struct {
 		Receipts []DurabilityReceipt
 	}{Receipts: receipts}))
-	return contentRoot, durabilityRoot, true
+	return contentRoot, durabilityRoot, true, nil
 }
 
 func (m *inMemory) durableEvidenceIdentitiesAreConsistent(content VerifiedCheckpointContent) bool {
@@ -874,19 +1056,6 @@ func checkpointManifestMatchesDeclaration(manifest CheckpointManifest, declared 
 	return true
 }
 
-func cloneOperationResult[T any](value T) T {
-	switch result := any(value).(type) {
-	case CommitRuntimeViewResult:
-		result.CheckpointEvidence = cloneCheckpointEvidence(result.CheckpointEvidence)
-		return any(result).(T)
-	case MaterializeResult:
-		result.CheckpointEvidence = cloneCheckpointEvidence(result.CheckpointEvidence)
-		return any(result).(T)
-	default:
-		return value
-	}
-}
-
 func validateDeclaredStateManifest(manifest DeclaredStateManifest) (EvidenceRoot, bool) {
 	if !validDigest(manifest.Digest) || manifest.Digest != manifest.CanonicalDigest() {
 		return "", false
@@ -993,28 +1162,58 @@ func (m *inMemory) ConfirmTaskWorkspace(_ context.Context, request ConfirmTaskWo
 		request.Operation.RequestDigest != request.CanonicalRequestDigest() {
 		return ConfirmTaskWorkspaceResult{}, &Error{Code: ErrorInvalidIntent}
 	}
-	if result, replayed, err := replayOperation[ConfirmTaskWorkspaceResult](m.operations, request.PolicyDomainID, request.TaskID, request.Operation); replayed {
+	scope := operationScope{
+		policyDomainID: request.PolicyDomainID,
+		taskID:         request.TaskID,
+		operationID:    request.Operation.ID,
+	}
+	if result, replayed, err := replayOperation[ConfirmTaskWorkspaceResult](m.operations, scope, request.Operation); replayed {
 		return result, err
+	}
+	var plannedWorkspaceID TaskWorkspaceID
+	var plannedRevisionID RevisionID
+	reserveIdentities := func() {
+		plannedWorkspaceID = TaskWorkspaceID(m.operationOpaqueID(scope, "workspace", "workspace"))
+		plannedRevisionID = RevisionID(m.operationOpaqueID(scope, "initial-revision", "revision"))
+		record := m.operations[scope]
+		record.expectedRevisionID = plannedRevisionID
+		m.operations[scope] = record
+	}
+	created, err := ensureOperationIntent(
+		m, scope, request.Operation, request, confirmJournalSpec(), reserveIdentities,
+	)
+	if err != nil {
+		return ConfirmTaskWorkspaceResult{}, err
+	}
+	if !created {
+		reserveIdentities()
 	}
 	if existing, ok := m.workspaces[request.TaskID]; ok {
 		if existing.policyDomainID != request.PolicyDomainID {
 			err := &Error{Code: ErrorOwnershipDenied}
-			recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, ConfirmTaskWorkspaceResult{}, err)
+			recordOperation(m.operations, scope, request.Operation, ConfirmTaskWorkspaceResult{}, err)
 			return ConfirmTaskWorkspaceResult{}, err
 		}
 		result := confirmResult(existing)
-		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, result, nil)
-		return result, nil
+		recordOperation(m.operations, scope, request.Operation, result, nil)
+		return deliverOperationResponse(m, request.Operation.ID, result)
 	}
 
 	emptyManifest := DeclaredStateManifest{}
 	binding := workspaceBinding{
 		policyDomainID:    request.PolicyDomainID,
-		taskWorkspaceID:   TaskWorkspaceID(m.nextOpaqueID("workspace")),
-		currentRevisionID: RevisionID(m.nextOpaqueID("revision")),
+		taskWorkspaceID:   plannedWorkspaceID,
+		currentRevisionID: plannedRevisionID,
 		currentManifest:   emptyManifest.CanonicalDigest(),
 		generation:        1,
 		fence:             1,
+	}
+	if err := m.injectFaultEvent(FaultEvent{
+		Point:       FaultBeforeAuthoritativeTransaction,
+		OperationID: request.Operation.ID,
+		SubjectID:   string(plannedWorkspaceID),
+	}); err != nil {
+		return ConfirmTaskWorkspaceResult{}, err
 	}
 	m.workspaces[request.TaskID] = binding
 	m.revisions[binding.currentRevisionID] = revisionRecord{
@@ -1022,8 +1221,15 @@ func (m *inMemory) ConfirmTaskWorkspace(_ context.Context, request ConfirmTaskWo
 		manifestDigest:  binding.currentManifest,
 	}
 	result := confirmResult(binding)
-	recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, result, nil)
-	return result, nil
+	recordOperation(m.operations, scope, request.Operation, result, nil)
+	if err := m.injectFaultEvent(FaultEvent{
+		Point:       FaultAfterAuthoritativeTransaction,
+		OperationID: request.Operation.ID,
+		SubjectID:   string(plannedWorkspaceID),
+	}); err != nil {
+		return ConfirmTaskWorkspaceResult{}, err
+	}
+	return deliverOperationResponse(m, request.Operation.ID, result)
 }
 
 func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) (MaterializeResult, error) {
@@ -1035,21 +1241,37 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 		request.Operation.ID == "" || request.Operation.RequestDigest != request.CanonicalRequestDigest() {
 		return MaterializeResult{}, &Error{Code: ErrorInvalidIntent}
 	}
-	if result, replayed, err := replayOperation[MaterializeResult](m.operations, request.PolicyDomainID, request.TaskID, request.Operation); replayed {
+	scope := operationScope{request.PolicyDomainID, request.TaskID, request.Operation.ID}
+	if result, replayed, err := replayOperation[MaterializeResult](m.operations, scope, request.Operation); replayed {
 		return result, err
+	}
+	if _, err := ensureOperationIntent(
+		m, scope, request.Operation, request, materializeJournalSpec(), nil,
+	); err != nil {
+		return MaterializeResult{}, err
 	}
 	workspace, ok := m.workspaces[request.TaskID]
 	if !ok || workspace.policyDomainID != request.PolicyDomainID || workspace.taskWorkspaceID != request.TaskWorkspaceID {
 		err := &Error{Code: ErrorOwnershipDenied}
-		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, MaterializeResult{}, err)
+		recordOperation(m.operations, scope, request.Operation, MaterializeResult{}, err)
 		return MaterializeResult{}, err
 	}
 	if workspace.currentRevisionID != request.RevisionID || workspace.currentCheckpointID != request.CheckpointID ||
 		workspace.generation != request.Generation || workspace.fence != request.Fence {
 		err := &Error{Code: ErrorStaleAuthority}
-		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, MaterializeResult{}, err)
+		recordOperation(m.operations, scope, request.Operation, MaterializeResult{}, err)
 		return MaterializeResult{}, err
 	}
+
+	identity := MaterializationID(m.operationOpaqueID(scope, "materialization", "materialization"))
+	if err := m.injectFaultEvent(FaultEvent{
+		Point:       FaultBeforeBaseMaterialization,
+		OperationID: request.Operation.ID,
+		SubjectID:   string(identity),
+	}); err != nil {
+		return MaterializeResult{}, err
+	}
+	markOperationReconciliationRequired(m.operations, scope)
 
 	checkpointEvidence := CheckpointEvidence{}
 	checkpointID := request.CheckpointID
@@ -1058,7 +1280,7 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 		if !exists || checkpoint.taskWorkspaceID != request.TaskWorkspaceID || checkpoint.revisionID != request.RevisionID ||
 			checkpoint.manifestDigest != workspace.currentManifest || m.durableObject == nil {
 			err := &Error{Code: ErrorIntegrityFailure}
-			recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, MaterializeResult{}, err)
+			recordOperation(m.operations, scope, request.Operation, MaterializeResult{}, err)
 			return MaterializeResult{}, err
 		}
 		verified, verifyErr := m.durableObject.VerifyCheckpoint(ctx, VerifyCheckpointContentRequest{
@@ -1075,15 +1297,22 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 			Operation:         request.Operation,
 		})
 		if verifyErr != nil {
+			if errors.Is(verifyErr, ErrDurableObjectResultAmbiguous) {
+				return MaterializeResult{}, &Error{Code: ErrorReconciliationRequired}
+			}
+			var lifecycleError *Error
+			if errors.As(verifyErr, &lifecycleError) && lifecycleError.Code == ErrorReconciliationRequired {
+				return MaterializeResult{}, lifecycleError
+			}
 			err := &Error{Code: ErrorIntegrityFailure}
-			recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, MaterializeResult{}, err)
+			recordOperation(m.operations, scope, request.Operation, MaterializeResult{}, err)
 			return MaterializeResult{}, err
 		}
 		var trusted bool
 		checkpointEvidence, trusted = m.reverifyCheckpointEvidence(request, checkpoint.evidence, verified)
 		if !trusted {
 			err := &Error{Code: ErrorIntegrityFailure}
-			recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, MaterializeResult{}, err)
+			recordOperation(m.operations, scope, request.Operation, MaterializeResult{}, err)
 			return MaterializeResult{}, err
 		}
 		checkpoint.evidence = cloneCheckpointEvidence(checkpointEvidence)
@@ -1091,7 +1320,6 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 		m.recordDurableEvidenceIdentities(verifiedCheckpointContent(checkpointEvidence))
 	}
 
-	identity := MaterializationID(m.nextOpaqueID("materialization"))
 	m.materializations[identity] = materializationBinding{
 		policyDomainID:  request.PolicyDomainID,
 		taskID:          request.TaskID,
@@ -1113,8 +1341,15 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 		Generation:             request.Generation,
 		Fence:                  request.Fence,
 	}
-	recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, result, nil)
-	return result, nil
+	if err := m.injectFaultEvent(FaultEvent{
+		Point:       FaultAfterBaseMaterialization,
+		OperationID: request.Operation.ID,
+		SubjectID:   string(identity),
+	}); err != nil {
+		return MaterializeResult{}, err
+	}
+	recordOperation(m.operations, scope, request.Operation, result, nil)
+	return deliverOperationResponse(m, request.Operation.ID, result)
 }
 
 func confirmResult(binding workspaceBinding) ConfirmTaskWorkspaceResult {
@@ -1132,51 +1367,60 @@ func (m *inMemory) nextOpaqueID(kind string) string {
 	return fmt.Sprintf("%s-%016x", kind, m.nextID)
 }
 
-func replayOperation[T any](
+func replayOperation[Result any](
 	records map[operationScope]operationRecord,
-	policyDomainID PolicyDomainID,
-	taskID TaskID,
+	scope operationScope,
 	operation Operation,
-) (T, bool, error) {
-	var zero T
-	record, ok := records[operationScope{
-		policyDomainID: policyDomainID,
-		taskID:         taskID,
-		operationID:    operation.ID,
-	}]
+) (Result, bool, error) {
+	var zero Result
+	record, ok := records[scope]
 	if !ok {
 		return zero, false, nil
 	}
 	if record.requestDigest != operation.RequestDigest {
 		return zero, true, &Error{Code: ErrorIntegrityConflict}
 	}
-	result, ok := record.result.(T)
+	if record.state != operationJournalTerminal {
+		return zero, false, nil
+	}
+	access, ok := record.payload.(operationResultAccess[Result])
 	if !ok {
 		return zero, true, &Error{Code: ErrorIntegrityConflict}
 	}
-	if record.err != nil {
-		return cloneOperationResult(result), true, cloneLifecycleError(record.err)
+	result, resultSet := access.operationResult()
+	if !resultSet {
+		return zero, true, &Error{Code: ErrorIntegrityConflict}
 	}
-	return cloneOperationResult(result), true, nil
+	if record.err != nil {
+		return result, true, cloneLifecycleError(record.err)
+	}
+	return result, true, nil
 }
 
-func recordOperation[T any](
+func recordOperation[Result any](
 	records map[operationScope]operationRecord,
-	policyDomainID PolicyDomainID,
-	taskID TaskID,
+	scope operationScope,
 	operation Operation,
-	result T,
+	result Result,
 	err *Error,
 ) {
-	records[operationScope{
-		policyDomainID: policyDomainID,
-		taskID:         taskID,
-		operationID:    operation.ID,
-	}] = operationRecord{
-		requestDigest: operation.RequestDigest,
-		result:        cloneOperationResult(result),
-		err:           cloneLifecycleError(err),
+	record := records[scope]
+	record.requestDigest = operation.RequestDigest
+	record.state = operationJournalTerminal
+	if err == nil {
+		record.intentState = OperationIntentActivated
+	} else {
+		record.intentState = OperationIntentRejected
 	}
+	access, ok := record.payload.(operationResultAccess[Result])
+	if !ok {
+		record.err = &Error{Code: ErrorIntegrityConflict}
+		records[scope] = record
+		return
+	}
+	access.storeOperationResult(result)
+	record.err = cloneLifecycleError(err)
+	records[scope] = record
 }
 
 func cloneLifecycleError(err *Error) *Error {

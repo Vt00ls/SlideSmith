@@ -89,13 +89,14 @@ type Operation struct {
 type ErrorCode string
 
 const (
-	ErrorInvalidIntent        ErrorCode = "invalid_intent"
-	ErrorIntegrityConflict    ErrorCode = "integrity_conflict"
-	ErrorIntegrityFailure     ErrorCode = "integrity_failure"
-	ErrorOwnershipDenied      ErrorCode = "ownership_denied"
-	ErrorStaleAuthority       ErrorCode = "stale_authority"
-	ErrorViewTerminalConflict ErrorCode = "view_terminal_conflict"
-	ErrorEffectDenied         ErrorCode = "effect_denied"
+	ErrorInvalidIntent          ErrorCode = "invalid_intent"
+	ErrorIntegrityConflict      ErrorCode = "integrity_conflict"
+	ErrorIntegrityFailure       ErrorCode = "integrity_failure"
+	ErrorOwnershipDenied        ErrorCode = "ownership_denied"
+	ErrorStaleAuthority         ErrorCode = "stale_authority"
+	ErrorViewTerminalConflict   ErrorCode = "view_terminal_conflict"
+	ErrorEffectDenied           ErrorCode = "effect_denied"
+	ErrorReconciliationRequired ErrorCode = "reconciliation_required"
 )
 
 type Error struct {
@@ -116,6 +117,8 @@ func (e *Error) Error() string {
 		return "task workspace lifecycle view is already terminal"
 	case ErrorEffectDenied:
 		return "task workspace lifecycle effect is not permitted"
+	case ErrorReconciliationRequired:
+		return "task workspace lifecycle operation requires reconciliation"
 	default:
 		return "task workspace lifecycle intent is invalid"
 	}
@@ -275,6 +278,8 @@ type Lifecycle interface {
 	CommitRuntimeView(context.Context, CommitRuntimeViewRequest) (CommitRuntimeViewResult, error)
 	DiscardRuntimeView(context.Context, DiscardRuntimeViewRequest) (DiscardRuntimeViewResult, error)
 	FenceRuntimeView(context.Context, FenceRuntimeViewRequest) (FenceRuntimeViewResult, error)
+	InspectOperation(context.Context, InspectOperationRequest) (OperationInspection, error)
+	ReconcileOperation(context.Context, ReconcileOperationRequest) (OperationInspection, error)
 }
 
 func canonicalDigest(value any) Digest {
