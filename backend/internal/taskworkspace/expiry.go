@@ -171,7 +171,7 @@ func (m *inMemory) ExpireMaterialization(
 	}
 	fail := func(code ErrorCode) (ExpireMaterializationResult, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, scope, request.Operation, ExpireMaterializationResult{}, err)
+		recordOperation(m.operations, m.now(), scope, request.Operation, ExpireMaterializationResult{}, err)
 		return ExpireMaterializationResult{}, err
 	}
 	workspace, workspaceOK := m.workspaces[request.TaskID]
@@ -217,7 +217,7 @@ func (m *inMemory) ExpireMaterialization(
 	}
 
 	expiredAt := m.now()
-	markOperationReconciliationRequired(m.operations, scope)
+	markOperationReconciliationRequired(m.operations, m.now(), scope)
 	if err := m.injectFaultEvent(FaultEvent{
 		Point:       FaultBeforePhysicalExpiry,
 		OperationID: request.Operation.ID,
@@ -237,7 +237,7 @@ func (m *inMemory) ExpireMaterialization(
 		ExpiredAt:         expiredAt,
 		Operation:         request.Operation,
 	}
-	recordOperation(m.operations, scope, request.Operation, result, nil)
+	recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 	if err := m.injectFaultEvent(FaultEvent{
 		Point:       FaultAfterPhysicalExpiry,
 		OperationID: request.Operation.ID,
@@ -274,7 +274,7 @@ func (m *inMemory) ExpireRuntimeView(
 	}
 	fail := func(code ErrorCode) (ExpireRuntimeViewResult, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, scope, request.Operation, ExpireRuntimeViewResult{}, err)
+		recordOperation(m.operations, m.now(), scope, request.Operation, ExpireRuntimeViewResult{}, err)
 		return ExpireRuntimeViewResult{}, err
 	}
 	workspace, workspaceOK := m.workspaces[request.TaskID]
@@ -314,7 +314,7 @@ func (m *inMemory) ExpireRuntimeView(
 		}
 	}
 
-	markOperationReconciliationRequired(m.operations, scope)
+	markOperationReconciliationRequired(m.operations, m.now(), scope)
 	if err := m.injectFaultEvent(FaultEvent{
 		Point:       FaultBeforePhysicalExpiry,
 		OperationID: request.Operation.ID,
@@ -334,7 +334,7 @@ func (m *inMemory) ExpireRuntimeView(
 		ExpiredAt:       m.now(),
 		Operation:       request.Operation,
 	}
-	recordOperation(m.operations, scope, request.Operation, result, nil)
+	recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 	if err := m.injectFaultEvent(FaultEvent{
 		Point:       FaultAfterPhysicalExpiry,
 		OperationID: request.Operation.ID,

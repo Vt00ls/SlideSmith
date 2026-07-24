@@ -144,7 +144,7 @@ func (m *inMemory) RestoreTaskWorkspace(
 	}
 	fail := func(code ErrorCode) (RestoreTaskWorkspaceResult, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, scope, request.Operation, RestoreTaskWorkspaceResult{}, err)
+		recordOperation(m.operations, m.now(), scope, request.Operation, RestoreTaskWorkspaceResult{}, err)
 		return RestoreTaskWorkspaceResult{}, err
 	}
 	currentIntent, intentOK := m.currentRecoveryIntent(intent.ID)
@@ -179,7 +179,7 @@ func (m *inMemory) RestoreTaskWorkspace(
 
 	nextGeneration := workspace.generation + 1
 	nextFence := workspace.fence + 1
-	markOperationReconciliationRequired(m.operations, scope)
+	markOperationReconciliationRequired(m.operations, m.now(), scope)
 	verified, verifyErr := m.durableObject.VerifyCheckpoint(ctx, VerifyCheckpointContentRequest{
 		PolicyDomainID:    intent.PolicyDomainID,
 		TaskID:            intent.TaskID,
@@ -242,7 +242,7 @@ func (m *inMemory) RestoreTaskWorkspace(
 		seenMaterializations[materialized.ID] = struct{}{}
 		readOnlyInputs = append(readOnlyInputs, materialized)
 	}
-	markOperationVerified(m.operations, scope)
+	markOperationVerified(m.operations, m.now(), scope)
 	materializationID := MaterializationID(m.operationOpaqueID(scope, "materialization", "materialization"))
 	if err := m.injectFaultEvent(FaultEvent{
 		Point:       FaultBeforeAuthoritativeTransaction,
@@ -257,6 +257,7 @@ func (m *inMemory) RestoreTaskWorkspace(
 	m.recordDurableEvidenceIdentities(verifiedCheckpointContent(evidence))
 	workspace.generation = nextGeneration
 	workspace.fence = nextFence
+	workspace.recordedAt = m.now()
 	m.workspaces[intent.TaskID] = workspace
 	m.materializations[materializationID] = materializationBinding{
 		policyDomainID:  intent.PolicyDomainID,
@@ -288,7 +289,7 @@ func (m *inMemory) RestoreTaskWorkspace(
 		RecoveryIntentID:       intent.ID,
 		Operation:              request.Operation,
 	}
-	recordOperation(m.operations, scope, request.Operation, result, nil)
+	recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 	if err := m.injectFaultEvent(FaultEvent{
 		Point:       FaultAfterAuthoritativeTransaction,
 		OperationID: request.Operation.ID,

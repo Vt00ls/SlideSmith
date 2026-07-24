@@ -103,6 +103,7 @@ type checkpointRetentionRecord struct {
 	pendingReferenceReleaseOperationID OperationID
 	reclaimed                          bool
 	reclamationEvidence                CheckpointReclamationEvidence
+	recordedAt                         Instant
 }
 
 func (r checkpointRetentionRecord) semanticallyRetained(now Instant) bool {
@@ -236,7 +237,7 @@ func (m *inMemory) ReleaseCheckpointRetention(
 	}
 	fail := func(code ErrorCode) (CheckpointRetention, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, scope, request.Operation, CheckpointRetention{}, err)
+		recordOperation(m.operations, m.now(), scope, request.Operation, CheckpointRetention{}, err)
 		return CheckpointRetention{}, err
 	}
 	workspace, workspaceOK := m.workspaces[request.TaskID]
@@ -291,13 +292,14 @@ func (m *inMemory) ReleaseCheckpointRetention(
 		if !resumingFinalRelease {
 			delete(checkpoint.retention.authorities, request.AuthorityID)
 			checkpoint.retention.generation++
+			checkpoint.retention.recordedAt = m.now()
 			checkpoint.retention.policyID = m.checkpointRetentionPolicy.ID
 			checkpoint.retention.eligibleAt = m.now() + Instant(m.checkpointRetentionPolicy.ReclamationGrace)
 			checkpoint.retention.pendingReferenceReleaseOperationID = request.Operation.ID
 			m.releaseCheckpointContentReferences(checkpoint)
 			m.checkpoints[request.CheckpointID] = checkpoint
 		}
-		markOperationReconciliationRequired(m.operations, scope)
+		markOperationReconciliationRequired(m.operations, m.now(), scope)
 		evidence, err := m.checkpointReclamation.ReleaseCheckpointReferences(ctx, transition)
 		if err != nil {
 			if errors.Is(err, ErrDurableObjectResultAmbiguous) {
@@ -318,10 +320,11 @@ func (m *inMemory) ReleaseCheckpointRetention(
 	if !finalRelease {
 		delete(checkpoint.retention.authorities, request.AuthorityID)
 		checkpoint.retention.generation++
+		checkpoint.retention.recordedAt = m.now()
 		m.checkpoints[request.CheckpointID] = checkpoint
 	}
 	result := checkpointRetentionSnapshot(request.CheckpointID, checkpoint, workspace, m.now(), request.Operation)
-	recordOperation(m.operations, scope, request.Operation, result, nil)
+	recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 	return deliverOperationResponse(m, request.Operation.ID, result)
 }
 
@@ -349,7 +352,7 @@ func (m *inMemory) AttachCheckpointRetention(
 	}
 	fail := func(code ErrorCode) (CheckpointRetention, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, scope, request.Operation, CheckpointRetention{}, err)
+		recordOperation(m.operations, m.now(), scope, request.Operation, CheckpointRetention{}, err)
 		return CheckpointRetention{}, err
 	}
 	workspace, workspaceOK := m.workspaces[request.TaskID]
@@ -393,7 +396,7 @@ func (m *inMemory) AttachCheckpointRetention(
 				request.Fence,
 				request.Operation,
 			)
-			markOperationReconciliationRequired(m.operations, scope)
+			markOperationReconciliationRequired(m.operations, m.now(), scope)
 			evidence, err := m.checkpointReclamation.AttachCheckpointReferences(ctx, transition)
 			if err != nil {
 				if errors.Is(err, ErrDurableObjectResultAmbiguous) {
@@ -411,6 +414,7 @@ func (m *inMemory) AttachCheckpointRetention(
 		}
 		checkpoint.retention.authorities[request.Authority.ID] = request.Authority
 		checkpoint.retention.generation++
+		checkpoint.retention.recordedAt = m.now()
 		checkpoint.retention.pendingReferenceReleaseOperationID = ""
 	}
 	checkpoint.retention.policyID = ""
@@ -418,7 +422,7 @@ func (m *inMemory) AttachCheckpointRetention(
 	m.checkpoints[request.CheckpointID] = checkpoint
 	m.recordDurableEvidenceIdentities(verifiedCheckpointContent(checkpoint.evidence))
 	result := checkpointRetentionSnapshot(request.CheckpointID, checkpoint, workspace, m.now(), request.Operation)
-	recordOperation(m.operations, scope, request.Operation, result, nil)
+	recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 	return deliverOperationResponse(m, request.Operation.ID, result)
 }
 

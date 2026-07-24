@@ -90,6 +90,8 @@ type Operation struct {
 
 type ErrorCode string
 
+type SafeErrorCategory string
+
 const (
 	ErrorInvalidIntent          ErrorCode = "invalid_intent"
 	ErrorIntegrityConflict      ErrorCode = "integrity_conflict"
@@ -102,6 +104,22 @@ const (
 	ErrorCheckpointNotRetained  ErrorCode = "checkpoint_not_retained"
 	ErrorRecoveryReadOnly       ErrorCode = "recovery_read_only"
 	ErrorReconciliationRequired ErrorCode = "reconciliation_required"
+	ErrorDurabilityUnverified   ErrorCode = "durability_unverified"
+	ErrorResourceExhausted      ErrorCode = "resource_exhausted"
+	ErrorRetryableUnavailable   ErrorCode = "retryable_unavailable"
+	ErrorCleanupDebt            ErrorCode = "cleanup_debt"
+
+	SafeErrorAuthorizationDenied          SafeErrorCategory = "authorization_denial"
+	SafeErrorInvalidIntent                SafeErrorCategory = "invalid_intent"
+	SafeErrorIdempotencyConflict          SafeErrorCategory = "idempotency_conflict"
+	SafeErrorStaleRevisionGenerationFence SafeErrorCategory = "stale_revision_generation_fence"
+	SafeErrorTerminalConflict             SafeErrorCategory = "terminal_conflict"
+	SafeErrorIntegrityUnavailableContent  SafeErrorCategory = "integrity_unavailable_content"
+	SafeErrorDurabilityUnverified         SafeErrorCategory = "durability_unverified"
+	SafeErrorResourceExhausted            SafeErrorCategory = "resource_exhausted"
+	SafeErrorRetryableUnavailable         SafeErrorCategory = "retryable_unavailable"
+	SafeErrorReconciliationRequired       SafeErrorCategory = "ambiguous_reconciliation_required"
+	SafeErrorCleanupDebt                  SafeErrorCategory = "cleanup_debt"
 )
 
 type Error struct {
@@ -130,8 +148,46 @@ func (e *Error) Error() string {
 		return "task workspace lifecycle recovery is read-only"
 	case ErrorReconciliationRequired:
 		return "task workspace lifecycle operation requires reconciliation"
+	case ErrorDurabilityUnverified:
+		return "task workspace lifecycle durability is unverified"
+	case ErrorResourceExhausted:
+		return "task workspace lifecycle resource capacity is exhausted"
+	case ErrorRetryableUnavailable:
+		return "task workspace lifecycle dependency is temporarily unavailable"
+	case ErrorCleanupDebt:
+		return "task workspace lifecycle cleanup remains pending"
 	default:
 		return "task workspace lifecycle intent is invalid"
+	}
+}
+
+func (e *Error) SafeCategory() SafeErrorCategory {
+	if e == nil {
+		return ""
+	}
+	switch e.Code {
+	case ErrorOwnershipDenied:
+		return SafeErrorAuthorizationDenied
+	case ErrorIntegrityConflict:
+		return SafeErrorIdempotencyConflict
+	case ErrorStaleAuthority:
+		return SafeErrorStaleRevisionGenerationFence
+	case ErrorViewTerminalConflict:
+		return SafeErrorTerminalConflict
+	case ErrorIntegrityFailure, ErrorCheckpointNotRetained:
+		return SafeErrorIntegrityUnavailableContent
+	case ErrorDurabilityUnverified:
+		return SafeErrorDurabilityUnverified
+	case ErrorResourceExhausted:
+		return SafeErrorResourceExhausted
+	case ErrorRetryableUnavailable, ErrorRecoveryReadOnly:
+		return SafeErrorRetryableUnavailable
+	case ErrorReconciliationRequired:
+		return SafeErrorReconciliationRequired
+	case ErrorCleanupDebt, ErrorExpiryBlocked:
+		return SafeErrorCleanupDebt
+	default:
+		return SafeErrorInvalidIntent
 	}
 }
 
@@ -306,6 +362,9 @@ type Lifecycle interface {
 	ReconcileCleanupDebt(context.Context, ReconcileCleanupDebtRequest) (CleanupDebt, error)
 	ResolveCleanupDebt(context.Context, ResolveCleanupDebtRequest) (CleanupDebt, error)
 	ReopenCleanupDebt(context.Context, ReopenCleanupDebtRequest) (CleanupDebt, error)
+	RebuildAuditDelivery(context.Context, AuditDeliveryRebuildRequest) (AuditDeliveryBacklog, error)
+	RebuildProjections(context.Context, ProjectionRebuildRequest) (ProjectionRebuildResult, error)
+	QueryAdministratorDiagnostics(context.Context, QueryAdministratorDiagnosticsRequest) (AdministratorDiagnostics, error)
 	AcceptLegacyCleanupObligation(context.Context, AcceptLegacyCleanupObligationRequest) (CleanupDebt, error)
 	InspectOperation(context.Context, InspectOperationRequest) (OperationInspection, error)
 	ReconcileOperation(context.Context, ReconcileOperationRequest) (OperationInspection, error)

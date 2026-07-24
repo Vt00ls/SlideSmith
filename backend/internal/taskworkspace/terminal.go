@@ -122,7 +122,7 @@ func (m *inMemory) DiscardRuntimeView(
 	}
 	fail := func(code ErrorCode) (DiscardRuntimeViewResult, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, scope, request.Operation, DiscardRuntimeViewResult{}, err)
+		recordOperation(m.operations, m.now(), scope, request.Operation, DiscardRuntimeViewResult{}, err)
 		return DiscardRuntimeViewResult{}, err
 	}
 
@@ -160,7 +160,7 @@ func (m *inMemory) DiscardRuntimeView(
 		Fence:             request.Fence,
 		Operation:         request.Operation,
 	}
-	recordOperation(m.operations, scope, request.Operation, result, nil)
+	recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 	if err := m.injectFault(FaultAfterDiscardEvidencePersistence, request.Operation.ID); err != nil {
 		return DiscardRuntimeViewResult{}, err
 	}
@@ -258,7 +258,7 @@ func (m *inMemory) FenceRuntimeView(
 	}
 	fail := func(code ErrorCode) (FenceRuntimeViewResult, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, scope, request.Operation, FenceRuntimeViewResult{}, err)
+		recordOperation(m.operations, m.now(), scope, request.Operation, FenceRuntimeViewResult{}, err)
 		return FenceRuntimeViewResult{}, err
 	}
 
@@ -285,6 +285,7 @@ func (m *inMemory) FenceRuntimeView(
 		return FenceRuntimeViewResult{}, err
 	}
 	workspace.fence++
+	workspace.recordedAt = m.now()
 	if request.Reason == RuntimeViewRecoveryGenerationAdvanced {
 		workspace.generation++
 	}
@@ -304,7 +305,7 @@ func (m *inMemory) FenceRuntimeView(
 		Fence:             workspace.fence,
 		Operation:         request.Operation,
 	}
-	recordOperation(m.operations, scope, request.Operation, result, nil)
+	recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 	if err := m.injectFault(FaultAfterAuthoritativeTransaction, request.Operation.ID); err != nil {
 		return FenceRuntimeViewResult{}, err
 	}

@@ -517,6 +517,7 @@ func persistOperationIntent[Request, Result any](
 	operation Operation,
 	request Request,
 	spec operationJournalSpec[Request, Result],
+	recordedAt Instant,
 ) bool {
 	if _, exists := records[scope]; exists {
 		return false
@@ -535,6 +536,7 @@ func persistOperationIntent[Request, Result any](
 		fence:                   metadata.fence,
 		authorityBindingsDigest: metadata.authorityBindingsDigest,
 		plannedIDs:              make(map[string]string),
+		recordedAt:              recordedAt,
 	}
 	return true
 }
@@ -553,7 +555,7 @@ func ensureOperationIntent[Request, Result any](
 	if err := m.injectFault(FaultBeforeIntentPersistence, operation.ID); err != nil {
 		return false, err
 	}
-	created := persistOperationIntent(m.operations, scope, operation, request, spec)
+	created := persistOperationIntent(m.operations, scope, operation, request, spec, m.now())
 	if !created {
 		return false, nil
 	}
@@ -568,21 +570,25 @@ func ensureOperationIntent[Request, Result any](
 
 func markOperationReconciliationRequired(
 	records map[operationScope]operationRecord,
+	recordedAt Instant,
 	scope operationScope,
 ) {
 	record := records[scope]
 	record.state = operationJournalReconciliationRequired
 	record.intentState = OperationIntentActing
+	record.recordedAt = recordedAt
 	records[scope] = record
 }
 
 func markOperationVerified(
 	records map[operationScope]operationRecord,
+	recordedAt Instant,
 	scope operationScope,
 ) {
 	record := records[scope]
 	record.state = operationJournalReconciliationRequired
 	record.intentState = OperationIntentVerified
+	record.recordedAt = recordedAt
 	records[scope] = record
 }
 
