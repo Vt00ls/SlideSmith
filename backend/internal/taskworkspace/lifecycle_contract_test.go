@@ -985,6 +985,7 @@ func TestPublicLifecycleContractAndErrorsDoNotExposePhysicalDetails(t *testing.T
 		taskworkspace.ErrorStaleAuthority,
 		taskworkspace.ErrorViewTerminalConflict,
 		taskworkspace.ErrorEffectDenied,
+		taskworkspace.ErrorReconciliationRequired,
 	} {
 		message := (&taskworkspace.Error{Code: code}).Error()
 		for _, term := range banned {

@@ -2,9 +2,15 @@ package taskworkspace
 
 import (
 	"context"
+	"errors"
 	"sort"
 	"time"
 )
+
+// ErrDurableObjectResultAmbiguous tells the lifecycle module that a durable
+// action may have completed even though its result was not acknowledged. The
+// operation journal remains the reconciliation authority for an exact retry.
+var ErrDurableObjectResultAmbiguous = errors.New("durable object result is ambiguous")
 
 type (
 	LogicalMember            string
@@ -64,6 +70,22 @@ type DurableObjectPort interface {
 	VerifyCheckpoint(context.Context, VerifyCheckpointContentRequest) (VerifiedCheckpointContent, error)
 }
 
+type DurableContentPrepareBoundary string
+
+const (
+	DurableContentPrepareBefore DurableContentPrepareBoundary = "before"
+	DurableContentPrepareAfter  DurableContentPrepareBoundary = "after"
+)
+
+// DurableContentPrepareProgress brackets one physical immutable-content
+// prepare. Adapters must report every declared member followed by the manifest
+// so lifecycle fault injection and reconciliation observe the real boundary.
+type DurableContentPrepareProgress struct {
+	Boundary  DurableContentPrepareBoundary
+	SubjectID string
+	Ordinal   int
+}
+
 type PrepareCheckpointContentRequest struct {
 	PolicyDomainID    PolicyDomainID
 	TaskID            TaskID
@@ -76,6 +98,7 @@ type PrepareCheckpointContentRequest struct {
 	Generation        Generation
 	Fence             Fence
 	Operation         Operation
+	Progress          func(DurableContentPrepareProgress) error
 }
 
 type VerifyCheckpointContentRequest struct {

@@ -237,10 +237,18 @@ func (d *integrityDurableObjectDouble) PrepareCheckpoint(
 	}
 	contentReferences := make([]taskworkspace.ContentReference, 0, len(request.Manifest.Members))
 	contents := make([]*integrityContent, 0, len(request.Manifest.Members)+1)
-	for _, member := range request.Manifest.Members {
+	for ordinal, member := range request.Manifest.Members {
 		payload, exists := d.sources[member.ContentDigest]
 		if !exists || digestBytes(payload) != member.ContentDigest || uint64(len(payload)) != member.Size {
 			return taskworkspace.VerifiedCheckpointContent{}, fmt.Errorf("declared content integrity failure")
+		}
+		if err := reportDurableContentPrepare(
+			request,
+			taskworkspace.DurableContentPrepareBefore,
+			ordinal,
+			string(member.ID),
+		); err != nil {
+			return taskworkspace.VerifiedCheckpointContent{}, err
 		}
 		content, err := d.prepareContent(request.PolicyDomainID, member.ContentDigest, member.Size, payload)
 		if err != nil {
@@ -257,9 +265,26 @@ func (d *integrityDurableObjectDouble) PrepareCheckpoint(
 			content.size,
 		))
 		contents = append(contents, content)
+		if err := reportDurableContentPrepare(
+			request,
+			taskworkspace.DurableContentPrepareAfter,
+			ordinal,
+			string(content.id),
+		); err != nil {
+			return taskworkspace.VerifiedCheckpointContent{}, err
+		}
 	}
 	manifest := checkpointManifestFromDeclared(request.Manifest, contentReferences)
 	manifestBytes := manifest.CanonicalBytes()
+	manifestOrdinal := len(request.Manifest.Members)
+	if err := reportDurableContentPrepare(
+		request,
+		taskworkspace.DurableContentPrepareBefore,
+		manifestOrdinal,
+		"checkpoint-manifest",
+	); err != nil {
+		return taskworkspace.VerifiedCheckpointContent{}, err
+	}
 	manifestContent, err := d.prepareContent(
 		request.PolicyDomainID,
 		manifest.Digest,
@@ -267,6 +292,14 @@ func (d *integrityDurableObjectDouble) PrepareCheckpoint(
 		manifestBytes,
 	)
 	if err != nil {
+		return taskworkspace.VerifiedCheckpointContent{}, err
+	}
+	if err := reportDurableContentPrepare(
+		request,
+		taskworkspace.DurableContentPrepareAfter,
+		manifestOrdinal,
+		string(manifestContent.id),
+	); err != nil {
 		return taskworkspace.VerifiedCheckpointContent{}, err
 	}
 	manifestReference := durableReference(

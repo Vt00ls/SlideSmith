@@ -109,14 +109,20 @@ func (m *inMemory) DiscardRuntimeView(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	scope := operationScope{request.PolicyDomainID, request.TaskID, request.Operation.ID}
 	if result, replayed, err := replayOperation[DiscardRuntimeViewResult](
-		m.operations, request.PolicyDomainID, request.TaskID, request.Operation,
+		m.operations, scope, request.Operation,
 	); replayed {
 		return result, err
 	}
+	if _, err := ensureOperationIntent(
+		m, scope, request.Operation, request, discardRuntimeViewJournalSpec(), nil,
+	); err != nil {
+		return DiscardRuntimeViewResult{}, err
+	}
 	fail := func(code ErrorCode) (DiscardRuntimeViewResult, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, DiscardRuntimeViewResult{}, err)
+		recordOperation(m.operations, scope, request.Operation, DiscardRuntimeViewResult{}, err)
 		return DiscardRuntimeViewResult{}, err
 	}
 
@@ -139,6 +145,9 @@ func (m *inMemory) DiscardRuntimeView(
 		return fail(ErrorStaleAuthority)
 	}
 
+	if err := m.injectFault(FaultBeforeDiscardEvidencePersistence, request.Operation.ID); err != nil {
+		return DiscardRuntimeViewResult{}, err
+	}
 	view.terminalDecision = runtimeViewDiscarded
 	m.views[request.RuntimeViewID] = view
 	result := DiscardRuntimeViewResult{
@@ -151,8 +160,11 @@ func (m *inMemory) DiscardRuntimeView(
 		Fence:             request.Fence,
 		Operation:         request.Operation,
 	}
-	recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, result, nil)
-	return result, nil
+	recordOperation(m.operations, scope, request.Operation, result, nil)
+	if err := m.injectFault(FaultAfterDiscardEvidencePersistence, request.Operation.ID); err != nil {
+		return DiscardRuntimeViewResult{}, err
+	}
+	return deliverOperationResponse(m, request.Operation.ID, result)
 }
 
 type FenceRuntimeViewRequest struct {
@@ -233,14 +245,20 @@ func (m *inMemory) FenceRuntimeView(
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	scope := operationScope{request.PolicyDomainID, request.TaskID, request.Operation.ID}
 	if result, replayed, err := replayOperation[FenceRuntimeViewResult](
-		m.operations, request.PolicyDomainID, request.TaskID, request.Operation,
+		m.operations, scope, request.Operation,
 	); replayed {
 		return result, err
 	}
+	if _, err := ensureOperationIntent(
+		m, scope, request.Operation, request, fenceRuntimeViewJournalSpec(), nil,
+	); err != nil {
+		return FenceRuntimeViewResult{}, err
+	}
 	fail := func(code ErrorCode) (FenceRuntimeViewResult, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, FenceRuntimeViewResult{}, err)
+		recordOperation(m.operations, scope, request.Operation, FenceRuntimeViewResult{}, err)
 		return FenceRuntimeViewResult{}, err
 	}
 
@@ -263,6 +281,9 @@ func (m *inMemory) FenceRuntimeView(
 		return fail(ErrorStaleAuthority)
 	}
 
+	if err := m.injectFault(FaultBeforeAuthoritativeTransaction, request.Operation.ID); err != nil {
+		return FenceRuntimeViewResult{}, err
+	}
 	workspace.fence++
 	if request.Reason == RuntimeViewRecoveryGenerationAdvanced {
 		workspace.generation++
@@ -283,8 +304,11 @@ func (m *inMemory) FenceRuntimeView(
 		Fence:             workspace.fence,
 		Operation:         request.Operation,
 	}
-	recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, result, nil)
-	return result, nil
+	recordOperation(m.operations, scope, request.Operation, result, nil)
+	if err := m.injectFault(FaultAfterAuthoritativeTransaction, request.Operation.ID); err != nil {
+		return FenceRuntimeViewResult{}, err
+	}
+	return deliverOperationResponse(m, request.Operation.ID, result)
 }
 
 func validRuntimeViewFenceReason(reason RuntimeViewFenceReason) bool {

@@ -1056,13 +1056,14 @@ func TestCommitRejectsDurableEvidenceIdentityRebindingAcrossCheckpoints(t *testi
 }
 
 type happyDurableObject struct {
-	prepared      int
-	verified      int
-	prepareError  error
-	mutateRequest func(*taskworkspace.DeclaredStateManifest)
-	mutate        func(*taskworkspace.VerifiedCheckpointContent)
-	verifyError   error
-	verifyMutate  func(*taskworkspace.VerifiedCheckpointContent)
+	prepared        int
+	contentPrepared int
+	verified        int
+	prepareError    error
+	mutateRequest   func(*taskworkspace.DeclaredStateManifest)
+	mutate          func(*taskworkspace.VerifiedCheckpointContent)
+	verifyError     error
+	verifyMutate    func(*taskworkspace.VerifiedCheckpointContent)
 }
 
 func (d *happyDurableObject) PrepareCheckpoint(
@@ -1076,21 +1077,46 @@ func (d *happyDurableObject) PrepareCheckpoint(
 	if d.mutateRequest != nil {
 		d.mutateRequest(&request.Manifest)
 	}
-	var memberReferences []taskworkspace.ContentReference
-	if len(request.Manifest.Members) != 0 {
-		member := request.Manifest.Members[0]
+	memberReferences := make([]taskworkspace.ContentReference, 0, len(request.Manifest.Members))
+	for ordinal, member := range request.Manifest.Members {
+		if err := reportDurableContentPrepare(
+			request,
+			taskworkspace.DurableContentPrepareBefore,
+			ordinal,
+			string(member.ID),
+		); err != nil {
+			return taskworkspace.VerifiedCheckpointContent{}, err
+		}
 		memberReferences = append(memberReferences, durableReference(
-			"reference-member-"+string(request.CheckpointID),
+			"reference-member-"+string(request.CheckpointID)+"-"+string(member.ID),
 			taskworkspace.CheckpointMemberReference,
 			request,
 			member.ID,
 			member.LogicalMember,
-			"content-member-"+string(request.CheckpointID),
+			"content-member-"+string(request.CheckpointID)+"-"+string(member.ID),
 			member.ContentDigest,
 			member.Size,
 		))
+		d.contentPrepared++
+		if err := reportDurableContentPrepare(
+			request,
+			taskworkspace.DurableContentPrepareAfter,
+			ordinal,
+			string(memberReferences[len(memberReferences)-1].ContentID),
+		); err != nil {
+			return taskworkspace.VerifiedCheckpointContent{}, err
+		}
 	}
 	manifest := checkpointManifestFromDeclared(request.Manifest, memberReferences)
+	manifestOrdinal := len(request.Manifest.Members)
+	if err := reportDurableContentPrepare(
+		request,
+		taskworkspace.DurableContentPrepareBefore,
+		manifestOrdinal,
+		"checkpoint-manifest",
+	); err != nil {
+		return taskworkspace.VerifiedCheckpointContent{}, err
+	}
 	manifestReference := durableReference(
 		"reference-manifest-"+string(request.CheckpointID),
 		taskworkspace.CheckpointManifestReference,
@@ -1101,6 +1127,15 @@ func (d *happyDurableObject) PrepareCheckpoint(
 		manifest.Digest,
 		uint64(len(manifest.CanonicalBytes())),
 	)
+	d.contentPrepared++
+	if err := reportDurableContentPrepare(
+		request,
+		taskworkspace.DurableContentPrepareAfter,
+		manifestOrdinal,
+		string(manifestReference.ContentID),
+	); err != nil {
+		return taskworkspace.VerifiedCheckpointContent{}, err
+	}
 	content := taskworkspace.VerifiedCheckpointContent{
 		Manifest:          manifest,
 		ManifestReference: manifestReference,
@@ -1118,6 +1153,22 @@ func (d *happyDurableObject) PrepareCheckpoint(
 		d.mutate(&content)
 	}
 	return content, nil
+}
+
+func reportDurableContentPrepare(
+	request taskworkspace.PrepareCheckpointContentRequest,
+	boundary taskworkspace.DurableContentPrepareBoundary,
+	ordinal int,
+	subjectID string,
+) error {
+	if request.Progress == nil {
+		return nil
+	}
+	return request.Progress(taskworkspace.DurableContentPrepareProgress{
+		Boundary:  boundary,
+		SubjectID: subjectID,
+		Ordinal:   ordinal,
+	})
 }
 
 func (d *happyDurableObject) VerifyCheckpoint(
