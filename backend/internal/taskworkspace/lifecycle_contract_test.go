@@ -1027,7 +1027,14 @@ func assertSafeContractName(t *testing.T, name string, banned []string) {
 	t.Helper()
 	normalized := strings.ToLower(name)
 	for _, term := range banned {
-		if strings.Contains(normalized, term) {
+		candidate := normalized
+		if term == "node" {
+			// Inode accounting is an explicit lifecycle capacity fact; it is not
+			// an Execution Node identity or topology leak.
+			candidate = strings.ReplaceAll(candidate, "inodes", "")
+			candidate = strings.ReplaceAll(candidate, "inode", "")
+		}
+		if strings.Contains(candidate, term) {
 			t.Fatal("public lifecycle contract exposes a physical implementation term")
 		}
 	}

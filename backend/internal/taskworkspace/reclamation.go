@@ -420,6 +420,7 @@ func (e CheckpointReclamationEvidence) CanonicalDigest() Digest {
 }
 
 type CheckpointReclamation struct {
+	CleanupDebtID       CleanupDebtID
 	TaskWorkspaceID     TaskWorkspaceID
 	CheckpointID        CheckpointID
 	RevisionID          RevisionID
@@ -594,6 +595,16 @@ func (m *inMemory) ReclaimCheckpoint(
 		recordOperation(m.operations, scope, request.Operation, result, nil)
 		return deliverOperationResponse(m, request.Operation.ID, result)
 	}
+	cleanupDebt := m.ensureCheckpointCleanupDebt(scope, request, checkpoint, resources, exactGenerationRoot)
+	resolvedPhysicalDebt := cleanupDebt.State == CleanupDebtResolved && checkpoint.retention.reclaimed &&
+		(cleanupDebt.Resolution == CleanupReclaimed || cleanupDebt.Resolution == CleanupAlreadyAbsent)
+	if cleanupDebt.State == CleanupDebtResolved && !resolvedPhysicalDebt {
+		return CheckpointReclamation{CleanupDebtID: cleanupDebt.DebtID}, &Error{Code: ErrorReconciliationRequired}
+	}
+	if !resolvedPhysicalDebt && (m.now() < cleanupDebt.NextRetryAt ||
+		(cleanupDebt.State == CleanupDebtClaimed && m.now() < cleanupDebt.ClaimExpiresAt)) {
+		return CheckpointReclamation{CleanupDebtID: cleanupDebt.DebtID}, &Error{Code: ErrorReconciliationRequired}
+	}
 
 	markOperationReconciliationRequired(m.operations, scope)
 	if err := m.injectFaultEvent(FaultEvent{
@@ -601,7 +612,10 @@ func (m *inMemory) ReclaimCheckpoint(
 		OperationID: request.Operation.ID,
 		SubjectID:   string(request.CheckpointID),
 	}); err != nil {
-		return CheckpointReclamation{}, err
+		return CheckpointReclamation{CleanupDebtID: cleanupDebt.DebtID}, err
+	}
+	if !resolvedPhysicalDebt {
+		m.beginCheckpointCleanupAttempt(cleanupDebt.DebtID, request.Operation)
 	}
 	mechanics, err := m.checkpointReclamation.ReclaimCheckpointContent(ctx, ReclaimCheckpointContentRequest{
 		PolicyDomainID:      request.PolicyDomainID,
@@ -618,7 +632,13 @@ func (m *inMemory) ReclaimCheckpoint(
 	})
 	if err != nil {
 		if errors.Is(err, ErrDurableObjectResultAmbiguous) {
-			return CheckpointReclamation{}, &Error{Code: ErrorReconciliationRequired}
+			if !resolvedPhysicalDebt {
+				m.failCheckpointCleanupDebt(cleanupDebt.DebtID, CleanupFailureAmbiguous, exactGenerationRoot)
+			}
+			return CheckpointReclamation{CleanupDebtID: cleanupDebt.DebtID}, &Error{Code: ErrorReconciliationRequired}
+		}
+		if !resolvedPhysicalDebt {
+			m.failCheckpointCleanupDebt(cleanupDebt.DebtID, CleanupFailureAdapterUnavailable, exactGenerationRoot)
 		}
 		return fail(ErrorIntegrityFailure)
 	}
@@ -627,10 +647,16 @@ func (m *inMemory) ReclaimCheckpoint(
 		OperationID: request.Operation.ID,
 		SubjectID:   string(request.CheckpointID),
 	}); err != nil {
-		return CheckpointReclamation{}, err
+		if !resolvedPhysicalDebt {
+			m.failCheckpointCleanupDebt(cleanupDebt.DebtID, CleanupFailureAmbiguous, exactGenerationRoot)
+		}
+		return CheckpointReclamation{CleanupDebtID: cleanupDebt.DebtID}, err
 	}
 	mechanicsBlockers, trusted := validateCheckpointContentReclamationEvidence(request, exactGenerationRoot, mechanics)
 	if !trusted {
+		if !resolvedPhysicalDebt {
+			m.failCheckpointCleanupDebt(cleanupDebt.DebtID, CleanupFailureInvalidEvidence, mechanics.Digest)
+		}
 		return fail(ErrorIntegrityFailure)
 	}
 	priorEvidenceDigest := Digest("")
@@ -641,6 +667,9 @@ func (m *inMemory) ReclaimCheckpoint(
 		scope, request, checkpoint, exactGenerationRoot, mechanics.Outcome,
 		mechanicsBlockers, mechanics.Digest, priorEvidenceDigest,
 	)
+	if !resolvedPhysicalDebt {
+		m.resolveCheckpointCleanupDebt(cleanupDebt.DebtID, result.Outcome, result.Evidence.Digest)
+	}
 	if result.Outcome == CheckpointReclaimed || result.Outcome == CheckpointAlreadyAbsent {
 		checkpoint.retention.reclaimed = true
 		checkpoint.retention.reclamationEvidence = result.Evidence
@@ -682,6 +711,7 @@ func (m *inMemory) checkpointReclamationResult(
 	}
 	evidence.Digest = evidence.CanonicalDigest()
 	return CheckpointReclamation{
+		CleanupDebtID:       m.checkpointCleanupDebtID(request, exactGenerationRoot),
 		TaskWorkspaceID:     request.TaskWorkspaceID,
 		CheckpointID:        request.CheckpointID,
 		RevisionID:          checkpoint.revisionID,
