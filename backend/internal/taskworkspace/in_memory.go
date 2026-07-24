@@ -13,25 +13,32 @@ import (
 )
 
 type InMemoryConfig struct {
-	ValidationAuthorityID          ValidationAuthorityID
-	DurabilityAuthorityID          DurabilityAuthorityID
-	DurableObject                  DurableObjectPort
-	Persistence                    *InMemoryPersistence
-	SandboxLeaseAuthorityID        SandboxLeaseAuthorityID
-	CurrentSandboxLeaseAuthorities []SandboxLeaseAuthority
-	CurrentSandboxLeaseAuthority   func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
-	Now                            func() Instant
-	BeforeRuntimeViewTerminal      func(RuntimeViewTerminalAttempt)
-	FaultHook                      func(FaultEvent) error
-	ResponseDelivery               func(ResponseDeliveryEvent)
-	ExpiryPolicy                   ExpiryPolicy
-	CheckpointRetentionPolicy      CheckpointRetentionPolicy
-	CheckpointReclamation          CheckpointReclamationPort
-	RecoveryAuthorityID            RecoveryAuthorityID
-	CurrentRecoveryIntents         []AuthorizedRecoveryIntent
-	CurrentRecoveryIntent          func(RecoveryIntentID) (AuthorizedRecoveryIntent, bool)
-	ReconstructionInput            ReconstructionInputPort
-	ExpiryProtection               ExpiryProtectionPort
+	ValidationAuthorityID                 ValidationAuthorityID
+	DurabilityAuthorityID                 DurabilityAuthorityID
+	DurableObject                         DurableObjectPort
+	Persistence                           *InMemoryPersistence
+	SandboxLeaseAuthorityID               SandboxLeaseAuthorityID
+	CurrentSandboxLeaseAuthorities        []SandboxLeaseAuthority
+	CurrentSandboxLeaseAuthority          func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
+	Now                                   func() Instant
+	BeforeRuntimeViewTerminal             func(RuntimeViewTerminalAttempt)
+	FaultHook                             func(FaultEvent) error
+	ResponseDelivery                      func(ResponseDeliveryEvent)
+	ExpiryPolicy                          ExpiryPolicy
+	CheckpointRetentionPolicy             CheckpointRetentionPolicy
+	CheckpointReclamation                 CheckpointReclamationPort
+	Cleanup                               CleanupPort
+	CleanupRetryPolicy                    CleanupRetryPolicy
+	CleanupAudit                          CleanupAuditPort
+	PlatformAdministratorAuthorityID      PlatformAdministratorAuthorityID
+	CurrentPlatformAdministratorAuthority func(PlatformAdministratorID) (PlatformAdministratorAuthority, bool)
+	LegacyMigrationAuthorityID            LegacyMigrationAuthorityID
+	CurrentCommitCutoverAuthority         func(CommitCutoverAuthorityID) (CommitCutoverAuthority, bool)
+	RecoveryAuthorityID                   RecoveryAuthorityID
+	CurrentRecoveryIntents                []AuthorizedRecoveryIntent
+	CurrentRecoveryIntent                 func(RecoveryIntentID) (AuthorizedRecoveryIntent, bool)
+	ReconstructionInput                   ReconstructionInputPort
+	ExpiryProtection                      ExpiryProtectionPort
 }
 
 // InMemoryPersistence is an opaque persistence handle for deterministic
@@ -50,28 +57,40 @@ type InMemoryPersistence struct {
 	durabilityReceipts map[DurabilityReceiptID]DurabilityReceipt
 	currentReceipts    map[receiptAuthorityScope]DurabilityReceipt
 	receiptGenerations map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID
+	cleanupDebts       map[CleanupDebtID]cleanupDebtRecord
+	cleanupDebtOwners  map[cleanupResourceKey]CleanupDebtID
+	cleanupOperations  map[operationScope]cleanupOperationRecord
+	legacyCleanupDebts map[legacyCleanupObligationKey]CleanupDebtID
+	cleanupAuditFacts  map[CleanupAuditEvidenceID]CleanupAuditEvidence
 }
 
 type inMemory struct {
 	*InMemoryPersistence
-	validationAuthorityID     ValidationAuthorityID
-	durabilityAuthorityID     DurabilityAuthorityID
-	durableObject             DurableObjectPort
-	sandboxLeaseAuthorityID   SandboxLeaseAuthorityID
-	now                       func() Instant
-	beforeTerminal            func(RuntimeViewTerminalAttempt)
-	faultHook                 func(FaultEvent) error
-	responseDelivery          func(ResponseDeliveryEvent)
-	expiryPolicy              ExpiryPolicy
-	checkpointRetentionPolicy CheckpointRetentionPolicy
-	checkpointReclamation     CheckpointReclamationPort
-	recoveryAuthorityID       RecoveryAuthorityID
-	recoveryIntents           map[RecoveryIntentID]AuthorizedRecoveryIntent
-	currentRecoveryIntent     func(RecoveryIntentID) (AuthorizedRecoveryIntent, bool)
-	reconstructionInput       ReconstructionInputPort
-	expiryProtection          ExpiryProtectionPort
-	sandboxLeaseAuthorities   map[SandboxLeaseID]SandboxLeaseAuthority
-	currentLeaseAuthority     func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
+	validationAuthorityID                 ValidationAuthorityID
+	durabilityAuthorityID                 DurabilityAuthorityID
+	durableObject                         DurableObjectPort
+	sandboxLeaseAuthorityID               SandboxLeaseAuthorityID
+	now                                   func() Instant
+	beforeTerminal                        func(RuntimeViewTerminalAttempt)
+	faultHook                             func(FaultEvent) error
+	responseDelivery                      func(ResponseDeliveryEvent)
+	expiryPolicy                          ExpiryPolicy
+	checkpointRetentionPolicy             CheckpointRetentionPolicy
+	checkpointReclamation                 CheckpointReclamationPort
+	cleanup                               CleanupPort
+	cleanupRetryPolicy                    CleanupRetryPolicy
+	cleanupAudit                          CleanupAuditPort
+	platformAdministratorAuthorityID      PlatformAdministratorAuthorityID
+	currentPlatformAdministratorAuthority func(PlatformAdministratorID) (PlatformAdministratorAuthority, bool)
+	legacyMigrationAuthorityID            LegacyMigrationAuthorityID
+	currentCommitCutoverAuthority         func(CommitCutoverAuthorityID) (CommitCutoverAuthority, bool)
+	recoveryAuthorityID                   RecoveryAuthorityID
+	recoveryIntents                       map[RecoveryIntentID]AuthorizedRecoveryIntent
+	currentRecoveryIntent                 func(RecoveryIntentID) (AuthorizedRecoveryIntent, bool)
+	reconstructionInput                   ReconstructionInputPort
+	expiryProtection                      ExpiryProtectionPort
+	sandboxLeaseAuthorities               map[SandboxLeaseID]SandboxLeaseAuthority
+	currentLeaseAuthority                 func(SandboxLeaseID) (SandboxLeaseAuthority, bool)
 }
 
 type durableContentFact struct {
@@ -206,6 +225,11 @@ func (p *InMemoryPersistence) initialize() {
 		p.durabilityReceipts = make(map[DurabilityReceiptID]DurabilityReceipt)
 		p.currentReceipts = make(map[receiptAuthorityScope]DurabilityReceipt)
 		p.receiptGenerations = make(map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID)
+		p.cleanupDebts = make(map[CleanupDebtID]cleanupDebtRecord)
+		p.cleanupDebtOwners = make(map[cleanupResourceKey]CleanupDebtID)
+		p.cleanupOperations = make(map[operationScope]cleanupOperationRecord)
+		p.legacyCleanupDebts = make(map[legacyCleanupObligationKey]CleanupDebtID)
+		p.cleanupAuditFacts = make(map[CleanupAuditEvidenceID]CleanupAuditEvidence)
 	}
 }
 
@@ -232,6 +256,16 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 	if checkpointRetentionPolicy.ReclamationGrace <= 0 {
 		checkpointRetentionPolicy.ReclamationGrace = Duration(7 * 24 * time.Hour)
 	}
+	cleanupRetryPolicy := config.CleanupRetryPolicy
+	if cleanupRetryPolicy.ClaimLifetime <= 0 {
+		cleanupRetryPolicy.ClaimLifetime = Duration(time.Minute)
+	}
+	if cleanupRetryPolicy.InitialBackoff <= 0 {
+		cleanupRetryPolicy.InitialBackoff = Duration(time.Second)
+	}
+	if cleanupRetryPolicy.MaximumBackoff < cleanupRetryPolicy.InitialBackoff {
+		cleanupRetryPolicy.MaximumBackoff = Duration(time.Hour)
+	}
 	persistence := config.Persistence
 	if persistence == nil {
 		persistence = NewInMemoryPersistence()
@@ -239,23 +273,30 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 		persistence.initialize()
 	}
 	memory := &inMemory{
-		InMemoryPersistence:       persistence,
-		validationAuthorityID:     config.ValidationAuthorityID,
-		durabilityAuthorityID:     config.DurabilityAuthorityID,
-		durableObject:             config.DurableObject,
-		sandboxLeaseAuthorityID:   config.SandboxLeaseAuthorityID,
-		now:                       now,
-		beforeTerminal:            config.BeforeRuntimeViewTerminal,
-		faultHook:                 config.FaultHook,
-		responseDelivery:          config.ResponseDelivery,
-		expiryPolicy:              expiryPolicy,
-		checkpointRetentionPolicy: checkpointRetentionPolicy,
-		checkpointReclamation:     config.CheckpointReclamation,
-		recoveryAuthorityID:       config.RecoveryAuthorityID,
-		recoveryIntents:           make(map[RecoveryIntentID]AuthorizedRecoveryIntent),
-		reconstructionInput:       config.ReconstructionInput,
-		expiryProtection:          config.ExpiryProtection,
-		sandboxLeaseAuthorities:   make(map[SandboxLeaseID]SandboxLeaseAuthority),
+		InMemoryPersistence:                   persistence,
+		validationAuthorityID:                 config.ValidationAuthorityID,
+		durabilityAuthorityID:                 config.DurabilityAuthorityID,
+		durableObject:                         config.DurableObject,
+		sandboxLeaseAuthorityID:               config.SandboxLeaseAuthorityID,
+		now:                                   now,
+		beforeTerminal:                        config.BeforeRuntimeViewTerminal,
+		faultHook:                             config.FaultHook,
+		responseDelivery:                      config.ResponseDelivery,
+		expiryPolicy:                          expiryPolicy,
+		checkpointRetentionPolicy:             checkpointRetentionPolicy,
+		checkpointReclamation:                 config.CheckpointReclamation,
+		cleanup:                               config.Cleanup,
+		cleanupRetryPolicy:                    cleanupRetryPolicy,
+		cleanupAudit:                          config.CleanupAudit,
+		platformAdministratorAuthorityID:      config.PlatformAdministratorAuthorityID,
+		currentPlatformAdministratorAuthority: config.CurrentPlatformAdministratorAuthority,
+		legacyMigrationAuthorityID:            config.LegacyMigrationAuthorityID,
+		currentCommitCutoverAuthority:         config.CurrentCommitCutoverAuthority,
+		recoveryAuthorityID:                   config.RecoveryAuthorityID,
+		recoveryIntents:                       make(map[RecoveryIntentID]AuthorizedRecoveryIntent),
+		reconstructionInput:                   config.ReconstructionInput,
+		expiryProtection:                      config.ExpiryProtection,
+		sandboxLeaseAuthorities:               make(map[SandboxLeaseID]SandboxLeaseAuthority),
 	}
 	leaseDuplicates := make(map[SandboxLeaseID]bool)
 	for _, authority := range config.CurrentSandboxLeaseAuthorities {

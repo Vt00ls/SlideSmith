@@ -300,6 +300,13 @@ type Lifecycle interface {
 	ReleaseCheckpointRetention(context.Context, ReleaseCheckpointRetentionRequest) (CheckpointRetention, error)
 	ReclaimCheckpoint(context.Context, ReclaimCheckpointRequest) (CheckpointReclamation, error)
 	ObserveCheckpointInventory(context.Context, ObserveCheckpointInventoryRequest) (CheckpointInventoryObservation, error)
+	CreateCleanupObligation(context.Context, CreateCleanupObligationRequest) (CleanupDebt, error)
+	InspectCleanupDebt(context.Context, InspectCleanupDebtRequest) (CleanupDebt, error)
+	ClaimCleanupDebt(context.Context, ClaimCleanupDebtRequest) (CleanupDebt, error)
+	ReconcileCleanupDebt(context.Context, ReconcileCleanupDebtRequest) (CleanupDebt, error)
+	ResolveCleanupDebt(context.Context, ResolveCleanupDebtRequest) (CleanupDebt, error)
+	ReopenCleanupDebt(context.Context, ReopenCleanupDebtRequest) (CleanupDebt, error)
+	AcceptLegacyCleanupObligation(context.Context, AcceptLegacyCleanupObligationRequest) (CleanupDebt, error)
 	InspectOperation(context.Context, InspectOperationRequest) (OperationInspection, error)
 	ReconcileOperation(context.Context, ReconcileOperationRequest) (OperationInspection, error)
 }

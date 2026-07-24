@@ -85,6 +85,7 @@ type OperationInspection struct {
 	AttachCheckpointRetention  *CheckpointRetention
 	ReleaseCheckpointRetention *CheckpointRetention
 	ReclaimCheckpoint          *CheckpointReclamation
+	ReconcileCleanupDebt       *CleanupDebt
 	Error                      *Error
 }
 
@@ -382,6 +383,31 @@ func reclaimCheckpointJournalSpec() operationJournalSpec[ReclaimCheckpointReques
 		},
 		project: func(inspection *OperationInspection, result CheckpointReclamation) {
 			inspection.ReclaimCheckpoint = &result
+		},
+	}
+}
+
+func reconcileCleanupDebtJournalSpec() operationJournalSpec[ReconcileCleanupDebtRequest, CleanupDebt] {
+	return operationJournalSpec[ReconcileCleanupDebtRequest, CleanupDebt]{
+		cloneRequest: identityClone[ReconcileCleanupDebtRequest],
+		cloneResult:  cloneCleanupDebt,
+		intent: func(request ReconcileCleanupDebtRequest) operationIntentMetadata {
+			return operationIntentMetadata{
+				generation: request.Generation,
+				fence:      request.Fence,
+				authorityBindingsDigest: canonicalDigest(struct {
+					DebtID          CleanupDebtID
+					ClaimID         CleanupClaimID
+					ClaimGeneration CleanupClaimGeneration
+					RetryGeneration CleanupRetryGeneration
+				}{request.DebtID, request.ClaimID, request.ClaimGeneration, request.RetryGeneration}),
+			}
+		},
+		execute: func(ctx context.Context, m *inMemory, request ReconcileCleanupDebtRequest) (CleanupDebt, error) {
+			return m.ReconcileCleanupDebt(ctx, request)
+		},
+		project: func(inspection *OperationInspection, result CleanupDebt) {
+			inspection.ReconcileCleanupDebt = &result
 		},
 	}
 }
