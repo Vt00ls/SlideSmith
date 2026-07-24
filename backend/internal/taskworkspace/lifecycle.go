@@ -99,6 +99,7 @@ const (
 	ErrorViewTerminalConflict   ErrorCode = "view_terminal_conflict"
 	ErrorEffectDenied           ErrorCode = "effect_denied"
 	ErrorExpiryBlocked          ErrorCode = "expiry_blocked"
+	ErrorCheckpointNotRetained  ErrorCode = "checkpoint_not_retained"
 	ErrorRecoveryReadOnly       ErrorCode = "recovery_read_only"
 	ErrorReconciliationRequired ErrorCode = "reconciliation_required"
 )
@@ -123,6 +124,8 @@ func (e *Error) Error() string {
 		return "task workspace lifecycle effect is not permitted"
 	case ErrorExpiryBlocked:
 		return "task workspace lifecycle expiry is blocked"
+	case ErrorCheckpointNotRetained:
+		return "task workspace lifecycle Checkpoint is not retained"
 	case ErrorRecoveryReadOnly:
 		return "task workspace lifecycle recovery is read-only"
 	case ErrorReconciliationRequired:
@@ -292,6 +295,11 @@ type Lifecycle interface {
 	ExpireRuntimeView(context.Context, ExpireRuntimeViewRequest) (ExpireRuntimeViewResult, error)
 	RestoreTaskWorkspace(context.Context, RestoreTaskWorkspaceRequest) (RestoreTaskWorkspaceResult, error)
 	ReconstructTaskWorkspace(context.Context, ReconstructTaskWorkspaceRequest) (ReconstructTaskWorkspaceResult, error)
+	InspectCheckpointRetention(context.Context, InspectCheckpointRetentionRequest) (CheckpointRetention, error)
+	AttachCheckpointRetention(context.Context, AttachCheckpointRetentionRequest) (CheckpointRetention, error)
+	ReleaseCheckpointRetention(context.Context, ReleaseCheckpointRetentionRequest) (CheckpointRetention, error)
+	ReclaimCheckpoint(context.Context, ReclaimCheckpointRequest) (CheckpointReclamation, error)
+	ObserveCheckpointInventory(context.Context, ObserveCheckpointInventoryRequest) (CheckpointInventoryObservation, error)
 	InspectOperation(context.Context, InspectOperationRequest) (OperationInspection, error)
 	ReconcileOperation(context.Context, ReconcileOperationRequest) (OperationInspection, error)
 }

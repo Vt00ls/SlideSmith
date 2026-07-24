@@ -1010,6 +1010,7 @@ func TestPublicLifecycleContractAndErrorsDoNotExposePhysicalDetails(t *testing.T
 		taskworkspace.ErrorViewTerminalConflict,
 		taskworkspace.ErrorEffectDenied,
 		taskworkspace.ErrorExpiryBlocked,
+		taskworkspace.ErrorCheckpointNotRetained,
 		taskworkspace.ErrorRecoveryReadOnly,
 		taskworkspace.ErrorReconciliationRequired,
 	} {

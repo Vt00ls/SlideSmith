@@ -170,6 +170,9 @@ func (m *inMemory) RestoreTaskWorkspace(
 		checkpoint.revisionID != intent.TargetRevisionID || m.durableObject == nil {
 		return fail(ErrorIntegrityFailure)
 	}
+	if !checkpoint.retention.semanticallyRetained(m.now()) {
+		return fail(ErrorCheckpointNotRetained)
+	}
 	if len(intent.ReadOnlyInputs) > 0 && m.reconstructionInput == nil {
 		return fail(ErrorIntegrityFailure)
 	}
