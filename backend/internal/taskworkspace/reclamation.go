@@ -557,7 +557,7 @@ func (m *inMemory) ReclaimCheckpoint(
 	}
 	fail := func(code ErrorCode) (CheckpointReclamation, error) {
 		err := &Error{Code: code}
-		recordOperation(m.operations, scope, request.Operation, CheckpointReclamation{}, err)
+		recordOperation(m.operations, m.now(), scope, request.Operation, CheckpointReclamation{}, err)
 		return CheckpointReclamation{}, err
 	}
 	workspace, workspaceOK := m.workspaces[request.TaskID]
@@ -584,7 +584,7 @@ func (m *inMemory) ReclaimCheckpoint(
 			scope, request, checkpoint, exactGenerationRoot, CheckpointRetainedByAuthority,
 			blockers, "", "",
 		)
-		recordOperation(m.operations, scope, request.Operation, result, nil)
+		recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 		return deliverOperationResponse(m, request.Operation.ID, result)
 	}
 	if m.checkpointReclamation == nil {
@@ -592,7 +592,7 @@ func (m *inMemory) ReclaimCheckpoint(
 			scope, request, checkpoint, exactGenerationRoot, CheckpointRetainedByAuthority,
 			[]CheckpointReclamationBlocker{CheckpointUnknownStateBlocker}, "", "",
 		)
-		recordOperation(m.operations, scope, request.Operation, result, nil)
+		recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 		return deliverOperationResponse(m, request.Operation.ID, result)
 	}
 	cleanupDebt := m.ensureCheckpointCleanupDebt(scope, request, checkpoint, resources, exactGenerationRoot)
@@ -606,7 +606,7 @@ func (m *inMemory) ReclaimCheckpoint(
 		return CheckpointReclamation{CleanupDebtID: cleanupDebt.DebtID}, &Error{Code: ErrorReconciliationRequired}
 	}
 
-	markOperationReconciliationRequired(m.operations, scope)
+	markOperationReconciliationRequired(m.operations, m.now(), scope)
 	if err := m.injectFaultEvent(FaultEvent{
 		Point:       FaultBeforeCheckpointReclaim,
 		OperationID: request.Operation.ID,
@@ -673,9 +673,10 @@ func (m *inMemory) ReclaimCheckpoint(
 	if result.Outcome == CheckpointReclaimed || result.Outcome == CheckpointAlreadyAbsent {
 		checkpoint.retention.reclaimed = true
 		checkpoint.retention.reclamationEvidence = result.Evidence
+		checkpoint.retention.recordedAt = m.now()
 		m.checkpoints[request.CheckpointID] = checkpoint
 	}
-	recordOperation(m.operations, scope, request.Operation, result, nil)
+	recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 	return deliverOperationResponse(m, request.Operation.ID, result)
 }
 

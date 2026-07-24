@@ -86,8 +86,9 @@ const (
 	CleanupExceptionUnsafeToReclaim CleanupExceptionReason = "unsafe_to_reclaim"
 	CleanupExceptionExternalHold    CleanupExceptionReason = "external_hold"
 
-	CleanupAuditAcceptException CleanupAuditAction = "accept_exception"
-	CleanupAuditReopenException CleanupAuditAction = "reopen_exception"
+	CleanupAuditAcceptException  CleanupAuditAction = "accept_exception"
+	CleanupAuditReopenException  CleanupAuditAction = "reopen_exception"
+	CleanupAuditQueryDiagnostics CleanupAuditAction = "query_diagnostics"
 
 	LegacyCleanupOpaqueObligation LegacyCleanupSourceAuthority = "opaque_numbered_obligation"
 )
@@ -545,6 +546,7 @@ type cleanupAuditTransaction struct {
 	intent    CleanupAuditIntent
 	commit    func(CleanupAuditEvidence) error
 	committed bool
+	evidence  CleanupAuditEvidence
 }
 
 func (t *cleanupAuditTransaction) Intent() CleanupAuditIntent {
@@ -558,6 +560,7 @@ func (t *cleanupAuditTransaction) Commit(evidence CleanupAuditEvidence) error {
 	if err := t.commit(evidence); err != nil {
 		return err
 	}
+	t.evidence = evidence
 	t.committed = true
 	return nil
 }
@@ -590,6 +593,7 @@ type cleanupOperationRecord struct {
 	requestDigest Digest
 	result        CleanupDebt
 	err           *Error
+	recordedAt    Instant
 }
 
 // CleanupPort is the exact-generation physical boundary. Creating an
@@ -765,6 +769,7 @@ func (m *inMemory) CreateCleanupObligation(
 		result := cloneCleanupDebt(record.debt)
 		m.cleanupOperations[scope] = cleanupOperationRecord{
 			kind: "create", requestDigest: request.Operation.RequestDigest, result: result,
+			recordedAt: m.now(),
 		}
 		return result, nil
 	}
@@ -782,6 +787,7 @@ func (m *inMemory) CreateCleanupObligation(
 	m.cleanupDebtOwners[key] = debtID
 	m.cleanupOperations[scope] = cleanupOperationRecord{
 		kind: "create", requestDigest: request.Operation.RequestDigest, result: cloneCleanupDebt(debt),
+		recordedAt: m.now(),
 	}
 	return cloneCleanupDebt(debt), nil
 }
@@ -819,6 +825,7 @@ func (m *inMemory) AcceptLegacyCleanupObligation(
 		result := cloneCleanupDebt(record.debt)
 		m.cleanupOperations[scope] = cleanupOperationRecord{
 			kind: "accept_legacy", requestDigest: request.Operation.RequestDigest, result: result,
+			recordedAt: m.now(),
 		}
 		return result, nil
 	}
@@ -843,6 +850,7 @@ func (m *inMemory) AcceptLegacyCleanupObligation(
 	m.legacyCleanupDebts[legacyKey] = debtID
 	m.cleanupOperations[scope] = cleanupOperationRecord{
 		kind: "accept_legacy", requestDigest: request.Operation.RequestDigest, result: cloneCleanupDebt(debt),
+		recordedAt: m.now(),
 	}
 	return cloneCleanupDebt(debt), nil
 }
@@ -923,6 +931,7 @@ func (m *inMemory) ClaimCleanupDebt(
 	m.cleanupDebts[request.DebtID] = record
 	m.cleanupOperations[scope] = cleanupOperationRecord{
 		kind: "claim", requestDigest: request.Operation.RequestDigest, result: cloneCleanupDebt(debt),
+		recordedAt: m.now(),
 	}
 	return cloneCleanupDebt(debt), nil
 }
@@ -954,9 +963,9 @@ func (m *inMemory) ReconcileCleanupDebt(
 			if !errors.As(err, &lifecycleErr) {
 				lifecycleErr = &Error{Code: ErrorIntegrityFailure}
 			}
-			recordOperation(m.operations, scope, request.Operation, CleanupDebt{}, lifecycleErr)
+			recordOperation(m.operations, m.now(), scope, request.Operation, CleanupDebt{}, lifecycleErr)
 		} else {
-			recordOperation(m.operations, scope, request.Operation, result, nil)
+			recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 		}
 		return result, err
 	}
@@ -976,7 +985,7 @@ func (m *inMemory) ReconcileCleanupDebt(
 		workspace.fence != request.Fence {
 		return m.recordCleanupError(scope, "reconcile", request.Operation, ErrorStaleAuthority)
 	}
-	markOperationReconciliationRequired(m.operations, scope)
+	markOperationReconciliationRequired(m.operations, m.now(), scope)
 	if record.checkpoint != nil {
 		return m.reconcileCheckpointCleanupDebt(ctx, scope, request, record)
 	}
@@ -1110,7 +1119,13 @@ func (m *inMemory) ResolveCleanupDebt(
 		return CleanupDebt{}, &Error{Code: ErrorInvalidIntent}
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var deliveryEvidence CleanupAuditEvidence
+	defer func() {
+		m.mu.Unlock()
+		if deliveryEvidence.ID != "" {
+			m.deliverRequiredAudit(ctx, deliveryEvidence)
+		}
+	}()
 	scope := operationScope{request.PolicyDomainID, request.TaskID, request.Operation.ID}
 	if result, replayed, err := replayCleanupOperation(m.cleanupOperations, scope, "resolve", request.Operation); replayed {
 		return result, err
@@ -1134,9 +1149,9 @@ func (m *inMemory) ResolveCleanupDebt(
 		AdministratorAuthority: request.AdministratorAuthority, Resolution: request.Resolution,
 		ClosedReason: request.ClosedReason, Duration: request.Duration,
 		DecisionEvidenceRoot: request.EvidenceRoot, ResolutionGeneration: debt.ResolutionGeneration + 1,
-		Operation: request.Operation,
+		Operation: contentFreeAuditOperation(scope, request.Operation),
 	}
-	if err := m.recordRequiredCleanupAudit(ctx, intent, func(auditEvidence CleanupAuditEvidence) error {
+	auditEvidence, err := m.recordRequiredCleanupAudit(ctx, intent, func(auditEvidence CleanupAuditEvidence) error {
 		if !m.platformAdministratorAuthorityIsCurrent(request.AdministratorAuthority) {
 			return &Error{Code: ErrorStaleAuthority}
 		}
@@ -1163,11 +1178,14 @@ func (m *inMemory) ResolveCleanupDebt(
 		m.cleanupDebts[debt.DebtID] = record
 		m.cleanupOperations[scope] = cleanupOperationRecord{
 			kind: "resolve", requestDigest: request.Operation.RequestDigest, result: cloneCleanupDebt(debt),
+			recordedAt: m.now(),
 		}
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		return m.recordCleanupError(scope, "resolve", request.Operation, ErrorIntegrityFailure)
 	}
+	deliveryEvidence = auditEvidence
 	return cloneCleanupDebt(debt), nil
 }
 
@@ -1183,7 +1201,13 @@ func (m *inMemory) ReopenCleanupDebt(
 		return CleanupDebt{}, &Error{Code: ErrorInvalidIntent}
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var deliveryEvidence CleanupAuditEvidence
+	defer func() {
+		m.mu.Unlock()
+		if deliveryEvidence.ID != "" {
+			m.deliverRequiredAudit(ctx, deliveryEvidence)
+		}
+	}()
 	scope := operationScope{request.PolicyDomainID, request.TaskID, request.Operation.ID}
 	if result, replayed, err := replayCleanupOperation(m.cleanupOperations, scope, "reopen", request.Operation); replayed {
 		return result, err
@@ -1209,9 +1233,9 @@ func (m *inMemory) ReopenCleanupDebt(
 		AdministratorAuthority: request.AdministratorAuthority, Resolution: CleanupAcceptedException,
 		ClosedReason: debt.ClosedReason, Duration: debt.ResolutionDuration,
 		DecisionEvidenceRoot: request.EvidenceRoot, ResolutionGeneration: debt.ResolutionGeneration + 1,
-		Operation: request.Operation,
+		Operation: contentFreeAuditOperation(scope, request.Operation),
 	}
-	if err := m.recordRequiredCleanupAudit(ctx, intent, func(auditEvidence CleanupAuditEvidence) error {
+	auditEvidence, err := m.recordRequiredCleanupAudit(ctx, intent, func(auditEvidence CleanupAuditEvidence) error {
 		if !m.platformAdministratorAuthorityIsCurrent(request.AdministratorAuthority) {
 			return &Error{Code: ErrorStaleAuthority}
 		}
@@ -1239,11 +1263,14 @@ func (m *inMemory) ReopenCleanupDebt(
 		m.cleanupDebts[debt.DebtID] = record
 		m.cleanupOperations[scope] = cleanupOperationRecord{
 			kind: "reopen", requestDigest: request.Operation.RequestDigest, result: cloneCleanupDebt(debt),
+			recordedAt: m.now(),
 		}
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		return m.recordCleanupError(scope, "reopen", request.Operation, ErrorIntegrityFailure)
 	}
+	deliveryEvidence = auditEvidence
 	return cloneCleanupDebt(debt), nil
 }
 
@@ -1262,16 +1289,199 @@ func (m *inMemory) recordRequiredCleanupAudit(
 	ctx context.Context,
 	intent CleanupAuditIntent,
 	commit func(CleanupAuditEvidence) error,
-) error {
+) (CleanupAuditEvidence, error) {
 	if m.cleanupAudit == nil {
-		return &Error{Code: ErrorIntegrityFailure}
+		return CleanupAuditEvidence{}, &Error{Code: ErrorIntegrityFailure}
 	}
 	transaction := &cleanupAuditTransaction{intent: intent, commit: commit}
 	_ = m.cleanupAudit.RecordRequired(ctx, transaction)
 	if !transaction.committed {
-		return &Error{Code: ErrorIntegrityFailure}
+		return CleanupAuditEvidence{}, &Error{Code: ErrorIntegrityFailure}
 	}
-	return nil
+	return transaction.evidence, nil
+}
+
+func (m *inMemory) deliverRequiredAudit(ctx context.Context, evidence CleanupAuditEvidence) {
+	fact := auditDeliveryFact(evidence)
+	m.mu.Lock()
+	record := m.auditDeliveries[evidence.ID]
+	if record.fact.AuditFactID == "" {
+		record.fact = fact
+	}
+	if record.fact.AuditFactID != fact.AuditFactID || record.fact.Digest != fact.Digest {
+		record.quarantined = true
+		record.lastResult = ProjectionResultRejected
+		record.safeError = SafeErrorIntegrityUnavailableContent
+		m.auditDeliveries[evidence.ID] = record
+		m.mu.Unlock()
+		m.alertAuditDeliveryIntegrity(ctx, fact.AuditFactID)
+		return
+	}
+	if record.delivered || record.delivering || record.quarantined || m.auditDelivery == nil {
+		m.auditDeliveries[evidence.ID] = record
+		m.mu.Unlock()
+		return
+	}
+	record.attempts++
+	record.attemptGeneration++
+	if record.firstAttemptAt == 0 {
+		record.firstAttemptAt = m.now()
+	}
+	record.lastAttemptAt = m.now()
+	record.lastResult = ProjectionResultPending
+	record.safeError = ""
+	record.delivering = true
+	m.auditDeliveries[evidence.ID] = record
+	delivery := m.auditDelivery
+	attemptGeneration := record.attemptGeneration
+	m.mu.Unlock()
+
+	err := delivery.Deliver(ctx, fact)
+	m.mu.Lock()
+	record = m.auditDeliveries[evidence.ID]
+	if record.fact.AuditFactID == fact.AuditFactID && record.fact.Digest == fact.Digest &&
+		record.attemptGeneration == attemptGeneration {
+		record.delivering = false
+		record.delivered = err == nil
+		if err == nil {
+			record.lastResult = ProjectionResultCommitted
+			record.safeError = ""
+		} else {
+			record.lastResult = ProjectionResultRejected
+			record.safeError = SafeErrorRetryableUnavailable
+		}
+		m.auditDeliveries[evidence.ID] = record
+	}
+	m.mu.Unlock()
+}
+
+func (m *inMemory) RebuildAuditDelivery(
+	ctx context.Context,
+	_ AuditDeliveryRebuildRequest,
+) (AuditDeliveryBacklog, error) {
+	m.mu.Lock()
+	if m.auditDelivery == nil {
+		m.mu.Unlock()
+		return AuditDeliveryBacklog{}, &Error{Code: ErrorReconciliationRequired}
+	}
+	alerts := make([]AuditDeliveryFactID, 0)
+	for id, evidence := range m.cleanupAuditFacts {
+		expected := auditDeliveryFact(evidence)
+		record, exists := m.auditDeliveries[id]
+		if !exists || record.fact.AuditFactID == "" {
+			record.fact = expected
+		} else if record.fact.AuditFactID != expected.AuditFactID || record.fact.Digest != expected.Digest {
+			record.quarantined = true
+			record.lastResult = ProjectionResultRejected
+			record.safeError = SafeErrorIntegrityUnavailableContent
+			alerts = append(alerts, expected.AuditFactID)
+		}
+		// In-flight delivery is runtime state. Clearing it makes a committed
+		// fact redeliverable after process interruption; the sink deduplicates
+		// by AuditFactID and digest.
+		record.delivering = false
+		m.auditDeliveries[id] = record
+	}
+	for id, record := range m.auditDeliveries {
+		if _, exists := m.cleanupAuditFacts[id]; exists {
+			continue
+		}
+		record.quarantined = true
+		record.delivering = false
+		record.lastResult = ProjectionResultRejected
+		record.safeError = SafeErrorIntegrityUnavailableContent
+		m.auditDeliveries[id] = record
+		alerts = append(alerts, record.fact.AuditFactID)
+	}
+	type deliveryAttempt struct {
+		sourceID   CleanupAuditEvidenceID
+		fact       AuditDeliveryFact
+		generation uint64
+	}
+	pending := make([]deliveryAttempt, 0, len(m.auditDeliveries))
+	for id, delivery := range m.auditDeliveries {
+		if !delivery.delivered && !delivery.delivering && !delivery.quarantined {
+			delivery.delivering = true
+			delivery.attempts++
+			delivery.attemptGeneration++
+			if delivery.firstAttemptAt == 0 {
+				delivery.firstAttemptAt = m.now()
+			}
+			delivery.lastAttemptAt = m.now()
+			delivery.lastResult = ProjectionResultPending
+			delivery.safeError = ""
+			m.auditDeliveries[id] = delivery
+			pending = append(pending, deliveryAttempt{
+				sourceID: id, fact: delivery.fact, generation: delivery.attemptGeneration,
+			})
+		}
+	}
+	sort.Slice(pending, func(i, j int) bool { return pending[i].fact.AuditFactID < pending[j].fact.AuditFactID })
+	delivery := m.auditDelivery
+	m.mu.Unlock()
+	for _, auditFactID := range alerts {
+		m.alertAuditDeliveryIntegrity(ctx, auditFactID)
+	}
+
+	for _, attempt := range pending {
+		err := delivery.Deliver(ctx, attempt.fact)
+		m.mu.Lock()
+		record := m.auditDeliveries[attempt.sourceID]
+		if record.fact.AuditFactID == attempt.fact.AuditFactID && record.fact.Digest == attempt.fact.Digest &&
+			record.attemptGeneration == attempt.generation {
+			record.delivering = false
+			record.delivered = err == nil
+			if err == nil {
+				record.lastResult = ProjectionResultCommitted
+				record.safeError = ""
+			} else {
+				record.lastResult = ProjectionResultRejected
+				record.safeError = SafeErrorRetryableUnavailable
+			}
+			m.auditDeliveries[attempt.sourceID] = record
+		}
+		m.mu.Unlock()
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var pendingCount, deliveredCount, quarantinedCount uint64
+	evidence := make([]AuditDeliveryEvidence, 0, len(m.auditDeliveries))
+	for _, delivery := range m.auditDeliveries {
+		switch {
+		case delivery.quarantined:
+			quarantinedCount++
+		case delivery.delivered:
+			deliveredCount++
+		default:
+			pendingCount++
+		}
+		evidence = append(evidence, AuditDeliveryEvidence{
+			AuditFactID: delivery.fact.AuditFactID, Digest: delivery.fact.Digest,
+			AttemptCount: delivery.attempts, AttemptGeneration: delivery.attemptGeneration,
+			FirstAttemptAt: delivery.firstAttemptAt,
+			LastAttemptAt:  delivery.lastAttemptAt, LastResult: delivery.lastResult,
+			SafeError: delivery.safeError, Quarantined: delivery.quarantined,
+		})
+	}
+	sort.Slice(evidence, func(i, j int) bool { return evidence[i].AuditFactID < evidence[j].AuditFactID })
+	return AuditDeliveryBacklog{
+		Pending:         KnownQuantity{Known: true, Value: pendingCount},
+		Delivered:       KnownQuantity{Known: true, Value: deliveredCount},
+		Quarantined:     KnownQuantity{Known: true, Value: quarantinedCount},
+		SourceWatermark: SourceWatermark{Known: true, Value: uint64(len(m.cleanupAuditFacts))},
+		Evidence:        evidence,
+	}, nil
+}
+
+func (m *inMemory) alertAuditDeliveryIntegrity(ctx context.Context, auditFactID AuditDeliveryFactID) {
+	if m.auditDeliveryAlerts == nil || auditFactID == "" {
+		return
+	}
+	_ = m.auditDeliveryAlerts.AlertAuditDeliveryIntegrity(ctx, AuditDeliveryIntegrityAlert{
+		AuditFactID: auditFactID,
+		SafeError:   SafeErrorIntegrityUnavailableContent,
+	})
 }
 
 func cleanupAuditEvidenceMatches(intent CleanupAuditIntent, evidence CleanupAuditEvidence) bool {
@@ -1282,6 +1492,18 @@ func cleanupAuditEvidenceMatches(intent CleanupAuditIntent, evidence CleanupAudi
 		evidence.Resolution == intent.Resolution && evidence.ClosedReason == intent.ClosedReason &&
 		evidence.Duration == intent.Duration && evidence.DecisionEvidenceRoot == intent.DecisionEvidenceRoot &&
 		evidence.ResolutionGeneration == intent.ResolutionGeneration && evidence.OperationID == intent.Operation.ID
+}
+
+func contentFreeAuditOperation(scope operationScope, operation Operation) Operation {
+	return Operation{
+		ID: OperationID(canonicalDigest(struct {
+			Kind           string
+			PolicyDomainID PolicyDomainID
+			TaskID         TaskID
+			OperationID    OperationID
+		}{"content_free_audit_operation", scope.policyDomainID, scope.taskID, operation.ID})),
+		RequestDigest: operation.RequestDigest,
+	}
 }
 
 func validCleanupExceptionReason(reason CleanupExceptionReason) bool {
@@ -1310,8 +1532,9 @@ func (m *inMemory) resolveCleanupFromEvidence(
 	m.cleanupDebts[debt.DebtID] = record
 	m.cleanupOperations[scope] = cleanupOperationRecord{
 		kind: "reconcile", requestDigest: operation.RequestDigest, result: cloneCleanupDebt(debt),
+		recordedAt: m.now(),
 	}
-	recordOperation(m.operations, scope, operation, debt, nil)
+	recordOperation(m.operations, m.now(), scope, operation, debt, nil)
 	return cloneCleanupDebt(debt), nil
 }
 
@@ -1359,8 +1582,9 @@ func (m *inMemory) scheduleCleanupRetry(
 	m.cleanupDebts[debt.DebtID] = record
 	m.cleanupOperations[scope] = cleanupOperationRecord{
 		kind: "reconcile", requestDigest: operation.RequestDigest, result: cloneCleanupDebt(debt),
+		recordedAt: m.now(),
 	}
-	recordOperation(m.operations, scope, operation, debt, nil)
+	recordOperation(m.operations, m.now(), scope, operation, debt, nil)
 	return cloneCleanupDebt(debt), nil
 }
 
@@ -1564,9 +1788,10 @@ func (m *inMemory) completeCheckpointCleanupDebt(
 	}
 	m.cleanupOperations[scope] = cleanupOperationRecord{
 		kind: "reconcile", requestDigest: operation.RequestDigest, result: cloneCleanupDebt(debt),
+		recordedAt: m.now(),
 	}
-	recordOperation(m.operations, scope, operation, debt, nil)
-	recordOperation(m.operations, originalScope, originalRequest.Operation, result, nil)
+	recordOperation(m.operations, m.now(), scope, operation, debt, nil)
+	recordOperation(m.operations, m.now(), originalScope, originalRequest.Operation, result, nil)
 	return cloneCleanupDebt(debt), nil
 }
 
@@ -1748,10 +1973,10 @@ func (m *inMemory) recordCleanupError(
 ) (CleanupDebt, error) {
 	err := &Error{Code: code}
 	m.cleanupOperations[scope] = cleanupOperationRecord{
-		kind: kind, requestDigest: operation.RequestDigest, err: err,
+		kind: kind, requestDigest: operation.RequestDigest, err: err, recordedAt: m.now(),
 	}
 	if kind == "reconcile" {
-		recordOperation(m.operations, scope, operation, CleanupDebt{}, err)
+		recordOperation(m.operations, m.now(), scope, operation, CleanupDebt{}, err)
 	}
 	return CleanupDebt{}, err
 }
