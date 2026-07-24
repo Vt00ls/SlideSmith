@@ -121,6 +121,92 @@ func TestCommitRejectsUnsafeOrExcludedCheckpointMembersBeforeDurablePreparation(
 	}
 }
 
+func TestCommitRejectsDurableObjectMutationOfDeclaredSemanticManifest(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*taskworkspace.DeclaredStateMember)
+	}{
+		{
+			name: "logical path",
+			mutate: func(member *taskworkspace.DeclaredStateMember) {
+				member.LogicalMember = "state/renamed.json"
+			},
+		},
+		{
+			name: "unsafe logical path",
+			mutate: func(member *taskworkspace.DeclaredStateMember) {
+				member.LogicalMember = "../secret"
+			},
+		},
+		{
+			name: "excluded class",
+			mutate: func(member *taskworkspace.DeclaredStateMember) {
+				member.Class = taskworkspace.StateMemberRuntimeRelease
+			},
+		},
+		{
+			name: "content digest",
+			mutate: func(member *taskworkspace.DeclaredStateMember) {
+				member.ContentDigest = "sha256:1dde25249fd4b6cbedb58974a4e89c06c5741fee860b2e7faf35cd9bfd3debaf"
+			},
+		},
+		{
+			name: "content size",
+			mutate: func(member *taskworkspace.DeclaredStateMember) {
+				member.Size++
+			},
+		},
+		{
+			name: "unsafe member type",
+			mutate: func(member *taskworkspace.DeclaredStateMember) {
+				member.Type = taskworkspace.StateMemberSymbolicLink
+			},
+		},
+		{
+			name: "unsafe member mode",
+			mutate: func(member *taskworkspace.DeclaredStateMember) {
+				member.Mode = 0o4600
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			durable := &happyDurableObject{
+				mutateRequest: func(manifest *taskworkspace.DeclaredStateManifest) {
+					test.mutate(&manifest.Members[0])
+				},
+			}
+			lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
+				ValidationAuthorityID: "validation-authority-1",
+				DurabilityAuthorityID: "durability-authority-1",
+				DurableObject:         durable,
+			})
+			confirmed, view := openRuntimeViewWithLifecycle(
+				t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
+			)
+			manifest := declaredStateManifest("content-1")
+			originalMember := manifest.Members[0]
+			validation := acceptedValidationEvidence(confirmed, view, manifest)
+
+			result, err := lifecycle.CommitRuntimeView(
+				context.Background(),
+				commitRequest(confirmed, view, manifest, validation, "commit-1"),
+			)
+			var lifecycleError *taskworkspace.Error
+			if !errors.As(err, &lifecycleError) || lifecycleError.Code != taskworkspace.ErrorIntegrityFailure {
+				t.Fatalf("commit error = %T/%v, want typed integrity failure", err, err)
+			}
+			if result.CheckpointID != "" || result.RevisionID != "" {
+				t.Fatal("adapter-mutated semantic manifest returned Checkpoint or Revision authority")
+			}
+			if manifest.Members[0] != originalMember {
+				t.Fatal("Durable Object mutation escaped its copied manifest input")
+			}
+		})
+	}
+}
+
 func TestCommitFailsClosedForUnverifiedOrIncompletelyBoundDurableContent(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -242,6 +328,23 @@ func TestCommitFailsClosedForUnverifiedOrIncompletelyBoundDurableContent(t *test
 			name: "receipt without verification time",
 			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
 				content.DurabilityReceipts[1].VerifiedAt = time.Time{}
+				content.DurabilityReceipts[1].EvidenceDigest = content.DurabilityReceipts[1].CanonicalDigest()
+			},
+		},
+		{
+			name: "first receipt claims an unknown predecessor",
+			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
+				content.DurabilityReceipts[1].Replaces = taskworkspace.DurabilityReplacementProof{
+					ReceiptID:    "receipt-not-current",
+					GenerationID: "durability-generation-not-current",
+				}
+				content.DurabilityReceipts[1].EvidenceDigest = content.DurabilityReceipts[1].CanonicalDigest()
+			},
+		},
+		{
+			name: "receipt carries an incomplete replacement proof",
+			mutate: func(content *taskworkspace.VerifiedCheckpointContent) {
+				content.DurabilityReceipts[1].Replaces.ReceiptID = "receipt-not-current"
 				content.DurabilityReceipts[1].EvidenceDigest = content.DurabilityReceipts[1].CanonicalDigest()
 			},
 		},
@@ -522,10 +625,15 @@ func TestMaterializeRejectsAReceiptFromTheGenerationBeforeExactRepair(t *testing
 	}
 
 	durable.verifyMutate = func(content *taskworkspace.VerifiedCheckpointContent) {
-		repaired := content.DurabilityReceipts[1]
+		prior := content.DurabilityReceipts[1]
+		repaired := prior
 		repaired.ID = "receipt-member-repaired"
 		repaired.DurableWriteID = "durable-write-member-repaired"
 		repaired.DurabilityGenerationID = "durability-generation-repaired"
+		repaired.Replaces = taskworkspace.DurabilityReplacementProof{
+			ReceiptID:    prior.ID,
+			GenerationID: prior.DurabilityGenerationID,
+		}
 		repaired.VerifiedAt = repaired.VerifiedAt.Add(time.Minute)
 		repaired.EvidenceDigest = repaired.CanonicalDigest()
 		content.DurabilityReceipts[1] = repaired
@@ -550,6 +658,155 @@ func TestMaterializeRejectsAReceiptFromTheGenerationBeforeExactRepair(t *testing
 	}
 	if result.MaterializationID != "" || result.CheckpointID != "" {
 		t.Fatal("stale pre-repair receipt returned materialization or Checkpoint authority")
+	}
+}
+
+func TestMaterializeRejectsReplacementReceiptWithoutCurrentSupersessionProof(t *testing.T) {
+	durable := &happyDurableObject{}
+	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
+		ValidationAuthorityID: "validation-authority-1",
+		DurabilityAuthorityID: "durability-authority-1",
+		DurableObject:         durable,
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
+	)
+	manifest := declaredStateManifest("content-1")
+	validation := acceptedValidationEvidence(confirmed, view, manifest)
+	if _, err := lifecycle.CommitRuntimeView(
+		context.Background(),
+		commitRequest(confirmed, view, manifest, validation, "commit-1"),
+	); err != nil {
+		t.Fatalf("commit Checkpoint: %v", err)
+	}
+	current, err := lifecycle.ConfirmTaskWorkspace(
+		context.Background(),
+		confirmRequest("policy-domain-1", "task-1", "confirm-2"),
+	)
+	if err != nil {
+		t.Fatalf("confirm current Task Workspace: %v", err)
+	}
+	durable.verifyMutate = func(content *taskworkspace.VerifiedCheckpointContent) {
+		replacement := content.DurabilityReceipts[1]
+		replacement.ID = "receipt-member-replacement"
+		replacement.DurableWriteID = "durable-write-member-replacement"
+		replacement.DurabilityGenerationID = "durability-generation-replacement"
+		replacement.VerifiedAt = replacement.VerifiedAt.Add(time.Minute)
+		replacement.EvidenceDigest = replacement.CanonicalDigest()
+		content.DurabilityReceipts[1] = replacement
+	}
+
+	result, err := lifecycle.Materialize(
+		context.Background(),
+		materializeRequest("policy-domain-1", "task-1", current, "materialize-without-supersession"),
+	)
+	var lifecycleError *taskworkspace.Error
+	if !errors.As(err, &lifecycleError) || lifecycleError.Code != taskworkspace.ErrorIntegrityFailure {
+		t.Fatalf("materialize error = %T/%v, want typed integrity failure", err, err)
+	}
+	if result.MaterializationID != "" || result.CheckpointID != "" {
+		t.Fatal("unproven replacement receipt returned materialization or Checkpoint authority")
+	}
+}
+
+func TestReceiptAuthorityRejectsStaleGenerationAndReverseReplacement(t *testing.T) {
+	tests := []struct {
+		name      string
+		candidate func(taskworkspace.DurabilityReceipt, taskworkspace.DurabilityReceipt) taskworkspace.DurabilityReceipt
+	}{
+		{
+			name: "first-seen receipt reuses a stale generation",
+			candidate: func(initial, current taskworkspace.DurabilityReceipt) taskworkspace.DurabilityReceipt {
+				return replacementReceipt(current, "receipt-member-stale-unseen", initial.DurabilityGenerationID)
+			},
+		},
+		{
+			name: "replacement points behind current receipt",
+			candidate: func(initial, current taskworkspace.DurabilityReceipt) taskworkspace.DurabilityReceipt {
+				reverse := replacementReceipt(current, "receipt-member-reverse", "durability-generation-reverse")
+				reverse.Replaces = taskworkspace.DurabilityReplacementProof{
+					ReceiptID:    initial.ID,
+					GenerationID: initial.DurabilityGenerationID,
+				}
+				reverse.EvidenceDigest = reverse.CanonicalDigest()
+				return reverse
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			durable := &happyDurableObject{}
+			lifecycle, current, committed := committedCheckpointForReceiptAuthority(t, durable)
+			initial := committed.CheckpointEvidence.DurabilityReceipts[1]
+			durable.verifyMutate = func(content *taskworkspace.VerifiedCheckpointContent) {
+				content.DurabilityReceipts[1] = replacementReceipt(
+					content.DurabilityReceipts[1],
+					"receipt-member-current",
+					"durability-generation-current",
+				)
+			}
+			replaced, err := lifecycle.Materialize(
+				context.Background(),
+				materializeRequest("policy-domain-1", "task-1", current, "materialize-replacement"),
+			)
+			if err != nil {
+				t.Fatalf("materialize verified replacement: %v", err)
+			}
+			currentReceipt := replaced.CheckpointEvidence.DurabilityReceipts[1]
+			durable.verifyMutate = func(content *taskworkspace.VerifiedCheckpointContent) {
+				content.DurabilityReceipts[1] = test.candidate(initial, currentReceipt)
+			}
+
+			result, err := lifecycle.Materialize(
+				context.Background(),
+				materializeRequest("policy-domain-1", "task-1", current, "materialize-invalid-replacement"),
+			)
+			var lifecycleError *taskworkspace.Error
+			if !errors.As(err, &lifecycleError) || lifecycleError.Code != taskworkspace.ErrorIntegrityFailure {
+				t.Fatalf("materialize error = %T/%v, want typed integrity failure", err, err)
+			}
+			if result.MaterializationID != "" || result.CheckpointID != "" {
+				t.Fatal("invalid receipt replacement returned materialization or Checkpoint authority")
+			}
+		})
+	}
+}
+
+func TestReplacementReceiptExactReplayDoesNotAdvanceAuthorityAgain(t *testing.T) {
+	durable := &happyDurableObject{}
+	lifecycle, current, _ := committedCheckpointForReceiptAuthority(t, durable)
+	durable.verifyMutate = func(content *taskworkspace.VerifiedCheckpointContent) {
+		content.DurabilityReceipts[1] = replacementReceipt(
+			content.DurabilityReceipts[1],
+			"receipt-member-current",
+			"durability-generation-current",
+		)
+	}
+	request := materializeRequest("policy-domain-1", "task-1", current, "materialize-replacement")
+	first, err := lifecycle.Materialize(context.Background(), request)
+	if err != nil {
+		t.Fatalf("materialize verified replacement: %v", err)
+	}
+	replayed, err := lifecycle.Materialize(context.Background(), request)
+	if err != nil {
+		t.Fatalf("replay verified replacement: %v", err)
+	}
+	if !reflect.DeepEqual(replayed, first) || durable.verified != 1 {
+		t.Fatal("exact replay changed replacement evidence or repeated receipt advancement")
+	}
+
+	durable.verifyMutate = nil
+	currentResult, err := lifecycle.Materialize(
+		context.Background(),
+		materializeRequest("policy-domain-1", "task-1", current, "materialize-current-receipt"),
+	)
+	if err != nil {
+		t.Fatalf("materialize current receipt after replay: %v", err)
+	}
+	if currentResult.CheckpointEvidence.DurabilityReceipts[1] != first.CheckpointEvidence.DurabilityReceipts[1] ||
+		durable.verified != 2 {
+		t.Fatal("exact replay corrupted current receipt authority")
 	}
 }
 
@@ -891,12 +1148,13 @@ func TestCommitRejectsDurableEvidenceIdentityRebindingAcrossCheckpoints(t *testi
 }
 
 type happyDurableObject struct {
-	prepared     int
-	verified     int
-	prepareError error
-	mutate       func(*taskworkspace.VerifiedCheckpointContent)
-	verifyError  error
-	verifyMutate func(*taskworkspace.VerifiedCheckpointContent)
+	prepared      int
+	verified      int
+	prepareError  error
+	mutateRequest func(*taskworkspace.DeclaredStateManifest)
+	mutate        func(*taskworkspace.VerifiedCheckpointContent)
+	verifyError   error
+	verifyMutate  func(*taskworkspace.VerifiedCheckpointContent)
 }
 
 func (d *happyDurableObject) PrepareCheckpoint(
@@ -906,6 +1164,9 @@ func (d *happyDurableObject) PrepareCheckpoint(
 	d.prepared++
 	if d.prepareError != nil {
 		return taskworkspace.VerifiedCheckpointContent{}, d.prepareError
+	}
+	if d.mutateRequest != nil {
+		d.mutateRequest(&request.Manifest)
 	}
 	member := request.Manifest.Members[0]
 	memberReference := durableReference(
@@ -1033,6 +1294,56 @@ func durableReceipt(id string, reference taskworkspace.ContentReference) taskwor
 	}
 	receipt.EvidenceDigest = receipt.CanonicalDigest()
 	return receipt
+}
+
+func replacementReceipt(
+	current taskworkspace.DurabilityReceipt,
+	id taskworkspace.DurabilityReceiptID,
+	generation taskworkspace.DurabilityGenerationID,
+) taskworkspace.DurabilityReceipt {
+	replacement := current
+	replacement.ID = id
+	replacement.DurableWriteID = taskworkspace.DurableWriteID("durable-write-" + string(id))
+	replacement.DurabilityGenerationID = generation
+	replacement.Replaces = taskworkspace.DurabilityReplacementProof{
+		ReceiptID:    current.ID,
+		GenerationID: current.DurabilityGenerationID,
+	}
+	replacement.VerifiedAt = current.VerifiedAt.Add(time.Minute)
+	replacement.EvidenceDigest = replacement.CanonicalDigest()
+	return replacement
+}
+
+func committedCheckpointForReceiptAuthority(
+	t *testing.T,
+	durable *happyDurableObject,
+) (taskworkspace.Lifecycle, taskworkspace.ConfirmTaskWorkspaceResult, taskworkspace.CommitRuntimeViewResult) {
+	t.Helper()
+	lifecycle := taskworkspace.NewInMemory(taskworkspace.InMemoryConfig{
+		ValidationAuthorityID: "validation-authority-1",
+		DurabilityAuthorityID: "durability-authority-1",
+		DurableObject:         durable,
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, lifecycle, "task-1", "confirm-1", "materialize-1", "open-view-1",
+	)
+	manifest := declaredStateManifest("content-1")
+	validation := acceptedValidationEvidence(confirmed, view, manifest)
+	committed, err := lifecycle.CommitRuntimeView(
+		context.Background(),
+		commitRequest(confirmed, view, manifest, validation, "commit-1"),
+	)
+	if err != nil {
+		t.Fatalf("commit Checkpoint: %v", err)
+	}
+	current, err := lifecycle.ConfirmTaskWorkspace(
+		context.Background(),
+		confirmRequest("policy-domain-1", "task-1", "confirm-2"),
+	)
+	if err != nil {
+		t.Fatalf("confirm current Task Workspace: %v", err)
+	}
+	return lifecycle, current, committed
 }
 
 func openRuntimeViewWithLifecycle(

@@ -31,13 +31,19 @@ type inMemory struct {
 	contentReferences     map[ContentReferenceID]ContentReference
 	contentFacts          map[ContentID]durableContentFact
 	durabilityReceipts    map[DurabilityReceiptID]DurabilityReceipt
-	supersededReceipts    map[DurabilityReceiptID]struct{}
+	currentReceipts       map[receiptAuthorityScope]DurabilityReceipt
+	receiptGenerations    map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID
 }
 
 type durableContentFact struct {
 	policyDomainID PolicyDomainID
 	contentDigest  Digest
 	size           uint64
+}
+
+type receiptAuthorityScope struct {
+	policyDomainID PolicyDomainID
+	contentID      ContentID
 }
 
 type workspaceBinding struct {
@@ -114,7 +120,8 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 		contentReferences:     make(map[ContentReferenceID]ContentReference),
 		contentFacts:          make(map[ContentID]durableContentFact),
 		durabilityReceipts:    make(map[DurabilityReceiptID]DurabilityReceipt),
-		supersededReceipts:    make(map[DurabilityReceiptID]struct{}),
+		currentReceipts:       make(map[receiptAuthorityScope]DurabilityReceipt),
+		receiptGenerations:    make(map[receiptAuthorityScope]map[DurabilityGenerationID]DurabilityReceiptID),
 	}
 	return memory
 }
@@ -189,6 +196,8 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 	if result, replayed, err := replayOperation[CommitRuntimeViewResult](m.operations, request.PolicyDomainID, request.TaskID, request.Operation); replayed {
 		return result, err
 	}
+	trustedRequest := request
+	trustedRequest.DeclaredStateManifest = cloneDeclaredStateManifest(request.DeclaredStateManifest)
 	fail := func(code ErrorCode) (CommitRuntimeViewResult, error) {
 		err := &Error{Code: code}
 		recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, CommitRuntimeViewResult{}, err)
@@ -212,17 +221,17 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		workspace.generation != request.Generation || workspace.fence != request.Fence {
 		return fail(ErrorStaleAuthority)
 	}
-	if !m.validationEvidenceMatches(request.ValidationEvidence, request, view) {
+	if !m.validationEvidenceMatches(trustedRequest.ValidationEvidence, trustedRequest, view) {
 		return fail(ErrorIntegrityFailure)
 	}
-	contentRoot, ok := validateDeclaredStateManifest(request.DeclaredStateManifest)
+	contentRoot, ok := validateDeclaredStateManifest(trustedRequest.DeclaredStateManifest)
 	if !ok {
 		return fail(ErrorIntegrityFailure)
 	}
 
 	predecessor := workspace.currentRevisionID
 	resultingRevision := predecessor
-	changed := request.DeclaredStateManifest.Digest != workspace.currentManifest
+	changed := trustedRequest.DeclaredStateManifest.Digest != workspace.currentManifest
 	if changed {
 		resultingRevision = RevisionID(m.nextOpaqueID("revision"))
 	} else {
@@ -239,8 +248,8 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 			RuntimeViewID:     request.RuntimeViewID,
 			RevisionID:        resultingRevision,
 			CheckpointID:      checkpointID,
-			Manifest:          request.DeclaredStateManifest,
-			CanonicalManifest: request.DeclaredStateManifest.CanonicalBytes(),
+			Manifest:          cloneDeclaredStateManifest(trustedRequest.DeclaredStateManifest),
+			CanonicalManifest: trustedRequest.DeclaredStateManifest.CanonicalBytes(),
 			Generation:        request.Generation,
 			Fence:             request.Fence,
 			Operation:         request.Operation,
@@ -248,9 +257,12 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		if err != nil {
 			return fail(ErrorIntegrityFailure)
 		}
+		if _, stillTrusted := validateDeclaredStateManifest(trustedRequest.DeclaredStateManifest); !stillTrusted {
+			return fail(ErrorIntegrityFailure)
+		}
 		var trusted bool
 		checkpointEvidence, contentRoot, durabilityRoot, trusted = m.bindCheckpointEvidence(
-			request,
+			trustedRequest,
 			resultingRevision,
 			checkpointID,
 			prepared,
@@ -265,18 +277,18 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 	if changed {
 		m.revisions[resultingRevision] = revisionRecord{
 			taskWorkspaceID: request.TaskWorkspaceID,
-			manifestDigest:  request.DeclaredStateManifest.Digest,
+			manifestDigest:  trustedRequest.DeclaredStateManifest.Digest,
 			predecessor:     predecessor,
 		}
 		workspace.currentRevisionID = resultingRevision
-		workspace.currentManifest = request.DeclaredStateManifest.Digest
+		workspace.currentManifest = trustedRequest.DeclaredStateManifest.Digest
 	}
 	workspace.currentCheckpointID = checkpointID
 	m.workspaces[request.TaskID] = workspace
 	m.checkpoints[checkpointID] = checkpointRecord{
 		taskWorkspaceID: request.TaskWorkspaceID,
 		revisionID:      resultingRevision,
-		manifestDigest:  request.DeclaredStateManifest.Digest,
+		manifestDigest:  trustedRequest.DeclaredStateManifest.Digest,
 		operationID:     request.Operation.ID,
 		evidence:        cloneCheckpointEvidence(checkpointEvidence),
 	}
@@ -290,7 +302,7 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		CheckpointID:             checkpointID,
 		BaseRevisionID:           request.BaseRevisionID,
 		PredecessorRevisionID:    predecessor,
-		ManifestDigest:           request.DeclaredStateManifest.Digest,
+		ManifestDigest:           trustedRequest.DeclaredStateManifest.Digest,
 		ValidationEvidenceID:     request.ValidationEvidence.ID,
 		ValidationEvidenceDigest: request.ValidationEvidence.Digest,
 		ContentEvidenceRoot:      contentRoot,
@@ -559,10 +571,10 @@ func (m *inMemory) durableEvidenceIdentitiesAreConsistent(content VerifiedCheckp
 		}
 	}
 	for _, receipt := range content.DurabilityReceipts {
-		if _, stale := m.supersededReceipts[receipt.ID]; stale {
+		if prior, exists := m.durabilityReceipts[receipt.ID]; exists && prior != receipt {
 			return false
 		}
-		if prior, exists := m.durabilityReceipts[receipt.ID]; exists && prior != receipt {
+		if !m.receiptCanBecomeCurrent(receipt) {
 			return false
 		}
 	}
@@ -580,7 +592,41 @@ func (m *inMemory) recordDurableEvidenceIdentities(content VerifiedCheckpointCon
 	}
 	for _, receipt := range content.DurabilityReceipts {
 		m.durabilityReceipts[receipt.ID] = receipt
+		scope := receiptAuthorityScope{
+			policyDomainID: receipt.PolicyDomainID,
+			contentID:      receipt.ContentID,
+		}
+		m.currentReceipts[scope] = receipt
+		generations := m.receiptGenerations[scope]
+		if generations == nil {
+			generations = make(map[DurabilityGenerationID]DurabilityReceiptID)
+			m.receiptGenerations[scope] = generations
+		}
+		generations[receipt.DurabilityGenerationID] = receipt.ID
 	}
+}
+
+func (m *inMemory) receiptCanBecomeCurrent(receipt DurabilityReceipt) bool {
+	scope := receiptAuthorityScope{
+		policyDomainID: receipt.PolicyDomainID,
+		contentID:      receipt.ContentID,
+	}
+	current, exists := m.currentReceipts[scope]
+	if !exists {
+		return receipt.Replaces == (DurabilityReplacementProof{})
+	}
+	if receipt == current {
+		return true
+	}
+	if receipt.ID == current.ID || receipt.DurabilityGenerationID == current.DurabilityGenerationID ||
+		receipt.Replaces.ReceiptID != current.ID ||
+		receipt.Replaces.GenerationID != current.DurabilityGenerationID {
+		return false
+	}
+	if _, reused := m.receiptGenerations[scope][receipt.DurabilityGenerationID]; reused {
+		return false
+	}
+	return true
 }
 
 func sameContentReferences(left, right []ContentReference) bool {
@@ -607,9 +653,6 @@ func (m *inMemory) receiptsRespectKnownIdentity(expected, verified []DurabilityR
 		knownByContent[receipt.ContentID] = receipt
 	}
 	for _, receipt := range verified {
-		if _, stale := m.supersededReceipts[receipt.ID]; stale {
-			return false
-		}
 		if prior, exists := knownByID[receipt.ID]; exists && prior != receipt {
 			return false
 		}
@@ -622,18 +665,6 @@ func (m *inMemory) receiptsRespectKnownIdentity(expected, verified []DurabilityR
 		}
 	}
 	return true
-}
-
-func (m *inMemory) recordSupersededReceipts(expected, verified []DurabilityReceipt) {
-	verifiedByContent := make(map[ContentID]DurabilityReceipt, len(verified))
-	for _, receipt := range verified {
-		verifiedByContent[receipt.ContentID] = receipt
-	}
-	for _, receipt := range expected {
-		if current, exists := verifiedByContent[receipt.ContentID]; exists && current.ID != receipt.ID {
-			m.supersededReceipts[receipt.ID] = struct{}{}
-		}
-	}
 }
 
 func verifiedCheckpointContent(evidence CheckpointEvidence) VerifiedCheckpointContent {
@@ -664,12 +695,13 @@ func contentReferenceIsCanonical(reference ContentReference) bool {
 }
 
 func durabilityReceiptIsCanonical(receipt DurabilityReceipt) bool {
+	replacementComplete := (receipt.Replaces.ReceiptID == "") == (receipt.Replaces.GenerationID == "")
 	return receipt.ID != "" && receipt.DurabilityAuthorityID != "" && receipt.DurableWriteID != "" &&
 		receipt.DurabilityAdapterID != "" && receipt.PolicyDomainID != "" && receipt.ContentID != "" && validDigest(receipt.ContentDigest) &&
 		receipt.DurabilityGenerationID != "" &&
 		(receipt.VerificationMethod == VerificationEndToEndChecksum ||
 			receipt.VerificationMethod == VerificationIndependentReadback) &&
-		!receipt.VerifiedAt.IsZero() && receipt.Decision == DurabilityVerified &&
+		replacementComplete && !receipt.VerifiedAt.IsZero() && receipt.Decision == DurabilityVerified &&
 		validDigest(receipt.EvidenceDigest) && receipt.EvidenceDigest == receipt.CanonicalDigest()
 }
 
@@ -935,7 +967,6 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 			recordOperation(m.operations, request.PolicyDomainID, request.TaskID, request.Operation, MaterializeResult{}, err)
 			return MaterializeResult{}, err
 		}
-		m.recordSupersededReceipts(checkpoint.evidence.DurabilityReceipts, checkpointEvidence.DurabilityReceipts)
 		checkpoint.evidence = cloneCheckpointEvidence(checkpointEvidence)
 		m.checkpoints[checkpointID] = checkpoint
 		m.recordDurableEvidenceIdentities(verifiedCheckpointContent(checkpointEvidence))

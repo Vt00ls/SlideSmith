@@ -21,6 +21,13 @@ type (
 	CheckpointIntegrityState string
 )
 
+// DurabilityReplacementProof binds a replacement receipt to the exact
+// receipt and opaque immutable generation that were current before it.
+type DurabilityReplacementProof struct {
+	ReceiptID    DurabilityReceiptID
+	GenerationID DurabilityGenerationID
+}
+
 const (
 	StateMemberRegularFile  StateMemberType = "regular_file"
 	StateMemberSymbolicLink StateMemberType = "symbolic_link"
@@ -144,6 +151,7 @@ type DurabilityReceipt struct {
 	ContentDigest          Digest
 	Size                   uint64
 	DurabilityGenerationID DurabilityGenerationID
+	Replaces               DurabilityReplacementProof
 	VerificationMethod     VerificationMethod
 	VerifiedAt             time.Time
 	Decision               DurabilityDecision
@@ -161,6 +169,7 @@ func (r DurabilityReceipt) CanonicalDigest() Digest {
 		ContentDigest          Digest
 		Size                   uint64
 		DurabilityGenerationID DurabilityGenerationID
+		Replaces               DurabilityReplacementProof
 		VerificationMethod     VerificationMethod
 		VerifiedAt             time.Time
 		Decision               DurabilityDecision
@@ -174,6 +183,7 @@ func (r DurabilityReceipt) CanonicalDigest() Digest {
 		ContentDigest:          r.ContentDigest,
 		Size:                   r.Size,
 		DurabilityGenerationID: r.DurabilityGenerationID,
+		Replaces:               r.Replaces,
 		VerificationMethod:     r.VerificationMethod,
 		VerifiedAt:             r.VerifiedAt,
 		Decision:               r.Decision,
