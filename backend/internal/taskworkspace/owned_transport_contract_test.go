@@ -556,400 +556,107 @@ func TestOwnedTransportPreservesAuthorizationIntegrityFencingAndAmbiguityCategor
 }
 
 func TestTaskWorkspaceLifecycleExternalContractRunsAcrossOwnedTransport(t *testing.T) {
-	adapters := []struct {
-		name    string
-		factory func(taskworkspace.InMemoryConfig) taskworkspace.Lifecycle
-	}{
-		{
-			name: "in_memory",
-			factory: func(config taskworkspace.InMemoryConfig) taskworkspace.Lifecycle {
-				return taskworkspace.NewInMemory(config)
-			},
-		},
-		{
-			name:    "owned_transport",
-			factory: ownedTransportLifecycle,
-		},
+	for _, adapter := range lifecycleContractAdapters() {
+		if adapter.name == "owned transport" {
+			runLifecycleAdapterExternalContract(t, adapter)
+			return
+		}
 	}
-	for _, adapter := range adapters {
-		t.Run(adapter.name, func(t *testing.T) {
-			runTaskWorkspaceLifecycleExternalContract(t, adapter.factory)
-		})
-	}
+	t.Fatal("owned transport is not registered in the shared lifecycle contract suite")
 }
 
-func runTaskWorkspaceLifecycleExternalContract(
-	t *testing.T,
-	factory func(taskworkspace.InMemoryConfig) taskworkspace.Lifecycle,
-) {
-	t.Helper()
-	t.Run("initialize materialize isolate commit discard idempotency fencing and integrity", func(t *testing.T) {
-		config := taskworkspaceTestConfig(&happyDurableObject{})
-		config.CurrentSandboxLeaseAuthorities = append(
-			config.CurrentSandboxLeaseAuthorities,
-			sandboxLeaseAuthority("policy-domain-1", "task-1", "phase-run-1", "runtime-run-3", "sandbox-lease-4"),
-		)
-		lifecycle := factory(config)
-		confirmed, materialized := materializedTaskUsing(t, lifecycle)
-		stable, err := lifecycle.ConfirmTaskWorkspace(
-			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-contract-stable-1"),
-		)
-		if err != nil || stable.TaskWorkspaceID != confirmed.TaskWorkspaceID {
-			t.Fatalf("stable Task Workspace = %#v, err = %v", stable, err)
-		}
-
-		discardedView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
-			"policy-domain-1", "task-1", confirmed, materialized,
-			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-contract-discard-1",
-		))
-		if err != nil {
-			t.Fatalf("open discard proposal: %v", err)
-		}
-		winningView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
-			"policy-domain-1", "task-1", confirmed, materialized,
-			"phase-run-1", "runtime-run-2", "sandbox-lease-2", "open-contract-winner-1",
-		))
-		if err != nil {
-			t.Fatalf("open winning proposal: %v", err)
-		}
-		staleView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
-			"policy-domain-1", "task-1", confirmed, materialized,
-			"phase-run-1", "runtime-run-3", "sandbox-lease-4", "open-contract-stale-1",
-		))
-		if err != nil {
-			t.Fatalf("open stale proposal: %v", err)
-		}
-
-		discard := discardRequest(
-			confirmed, discardedView, taskworkspace.RuntimeViewValidationRejected, "discard-contract-1",
-		)
-		firstDiscard, err := lifecycle.DiscardRuntimeView(context.Background(), discard)
-		if err != nil {
-			t.Fatalf("discard rejected proposal: %v", err)
-		}
-		replayedDiscard, err := lifecycle.DiscardRuntimeView(context.Background(), discard)
-		if err != nil || !reflect.DeepEqual(firstDiscard, replayedDiscard) {
-			t.Fatalf("discard replay = %#v, err = %v", replayedDiscard, err)
-		}
-
-		manifest := declaredStateManifest("content-1")
-		commit := commitRequest(
-			confirmed,
-			winningView,
-			manifest,
-			acceptedValidationEvidence(confirmed, winningView, manifest),
-			"commit-contract-1",
-		)
-		committed, err := lifecycle.CommitRuntimeView(context.Background(), commit)
-		if err != nil || committed.RevisionID == "" || committed.CheckpointID == "" ||
-			committed.RevisionID == confirmed.CurrentRevisionID {
-			t.Fatalf("validated commit = %#v, err = %v", committed, err)
-		}
-		replayedCommit, err := lifecycle.CommitRuntimeView(context.Background(), commit)
-		if err != nil || !reflect.DeepEqual(replayedCommit, committed) {
-			t.Fatalf("commit replay = %#v, err = %v", replayedCommit, err)
-		}
-
-		staleManifest := declaredStateManifest("content-2")
-		staleCommit := commitRequest(
-			confirmed,
-			staleView,
-			staleManifest,
-			acceptedValidationEvidence(confirmed, staleView, staleManifest),
-			"commit-contract-stale-1",
-		)
-		_, err = lifecycle.CommitRuntimeView(context.Background(), staleCommit)
-		assertLifecycleErrorCode(t, err, taskworkspace.ErrorStaleAuthority)
-
-		differentPayload := commit
-		differentPayload.DeclaredStateManifest = staleManifest
-		differentPayload.ValidationEvidence = acceptedValidationEvidence(confirmed, winningView, staleManifest)
-		differentPayload.Operation.RequestDigest = differentPayload.CanonicalRequestDigest()
-		_, err = lifecycle.CommitRuntimeView(context.Background(), differentPayload)
-		assertLifecycleErrorCode(t, err, taskworkspace.ErrorIntegrityConflict)
-
-		current, err := lifecycle.ConfirmTaskWorkspace(
-			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-contract-current-1"),
-		)
-		if err != nil || current.CurrentRevisionID != committed.RevisionID ||
-			current.CurrentCheckpointID != committed.CheckpointID {
-			t.Fatalf("authoritative state after commit = %#v, err = %v", current, err)
-		}
-		currentMaterialization, err := lifecycle.Materialize(
-			context.Background(), materializeRequest("policy-domain-1", "task-1", current, "materialize-contract-current-1"),
-		)
-		if err != nil {
-			t.Fatalf("materialize committed state: %v", err)
-		}
-		fencedView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
-			"policy-domain-1", "task-1", current, currentMaterialization,
-			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-contract-fenced-1",
-		))
-		if err != nil {
-			t.Fatalf("open proposal to fence: %v", err)
-		}
-		if _, err := lifecycle.FenceRuntimeView(context.Background(), fenceRequest(
-			current, fencedView, taskworkspace.RuntimeViewCancelled, "fence-contract-1",
-		)); err != nil {
-			t.Fatalf("fence Runtime View: %v", err)
-		}
-		lateManifest := declaredStateManifest("content-2")
-		_, err = lifecycle.CommitRuntimeView(context.Background(), commitRequest(
-			current,
-			fencedView,
-			lateManifest,
-			acceptedValidationEvidence(current, fencedView, lateManifest),
-			"commit-contract-after-fence-1",
-		))
-		assertLifecycleErrorCode(t, err, taskworkspace.ErrorStaleAuthority)
-	})
-
-	t.Run("expire and restore exact Checkpoint without changing identity", func(t *testing.T) {
-		now := taskworkspace.Instant(100)
-		var recoveryIntent taskworkspace.AuthorizedRecoveryIntent
-		config := taskworkspaceTestConfig(&happyDurableObject{})
-		config.Now = func() taskworkspace.Instant { return now }
-		config.ExpiryPolicy = taskworkspace.ExpiryPolicy{
-			ID: "expiry-policy-1", MaterializationLifetime: 10, RuntimeViewLifetime: 10,
-		}
-		config.RecoveryAuthorityID = "recovery-authority-1"
-		config.CurrentRecoveryIntent = func(id taskworkspace.RecoveryIntentID) (taskworkspace.AuthorizedRecoveryIntent, bool) {
-			return recoveryIntent, id != "" && id == recoveryIntent.ID
-		}
-		lifecycle := factory(config)
-		confirmed, materialized := materializedTaskUsing(t, lifecycle)
-		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
-			"policy-domain-1", "task-1", confirmed, materialized,
-			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-contract-restore-1",
-		))
-		if err != nil {
-			t.Fatalf("open restore proposal: %v", err)
-		}
-		manifest := declaredStateManifest("content-1")
-		committed, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest(
-			confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest), "commit-contract-restore-1",
-		))
-		if err != nil {
-			t.Fatalf("commit restorable Checkpoint: %v", err)
-		}
-		current, err := lifecycle.ConfirmTaskWorkspace(
-			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-contract-restore-current-1"),
-		)
-		if err != nil {
-			t.Fatalf("confirm restorable state: %v", err)
-		}
-		currentMaterialization, err := lifecycle.Materialize(
-			context.Background(), materializeRequest(
-				"policy-domain-1", "task-1", current, "materialize-contract-expiring-view-1",
-			),
-		)
-		if err != nil {
-			t.Fatalf("materialize expiring Runtime View base: %v", err)
-		}
-		expiringView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
-			"policy-domain-1", "task-1", current, currentMaterialization,
-			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-contract-expiring-view-1",
-		))
-		if err != nil {
-			t.Fatalf("open expiring Runtime View: %v", err)
-		}
-		now = 301
-		if _, err := lifecycle.ExpireMaterialization(
-			context.Background(), expireMaterializationRequest(confirmed, materialized, "expire-contract-materialization-1"),
-		); err != nil {
-			t.Fatalf("expire disposable materialization: %v", err)
-		}
-		expireView := taskworkspace.ExpireRuntimeViewRequest{
-			PolicyDomainID:    "policy-domain-1",
-			TaskID:            "task-1",
-			TaskWorkspaceID:   current.TaskWorkspaceID,
-			RuntimeViewID:     expiringView.RuntimeViewID,
-			MaterializationID: currentMaterialization.MaterializationID,
-			BaseRevisionID:    current.CurrentRevisionID,
-			Generation:        current.Generation,
-			Fence:             current.Fence,
-			ExpiryPolicyID:    "expiry-policy-1",
-			Operation:         taskworkspace.Operation{ID: "expire-contract-runtime-view-1"},
-		}
-		expireView.Operation.RequestDigest = expireView.CanonicalRequestDigest()
-		expiredView, err := lifecycle.ExpireRuntimeView(context.Background(), expireView)
-		if err != nil || expiredView.RuntimeViewID != expiringView.RuntimeViewID {
-			t.Fatalf("expire Runtime View = %#v, err = %v", expiredView, err)
-		}
-		recoveryIntent = authorizedCheckpointRestoreIntent(current, "recovery-contract-1")
-		recoveryIntent.ExpiresAt = 1_000
-		recoveryIntent.Digest = recoveryIntent.CanonicalDigest()
-		restore := taskworkspace.RestoreTaskWorkspaceRequest{
-			Intent: recoveryIntent, Operation: taskworkspace.Operation{ID: "restore-contract-1"},
-		}
-		restore.Operation.RequestDigest = restore.CanonicalRequestDigest()
-		restored, err := lifecycle.RestoreTaskWorkspace(context.Background(), restore)
-		if err != nil || restored.TaskWorkspaceID != confirmed.TaskWorkspaceID ||
-			restored.RevisionID != committed.RevisionID || restored.CheckpointID != committed.CheckpointID ||
-			restored.Generation <= current.Generation || restored.Fence <= current.Fence {
-			t.Fatalf("restored exact Checkpoint = %#v, err = %v", restored, err)
-		}
-		replayed, err := lifecycle.RestoreTaskWorkspace(context.Background(), restore)
-		if err != nil || !reflect.DeepEqual(replayed, restored) {
-			t.Fatalf("restore replay = %#v, err = %v", replayed, err)
-		}
-	})
-
-	t.Run("reconstruct exact Artifact Version without changing authoritative history", func(t *testing.T) {
-		var recoveryIntent taskworkspace.AuthorizedRecoveryIntent
-		reconstruction := &reconstructionInputDouble{}
-		config := taskworkspaceTestConfig(&happyDurableObject{})
-		config.RecoveryAuthorityID = "recovery-authority-1"
-		config.ReconstructionInput = reconstruction
-		config.CurrentRecoveryIntent = func(
-			id taskworkspace.RecoveryIntentID,
-		) (taskworkspace.AuthorizedRecoveryIntent, bool) {
-			return recoveryIntent, recoveryIntent.ID == id
-		}
-		lifecycle := factory(config)
-		confirmed, materialized := materializedTaskUsing(t, lifecycle)
-		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
-			"policy-domain-1", "task-1", confirmed, materialized,
-			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-contract-reconstruct-1",
-		))
-		if err != nil {
-			t.Fatalf("open reconstruction base: %v", err)
-		}
-		manifest := declaredStateManifest("content-1")
-		if _, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest(
-			confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
-			"commit-contract-reconstruct-1",
-		)); err != nil {
-			t.Fatalf("commit reconstruction base: %v", err)
-		}
-		current, err := lifecycle.ConfirmTaskWorkspace(
-			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-contract-reconstruct-1"),
-		)
-		if err != nil {
-			t.Fatalf("confirm reconstruction base: %v", err)
-		}
-		recoveryIntent = authorizedArtifactReconstructionIntent(current, "recovery-contract-artifact-1")
-		request := taskworkspace.ReconstructTaskWorkspaceRequest{
-			Intent: recoveryIntent, Operation: taskworkspace.Operation{ID: "reconstruct-contract-artifact-1"},
-		}
-		request.Operation.RequestDigest = request.CanonicalRequestDigest()
-		reconstructed, err := lifecycle.ReconstructTaskWorkspace(context.Background(), request)
-		if err != nil || reconstructed.TaskWorkspaceID != current.TaskWorkspaceID ||
-			reconstructed.CurrentRevisionID != current.CurrentRevisionID ||
-			reconstructed.CurrentCheckpointID != current.CurrentCheckpointID ||
-			reconstructed.Generation != current.Generation+1 || reconstructed.Fence != current.Fence+1 ||
-			reconstruction.artifactVerifications != 1 {
-			t.Fatalf("reconstruct exact Artifact Version = %#v, err = %v", reconstructed, err)
-		}
-		replayed, err := lifecycle.ReconstructTaskWorkspace(context.Background(), request)
-		if err != nil || !reflect.DeepEqual(replayed, reconstructed) || reconstruction.artifactVerifications != 1 {
-			t.Fatalf("reconstruction replay = %#v, err = %v", replayed, err)
-		}
-	})
-
-	t.Run("retention grace and exact-generation reclamation", func(t *testing.T) {
+func TestOwnedTransportPreservesSupplementalLifecycleSemantics(t *testing.T) {
+	t.Run("exact-generation reclamation dispatches once", func(t *testing.T) {
 		now := taskworkspace.Instant(100)
 		mechanics := &checkpointReclamationMechanics{present: true}
 		config := taskworkspaceTestConfig(&happyDurableObject{})
 		config.Now = func() taskworkspace.Instant { return now }
 		config.CheckpointReclamation = mechanics
-		lifecycle := factory(config)
+		lifecycle := ownedTransportLifecycle(config)
 		confirmed, materialized := materializedTaskUsing(t, lifecycle)
 		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
 			"policy-domain-1", "task-1", confirmed, materialized,
-			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-contract-retention-1",
+			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-transport-retention-1",
 		))
 		if err != nil {
 			t.Fatalf("open first retention proposal: %v", err)
 		}
 		manifest := declaredStateManifest("content-1")
 		older, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest(
-			confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest), "commit-contract-retention-1",
+			confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+			"commit-transport-retention-1",
 		))
 		if err != nil {
 			t.Fatalf("commit first retained Checkpoint: %v", err)
 		}
 		current, err := lifecycle.ConfirmTaskWorkspace(
-			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-contract-retention-1"),
+			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-transport-retention-1"),
 		)
 		if err != nil {
 			t.Fatalf("confirm first retained state: %v", err)
 		}
 		secondMaterialization, err := lifecycle.Materialize(
-			context.Background(), materializeRequest("policy-domain-1", "task-1", current, "materialize-contract-retention-2"),
+			context.Background(), materializeRequest(
+				"policy-domain-1", "task-1", current, "materialize-transport-retention-2",
+			),
 		)
 		if err != nil {
 			t.Fatalf("materialize for second Checkpoint: %v", err)
 		}
 		secondView, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
 			"policy-domain-1", "task-1", current, secondMaterialization,
-			"phase-run-1", "runtime-run-2", "sandbox-lease-2", "open-contract-retention-2",
+			"phase-run-1", "runtime-run-2", "sandbox-lease-2", "open-transport-retention-2",
 		))
 		if err != nil {
 			t.Fatalf("open second retention proposal: %v", err)
 		}
 		secondManifest := declaredStateManifest("content-2")
 		if _, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest(
-			current,
-			secondView,
-			secondManifest,
+			current, secondView, secondManifest,
 			acceptedValidationEvidence(current, secondView, secondManifest),
-			"commit-contract-retention-2",
+			"commit-transport-retention-2",
 		)); err != nil {
 			t.Fatalf("commit second retained Checkpoint: %v", err)
 		}
 		current, err = lifecycle.ConfirmTaskWorkspace(
-			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-contract-retention-2"),
+			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-transport-retention-2"),
 		)
 		if err != nil {
 			t.Fatalf("confirm second retained state: %v", err)
 		}
 		released := releaseFinalCheckpointAuthority(
-			t, lifecycle, current, older.CheckpointID, "release-contract-retention-1",
+			t, lifecycle, current, older.CheckpointID, "release-transport-retention-1",
 		)
 		beforeGrace, err := lifecycle.ReclaimCheckpoint(context.Background(), reclaimCheckpointRequest(
-			current, older.CheckpointID, released.RetentionGeneration, "reclaim-contract-before-grace-1",
+			current, older.CheckpointID, released.RetentionGeneration, "reclaim-transport-before-grace-1",
 		))
 		if err != nil || beforeGrace.Outcome != taskworkspace.CheckpointRetainedByAuthority {
 			t.Fatalf("reclaim before grace = %#v, err = %v", beforeGrace, err)
 		}
 		now = released.EligibleAt
 		reclaimed, err := lifecycle.ReclaimCheckpoint(context.Background(), reclaimCheckpointRequest(
-			current, older.CheckpointID, released.RetentionGeneration, "reclaim-contract-after-grace-1",
+			current, older.CheckpointID, released.RetentionGeneration, "reclaim-transport-after-grace-1",
 		))
 		if err != nil || reclaimed.Outcome != taskworkspace.CheckpointReclaimed || mechanics.calls != 1 {
 			t.Fatalf("exact-generation reclaim = %#v, calls = %d, err = %v", reclaimed, mechanics.calls, err)
 		}
 	})
 
-	t.Run("Cleanup Debt retries one identity and mandatory audit protects exception", func(t *testing.T) {
-		now := taskworkspace.Instant(100)
-		administrator := platformAdministratorAuthority(now)
+	t.Run("Cleanup Debt preserves reclaimed disposition", func(t *testing.T) {
 		cleanup := &exactGenerationCleanupDouble{
 			inspectionDisposition: taskworkspace.CleanupInspectionEligible,
 			attemptOutcome:        taskworkspace.CleanupReclaimed,
 		}
-		audit := &cleanupAuditDouble{}
-		externalAudit := &auditDeliveryDouble{}
 		config := taskworkspaceTestConfig(&happyDurableObject{})
-		config.Now = func() taskworkspace.Instant { return now }
 		config.Cleanup = cleanup
-		config.CleanupAudit = audit
-		config.AuditDelivery = externalAudit
-		config.PlatformAdministratorAuthorityID = "platform-administrator-authority-1"
-		config.CurrentPlatformAdministratorAuthority = func(
-			id taskworkspace.PlatformAdministratorID,
-		) (taskworkspace.PlatformAdministratorAuthority, bool) {
-			return administrator, id == administrator.ID
-		}
-		lifecycle := factory(config)
+		lifecycle := ownedTransportLifecycle(config)
 		confirmed, err := lifecycle.ConfirmTaskWorkspace(
-			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-contract-cleanup-1"),
+			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-transport-cleanup-1"),
 		)
 		if err != nil {
 			t.Fatalf("confirm Cleanup Debt workspace: %v", err)
 		}
-		create := createCleanupObligationRequest(confirmed, "create-contract-cleanup-1")
+		create := createCleanupObligationRequest(confirmed, "create-transport-cleanup-1")
 		debt, err := lifecycle.CreateCleanupObligation(context.Background(), create)
 		if err != nil {
 			t.Fatalf("create Cleanup Debt: %v", err)
@@ -959,81 +666,29 @@ func runTaskWorkspaceLifecycleExternalContract(
 			t.Fatalf("Cleanup Debt replay = %#v, err = %v", replayedDebt, err)
 		}
 		claimed, err := lifecycle.ClaimCleanupDebt(
-			context.Background(), claimCleanupDebtRequest(debt, debt.RetryGeneration, "claim-contract-cleanup-1"),
+			context.Background(), claimCleanupDebtRequest(debt, debt.RetryGeneration, "claim-transport-cleanup-1"),
 		)
 		if err != nil {
 			t.Fatalf("claim Cleanup Debt: %v", err)
 		}
 		resolved, err := lifecycle.ReconcileCleanupDebt(
-			context.Background(), reconcileCleanupDebtRequest(claimed, "reconcile-contract-cleanup-1"),
+			context.Background(), reconcileCleanupDebtRequest(claimed, "reconcile-transport-cleanup-1"),
 		)
 		if err != nil || resolved.DebtID != debt.DebtID ||
-			resolved.State != taskworkspace.CleanupDebtResolved || resolved.Resolution != taskworkspace.CleanupReclaimed {
+			resolved.State != taskworkspace.CleanupDebtResolved ||
+			resolved.Resolution != taskworkspace.CleanupReclaimed {
 			t.Fatalf("reconciled Cleanup Debt = %#v, err = %v", resolved, err)
 		}
-
-		exceptionDebt, err := lifecycle.CreateCleanupObligation(
-			context.Background(), func() taskworkspace.CreateCleanupObligationRequest {
-				request := createCleanupObligationRequest(confirmed, "create-contract-exception-1")
-				request.ResourceID = "opaque-cleanup-resource-2"
-				request.Operation.RequestDigest = request.CanonicalRequestDigest()
-				return request
-			}(),
-		)
-		if err != nil {
-			t.Fatalf("create exception Cleanup Debt: %v", err)
-		}
-		accepted, err := lifecycle.ResolveCleanupDebt(context.Background(), resolveAcceptedExceptionRequest(
-			exceptionDebt, administrator, "resolve-contract-exception-1",
-		))
-		if err != nil || accepted.Resolution != taskworkspace.CleanupAcceptedException ||
-			accepted.ResolutionAuditEvidenceRoot == "" || audit.calls != 1 || externalAudit.calls != 1 {
-			t.Fatalf("audited Cleanup Debt exception = %#v, audit calls = %d, err = %v", accepted, audit.calls, err)
-		}
-		backlog, err := lifecycle.RebuildAuditDelivery(
-			context.Background(), taskworkspace.AuditDeliveryRebuildRequest{},
-		)
-		if err != nil || !backlog.Pending.Known || backlog.Pending.Value != 0 ||
-			!backlog.Delivered.Known || backlog.Delivered.Value != 1 || len(backlog.Evidence) != 1 {
-			t.Fatalf("rebuilt audit delivery backlog = %#v, err = %v", backlog, err)
-		}
 	})
 
-	t.Run("telemetry outage cannot roll back authoritative commit", func(t *testing.T) {
-		telemetry := &telemetryDouble{failure: errors.New("collector unavailable")}
-		config := taskworkspaceTestConfig(&happyDurableObject{})
-		config.Projection = taskworkspace.NewDeterministicProjection(telemetry)
-		config.ProjectionSchemaRevision = taskworkspace.ProjectionSchemaV1
-		lifecycle := factory(config)
-		confirmed, materialized := materializedTaskUsing(t, lifecycle)
-		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
-			"policy-domain-1", "task-1", confirmed, materialized,
-			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-contract-telemetry-1",
-		))
-		if err != nil {
-			t.Fatalf("open telemetry proposal: %v", err)
-		}
-		manifest := declaredStateManifest("content-1")
-		committed, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest(
-			confirmed,
-			view,
-			manifest,
-			acceptedValidationEvidence(confirmed, view, manifest),
-			"commit-contract-telemetry-1",
-		))
-		if err != nil || committed.RevisionID == "" || telemetry.calls == 0 {
-			t.Fatalf("commit through telemetry outage = %#v, calls = %d, err = %v", committed, telemetry.calls, err)
-		}
-	})
-
-	t.Run("dependency failures do not leak content path session mount locator vendor or credentials", func(t *testing.T) {
-		canary := "raw vendor content /private/path session mount locator credential=do-not-disclose"
+	t.Run("dependency failure remains non-leaking", func(t *testing.T) {
+		const canary = "raw vendor content /private/path session mount locator credential=do-not-disclose"
 		config := taskworkspaceTestConfig(&happyDurableObject{prepareError: errors.New(canary)})
-		lifecycle := factory(config)
+		lifecycle := ownedTransportLifecycle(config)
 		confirmed, materialized := materializedTaskUsing(t, lifecycle)
 		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
 			"policy-domain-1", "task-1", confirmed, materialized,
-			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-contract-non-leakage-1",
+			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-transport-non-leakage-1",
 		))
 		if err != nil {
 			t.Fatalf("open non-leakage proposal: %v", err)
@@ -1041,7 +696,7 @@ func runTaskWorkspaceLifecycleExternalContract(
 		manifest := declaredStateManifest("content-1")
 		_, err = lifecycle.CommitRuntimeView(context.Background(), commitRequest(
 			confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
-			"commit-contract-non-leakage-1",
+			"commit-transport-non-leakage-1",
 		))
 		assertLifecycleErrorCode(t, err, taskworkspace.ErrorIntegrityFailure)
 		for _, forbidden := range []string{
