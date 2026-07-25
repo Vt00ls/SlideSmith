@@ -27,6 +27,7 @@ func runLifecycleAdapterExternalContract(t *testing.T, adapter lifecycleContract
 	runLifecycleResponseLossReconciliationContract(t, adapter)
 	runLifecycleOwnershipAndFenceContract(t, adapter)
 	runLifecycleExpiryAndRestoreContract(t, adapter)
+	runLifecycleReconstructionContract(t, adapter)
 	runLifecycleRetentionAndReclaimContract(t, adapter)
 	runLifecycleRetentionRaceContract(t, adapter)
 	runLifecycleCleanupDebtContract(t, adapter)
@@ -312,9 +313,11 @@ func runLifecycleMandatoryAuditContract(t *testing.T, adapter lifecycleContractA
 		now := taskworkspace.Instant(100)
 		administrator := platformAdministratorAuthority(now)
 		audit := &cleanupAuditDouble{failure: errors.New("audit unavailable")}
+		externalAudit := &auditDeliveryDouble{}
 		config := taskworkspaceTestConfig(nil)
 		config.Now = func() taskworkspace.Instant { return now }
 		config.CleanupAudit = audit
+		config.AuditDelivery = externalAudit
 		config.PlatformAdministratorAuthorityID = "platform-administrator-authority-1"
 		config.CurrentPlatformAdministratorAuthority = func(
 			id taskworkspace.PlatformAdministratorID,
@@ -351,8 +354,70 @@ func runLifecycleMandatoryAuditContract(t *testing.T, adapter lifecycleContractA
 		))
 		if err != nil || resolved.State != taskworkspace.CleanupDebtResolved ||
 			resolved.Resolution != taskworkspace.CleanupAcceptedException ||
-			resolved.ResolutionAuditEvidenceRoot == "" {
+			resolved.ResolutionAuditEvidenceRoot == "" || audit.calls != 2 || externalAudit.calls != 1 {
 			t.Fatalf("audited Cleanup Debt resolution = %#v, err = %v", resolved, err)
+		}
+		backlog, err := lifecycle.RebuildAuditDelivery(
+			context.Background(), taskworkspace.AuditDeliveryRebuildRequest{},
+		)
+		if err != nil || !backlog.Pending.Known || backlog.Pending.Value != 0 ||
+			!backlog.Delivered.Known || backlog.Delivered.Value != 1 || len(backlog.Evidence) != 1 {
+			t.Fatalf("rebuilt audit delivery backlog = %#v, err = %v", backlog, err)
+		}
+	})
+}
+
+func runLifecycleReconstructionContract(t *testing.T, adapter lifecycleContractAdapter) {
+	t.Helper()
+	t.Run("reconstruct exact Artifact Version without changing authoritative history", func(t *testing.T) {
+		var recoveryIntent taskworkspace.AuthorizedRecoveryIntent
+		reconstruction := &reconstructionInputDouble{}
+		config := taskworkspaceTestConfig(nil)
+		config.RecoveryAuthorityID = "recovery-authority-1"
+		config.ReconstructionInput = reconstruction
+		config.CurrentRecoveryIntent = func(
+			id taskworkspace.RecoveryIntentID,
+		) (taskworkspace.AuthorizedRecoveryIntent, bool) {
+			return recoveryIntent, recoveryIntent.ID == id
+		}
+		lifecycle := adapter.newConfigured(t, config)
+		confirmed, materialized := materializedTaskUsing(t, lifecycle)
+		view, err := lifecycle.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+			"policy-domain-1", "task-1", confirmed, materialized,
+			"phase-run-1", "runtime-run-1", "sandbox-lease-1", "open-contract-reconstruct-1",
+		))
+		if err != nil {
+			t.Fatalf("open reconstruction base: %v", err)
+		}
+		manifest := declaredStateManifest("content-1")
+		if _, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest(
+			confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+			"commit-contract-reconstruct-1",
+		)); err != nil {
+			t.Fatalf("commit reconstruction base: %v", err)
+		}
+		current, err := lifecycle.ConfirmTaskWorkspace(
+			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-contract-reconstruct-1"),
+		)
+		if err != nil {
+			t.Fatalf("confirm reconstruction base: %v", err)
+		}
+		recoveryIntent = authorizedArtifactReconstructionIntent(current, "recovery-contract-artifact-1")
+		request := taskworkspace.ReconstructTaskWorkspaceRequest{
+			Intent: recoveryIntent, Operation: taskworkspace.Operation{ID: "reconstruct-contract-artifact-1"},
+		}
+		request.Operation.RequestDigest = request.CanonicalRequestDigest()
+		reconstructed, err := lifecycle.ReconstructTaskWorkspace(context.Background(), request)
+		if err != nil || reconstructed.TaskWorkspaceID != current.TaskWorkspaceID ||
+			reconstructed.CurrentRevisionID != current.CurrentRevisionID ||
+			reconstructed.CurrentCheckpointID != current.CurrentCheckpointID ||
+			reconstructed.Generation != current.Generation+1 || reconstructed.Fence != current.Fence+1 ||
+			reconstruction.artifactVerifications != 1 {
+			t.Fatalf("reconstruct exact Artifact Version = %#v, err = %v", reconstructed, err)
+		}
+		replayed, err := lifecycle.ReconstructTaskWorkspace(context.Background(), request)
+		if err != nil || !reflect.DeepEqual(replayed, reconstructed) || reconstruction.artifactVerifications != 1 {
+			t.Fatalf("reconstruction replay = %#v, err = %v", replayed, err)
 		}
 	})
 }
@@ -629,6 +694,12 @@ func runLifecycleCleanupDebtContract(t *testing.T, adapter lifecycleContractAdap
 		if err != nil {
 			t.Fatalf("create Cleanup Debt: %v", err)
 		}
+		createReplay, err := lifecycle.CreateCleanupObligation(
+			context.Background(), createCleanupObligationRequest(confirmed, "create-cleanup-contract"),
+		)
+		if err != nil || createReplay.DebtID != debt.DebtID {
+			t.Fatalf("Cleanup Debt creation replay = %#v, err = %v", createReplay, err)
+		}
 		claimed, err := lifecycle.ClaimCleanupDebt(
 			context.Background(), claimCleanupDebtRequest(debt, debt.RetryGeneration, "claim-cleanup-contract"),
 		)
@@ -668,6 +739,9 @@ func runLifecycleProjectionAndNonLeakageContract(t *testing.T, adapter lifecycle
 		))
 		if err != nil {
 			t.Fatalf("projection outage rolled back committed lifecycle fact: %v", err)
+		}
+		if len(projection.envelopes) == 0 {
+			t.Fatal("committed lifecycle fact was not offered to the projection")
 		}
 		encoded, err := json.Marshal(struct {
 			Result      taskworkspace.CommitRuntimeViewResult
