@@ -443,7 +443,36 @@ func lifecycleContractAdapters() []lifecycleContractAdapter {
 				return lifecycle, func() {}
 			},
 		},
+		{
+			name: "owned transport",
+			new: func(t *testing.T) taskworkspace.Lifecycle {
+				return ownedTransportContractLifecycle(t, taskworkspaceTestConfig(&happyDurableObject{}))
+			},
+			newConfigured: ownedTransportContractLifecycle,
+			newAmbiguousCleanup: func(t *testing.T, config taskworkspace.InMemoryConfig) (taskworkspace.Lifecycle, func()) {
+				cleanup := &exactGenerationCleanupDouble{
+					inspectionDisposition: taskworkspace.CleanupInspectionEligible,
+					attemptError:          taskworkspace.ErrCleanupResultAmbiguous,
+				}
+				config.Cleanup = cleanup
+				lifecycle := ownedTransportContractLifecycle(t, config)
+				return lifecycle, func() {
+					cleanup.attemptError = nil
+					cleanup.attemptOutcome = taskworkspace.CleanupAlreadyAbsent
+				}
+			},
+		},
 	}
+}
+
+func ownedTransportContractLifecycle(
+	_ *testing.T,
+	config taskworkspace.InMemoryConfig,
+) taskworkspace.Lifecycle {
+	if config.DurableObject == nil {
+		config.DurableObject = &happyDurableObject{}
+	}
+	return ownedTransportLifecycle(config)
 }
 
 func localContractPayloads() map[taskworkspace.Digest][]byte {

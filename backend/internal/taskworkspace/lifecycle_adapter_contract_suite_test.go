@@ -15,19 +15,24 @@ func TestTaskWorkspaceLifecycleExternalContract(t *testing.T) {
 	for _, adapter := range lifecycleContractAdapters() {
 		adapter := adapter
 		t.Run(adapter.name, func(t *testing.T) {
-			runLifecycleIdentityCommitAndTerminalContract(t, adapter)
-			runLifecycleIntegrityContract(t, adapter)
-			runLifecycleResponseLossReconciliationContract(t, adapter)
-			runLifecycleOwnershipAndFenceContract(t, adapter)
-			runLifecycleExpiryAndRestoreContract(t, adapter)
-			runLifecycleRetentionAndReclaimContract(t, adapter)
-			runLifecycleRetentionRaceContract(t, adapter)
-			runLifecycleCleanupDebtContract(t, adapter)
-			runLifecycleAmbiguousCleanupRetryContract(t, adapter)
-			runLifecycleMandatoryAuditContract(t, adapter)
-			runLifecycleProjectionAndNonLeakageContract(t, adapter)
+			runLifecycleAdapterExternalContract(t, adapter)
 		})
 	}
+}
+
+func runLifecycleAdapterExternalContract(t *testing.T, adapter lifecycleContractAdapter) {
+	t.Helper()
+	runLifecycleIdentityCommitAndTerminalContract(t, adapter)
+	runLifecycleIntegrityContract(t, adapter)
+	runLifecycleResponseLossReconciliationContract(t, adapter)
+	runLifecycleOwnershipAndFenceContract(t, adapter)
+	runLifecycleExpiryAndRestoreContract(t, adapter)
+	runLifecycleRetentionAndReclaimContract(t, adapter)
+	runLifecycleRetentionRaceContract(t, adapter)
+	runLifecycleCleanupDebtContract(t, adapter)
+	runLifecycleAmbiguousCleanupRetryContract(t, adapter)
+	runLifecycleMandatoryAuditContract(t, adapter)
+	runLifecycleProjectionAndNonLeakageContract(t, adapter)
 }
 
 func runLifecycleAmbiguousCleanupRetryContract(t *testing.T, adapter lifecycleContractAdapter) {
