@@ -83,6 +83,49 @@ func TestOwnedTransportUsesAnExplicitModuleScopeForModuleWideRebuild(t *testing.
 	}
 }
 
+func TestOwnedTransportProjectionFailureWireIsClosedAndNonLeaking(t *testing.T) {
+	const canary = "projection-wire-/private/c04 session-c04 mount-c04 bucket-c04 object-key-c04 " +
+		"vendor-c04 credential-c04 token-c04 user-content-c04 foreign-workspace-exists-c04"
+	config := taskworkspaceTestConfig(&happyDurableObject{})
+	config.Projection = &failingLifecycleProjection{err: errors.New(canary)}
+	harness := taskworkspace.NewOwnedTransportHarness(taskworkspace.OwnedTransportHarnessConfig{
+		Lifecycle: taskworkspace.NewInMemory(config),
+		MachineAuthority: taskworkspace.OwnedTransportMachineAuthority{
+			ID: "projection-failure-machine-1", Generation: 3, ExpiresAt: 1_000,
+		},
+		AuthenticationKey: []byte("projection-failure-transport-key"),
+		Authorize: func(scope taskworkspace.OwnedTransportAuthorityScope) bool {
+			return scope.ScopeKind == taskworkspace.OwnedTransportModuleScope
+		},
+		Now: func() taskworkspace.Instant { return 100 }, RequestLifetime: 50,
+	})
+
+	result, err := harness.Lifecycle().RebuildProjections(
+		context.Background(),
+		taskworkspace.ProjectionRebuildRequest{SchemaRevision: taskworkspace.ProjectionSchemaV1},
+	)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorRetryableUnavailable)
+	if result.Projected.Known || result.SourceWatermark.Known {
+		t.Fatalf("failed owned rebuild fabricated zero: %#v", result)
+	}
+	assertLastOwnedTransportWireCategory(
+		t, harness, taskworkspace.SafeErrorRetryableUnavailable, true, false,
+	)
+	captured, marshalErr := json.Marshal(struct {
+		Responses []taskworkspace.OwnedTransportResponse
+		Callbacks []taskworkspace.OwnedTransportCallback
+		Signals   []taskworkspace.OwnedTransportOperationalSignal
+	}{harness.Responses(), harness.Callbacks(), harness.OperationalSignals()})
+	if marshalErr != nil {
+		t.Fatalf("marshal owned projection failure evidence: %v", marshalErr)
+	}
+	for _, forbidden := range strings.Fields(canary) {
+		if strings.Contains(string(captured), forbidden) || strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("owned projection wire or public error leaked %q: %s", forbidden, captured)
+		}
+	}
+}
+
 func TestOwnedTransportResponseLossRequiresOperationReconciliation(t *testing.T) {
 	harness := newOwnedTransportHarness(t, func() taskworkspace.Instant { return 100 })
 	lifecycle := harness.Lifecycle()

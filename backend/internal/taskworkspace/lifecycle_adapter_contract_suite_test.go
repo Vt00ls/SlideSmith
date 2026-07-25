@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -35,6 +36,275 @@ func runLifecycleAdapterExternalContract(t *testing.T, adapter lifecycleContract
 	runLifecycleAmbiguousCleanupRetryContract(t, adapter)
 	runLifecycleMandatoryAuditContract(t, adapter)
 	runLifecycleProjectionAndNonLeakageContract(t, adapter)
+	runLifecycleProjectionFailureNormalizationContract(t, adapter)
+	runLifecycleProjectionPanicNormalizationContract(t, adapter)
+	runLifecycleTelemetryFailureAuthorityContract(t, adapter)
+	runLifecycleTelemetryPanicRetryContract(t, adapter)
+}
+
+func runLifecycleProjectionFailureNormalizationContract(t *testing.T, adapter lifecycleContractAdapter) {
+	t.Helper()
+	t.Run("projection rebuild failure is closed retryable and non-leaking", func(t *testing.T) {
+		const canary = "host=/private/c04-canary session=session-c04-canary mount=/mnt/c04-canary " +
+			"bucket=bucket-c04-canary locator=object-key-c04-canary vendor=vendor-c04-canary " +
+			"credential=credential-c04-canary token=token-c04-canary content=user-content-c04-canary " +
+			"foreign_workspace=workspace-exists-c04-canary"
+		for _, test := range []struct {
+			name string
+			err  error
+		}{
+			{name: "raw", err: errors.New(canary)},
+			{name: "wrapped raw", err: fmt.Errorf("wrapped projection adapter failure: %w", errors.New(canary))},
+			{name: "wrapped closed typed", err: fmt.Errorf("%s: %w", canary, &taskworkspace.Error{
+				Code: taskworkspace.ErrorRetryableUnavailable,
+			})},
+			{name: "wrapped foreign lifecycle typed", err: fmt.Errorf("%s: %w", canary, &taskworkspace.Error{
+				Code: taskworkspace.ErrorOwnershipDenied,
+			})},
+			{name: "wrapped unknown typed", err: fmt.Errorf("%s: %w", canary, &taskworkspace.Error{
+				Code: taskworkspace.ErrorCode("unknown-projection-adapter-code"),
+			})},
+			{name: "temporary", err: temporaryProjectionError{message: canary}},
+		} {
+			test := test
+			t.Run(test.name, func(t *testing.T) {
+				projection := &failingLifecycleProjection{err: test.err}
+				config := taskworkspaceTestConfig(nil)
+				config.Projection = projection
+				lifecycle := adapter.newConfigured(t, config)
+
+				result, err := lifecycle.RebuildProjections(
+					context.Background(),
+					taskworkspace.ProjectionRebuildRequest{SchemaRevision: taskworkspace.ProjectionSchemaV1},
+				)
+				assertLifecycleErrorCode(t, err, taskworkspace.ErrorRetryableUnavailable)
+				failure := err.(*taskworkspace.Error)
+				if !failure.Retryable() || failure.ReconciliationRequired() ||
+					failure.SafeCategory() != taskworkspace.SafeErrorRetryableUnavailable {
+					t.Fatalf("projection failure semantics = %#v", failure)
+				}
+				if result.Projected.Known || result.SourceWatermark.Known {
+					t.Fatalf("failed rebuild fabricated zero or promoted a partial projection: %#v", result)
+				}
+
+				formatted := fmt.Sprintf("%v | %+v | %#v", err, err, result)
+				for _, forbidden := range strings.Fields(canary) {
+					if strings.Contains(formatted, forbidden) {
+						t.Fatalf("formatted lifecycle result leaked %q: %s", forbidden, formatted)
+					}
+				}
+			})
+		}
+	})
+}
+
+func runLifecycleProjectionPanicNormalizationContract(t *testing.T, adapter lifecycleContractAdapter) {
+	t.Helper()
+	t.Run("ordinary projection panic cannot change or escape a lifecycle decision", func(t *testing.T) {
+		const canary = "panic-host-/private/c04 session-c04 mount-c04 bucket-c04 object-key-c04 " +
+			"vendor-c04 credential-c04 token-c04 user-content-c04 foreign-workspace-exists-c04"
+		config := taskworkspaceTestConfig(nil)
+		config.Projection = &panickingLifecycleProjection{value: canary}
+		lifecycle := adapter.newConfigured(t, config)
+
+		var confirmed taskworkspace.ConfirmTaskWorkspaceResult
+		var err error
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("projection panic crossed the public Lifecycle seam: %v", recovered)
+				}
+			}()
+			confirmed, err = lifecycle.ConfirmTaskWorkspace(
+				context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-projection-panic"),
+			)
+		}()
+		if err != nil || confirmed.TaskWorkspaceID == "" || confirmed.CurrentRevisionID == "" ||
+			confirmed.Generation == 0 || confirmed.Fence == 0 {
+			t.Fatalf("ordinary projection panic changed the authoritative decision: %#v, err=%v", confirmed, err)
+		}
+		rebuilt, err := lifecycle.RebuildProjections(
+			context.Background(),
+			taskworkspace.ProjectionRebuildRequest{SchemaRevision: taskworkspace.ProjectionSchemaV1},
+		)
+		assertLifecycleErrorCode(t, err, taskworkspace.ErrorRetryableUnavailable)
+		if rebuilt.Projected.Known || rebuilt.SourceWatermark.Known || strings.Contains(err.Error(), canary) {
+			t.Fatalf("projection rebuild panic escaped or fabricated zero: result=%#v err=%v", rebuilt, err)
+		}
+	})
+}
+
+func runLifecycleTelemetryFailureAuthorityContract(t *testing.T, adapter lifecycleContractAdapter) {
+	t.Helper()
+	t.Run("telemetry failure preserves authority audit diagnostics and exact rebuild retry", func(t *testing.T) {
+		const canary = "host-private-c04-canary session-c04-canary mount-c04-canary " +
+			"bucket-c04-canary object-locator-c04-canary vendor-c04-canary credential-c04-canary " +
+			"token-c04-canary user-content-c04-canary foreign-workspace-exists-c04-canary"
+		now := taskworkspace.Instant(100)
+		administrator := platformAdministratorAuthority(now)
+		telemetry := &telemetryDouble{failure: fmt.Errorf("wrapped telemetry adapter failure: %w", errors.New(canary))}
+		mandatoryAudit := &capturingCleanupAuditDouble{}
+		externalAudit := &auditDeliveryDouble{}
+		diagnostics := &diagnosticsDouble{status: taskworkspace.DiagnosticsSourceStatus{
+			State: taskworkspace.DiagnosticsSourceCurrent,
+		}}
+		config := taskworkspaceTestConfig(nil)
+		config.Now = func() taskworkspace.Instant { return now }
+		config.Projection = taskworkspace.NewDeterministicProjection(telemetry)
+		config.CleanupAudit = mandatoryAudit
+		config.AuditDelivery = externalAudit
+		config.Diagnostics = diagnostics
+		config.PlatformAdministratorAuthorityID = "platform-administrator-authority-1"
+		config.CurrentPlatformAdministratorAuthority = func(
+			id taskworkspace.PlatformAdministratorID,
+		) (taskworkspace.PlatformAdministratorAuthority, bool) {
+			return administrator, id == administrator.ID
+		}
+		lifecycle := adapter.newConfigured(t, config)
+
+		confirmed, view := openRuntimeViewWithLifecycle(
+			t, lifecycle, "task-1", "confirm-telemetry-failure", "materialize-telemetry-failure",
+			"open-telemetry-failure",
+		)
+		manifest := declaredStateManifest("content-1")
+		commitRequest := commitRequest(
+			confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+			"commit-telemetry-failure",
+		)
+		committed, err := lifecycle.CommitRuntimeView(context.Background(), commitRequest)
+		if err != nil || committed.RevisionID == "" || committed.CheckpointID == "" {
+			t.Fatalf("ordinary telemetry failure changed commit: %#v, err=%v", committed, err)
+		}
+		current, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+			"policy-domain-1", "task-1", "confirm-after-telemetry-failure",
+		))
+		if err != nil || current.CurrentRevisionID != committed.RevisionID ||
+			current.CurrentCheckpointID != committed.CheckpointID {
+			t.Fatalf("ordinary telemetry failure changed Revision or Checkpoint: %#v, err=%v", current, err)
+		}
+		inspection, err := lifecycle.InspectOperation(context.Background(), taskworkspace.InspectOperationRequest{
+			PolicyDomainID: commitRequest.PolicyDomainID,
+			TaskID:         commitRequest.TaskID,
+			OperationID:    commitRequest.Operation.ID,
+		})
+		if err != nil || inspection.Disposition != taskworkspace.OperationTerminal ||
+			inspection.CommitRuntimeView == nil || !reflect.DeepEqual(*inspection.CommitRuntimeView, committed) {
+			t.Fatalf("ordinary telemetry failure changed terminal decision: %#v, err=%v", inspection, err)
+		}
+
+		debt, err := lifecycle.CreateCleanupObligation(
+			context.Background(), createCleanupObligationRequest(current, "create-telemetry-failure-debt"),
+		)
+		if err != nil || debt.State != taskworkspace.CleanupDebtOpen {
+			t.Fatalf("ordinary telemetry failure changed Cleanup Debt creation: %#v, err=%v", debt, err)
+		}
+		resolved, err := lifecycle.ResolveCleanupDebt(context.Background(), resolveAcceptedExceptionRequest(
+			debt, administrator, "resolve-telemetry-failure-debt",
+		))
+		if err != nil || resolved.State != taskworkspace.CleanupDebtResolved ||
+			resolved.Resolution != taskworkspace.CleanupAcceptedException ||
+			resolved.ResolutionAuditEvidenceRoot == "" || len(mandatoryAudit.facts) != 1 {
+			t.Fatalf("ordinary telemetry failure changed mandatory audit or resolution: %#v, err=%v", resolved, err)
+		}
+		diagnostic, err := lifecycle.QueryAdministratorDiagnostics(
+			context.Background(),
+			administratorDiagnosticsRequest(resolved, administrator, "query-telemetry-failure-diagnostics"),
+		)
+		if err != nil || diagnostic.LifecycleState != taskworkspace.DiagnosticLifecycleResolved ||
+			diagnostic.SourceState != taskworkspace.DiagnosticsSourceCurrent || len(mandatoryAudit.facts) != 2 {
+			t.Fatalf("ordinary telemetry failure changed diagnostics or mandatory audit: %#v, err=%v", diagnostic, err)
+		}
+
+		failedRebuild, rebuildErr := lifecycle.RebuildProjections(
+			context.Background(),
+			taskworkspace.ProjectionRebuildRequest{SchemaRevision: taskworkspace.ProjectionSchemaV1},
+		)
+		assertLifecycleErrorCode(t, rebuildErr, taskworkspace.ErrorReconciliationRequired)
+		rebuildFailure := rebuildErr.(*taskworkspace.Error)
+		if rebuildFailure.Retryable() || !rebuildFailure.ReconciliationRequired() ||
+			failedRebuild.Projected.Known || failedRebuild.SourceWatermark.Known {
+			t.Fatalf("failed telemetry rebuild semantics = %#v, result=%#v", rebuildFailure, failedRebuild)
+		}
+		telemetry.failure = nil
+		rebuilt, err := lifecycle.RebuildProjections(
+			context.Background(),
+			taskworkspace.ProjectionRebuildRequest{SchemaRevision: taskworkspace.ProjectionSchemaV1},
+		)
+		if err != nil || !rebuilt.Projected.Known || rebuilt.Projected.Value == 0 ||
+			!rebuilt.SourceWatermark.Known || rebuilt.SourceWatermark.Value == 0 {
+			t.Fatalf("exact projection rebuild retry = %#v, err=%v", rebuilt, err)
+		}
+
+		encoded, marshalErr := json.Marshal(struct {
+			Committed      taskworkspace.CommitRuntimeViewResult
+			Current        taskworkspace.ConfirmTaskWorkspaceResult
+			Inspection     taskworkspace.OperationInspection
+			Debt           taskworkspace.CleanupDebt
+			Diagnostics    taskworkspace.AdministratorDiagnostics
+			Telemetry      []taskworkspace.OperationalSignals
+			AuditIntents   []taskworkspace.CleanupAuditIntent
+			AuditFacts     []taskworkspace.CleanupAuditEvidence
+			ExternalAudit  []taskworkspace.AuditDeliveryFact
+			FailedRebuild  taskworkspace.ProjectionRebuildResult
+			RebuildFailure string
+			Rebuilt        taskworkspace.ProjectionRebuildResult
+		}{
+			committed, current, inspection, resolved, diagnostic, telemetry.signals,
+			mandatoryAudit.intents, mandatoryAudit.facts, externalAudit.facts,
+			failedRebuild, fmt.Sprintf("%v | %+v", rebuildErr, rebuildErr), rebuilt,
+		})
+		if marshalErr != nil {
+			t.Fatalf("marshal telemetry failure evidence: %v", marshalErr)
+		}
+		for _, forbidden := range strings.Fields(canary) {
+			if strings.Contains(string(encoded), forbidden) {
+				t.Fatalf("lifecycle, telemetry, audit, diagnostics, or formatted result leaked %q: %s",
+					forbidden, encoded)
+			}
+		}
+	})
+}
+
+func runLifecycleTelemetryPanicRetryContract(t *testing.T, adapter lifecycleContractAdapter) {
+	t.Helper()
+	t.Run("telemetry panic records degraded retry state and exact rebuild recovers", func(t *testing.T) {
+		const canary = "telemetry-panic-/private/c04 session-c04 mount-c04 bucket-c04 object-c04 " +
+			"vendor-c04 credential-c04 token-c04 user-content-c04 foreign-workspace-c04"
+		telemetry := &panickingTelemetryDouble{value: canary, panics: true}
+		projector := taskworkspace.NewDeterministicProjection(telemetry)
+		config := taskworkspaceTestConfig(nil)
+		config.Projection = projector
+		lifecycle := adapter.newConfigured(t, config)
+
+		confirmed, err := lifecycle.ConfirmTaskWorkspace(
+			context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-telemetry-panic"),
+		)
+		if err != nil || confirmed.TaskWorkspaceID == "" {
+			t.Fatalf("telemetry panic changed authoritative confirm: %#v, err=%v", confirmed, err)
+		}
+		cursor, err := projector.Cursor(taskworkspace.ProjectionSchemaV1)
+		if err != nil || !cursor.RetryPending.Known || cursor.RetryPending.Value == 0 ||
+			cursor.SafeError != taskworkspace.SafeErrorReconciliationRequired {
+			t.Fatalf("telemetry panic omitted degraded retry evidence: %#v, err=%v", cursor, err)
+		}
+
+		telemetry.panics = false
+		rebuilt, err := lifecycle.RebuildProjections(
+			context.Background(),
+			taskworkspace.ProjectionRebuildRequest{SchemaRevision: taskworkspace.ProjectionSchemaV1},
+		)
+		if err != nil || !rebuilt.Projected.Known || rebuilt.Projected.Value == 0 {
+			t.Fatalf("exact rebuild after telemetry panic = %#v, err=%v", rebuilt, err)
+		}
+		cursor, err = projector.Cursor(taskworkspace.ProjectionSchemaV1)
+		if err != nil || cursor.RetryPending.Value != 0 || cursor.SafeError != "" {
+			t.Fatalf("successful rebuild retained degraded retry evidence: %#v, err=%v", cursor, err)
+		}
+		encoded, marshalErr := json.Marshal(telemetry.signals)
+		if marshalErr != nil || strings.Contains(string(encoded), canary) {
+			t.Fatalf("telemetry panic evidence leaked canary: %s, err=%v", encoded, marshalErr)
+		}
+	})
 }
 
 func runLifecycleInvalidCompoundIntentContract(t *testing.T, adapter lifecycleContractAdapter) {
@@ -807,6 +1077,47 @@ func runLifecycleProjectionAndNonLeakageContract(t *testing.T, adapter lifecycle
 type failingLifecycleProjection struct {
 	err       error
 	envelopes []taskworkspace.ProjectionEnvelope
+}
+
+type panickingLifecycleProjection struct {
+	value any
+}
+
+type temporaryProjectionError struct {
+	message string
+}
+
+type panickingTelemetryDouble struct {
+	value   any
+	panics  bool
+	signals []taskworkspace.OperationalSignals
+}
+
+func (e temporaryProjectionError) Error() string { return e.message }
+
+func (temporaryProjectionError) Temporary() bool { return true }
+
+func (d *panickingTelemetryDouble) Emit(
+	_ context.Context,
+	signals taskworkspace.OperationalSignals,
+) error {
+	d.signals = append(d.signals, signals)
+	if d.panics {
+		panic(d.value)
+	}
+	return nil
+}
+
+func (p *panickingLifecycleProjection) Project(context.Context, taskworkspace.ProjectionEnvelope) error {
+	panic(p.value)
+}
+
+func (p *panickingLifecycleProjection) Rebuild(
+	context.Context,
+	taskworkspace.ProjectionSchemaRevision,
+	[]taskworkspace.ProjectionEnvelope,
+) error {
+	panic(p.value)
 }
 
 func (p *failingLifecycleProjection) Project(_ context.Context, envelope taskworkspace.ProjectionEnvelope) error {
