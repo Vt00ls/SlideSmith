@@ -1202,7 +1202,7 @@ func encodeOwnedTransportResponse[Result any](
 }
 
 func ownedTransportErrorResponse(envelope OwnedTransportEnvelope, err error) OwnedTransportResponse {
-	lifecycleError := normalizeOwnedTransportError(err)
+	lifecycleError := normalizeLifecycleError(err)
 	return OwnedTransportResponse{
 		Method:                 envelope.Method,
 		OperationID:            envelope.OperationID,
@@ -1220,38 +1220,17 @@ func decodeOwnedTransportError(wire OwnedTransportWireError) error {
 	if !validOwnedTransportWireError(wire) {
 		return &Error{Code: ErrorIntegrityConflict}
 	}
-	return normalizeOwnedTransportError(&Error{Code: wire.Code})
+	return normalizeLifecycleError(&Error{Code: wire.Code})
 }
 
 func validOwnedTransportWireError(wire OwnedTransportWireError) bool {
-	if !knownOwnedTransportErrorCode(wire.Code) {
+	if !knownLifecycleErrorCode(wire.Code) {
 		return false
 	}
-	expected := normalizeOwnedTransportError(&Error{Code: wire.Code})
+	expected := normalizeLifecycleError(&Error{Code: wire.Code})
 	return wire.SafeCategory == expected.SafeCategory() &&
 		wire.Retryable == expected.Retryable() &&
 		wire.ReconciliationRequired == expected.ReconciliationRequired()
-}
-
-func knownOwnedTransportErrorCode(code ErrorCode) bool {
-	switch code {
-	case ErrorInvalidIntent, ErrorIntegrityConflict, ErrorIntegrityFailure,
-		ErrorOwnershipDenied, ErrorStaleAuthority, ErrorViewTerminalConflict,
-		ErrorEffectDenied, ErrorExpiryBlocked, ErrorCheckpointNotRetained,
-		ErrorRecoveryReadOnly, ErrorReconciliationRequired, ErrorDurabilityUnverified,
-		ErrorResourceExhausted, ErrorRetryableUnavailable, ErrorCleanupDebt:
-		return true
-	default:
-		return false
-	}
-}
-
-func normalizeOwnedTransportError(err error) *Error {
-	var lifecycleError *Error
-	if errors.As(err, &lifecycleError) && lifecycleError != nil {
-		return &Error{Code: lifecycleError.Code}
-	}
-	return &Error{Code: ErrorRetryableUnavailable}
 }
 
 func ownedTransportDigest(payload []byte) Digest {

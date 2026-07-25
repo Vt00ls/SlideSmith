@@ -496,7 +496,9 @@ func (p *DeterministicProjection) project(
 	attemptGeneration := state.attemptGeneration
 	p.mu.Unlock()
 
-	emitErr := p.telemetry.Emit(ctx, operationalSignals(envelope))
+	emitErr := callProjectionAdapter(func() error {
+		return p.telemetry.Emit(ctx, operationalSignals(envelope))
+	})
 	p.mu.Lock()
 	current, currentExists := p.states[identity]
 	if currentExists && current.revision == envelope.FactRevision && current.digest == digest &&
@@ -975,8 +977,22 @@ func (l *observedLifecycle) projectCheckpoint(
 
 func (l *observedLifecycle) projectEnvelope(ctx context.Context, envelope ProjectionEnvelope) {
 	if l.projection != nil {
-		_ = l.projection.Project(ctx, envelope)
+		_ = callProjectionAdapter(func() error {
+			return l.projection.Project(ctx, envelope)
+		})
 	}
+}
+
+func callProjectionAdapter(invoke func() error) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = &Error{Code: ErrorRetryableUnavailable}
+		}
+	}()
+	if err = invoke(); err != nil {
+		return normalizeProjectionAdapterError(err)
+	}
+	return nil
 }
 
 func (l *observedLifecycle) CreateCleanupObligation(
@@ -1314,7 +1330,9 @@ func (m *inMemory) RebuildProjections(
 		}
 		return facts[i].FactID < facts[j].FactID
 	})
-	if err := observed.Rebuild(ctx, request.SchemaRevision, facts); err != nil {
+	if err := callProjectionAdapter(func() error {
+		return observed.Rebuild(ctx, request.SchemaRevision, facts)
+	}); err != nil {
 		return ProjectionRebuildResult{}, err
 	}
 	return ProjectionRebuildResult{

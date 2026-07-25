@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 )
 
 type (
@@ -197,6 +198,42 @@ func (e *Error) Retryable() bool {
 
 func (e *Error) ReconciliationRequired() bool {
 	return e != nil && e.Code == ErrorReconciliationRequired
+}
+
+// normalizeLifecycleError copies only a known lifecycle code and never
+// retains an error chain or message.
+func normalizeLifecycleError(err error) *Error {
+	var lifecycleError *Error
+	if errors.As(err, &lifecycleError) && lifecycleError != nil &&
+		knownLifecycleErrorCode(lifecycleError.Code) {
+		return &Error{Code: lifecycleError.Code}
+	}
+	return &Error{Code: ErrorRetryableUnavailable}
+}
+
+// normalizeProjectionAdapterError prevents a projection adapter from
+// inventing lifecycle authority semantics. Only the two projection-delivery
+// dispositions may cross this internal seam.
+func normalizeProjectionAdapterError(err error) *Error {
+	normalized := normalizeLifecycleError(err)
+	if normalized.Code == ErrorRetryableUnavailable ||
+		normalized.Code == ErrorReconciliationRequired {
+		return normalized
+	}
+	return &Error{Code: ErrorRetryableUnavailable}
+}
+
+func knownLifecycleErrorCode(code ErrorCode) bool {
+	switch code {
+	case ErrorInvalidIntent, ErrorIntegrityConflict, ErrorIntegrityFailure,
+		ErrorOwnershipDenied, ErrorStaleAuthority, ErrorViewTerminalConflict,
+		ErrorEffectDenied, ErrorExpiryBlocked, ErrorCheckpointNotRetained,
+		ErrorRecoveryReadOnly, ErrorReconciliationRequired, ErrorDurabilityUnverified,
+		ErrorResourceExhausted, ErrorRetryableUnavailable, ErrorCleanupDebt:
+		return true
+	default:
+		return false
+	}
 }
 
 type ConfirmTaskWorkspaceRequest struct {
