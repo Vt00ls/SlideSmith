@@ -197,7 +197,7 @@ func (m *inMemory) RestoreTaskWorkspace(
 		if errors.Is(verifyErr, ErrDurableObjectResultAmbiguous) {
 			return RestoreTaskWorkspaceResult{}, &Error{Code: ErrorReconciliationRequired}
 		}
-		return fail(ErrorIntegrityFailure)
+		return fail(durableObjectErrorCode(verifyErr))
 	}
 	verificationRequest := MaterializeRequest{
 		PolicyDomainID:  intent.PolicyDomainID,

@@ -371,6 +371,24 @@ func NewInMemory(config InMemoryConfig) Lifecycle {
 	return &observedLifecycle{inMemory: memory, projection: config.Projection, schema: schema}
 }
 
+// currentLocalWorkspaceAuthority is an adapter-private read used only to bind
+// physical cleanup residue to the current C04 authority. It deliberately does
+// not expose a filesystem locator or become part of Lifecycle.
+func (m *inMemory) currentLocalWorkspaceAuthority(
+	policyDomainID PolicyDomainID,
+	taskID TaskID,
+	taskWorkspaceID TaskWorkspaceID,
+) (Generation, Fence, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	workspace, ok := m.workspaces[taskID]
+	if !ok || workspace.policyDomainID != policyDomainID ||
+		workspace.taskWorkspaceID != taskWorkspaceID {
+		return 0, 0, false
+	}
+	return workspace.generation, workspace.fence, true
+}
+
 func (m *inMemory) OpenRuntimeView(_ context.Context, request OpenRuntimeViewRequest) (OpenRuntimeViewResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -664,7 +682,7 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 			if errors.As(err, &lifecycleError) && lifecycleError.Code == ErrorReconciliationRequired {
 				return CommitRuntimeViewResult{}, lifecycleError
 			}
-			return fail(ErrorIntegrityFailure)
+			return fail(durableObjectErrorCode(err))
 		}
 		if prepareStarted || prepareOrdinal != expectedPrepares {
 			return fail(ErrorIntegrityFailure)
@@ -1528,7 +1546,7 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 			if errors.As(verifyErr, &lifecycleError) && lifecycleError.Code == ErrorReconciliationRequired {
 				return MaterializeResult{}, lifecycleError
 			}
-			err := &Error{Code: ErrorIntegrityFailure}
+			err := &Error{Code: durableObjectErrorCode(verifyErr)}
 			recordOperation(m.operations, m.now(), scope, request.Operation, MaterializeResult{}, err)
 			return MaterializeResult{}, err
 		}

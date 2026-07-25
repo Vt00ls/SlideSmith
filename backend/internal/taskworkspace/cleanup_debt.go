@@ -995,6 +995,9 @@ func (m *inMemory) ReconcileCleanupDebt(
 	inspectionRequest := cleanupInspectionRequest(debt, request)
 	inspection, err := m.cleanup.InspectCleanup(ctx, inspectionRequest)
 	if err != nil {
+		if errors.Is(err, ErrCleanupResultAmbiguous) {
+			return m.scheduleCleanupRetry(scope, request.Operation, record, CleanupFailureAmbiguous, "", nil, false)
+		}
 		return m.scheduleCleanupRetry(scope, request.Operation, record, CleanupFailureAdapterUnavailable, "", nil, false)
 	}
 	if !validCleanupInspectionEvidence(inspectionRequest, inspection) {

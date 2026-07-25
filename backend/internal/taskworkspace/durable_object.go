@@ -12,6 +12,20 @@ import (
 // operation journal remains the reconciliation authority for an exact retry.
 var ErrDurableObjectResultAmbiguous = errors.New("durable object result is ambiguous")
 
+func durableObjectErrorCode(err error) ErrorCode {
+	var lifecycleError *Error
+	if !errors.As(err, &lifecycleError) {
+		return ErrorIntegrityFailure
+	}
+	switch lifecycleError.Code {
+	case ErrorIntegrityFailure, ErrorDurabilityUnverified, ErrorResourceExhausted,
+		ErrorRetryableUnavailable:
+		return lifecycleError.Code
+	default:
+		return ErrorIntegrityFailure
+	}
+}
+
 type (
 	LogicalMember            string
 	StateMemberType          string
