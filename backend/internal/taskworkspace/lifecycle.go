@@ -191,6 +191,14 @@ func (e *Error) SafeCategory() SafeErrorCategory {
 	}
 }
 
+func (e *Error) Retryable() bool {
+	return e != nil && e.Code == ErrorRetryableUnavailable
+}
+
+func (e *Error) ReconciliationRequired() bool {
+	return e != nil && e.Code == ErrorReconciliationRequired
+}
+
 type ConfirmTaskWorkspaceRequest struct {
 	PolicyDomainID PolicyDomainID
 	TaskID         TaskID
