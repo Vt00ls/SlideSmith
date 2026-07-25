@@ -477,6 +477,11 @@ func (s *localFilesystemStore) expireMaterialization(
 	delete(s.state.MaterializationIDs, request.MaterializationID)
 	delete(s.state.CleanupResources, cleanupResource.ID)
 	delete(s.state.CleanupClaims, localCleanupClaimKey(request.Operation.ID, cleanupResource.ID, cleanupResource.Entry))
+	if err := s.inject(LocalFaultAfterCompletionMutation, event); err != nil {
+		return &localFilesystemResidue{
+			id: cleanupResource.ID, generation: cleanupResource.Generation, capacity: cleanupResource.Capacity,
+		}, ErrCleanupResultAmbiguous
+	}
 	if err := s.persistState(); err != nil {
 		return &localFilesystemResidue{id: cleanupResource.ID, generation: cleanupResource.Generation, capacity: cleanupResource.Capacity}, ErrCleanupResultAmbiguous
 	}

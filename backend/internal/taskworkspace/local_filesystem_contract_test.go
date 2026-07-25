@@ -303,9 +303,780 @@ func TestLocalFilesystemRestartReconcilesPromotedAmbiguityFromLifecycleJournal(t
 	if err != nil || reconciled.CommitRuntimeView == nil || reconciled.Disposition != taskworkspace.OperationTerminal {
 		t.Fatalf("restart reconciliation = %#v, err = %v", reconciled, err)
 	}
+	current, err := restarted.ConfirmTaskWorkspace(
+		context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-reconciled-current"),
+	)
+	if err != nil {
+		t.Fatalf("confirm reconciled current workspace: %v", err)
+	}
+	materialized, err := restarted.Materialize(context.Background(), materializeRequest(
+		"policy-domain-1", "task-1", current, "materialize-reconciled-commit",
+	))
+	if err != nil || materialized.CheckpointID != reconciled.CommitRuntimeView.CheckpointID {
+		t.Fatalf("materialize immediately after reconciliation = %#v, err = %v", materialized, err)
+	}
 	replayed, err := restarted.CommitRuntimeView(context.Background(), commit)
 	if err != nil || !reflect.DeepEqual(replayed, *reconciled.CommitRuntimeView) {
 		t.Fatal("restart replay changed the authoritative commit decision")
+	}
+}
+
+func TestLocalFilesystemCoreTerminalFaultRequiresRestartReconciliation(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	faulted := false
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if !faulted && event.OperationID == "commit-core-terminal-crash" &&
+			event.Point == taskworkspace.FaultAfterAuthoritativeTransaction {
+			faulted = true
+			return errors.New("simulated crash after core terminal")
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, nil)
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-core-terminal-crash", "materialize-core-terminal-crash",
+		"open-core-terminal-crash",
+	)
+	manifest := declaredStateManifest("content-1")
+	commit := commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-core-terminal-crash",
+	)
+	_, err := first.CommitRuntimeView(context.Background(), commit)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	inspection, err := first.InspectOperation(context.Background(), taskworkspace.InspectOperationRequest{
+		PolicyDomainID: commit.PolicyDomainID, TaskID: commit.TaskID, OperationID: commit.Operation.ID,
+	})
+	if err != nil || inspection.Disposition != taskworkspace.OperationReconciliationRequired ||
+		inspection.CommitRuntimeView != nil {
+		t.Fatalf("post-core terminal inspection = %#v, err = %v", inspection, err)
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	restarted := newLocalContractLifecycleAtRoot(t, root, restartedConfig, nil)
+	reconciled, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: commit.PolicyDomainID, TaskID: commit.TaskID, OperationID: commit.Operation.ID,
+	})
+	if err != nil || reconciled.Disposition != taskworkspace.OperationTerminal ||
+		reconciled.CommitRuntimeView == nil {
+		t.Fatalf("restart core-terminal reconciliation = %#v, err = %v", reconciled, err)
+	}
+	current, err := restarted.ConfirmTaskWorkspace(
+		context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-core-terminal-current"),
+	)
+	if err != nil {
+		t.Fatalf("confirm core-terminal current workspace: %v", err)
+	}
+	materialized, err := restarted.Materialize(context.Background(), materializeRequest(
+		"policy-domain-1", "task-1", current, "materialize-core-terminal-result",
+	))
+	if err != nil || materialized.CheckpointID != reconciled.CommitRuntimeView.CheckpointID {
+		t.Fatalf("materialize reconciled core terminal = %#v, err = %v", materialized, err)
+	}
+}
+
+func TestLocalFilesystemAdapterCompletionPersistenceFaultsAreRestartSafe(t *testing.T) {
+	for _, test := range []struct {
+		name            string
+		point           taskworkspace.LocalFilesystemFaultPoint
+		ordinal         int
+		wantDisposition taskworkspace.OperationDisposition
+	}{
+		{
+			name:            "adapter state mutation before persist",
+			point:           taskworkspace.LocalFaultAfterCompletionMutation,
+			wantDisposition: taskworkspace.OperationReconciliationRequired,
+		},
+		{
+			name:            "completion record mutation before persist",
+			point:           taskworkspace.LocalFaultAfterCompletionMutation,
+			ordinal:         2,
+			wantDisposition: taskworkspace.OperationReconciliationRequired,
+		},
+		{
+			name:            "completion persist before response acknowledgement",
+			point:           taskworkspace.LocalFaultAfterCompletionPersistence,
+			ordinal:         -1,
+			wantDisposition: taskworkspace.OperationTerminal,
+		},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			persistence := taskworkspace.NewInMemoryPersistence()
+			config := taskworkspaceTestConfig(nil)
+			config.Persistence = persistence
+			faulted := false
+			operationID := "commit-completion-" + strings.ReplaceAll(test.name, " ", "-")
+			first := newLocalContractLifecycleAtRoot(t, root, config, func(local *taskworkspace.LocalFilesystemConfig) {
+				local.FilesystemFault = func(event taskworkspace.LocalFilesystemFaultEvent) error {
+					if !faulted && event.OperationID == taskworkspace.OperationID(operationID) &&
+						event.Point == test.point && (test.ordinal < 0 || event.Ordinal == test.ordinal) {
+						faulted = true
+						return errors.New("simulated adapter completion persistence fault")
+					}
+					return nil
+				}
+			})
+			confirmed, view := openRuntimeViewWithLifecycle(
+				t, first, "task-1", "confirm-"+operationID, "materialize-"+operationID,
+				"open-"+operationID,
+			)
+			manifest := declaredStateManifest("content-1")
+			commit := commitRequest(
+				confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest), operationID,
+			)
+			result, err := first.CommitRuntimeView(context.Background(), commit)
+			assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+			if !faulted || result.RevisionID != "" || result.CheckpointID != "" {
+				t.Fatal("completion persistence fault exposed an unacknowledged terminal result")
+			}
+			conflict := commit
+			conflict.Fence++
+			conflict.Operation.RequestDigest = conflict.CanonicalRequestDigest()
+			_, err = first.CommitRuntimeView(context.Background(), conflict)
+			assertLifecycleErrorCode(t, err, taskworkspace.ErrorIntegrityConflict)
+
+			stale := commit
+			stale.Operation.ID = taskworkspace.OperationID(operationID + "-stale")
+			stale.Generation++
+			stale.Fence++
+			stale.Operation.RequestDigest = stale.CanonicalRequestDigest()
+			_, err = first.CommitRuntimeView(context.Background(), stale)
+			assertLifecycleErrorCode(t, err, taskworkspace.ErrorStaleAuthority)
+
+			crossWorkspace := commit
+			crossWorkspace.Operation.ID = taskworkspace.OperationID(operationID + "-cross-workspace")
+			crossWorkspace.TaskWorkspaceID = "foreign-workspace-canary"
+			crossWorkspace.Operation.RequestDigest = crossWorkspace.CanonicalRequestDigest()
+			_, err = first.CommitRuntimeView(context.Background(), crossWorkspace)
+			assertLifecycleErrorCode(t, err, taskworkspace.ErrorOwnershipDenied)
+
+			inspection, err := first.InspectOperation(context.Background(), taskworkspace.InspectOperationRequest{
+				PolicyDomainID: commit.PolicyDomainID, TaskID: commit.TaskID, OperationID: commit.Operation.ID,
+			})
+			if err != nil || inspection.Disposition != test.wantDisposition {
+				t.Fatalf("completion persistence inspection = %#v, err = %v", inspection, err)
+			}
+
+			restarted := newLocalContractLifecycleAtRoot(t, root, config, nil)
+			restartInspection, err := restarted.InspectOperation(context.Background(), taskworkspace.InspectOperationRequest{
+				PolicyDomainID: commit.PolicyDomainID, TaskID: commit.TaskID, OperationID: commit.Operation.ID,
+			})
+			if err != nil || restartInspection.Disposition != test.wantDisposition {
+				t.Fatalf("completion persistence restart inspection = %#v, err = %v", restartInspection, err)
+			}
+			reconciled, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+				PolicyDomainID: commit.PolicyDomainID, TaskID: commit.TaskID, OperationID: commit.Operation.ID,
+			})
+			if err != nil || reconciled.Disposition != taskworkspace.OperationTerminal ||
+				reconciled.CommitRuntimeView == nil {
+				t.Fatalf("completion persistence reconciliation = %#v, err = %v", reconciled, err)
+			}
+			repeated, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+				PolicyDomainID: commit.PolicyDomainID, TaskID: commit.TaskID, OperationID: commit.Operation.ID,
+			})
+			if err != nil || !reflect.DeepEqual(repeated, reconciled) {
+				t.Fatalf("repeated completion reconciliation = %#v, err = %v", repeated, err)
+			}
+			current, err := restarted.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+				"policy-domain-1", "task-1", "confirm-current-"+operationID,
+			))
+			if err != nil {
+				t.Fatalf("confirm completion current workspace: %v", err)
+			}
+			if current.CurrentRevisionID != reconciled.CommitRuntimeView.RevisionID ||
+				current.CurrentCheckpointID != reconciled.CommitRuntimeView.CheckpointID {
+				t.Fatal("fail-closed probes changed the reconciled Revision or Checkpoint")
+			}
+			materialized, err := restarted.Materialize(context.Background(), materializeRequest(
+				"policy-domain-1", "task-1", current, "materialize-result-"+operationID,
+			))
+			if err != nil || materialized.CheckpointID != reconciled.CommitRuntimeView.CheckpointID {
+				t.Fatalf("materialize completion result = %#v, err = %v", materialized, err)
+			}
+			replayed, err := restarted.CommitRuntimeView(context.Background(), commit)
+			if err != nil || !reflect.DeepEqual(replayed, *reconciled.CommitRuntimeView) {
+				t.Fatalf("completion exact replay = %#v, err = %v", replayed, err)
+			}
+		})
+	}
+}
+
+func TestLocalFilesystemCompletionIntentMutationFaultCannotBypassDurability(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	intentFaulted := false
+	coreFaulted := false
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if intentFaulted && !coreFaulted && event.OperationID == "commit-intent-mutation-crash" &&
+			event.Point == taskworkspace.FaultAfterAuthoritativeTransaction {
+			coreFaulted = true
+			return errors.New("simulated crash after core terminal")
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = func(event taskworkspace.LocalFilesystemFaultEvent) error {
+			if !intentFaulted && event.OperationID == "commit-intent-mutation-crash" &&
+				event.Point == taskworkspace.LocalFaultAfterCompletionMutation && event.Ordinal == 1 {
+				intentFaulted = true
+				return errors.New("simulated crash after completion intent mutation")
+			}
+			return nil
+		}
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-intent-mutation", "materialize-intent-mutation",
+		"open-intent-mutation",
+	)
+	manifest := declaredStateManifest("content-1")
+	commit := commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-intent-mutation-crash",
+	)
+	_, err := first.CommitRuntimeView(context.Background(), commit)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	if !intentFaulted || coreFaulted {
+		t.Fatal("completion intent fault did not stop before core authority")
+	}
+	_, err = first.CommitRuntimeView(context.Background(), commit)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	if !coreFaulted {
+		t.Fatal("exact retry did not reach the core terminal boundary")
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	restarted := newLocalContractLifecycleAtRoot(t, root, restartedConfig, nil)
+	reconciled, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: commit.PolicyDomainID, TaskID: commit.TaskID, OperationID: commit.Operation.ID,
+	})
+	if err != nil || reconciled.Disposition != taskworkspace.OperationTerminal ||
+		reconciled.CommitRuntimeView == nil {
+		t.Fatalf("completion intent durability reconciliation = %#v, err = %v", reconciled, err)
+	}
+}
+
+func TestLocalFilesystemOutOfOrderCompoundReplayDoesNotReactivateOlderCommit(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	faulted := false
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if !faulted && event.OperationID == "commit-out-of-order-older" &&
+			event.Point == taskworkspace.FaultBeforeResponse {
+			faulted = true
+			return errors.New("simulated older commit response loss")
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, nil)
+	confirmed, olderView := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-out-of-order", "materialize-out-of-order-base",
+		"open-out-of-order-older",
+	)
+	olderManifest := declaredStateManifest("content-1")
+	olderRequest := commitRequest(
+		confirmed, olderView, olderManifest, acceptedValidationEvidence(confirmed, olderView, olderManifest),
+		"commit-out-of-order-older",
+	)
+	_, err := first.CommitRuntimeView(context.Background(), olderRequest)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	if !faulted {
+		t.Fatal("older commit did not reach response-loss boundary")
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	restarted := newLocalContractLifecycleAtRoot(t, root, restartedConfig, nil)
+	olderInspection, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: olderRequest.PolicyDomainID, TaskID: olderRequest.TaskID,
+		OperationID: olderRequest.Operation.ID,
+	})
+	if err != nil || olderInspection.Disposition != taskworkspace.OperationTerminal ||
+		olderInspection.CommitRuntimeView == nil {
+		t.Fatalf("reconcile older compound commit = %#v, err = %v", olderInspection, err)
+	}
+	current, err := restarted.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-out-of-order-current",
+	))
+	if err != nil {
+		t.Fatalf("confirm older commit: %v", err)
+	}
+	materialized, err := restarted.Materialize(context.Background(), materializeRequest(
+		"policy-domain-1", "task-1", current, "materialize-out-of-order-current",
+	))
+	if err != nil {
+		t.Fatalf("materialize older commit: %v", err)
+	}
+	newerView, err := restarted.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+		"policy-domain-1", "task-1", current, materialized,
+		"phase-run-1", "runtime-run-2", "sandbox-lease-2", "open-out-of-order-newer",
+	))
+	if err != nil {
+		t.Fatalf("open newer Runtime View: %v", err)
+	}
+	newerManifest := declaredStateManifest("content-2")
+	newer, err := restarted.CommitRuntimeView(context.Background(), commitRequest(
+		current, newerView, newerManifest, acceptedValidationEvidence(current, newerView, newerManifest),
+		"commit-out-of-order-newer",
+	))
+	if err != nil {
+		t.Fatalf("commit newer state: %v", err)
+	}
+
+	lateReconcile, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: olderRequest.PolicyDomainID, TaskID: olderRequest.TaskID,
+		OperationID: olderRequest.Operation.ID,
+	})
+	if err != nil || !reflect.DeepEqual(lateReconcile, olderInspection) {
+		t.Fatalf("late older reconciliation = %#v, err = %v", lateReconcile, err)
+	}
+	lateReplay, err := restarted.CommitRuntimeView(context.Background(), olderRequest)
+	if err != nil || !reflect.DeepEqual(lateReplay, *olderInspection.CommitRuntimeView) {
+		t.Fatalf("late older exact replay = %#v, err = %v", lateReplay, err)
+	}
+	after, err := restarted.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-out-of-order-after-late-replay",
+	))
+	if err != nil || after.CurrentRevisionID != newer.RevisionID ||
+		after.CurrentCheckpointID != newer.CheckpointID {
+		t.Fatalf("out-of-order replay changed current authority = %#v, err = %v", after, err)
+	}
+}
+
+func TestLocalFilesystemMaterializeReconciliationBindsExactMaterialization(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	now := taskworkspace.Instant(100)
+	armed := false
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	config.Now = func() taskworkspace.Instant { return now }
+	config.ExpiryPolicy = taskworkspace.ExpiryPolicy{
+		ID: "expiry-policy-1", MaterializationLifetime: 10, RuntimeViewLifetime: 100,
+	}
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if armed && event.OperationID == "materialize-binding-crash" &&
+			event.Point == taskworkspace.FaultBeforeResponse {
+			armed = false
+			return errors.New("simulated materialize acknowledgement loss")
+		}
+		return nil
+	}
+	cleanupStarted := false
+	filesystemFault := func(event taskworkspace.LocalFilesystemFaultEvent) error {
+		if event.OperationID == "expire-reconciled-materialization" &&
+			event.Point == taskworkspace.LocalFaultBeforeCleanup {
+			cleanupStarted = true
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = filesystemFault
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-materialize-binding", "materialize-binding-base",
+		"open-materialize-binding",
+	)
+	manifest := declaredStateManifest("content-1")
+	if _, err := first.CommitRuntimeView(context.Background(), commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-materialize-binding",
+	)); err != nil {
+		t.Fatalf("commit binding Checkpoint: %v", err)
+	}
+	current, err := first.ConfirmTaskWorkspace(
+		context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-materialize-binding-current"),
+	)
+	if err != nil {
+		t.Fatalf("confirm binding current workspace: %v", err)
+	}
+	request := materializeRequest(
+		"policy-domain-1", "task-1", current, "materialize-binding-crash",
+	)
+	armed = true
+	_, err = first.Materialize(context.Background(), request)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	restarted := newLocalContractLifecycleAtRoot(t, root, restartedConfig, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = filesystemFault
+	})
+	reconciled, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: request.PolicyDomainID, TaskID: request.TaskID, OperationID: request.Operation.ID,
+	})
+	if err != nil || reconciled.Disposition != taskworkspace.OperationTerminal || reconciled.Materialize == nil {
+		t.Fatalf("materialize binding reconciliation = %#v, err = %v", reconciled, err)
+	}
+	now = 1_000
+	if _, err := restarted.ExpireMaterialization(context.Background(), expireMaterializationRequest(
+		current, *reconciled.Materialize, "expire-reconciled-materialization",
+	)); err != nil {
+		t.Fatalf("expire reconciled materialization: %v", err)
+	}
+	if !cleanupStarted {
+		t.Fatal("reconciled MaterializationID was not bound to its exact local generation")
+	}
+}
+
+func TestLocalFilesystemMaterializationBindingMutationFaultIsRestartSafe(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	now := taskworkspace.Instant(100)
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	config.Now = func() taskworkspace.Instant { return now }
+	config.ExpiryPolicy = taskworkspace.ExpiryPolicy{
+		ID: "expiry-policy-1", MaterializationLifetime: 10, RuntimeViewLifetime: 100,
+	}
+	faulted := false
+	first := newLocalContractLifecycleAtRoot(t, root, config, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = func(event taskworkspace.LocalFilesystemFaultEvent) error {
+			if !faulted && event.OperationID == "materialize-binding-mutation-crash" &&
+				event.Point == taskworkspace.LocalFaultAfterCompletionMutation && event.Ordinal == 0 {
+				faulted = true
+				return errors.New("simulated binding mutation crash")
+			}
+			return nil
+		}
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-binding-mutation", "materialize-binding-mutation-base",
+		"open-binding-mutation",
+	)
+	manifest := declaredStateManifest("content-1")
+	if _, err := first.CommitRuntimeView(context.Background(), commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-binding-mutation",
+	)); err != nil {
+		t.Fatalf("commit binding mutation Checkpoint: %v", err)
+	}
+	current, err := first.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-binding-mutation-current",
+	))
+	if err != nil {
+		t.Fatalf("confirm binding mutation current workspace: %v", err)
+	}
+	request := materializeRequest(
+		"policy-domain-1", "task-1", current, "materialize-binding-mutation-crash",
+	)
+	result, err := first.Materialize(context.Background(), request)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	if !faulted || result.MaterializationID != "" {
+		t.Fatal("binding mutation fault exposed an unpersisted Materialization")
+	}
+
+	cleanupStarted := false
+	restarted := newLocalContractLifecycleAtRoot(t, root, config, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = func(event taskworkspace.LocalFilesystemFaultEvent) error {
+			if event.OperationID == "expire-binding-mutation-reconciled" &&
+				event.Point == taskworkspace.LocalFaultBeforeCleanup {
+				cleanupStarted = true
+			}
+			return nil
+		}
+	})
+	reconciled, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: request.PolicyDomainID, TaskID: request.TaskID, OperationID: request.Operation.ID,
+	})
+	if err != nil || reconciled.Disposition != taskworkspace.OperationTerminal || reconciled.Materialize == nil {
+		t.Fatalf("binding mutation reconciliation = %#v, err = %v", reconciled, err)
+	}
+	now = 1_000
+	if _, err := restarted.ExpireMaterialization(context.Background(), expireMaterializationRequest(
+		current, *reconciled.Materialize, "expire-binding-mutation-reconciled",
+	)); err != nil {
+		t.Fatalf("expire reconciled binding mutation result: %v", err)
+	}
+	if !cleanupStarted {
+		t.Fatal("reconciled binding mutation did not bind the exact local Materialization")
+	}
+}
+
+func TestLocalFilesystemRestoreReconciliationBindsExactMaterialization(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	now := taskworkspace.Instant(100)
+	var recoveryIntent taskworkspace.AuthorizedRecoveryIntent
+	armed := false
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	config.Now = func() taskworkspace.Instant { return now }
+	config.ExpiryPolicy = taskworkspace.ExpiryPolicy{
+		ID: "expiry-policy-1", MaterializationLifetime: 10, RuntimeViewLifetime: 100,
+	}
+	config.RecoveryAuthorityID = "recovery-authority-1"
+	config.CurrentRecoveryIntent = func(id taskworkspace.RecoveryIntentID) (taskworkspace.AuthorizedRecoveryIntent, bool) {
+		return recoveryIntent, recoveryIntent.ID == id && id != ""
+	}
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if armed && event.OperationID == "restore-binding-crash" &&
+			event.Point == taskworkspace.FaultBeforeResponse {
+			armed = false
+			return errors.New("simulated restore acknowledgement loss")
+		}
+		return nil
+	}
+	cleanupStarted := false
+	filesystemFault := func(event taskworkspace.LocalFilesystemFaultEvent) error {
+		if event.OperationID == "expire-reconciled-restore" &&
+			event.Point == taskworkspace.LocalFaultBeforeCleanup {
+			cleanupStarted = true
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = filesystemFault
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-restore-binding", "materialize-restore-binding-base",
+		"open-restore-binding",
+	)
+	manifest := declaredStateManifest("content-1")
+	if _, err := first.CommitRuntimeView(context.Background(), commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-restore-binding",
+	)); err != nil {
+		t.Fatalf("commit restore binding Checkpoint: %v", err)
+	}
+	current, err := first.ConfirmTaskWorkspace(
+		context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-restore-binding-current"),
+	)
+	if err != nil {
+		t.Fatalf("confirm restore binding current workspace: %v", err)
+	}
+	recoveryIntent = authorizedCheckpointRestoreIntent(current, "recovery-intent-binding")
+	request := taskworkspace.RestoreTaskWorkspaceRequest{
+		Intent: recoveryIntent, Operation: taskworkspace.Operation{ID: "restore-binding-crash"},
+	}
+	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	armed = true
+	_, err = first.RestoreTaskWorkspace(context.Background(), request)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	inspection, err := first.InspectOperation(context.Background(), taskworkspace.InspectOperationRequest{
+		PolicyDomainID: request.Intent.PolicyDomainID, TaskID: request.Intent.TaskID,
+		OperationID: request.Operation.ID,
+	})
+	if err != nil || inspection.Disposition != taskworkspace.OperationReconciliationRequired ||
+		inspection.RestoreTaskWorkspace != nil {
+		t.Fatalf("restore adapter-pending inspection = %#v, err = %v", inspection, err)
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	restarted := newLocalContractLifecycleAtRoot(t, root, restartedConfig, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = filesystemFault
+	})
+	reconciled, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: request.Intent.PolicyDomainID, TaskID: request.Intent.TaskID,
+		OperationID: request.Operation.ID,
+	})
+	if err != nil || reconciled.Disposition != taskworkspace.OperationTerminal ||
+		reconciled.RestoreTaskWorkspace == nil {
+		t.Fatalf("restore binding reconciliation = %#v, err = %v", reconciled, err)
+	}
+	restored := *reconciled.RestoreTaskWorkspace
+	now = 1_000
+	expire := taskworkspace.ExpireMaterializationRequest{
+		PolicyDomainID: request.Intent.PolicyDomainID, TaskID: request.Intent.TaskID,
+		TaskWorkspaceID: restored.TaskWorkspaceID, MaterializationID: restored.MaterializationID,
+		RevisionID: restored.RevisionID, CheckpointID: restored.CheckpointID,
+		Generation: restored.Generation, Fence: restored.Fence, ExpiryPolicyID: "expiry-policy-1",
+		Operation: taskworkspace.Operation{ID: "expire-reconciled-restore"},
+	}
+	expire.Operation.RequestDigest = expire.CanonicalRequestDigest()
+	if _, err := restarted.ExpireMaterialization(context.Background(), expire); err != nil {
+		t.Fatalf("expire reconciled restore: %v", err)
+	}
+	if !cleanupStarted {
+		t.Fatal("reconciled restore MaterializationID was not bound to its exact local generation")
+	}
+}
+
+func TestLocalFilesystemReconstructionReconciliationBindsExactMaterialization(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	now := taskworkspace.Instant(100)
+	var recoveryIntent taskworkspace.AuthorizedRecoveryIntent
+	reconstruction := &reconstructionInputDouble{}
+	armed := false
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	config.Now = func() taskworkspace.Instant { return now }
+	config.RecoveryAuthorityID = "recovery-authority-1"
+	config.ReconstructionInput = reconstruction
+	config.CurrentRecoveryIntent = func(id taskworkspace.RecoveryIntentID) (taskworkspace.AuthorizedRecoveryIntent, bool) {
+		return recoveryIntent, recoveryIntent.ID == id && id != ""
+	}
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if armed && event.OperationID == "reconstruct-binding-crash" &&
+			event.Point == taskworkspace.FaultBeforeResponse {
+			armed = false
+			return errors.New("simulated reconstruction acknowledgement loss")
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, nil)
+	confirmed, err := first.ConfirmTaskWorkspace(
+		context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-reconstruct-binding"),
+	)
+	if err != nil {
+		t.Fatalf("confirm reconstruction binding workspace: %v", err)
+	}
+	recoveryIntent = authorizedArtifactReconstructionIntent(confirmed, "recovery-intent-reconstruct-binding")
+	request := taskworkspace.ReconstructTaskWorkspaceRequest{
+		Intent: recoveryIntent, Operation: taskworkspace.Operation{ID: "reconstruct-binding-crash"},
+	}
+	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	armed = true
+	_, err = first.ReconstructTaskWorkspace(context.Background(), request)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	inspection, err := first.InspectOperation(context.Background(), taskworkspace.InspectOperationRequest{
+		PolicyDomainID: request.Intent.PolicyDomainID, TaskID: request.Intent.TaskID,
+		OperationID: request.Operation.ID,
+	})
+	if err != nil || inspection.Disposition != taskworkspace.OperationReconciliationRequired ||
+		inspection.ReconstructTaskWorkspace != nil {
+		t.Fatalf("reconstruction adapter-pending inspection = %#v, err = %v", inspection, err)
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	restarted := newLocalContractLifecycleAtRoot(t, root, restartedConfig, nil)
+	reconciled, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: request.Intent.PolicyDomainID, TaskID: request.Intent.TaskID,
+		OperationID: request.Operation.ID,
+	})
+	if err != nil || reconciled.Disposition != taskworkspace.OperationTerminal ||
+		reconciled.ReconstructTaskWorkspace == nil || reconstruction.artifactVerifications != 1 {
+		t.Fatalf("reconstruction binding reconciliation = %#v, err = %v", reconciled, err)
+	}
+	repeated, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: request.Intent.PolicyDomainID, TaskID: request.Intent.TaskID,
+		OperationID: request.Operation.ID,
+	})
+	if err != nil || !reflect.DeepEqual(repeated, reconciled) || reconstruction.artifactVerifications != 1 {
+		t.Fatalf("repeated reconstruction reconciliation = %#v, err = %v", repeated, err)
+	}
+	current, err := restarted.ConfirmTaskWorkspace(
+		context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-reconstruct-bound-current"),
+	)
+	if err != nil {
+		t.Fatalf("confirm reconstructed current workspace: %v", err)
+	}
+	reconstructed := reconciled.ReconstructTaskWorkspace
+	materialized := taskworkspace.MaterializeResult{
+		MaterializationID: reconstructed.MaterializationID,
+		TaskWorkspaceID:   reconstructed.TaskWorkspaceID,
+		RevisionID:        reconstructed.CurrentRevisionID,
+		CheckpointID:      reconstructed.CurrentCheckpointID,
+		Generation:        reconstructed.Generation, Fence: reconstructed.Fence,
+	}
+	if _, err := restarted.OpenRuntimeView(context.Background(), openRuntimeViewRequest(
+		"policy-domain-1", "task-1", current, materialized,
+		"phase-run-1", "runtime-run-1", "sandbox-lease-1",
+		"open-reconciled-reconstruction",
+	)); err != nil {
+		t.Fatalf("open Runtime View from reconciled reconstruction: %v", err)
+	}
+}
+
+func TestLocalFilesystemExpiryReconciliationCompletesExactCleanup(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	now := taskworkspace.Instant(100)
+	armed := false
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	config.Now = func() taskworkspace.Instant { return now }
+	config.ExpiryPolicy = taskworkspace.ExpiryPolicy{
+		ID: "expiry-policy-1", MaterializationLifetime: 10, RuntimeViewLifetime: 100,
+	}
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if armed && event.OperationID == "expire-completion-crash" &&
+			event.Point == taskworkspace.FaultBeforeResponse {
+			armed = false
+			return errors.New("simulated expiry acknowledgement loss")
+		}
+		return nil
+	}
+	cleanupAttempts := 0
+	filesystemFault := func(event taskworkspace.LocalFilesystemFaultEvent) error {
+		if event.OperationID == "expire-completion-crash" &&
+			event.Point == taskworkspace.LocalFaultBeforeCleanup {
+			cleanupAttempts++
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = filesystemFault
+	})
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-expiry-completion", "materialize-expiry-completion-base",
+		"open-expiry-completion",
+	)
+	manifest := declaredStateManifest("content-1")
+	if _, err := first.CommitRuntimeView(context.Background(), commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-expiry-completion",
+	)); err != nil {
+		t.Fatalf("commit expiry completion Checkpoint: %v", err)
+	}
+	current, err := first.ConfirmTaskWorkspace(
+		context.Background(), confirmRequest("policy-domain-1", "task-1", "confirm-expiry-completion-current"),
+	)
+	if err != nil {
+		t.Fatalf("confirm expiry completion current workspace: %v", err)
+	}
+	materialized, err := first.Materialize(context.Background(), materializeRequest(
+		"policy-domain-1", "task-1", current, "materialize-expiry-completion-current",
+	))
+	if err != nil {
+		t.Fatalf("materialize expiry completion Checkpoint: %v", err)
+	}
+	now = 1_000
+	request := expireMaterializationRequest(current, materialized, "expire-completion-crash")
+	armed = true
+	_, err = first.ExpireMaterialization(context.Background(), request)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	inspection, err := first.InspectOperation(context.Background(), taskworkspace.InspectOperationRequest{
+		PolicyDomainID: request.PolicyDomainID, TaskID: request.TaskID, OperationID: request.Operation.ID,
+	})
+	if err != nil || inspection.Disposition != taskworkspace.OperationReconciliationRequired ||
+		inspection.ExpireMaterialization != nil || cleanupAttempts != 0 {
+		t.Fatalf("expiry adapter-pending inspection = %#v, cleanup attempts = %d, err = %v",
+			inspection, cleanupAttempts, err)
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	restarted := newLocalContractLifecycleAtRoot(t, root, restartedConfig, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = filesystemFault
+	})
+	reconciled, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: request.PolicyDomainID, TaskID: request.TaskID, OperationID: request.Operation.ID,
+	})
+	if err != nil || reconciled.Disposition != taskworkspace.OperationTerminal ||
+		reconciled.ExpireMaterialization == nil || cleanupAttempts != 1 {
+		t.Fatalf("expiry cleanup reconciliation = %#v, cleanup attempts = %d, err = %v",
+			reconciled, cleanupAttempts, err)
+	}
+	repeated, err := restarted.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: request.PolicyDomainID, TaskID: request.TaskID, OperationID: request.Operation.ID,
+	})
+	if err != nil || !reflect.DeepEqual(repeated, reconciled) || cleanupAttempts != 1 {
+		t.Fatalf("repeated expiry reconciliation = %#v, cleanup attempts = %d, err = %v",
+			repeated, cleanupAttempts, err)
 	}
 }
 

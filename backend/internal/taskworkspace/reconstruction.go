@@ -305,8 +305,9 @@ func (m *inMemory) ReconstructTaskWorkspace(
 	request ReconstructTaskWorkspaceRequest,
 ) (ReconstructTaskWorkspaceResult, error) {
 	intent := cloneAuthorizedRecoveryIntent(request.Intent)
-	if !authorizedArtifactReconstructionIntentIsCanonical(intent) || request.Operation.ID == "" ||
-		request.Operation.RequestDigest != request.CanonicalRequestDigest() {
+	if !validReconstructTaskWorkspaceRequest(ReconstructTaskWorkspaceRequest{
+		Intent: intent, Operation: request.Operation,
+	}) {
 		return ReconstructTaskWorkspaceResult{}, &Error{Code: ErrorInvalidIntent}
 	}
 
@@ -456,6 +457,11 @@ func (m *inMemory) ReconstructTaskWorkspace(
 		return ReconstructTaskWorkspaceResult{}, err
 	}
 	return deliverOperationResponse(m, request.Operation.ID, result)
+}
+
+func validReconstructTaskWorkspaceRequest(request ReconstructTaskWorkspaceRequest) bool {
+	return authorizedArtifactReconstructionIntentIsCanonical(request.Intent) &&
+		request.Operation.ID != "" && request.Operation.RequestDigest == request.CanonicalRequestDigest()
 }
 
 func authorizedArtifactReconstructionIntentIsCanonical(intent AuthorizedRecoveryIntent) bool {

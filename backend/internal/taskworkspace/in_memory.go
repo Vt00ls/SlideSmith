@@ -525,11 +525,7 @@ func sandboxLeaseAuthorityIsCanonical(authority SandboxLeaseAuthority) bool {
 }
 
 func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeViewRequest) (CommitRuntimeViewResult, error) {
-	if request.PolicyDomainID == "" || request.TaskID == "" || request.TaskWorkspaceID == "" ||
-		request.RuntimeViewID == "" || request.RuntimeOperationID == "" || request.SandboxLeaseAuthority.ID == "" ||
-		request.BaseRevisionID == "" || request.ExpectedCurrentRevision == "" ||
-		request.Generation == 0 || request.Fence == 0 || request.Operation.ID == "" ||
-		request.Operation.RequestDigest != request.CanonicalRequestDigest() {
+	if !validCommitRuntimeViewRequest(request) {
 		return CommitRuntimeViewResult{}, &Error{Code: ErrorInvalidIntent}
 	}
 	m.beforeRuntimeViewTerminal(RuntimeViewTerminalAttempt{
@@ -807,6 +803,14 @@ func (m *inMemory) CommitRuntimeView(ctx context.Context, request CommitRuntimeV
 		return CommitRuntimeViewResult{}, err
 	}
 	return deliverOperationResponse(m, request.Operation.ID, result)
+}
+
+func validCommitRuntimeViewRequest(request CommitRuntimeViewRequest) bool {
+	return request.PolicyDomainID != "" && request.TaskID != "" && request.TaskWorkspaceID != "" &&
+		request.RuntimeViewID != "" && request.RuntimeOperationID != "" && request.SandboxLeaseAuthority.ID != "" &&
+		request.BaseRevisionID != "" && request.ExpectedCurrentRevision != "" &&
+		request.Generation != 0 && request.Fence != 0 && request.Operation.ID != "" &&
+		request.Operation.RequestDigest == request.CanonicalRequestDigest()
 }
 
 func (m *inMemory) beforeRuntimeViewTerminal(attempt RuntimeViewTerminalAttempt) {
@@ -1468,9 +1472,7 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if request.PolicyDomainID == "" || request.TaskID == "" || request.TaskWorkspaceID == "" ||
-		request.RevisionID == "" || request.Generation == 0 || request.Fence == 0 ||
-		request.Operation.ID == "" || request.Operation.RequestDigest != request.CanonicalRequestDigest() {
+	if !validMaterializeRequest(request) {
 		return MaterializeResult{}, &Error{Code: ErrorInvalidIntent}
 	}
 	scope := operationScope{request.PolicyDomainID, request.TaskID, request.Operation.ID}
@@ -1594,6 +1596,12 @@ func (m *inMemory) Materialize(ctx context.Context, request MaterializeRequest) 
 	}
 	recordOperation(m.operations, m.now(), scope, request.Operation, result, nil)
 	return deliverOperationResponse(m, request.Operation.ID, result)
+}
+
+func validMaterializeRequest(request MaterializeRequest) bool {
+	return request.PolicyDomainID != "" && request.TaskID != "" && request.TaskWorkspaceID != "" &&
+		request.RevisionID != "" && request.Generation != 0 && request.Fence != 0 &&
+		request.Operation.ID != "" && request.Operation.RequestDigest == request.CanonicalRequestDigest()
 }
 
 func confirmResult(binding workspaceBinding) ConfirmTaskWorkspaceResult {

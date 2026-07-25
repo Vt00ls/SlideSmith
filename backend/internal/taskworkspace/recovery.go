@@ -123,8 +123,7 @@ func (m *inMemory) RestoreTaskWorkspace(
 	request RestoreTaskWorkspaceRequest,
 ) (RestoreTaskWorkspaceResult, error) {
 	intent := cloneAuthorizedRecoveryIntent(request.Intent)
-	if !authorizedCheckpointRestoreIntentIsCanonical(intent) ||
-		request.Operation.ID == "" || request.Operation.RequestDigest != request.CanonicalRequestDigest() {
+	if !validRestoreTaskWorkspaceRequest(RestoreTaskWorkspaceRequest{Intent: intent, Operation: request.Operation}) {
 		return RestoreTaskWorkspaceResult{}, &Error{Code: ErrorInvalidIntent}
 	}
 
@@ -298,6 +297,11 @@ func (m *inMemory) RestoreTaskWorkspace(
 		return RestoreTaskWorkspaceResult{}, err
 	}
 	return deliverOperationResponse(m, request.Operation.ID, result)
+}
+
+func validRestoreTaskWorkspaceRequest(request RestoreTaskWorkspaceRequest) bool {
+	return authorizedCheckpointRestoreIntentIsCanonical(request.Intent) &&
+		request.Operation.ID != "" && request.Operation.RequestDigest == request.CanonicalRequestDigest()
 }
 
 func authorizedCheckpointRestoreIntentIsCanonical(intent AuthorizedRecoveryIntent) bool {
