@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"syscall"
@@ -1617,6 +1618,116 @@ func TestLocalFilesystemExpiryFailsClosedWhenCleanupDebtCannotBePersisted(t *tes
 	}
 	if len(persistence.cleanupDebts) != 0 {
 		t.Fatal("failing Cleanup Debt adapter unexpectedly persisted an expiry obligation")
+	}
+}
+
+func TestLocalFilesystemExpiryDebtRegistrationAmbiguityReconcilesWithoutDuplicateDebt(t *testing.T) {
+	store, rootName := newLocalStoreForTest(t)
+	persistence := NewInMemoryPersistence()
+	authority := localSandboxAuthorityForTest()
+	now := Instant(100)
+	config := InMemoryConfig{
+		ValidationAuthorityID: "validation-authority-1", DurabilityAuthorityID: "durability-authority-1",
+		DurableObject: store, CheckpointReclamation: store, Cleanup: store, Persistence: persistence,
+		SandboxLeaseAuthorityID:        "sandbox-authority-1",
+		CurrentSandboxLeaseAuthorities: []SandboxLeaseAuthority{authority},
+		Now:                            func() Instant { return now },
+		ExpiryPolicy: ExpiryPolicy{
+			ID: "test-expiry-policy", MaterializationLifetime: 10, RuntimeViewLifetime: 100,
+		},
+	}
+	lifecycle := &localFilesystemLifecycle{Lifecycle: NewInMemory(config), store: store}
+	confirmed := localConfirmForTest(t, lifecycle)
+	base := localMaterializeForTest(t, lifecycle, confirmed)
+	view := localOpenViewForTest(t, lifecycle, confirmed, base, authority)
+	manifest := localPrepareRequestForTest("unused-manifest-source", false).Manifest
+	if _, err := lifecycle.CommitRuntimeView(context.Background(), localCommitForTest(
+		confirmed, view, authority, manifest, "commit-before-expiry-debt-registration-ambiguity",
+	)); err != nil {
+		t.Fatalf("commit Checkpoint: %v", err)
+	}
+	current := localConfirmForTestWithOperation(t, lifecycle, "confirm-before-expiry-debt-registration-ambiguity")
+	materialize := MaterializeRequest{
+		PolicyDomainID: "policy-domain-1", TaskID: "task-1", TaskWorkspaceID: current.TaskWorkspaceID,
+		RevisionID: current.CurrentRevisionID, CheckpointID: current.CurrentCheckpointID,
+		Generation: current.Generation, Fence: current.Fence,
+		Operation: Operation{ID: "materialize-before-expiry-debt-registration-ambiguity"},
+	}
+	materialize.Operation.RequestDigest = materialize.CanonicalRequestDigest()
+	materialized, err := lifecycle.Materialize(context.Background(), materialize)
+	if err != nil {
+		t.Fatalf("materialize committed Checkpoint: %v", err)
+	}
+
+	now = 111
+	expire := ExpireMaterializationRequest{
+		PolicyDomainID: "policy-domain-1", TaskID: "task-1", TaskWorkspaceID: current.TaskWorkspaceID,
+		MaterializationID: materialized.MaterializationID, RevisionID: current.CurrentRevisionID,
+		CheckpointID: current.CurrentCheckpointID, Generation: current.Generation, Fence: current.Fence,
+		ExpiryPolicyID: "test-expiry-policy", Operation: Operation{ID: "expire-debt-registration-ambiguity"},
+	}
+	expire.Operation.RequestDigest = expire.CanonicalRequestDigest()
+	registrationFaulted := false
+	store.fault = func(event LocalFilesystemFaultEvent) error {
+		if event.OperationID != expire.Operation.ID {
+			return nil
+		}
+		if event.Point == LocalFaultBeforeCleanup {
+			return errors.New("cleanup result ambiguous")
+		}
+		if !registrationFaulted && event.Point == LocalFaultAfterCompletionMutation && event.Ordinal == 0 {
+			registrationFaulted = true
+			return errors.New("crash after Cleanup Debt registration mutation")
+		}
+		return nil
+	}
+
+	result, err := lifecycle.ExpireMaterialization(context.Background(), expire)
+	assertLocalLifecycleError(t, err, ErrorReconciliationRequired)
+	if result.MaterializationID != "" || !registrationFaulted || len(persistence.cleanupDebts) != 1 {
+		t.Fatalf("debt registration ambiguity = %#v, faulted = %t, debts = %d",
+			result, registrationFaulted, len(persistence.cleanupDebts))
+	}
+	inspection, err := lifecycle.InspectOperation(context.Background(), InspectOperationRequest{
+		PolicyDomainID: expire.PolicyDomainID, TaskID: expire.TaskID, OperationID: expire.Operation.ID,
+	})
+	if err != nil || inspection.Disposition != OperationReconciliationRequired ||
+		inspection.ExpireMaterialization != nil {
+		t.Fatalf("ambiguous debt registration inspection = %#v, err = %v", inspection, err)
+	}
+
+	restartedStore := restartLocalStoreForTest(t, rootName)
+	restartedStore.fault = func(event LocalFilesystemFaultEvent) error {
+		if event.OperationID == expire.Operation.ID && event.Point == LocalFaultBeforeCleanup {
+			return errors.New("cleanup remains ambiguous")
+		}
+		return nil
+	}
+	restartedConfig := config
+	restartedConfig.DurableObject = restartedStore
+	restartedConfig.CheckpointReclamation = restartedStore
+	restartedConfig.Cleanup = restartedStore
+	restarted := &localFilesystemLifecycle{Lifecycle: NewInMemory(restartedConfig), store: restartedStore}
+	reconciled, err := restarted.ReconcileOperation(context.Background(), ReconcileOperationRequest{
+		PolicyDomainID: expire.PolicyDomainID, TaskID: expire.TaskID, OperationID: expire.Operation.ID,
+	})
+	if err != nil || reconciled.Disposition != OperationTerminal ||
+		reconciled.ExpireMaterialization == nil || len(persistence.cleanupDebts) != 1 ||
+		len(restartedStore.state.CleanupResources) != 1 {
+		t.Fatalf("debt registration reconciliation = %#v, debts = %d, resources = %d, err = %v",
+			reconciled, len(persistence.cleanupDebts), len(restartedStore.state.CleanupResources), err)
+	}
+	for _, resource := range restartedStore.state.CleanupResources {
+		if !resource.DebtRegistered {
+			t.Fatal("reconciliation reported terminal before the Cleanup Debt marker was durable")
+		}
+	}
+	repeated, err := restarted.ReconcileOperation(context.Background(), ReconcileOperationRequest{
+		PolicyDomainID: expire.PolicyDomainID, TaskID: expire.TaskID, OperationID: expire.Operation.ID,
+	})
+	if err != nil || !reflect.DeepEqual(repeated, reconciled) || len(persistence.cleanupDebts) != 1 {
+		t.Fatalf("repeated debt registration reconciliation = %#v, debts = %d, err = %v",
+			repeated, len(persistence.cleanupDebts), err)
 	}
 }
 

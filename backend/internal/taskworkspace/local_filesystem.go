@@ -52,6 +52,8 @@ const (
 	LocalFaultAfterCleanupPrepare          LocalFilesystemFaultPoint = "after_cleanup_prepare"
 	LocalFaultBeforeCleanupEntryRemove     LocalFilesystemFaultPoint = "before_cleanup_entry_remove"
 	LocalFaultAfterCleanup                 LocalFilesystemFaultPoint = "after_cleanup"
+	LocalFaultAfterCompletionMutation      LocalFilesystemFaultPoint = "after_completion_mutation"
+	LocalFaultAfterCompletionPersistence   LocalFilesystemFaultPoint = "after_completion_persistence"
 )
 
 // LocalFilesystemFaultEvent contains only opaque authority identities. It is
@@ -133,140 +135,60 @@ type localWorkspaceAuthorityReader interface {
 	) (Generation, Fence, bool)
 }
 
-type localResidueAuthority struct {
-	policyDomainID  PolicyDomainID
-	taskID          TaskID
-	taskWorkspaceID TaskWorkspaceID
-	generation      Generation
-	fence           Fence
-	operationID     OperationID
-}
-
 func (l *localFilesystemLifecycle) Materialize(
 	ctx context.Context,
 	request MaterializeRequest,
 ) (MaterializeResult, error) {
-	result, err := l.Lifecycle.Materialize(ctx, request)
-	outcomeErr := l.finishMaterialization(ctx, localResidueAuthority{
-		policyDomainID: request.PolicyDomainID, taskID: request.TaskID,
-		taskWorkspaceID: request.TaskWorkspaceID, generation: request.Generation,
-		fence: request.Fence, operationID: request.Operation.ID,
-	}, localMaterializationAuthority{
-		OperationID: request.Operation.ID, MaterializationID: result.MaterializationID,
-		PolicyDomainID: request.PolicyDomainID, TaskID: request.TaskID,
-		TaskWorkspaceID: request.TaskWorkspaceID, Generation: request.Generation,
-		Fence: request.Fence, PhysicalRequired: request.CheckpointID != "",
-	}, err)
-	if outcomeErr != nil {
-		return result, outcomeErr
-	}
-	return result, nil
+	return runLocalCompoundOperation(
+		ctx, l, validMaterializeRequest(request), localMaterializeCompletionIntent(request), true,
+		func() (MaterializeResult, error) { return l.Lifecycle.Materialize(ctx, request) },
+	)
 }
 
 func (l *localFilesystemLifecycle) RestoreTaskWorkspace(
 	ctx context.Context,
 	request RestoreTaskWorkspaceRequest,
 ) (RestoreTaskWorkspaceResult, error) {
-	result, err := l.Lifecycle.RestoreTaskWorkspace(ctx, request)
-	outcomeErr := l.finishMaterialization(ctx, localResidueAuthority{
-		policyDomainID: request.Intent.PolicyDomainID, taskID: request.Intent.TaskID,
-		taskWorkspaceID: request.Intent.TaskWorkspaceID, generation: request.Intent.Generation,
-		fence: request.Intent.Fence, operationID: request.Operation.ID,
-	}, localMaterializationAuthority{
-		OperationID: request.Operation.ID, MaterializationID: result.MaterializationID,
-		PolicyDomainID: request.Intent.PolicyDomainID, TaskID: request.Intent.TaskID,
-		TaskWorkspaceID: result.TaskWorkspaceID, Generation: result.Generation,
-		Fence: result.Fence, PhysicalRequired: result.CheckpointID != "",
-	}, err)
-	if outcomeErr != nil {
-		return result, outcomeErr
-	}
-	return result, nil
+	return runLocalCompoundOperation(
+		ctx, l, validRestoreTaskWorkspaceRequest(request), localRestoreCompletionIntent(request), true,
+		func() (RestoreTaskWorkspaceResult, error) {
+			return l.Lifecycle.RestoreTaskWorkspace(ctx, request)
+		},
+	)
 }
 
 func (l *localFilesystemLifecycle) ReconstructTaskWorkspace(
 	ctx context.Context,
 	request ReconstructTaskWorkspaceRequest,
 ) (ReconstructTaskWorkspaceResult, error) {
-	result, err := l.Lifecycle.ReconstructTaskWorkspace(ctx, request)
-	outcomeErr := l.finishMaterialization(ctx, localResidueAuthority{
-		policyDomainID: request.Intent.PolicyDomainID, taskID: request.Intent.TaskID,
-		taskWorkspaceID: request.Intent.TaskWorkspaceID, generation: request.Intent.Generation,
-		fence: request.Intent.Fence, operationID: request.Operation.ID,
-	}, localMaterializationAuthority{
-		OperationID: request.Operation.ID, MaterializationID: result.MaterializationID,
-		PolicyDomainID: request.Intent.PolicyDomainID, TaskID: request.Intent.TaskID,
-		TaskWorkspaceID: result.TaskWorkspaceID, Generation: result.Generation,
-		Fence: result.Fence,
-	}, err)
-	if outcomeErr != nil {
-		return result, outcomeErr
-	}
-	return result, nil
-}
-
-func (l *localFilesystemLifecycle) finishMaterialization(
-	ctx context.Context,
-	residueAuthority localResidueAuthority,
-	materializationAuthority localMaterializationAuthority,
-	lifecycleErr error,
-) error {
-	if lifecycleErr != nil {
-		if debtErr := l.createFailureResidueDebts(
-			ctx, residueAuthority.policyDomainID, residueAuthority.taskID,
-			residueAuthority.taskWorkspaceID, residueAuthority.generation,
-			residueAuthority.fence, residueAuthority.operationID,
-		); debtErr != nil {
-			return &Error{Code: ErrorReconciliationRequired}
-		}
-		return lifecycleErr
-	}
-	if err := l.store.bindMaterialization(materializationAuthority); err != nil {
-		return &Error{Code: ErrorReconciliationRequired}
-	}
-	return nil
+	return runLocalCompoundOperation(
+		ctx, l, validReconstructTaskWorkspaceRequest(request), localReconstructCompletionIntent(request), true,
+		func() (ReconstructTaskWorkspaceResult, error) {
+			return l.Lifecycle.ReconstructTaskWorkspace(ctx, request)
+		},
+	)
 }
 
 func (l *localFilesystemLifecycle) CommitRuntimeView(
 	ctx context.Context,
 	request CommitRuntimeViewRequest,
 ) (CommitRuntimeViewResult, error) {
-	result, err := l.Lifecycle.CommitRuntimeView(ctx, request)
-	if err != nil {
-		if debtErr := l.createFailureResidueDebts(ctx, request.PolicyDomainID, request.TaskID,
-			request.TaskWorkspaceID, request.Generation, request.Fence, request.Operation.ID); debtErr != nil {
-			return CommitRuntimeViewResult{}, &Error{Code: ErrorReconciliationRequired}
-		}
-		return result, err
-	}
-	if err := l.store.activateCheckpoint(request.Operation.ID, result.CheckpointEvidence); err != nil {
-		_ = l.createFailureResidueDebts(ctx, request.PolicyDomainID, request.TaskID,
-			request.TaskWorkspaceID, request.Generation, request.Fence, request.Operation.ID)
-		return CommitRuntimeViewResult{}, &Error{Code: ErrorReconciliationRequired}
-	}
-	return result, nil
+	return runLocalCompoundOperation(
+		ctx, l, validCommitRuntimeViewRequest(request), localCommitCompletionIntent(request), true,
+		func() (CommitRuntimeViewResult, error) { return l.Lifecycle.CommitRuntimeView(ctx, request) },
+	)
 }
 
 func (l *localFilesystemLifecycle) ExpireMaterialization(
 	ctx context.Context,
 	request ExpireMaterializationRequest,
 ) (ExpireMaterializationResult, error) {
-	result, err := l.Lifecycle.ExpireMaterialization(ctx, request)
-	if err != nil {
-		return result, err
-	}
-	residue, cleanupErr := l.store.expireMaterialization(request)
-	if cleanupErr != nil {
-		if residue == nil {
-			return ExpireMaterializationResult{}, &Error{Code: ErrorReconciliationRequired}
-		}
-		if debtErr := l.createResidueDebt(ctx, request.PolicyDomainID, request.TaskID, request.TaskWorkspaceID,
-			request.Generation, request.Fence, request.Operation.ID, *residue,
-			CleanupTaskWorkspaceMaterialization); debtErr != nil {
-			return ExpireMaterializationResult{}, &Error{Code: ErrorReconciliationRequired}
-		}
-	}
-	return result, nil
+	return runLocalCompoundOperation(
+		ctx, l, validExpireMaterializationRequest(request), localExpireCompletionIntent(request), false,
+		func() (ExpireMaterializationResult, error) {
+			return l.Lifecycle.ExpireMaterialization(ctx, request)
+		},
+	)
 }
 
 func (l *localFilesystemLifecycle) createFailureResidueDebts(
@@ -334,7 +256,7 @@ func (l *localFilesystemLifecycle) createResidueDebt(
 	if _, err := l.Lifecycle.CreateCleanupObligation(ctx, request); err != nil {
 		return &Error{Code: ErrorReconciliationRequired}
 	}
-	if err := l.store.markCleanupDebtRegistered(residue.id, residue.generation); err != nil {
+	if err := l.store.markCleanupDebtRegistered(residue.id, residue.generation, causeOperationID); err != nil {
 		return &Error{Code: ErrorReconciliationRequired}
 	}
 	return nil

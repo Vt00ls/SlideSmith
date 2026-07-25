@@ -149,10 +149,7 @@ func (m *inMemory) ExpireMaterialization(
 	ctx context.Context,
 	request ExpireMaterializationRequest,
 ) (ExpireMaterializationResult, error) {
-	if request.PolicyDomainID == "" || request.TaskID == "" || request.TaskWorkspaceID == "" ||
-		request.MaterializationID == "" || request.RevisionID == "" || request.Generation == 0 ||
-		request.Fence == 0 || request.ExpiryPolicyID == "" || request.Operation.ID == "" ||
-		request.Operation.RequestDigest != request.CanonicalRequestDigest() {
+	if !validExpireMaterializationRequest(request) {
 		return ExpireMaterializationResult{}, &Error{Code: ErrorInvalidIntent}
 	}
 
@@ -246,6 +243,13 @@ func (m *inMemory) ExpireMaterialization(
 		return ExpireMaterializationResult{}, err
 	}
 	return deliverOperationResponse(m, request.Operation.ID, result)
+}
+
+func validExpireMaterializationRequest(request ExpireMaterializationRequest) bool {
+	return request.PolicyDomainID != "" && request.TaskID != "" && request.TaskWorkspaceID != "" &&
+		request.MaterializationID != "" && request.RevisionID != "" && request.Generation != 0 &&
+		request.Fence != 0 && request.ExpiryPolicyID != "" && request.Operation.ID != "" &&
+		request.Operation.RequestDigest == request.CanonicalRequestDigest()
 }
 
 func (m *inMemory) ExpireRuntimeView(

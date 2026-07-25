@@ -22,6 +22,7 @@ func TestTaskWorkspaceLifecycleExternalContract(t *testing.T) {
 
 func runLifecycleAdapterExternalContract(t *testing.T, adapter lifecycleContractAdapter) {
 	t.Helper()
+	runLifecycleInvalidCompoundIntentContract(t, adapter)
 	runLifecycleIdentityCommitAndTerminalContract(t, adapter)
 	runLifecycleIntegrityContract(t, adapter)
 	runLifecycleResponseLossReconciliationContract(t, adapter)
@@ -34,6 +35,30 @@ func runLifecycleAdapterExternalContract(t *testing.T, adapter lifecycleContract
 	runLifecycleAmbiguousCleanupRetryContract(t, adapter)
 	runLifecycleMandatoryAuditContract(t, adapter)
 	runLifecycleProjectionAndNonLeakageContract(t, adapter)
+}
+
+func runLifecycleInvalidCompoundIntentContract(t *testing.T, adapter lifecycleContractAdapter) {
+	t.Helper()
+	t.Run("invalid compound intent is rejected before journaling", func(t *testing.T) {
+		lifecycle := adapter.new(t)
+		confirmed, view := openRuntimeViewWithLifecycle(
+			t, lifecycle, "task-1", "confirm-invalid-compound-contract",
+			"materialize-invalid-compound-contract", "open-invalid-compound-contract",
+		)
+		manifest := declaredStateManifest("content-1")
+		request := commitRequest(
+			confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+			"commit-invalid-compound-contract",
+		)
+		request.RuntimeViewID = ""
+		request.Operation.RequestDigest = request.CanonicalRequestDigest()
+		_, err := lifecycle.CommitRuntimeView(context.Background(), request)
+		assertLifecycleErrorCode(t, err, taskworkspace.ErrorInvalidIntent)
+		_, err = lifecycle.InspectOperation(context.Background(), taskworkspace.InspectOperationRequest{
+			PolicyDomainID: request.PolicyDomainID, TaskID: request.TaskID, OperationID: request.Operation.ID,
+		})
+		assertLifecycleErrorCode(t, err, taskworkspace.ErrorInvalidIntent)
+	})
 }
 
 func runLifecycleAmbiguousCleanupRetryContract(t *testing.T, adapter lifecycleContractAdapter) {
@@ -295,12 +320,33 @@ func runLifecycleResponseLossReconciliationContract(t *testing.T, adapter lifecy
 			PolicyDomainID: request.PolicyDomainID, TaskID: request.TaskID,
 			OperationID: request.Operation.ID,
 		})
-		if err != nil || inspection.Disposition != taskworkspace.OperationTerminal ||
-			inspection.CommitRuntimeView == nil {
+		if err != nil || inspection.Disposition != taskworkspace.OperationTerminal &&
+			inspection.Disposition != taskworkspace.OperationReconciliationRequired {
 			t.Fatalf("response-loss inspection = %#v, err = %v", inspection, err)
 		}
+		reconciled, err := lifecycle.ReconcileOperation(context.Background(), taskworkspace.ReconcileOperationRequest{
+			PolicyDomainID: request.PolicyDomainID, TaskID: request.TaskID,
+			OperationID: request.Operation.ID,
+		})
+		if err != nil || reconciled.Disposition != taskworkspace.OperationTerminal ||
+			reconciled.CommitRuntimeView == nil {
+			t.Fatalf("response-loss reconciliation = %#v, err = %v", reconciled, err)
+		}
+		current, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+			"policy-domain-1", "task-1", "confirm-response-loss-current-contract",
+		))
+		if err != nil {
+			t.Fatalf("confirm response-loss current workspace: %v", err)
+		}
+		materialized, err := lifecycle.Materialize(context.Background(), materializeRequest(
+			"policy-domain-1", "task-1", current, "materialize-response-loss-reconciled-contract",
+		))
+		if err != nil || materialized.CheckpointID != reconciled.CommitRuntimeView.CheckpointID ||
+			materialized.RevisionID != reconciled.CommitRuntimeView.RevisionID {
+			t.Fatalf("materialize immediately after commit reconciliation = %#v, err = %v", materialized, err)
+		}
 		replayed, err := lifecycle.CommitRuntimeView(context.Background(), request)
-		if err != nil || !reflect.DeepEqual(replayed, *inspection.CommitRuntimeView) ||
+		if err != nil || !reflect.DeepEqual(replayed, *reconciled.CommitRuntimeView) ||
 			replayed.RevisionID == "" || replayed.CheckpointID == "" {
 			t.Fatalf("response-loss replay = %#v, err = %v", replayed, err)
 		}

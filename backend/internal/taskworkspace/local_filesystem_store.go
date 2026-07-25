@@ -60,6 +60,7 @@ type localFilesystemState struct {
 	CleanupTreeClaims    map[string]localCleanupTreeClaim                             `json:"cleanup_tree_claims"`
 	CleanupInspections   map[OperationID]CleanupInspectionEvidence                    `json:"cleanup_inspections"`
 	CleanupAttempts      map[OperationID]CleanupAttemptEvidence                       `json:"cleanup_attempts"`
+	Completions          map[string]localCompletionRecord                             `json:"completions"`
 }
 
 type localPreparedCheckpointRecord struct {
@@ -256,6 +257,9 @@ func (s *localFilesystemStore) initializeState() {
 	}
 	if s.state.CleanupAttempts == nil {
 		s.state.CleanupAttempts = make(map[OperationID]CleanupAttemptEvidence)
+	}
+	if s.state.Completions == nil {
+		s.state.Completions = make(map[string]localCompletionRecord)
 	}
 }
 
@@ -1438,6 +1442,11 @@ func (s *localFilesystemStore) bindMaterialization(authority localMaterializatio
 	record.MaterializationID = authority.MaterializationID
 	s.state.Materializations[authority.OperationID] = record
 	s.state.MaterializationIDs[authority.MaterializationID] = authority.OperationID
+	if err := s.inject(LocalFaultAfterCompletionMutation, LocalFilesystemFaultEvent{
+		OperationID: authority.OperationID, SubjectID: string(authority.MaterializationID),
+	}); err != nil {
+		return ErrDurableObjectResultAmbiguous
+	}
 	return s.persistState()
 }
 
@@ -1497,6 +1506,11 @@ func (s *localFilesystemStore) activateCheckpoint(
 	}
 	prepared.Activated = true
 	s.state.PreparedCheckpoints[operationID] = prepared
+	if err := s.inject(LocalFaultAfterCompletionMutation, LocalFilesystemFaultEvent{
+		OperationID: operationID, SubjectID: string(evidence.IntegrityEvidence.CheckpointID),
+	}); err != nil {
+		return ErrDurableObjectResultAmbiguous
+	}
 	if err := s.persistState(); err != nil {
 		return ErrDurableObjectResultAmbiguous
 	}
@@ -1519,7 +1533,11 @@ func (s *localFilesystemStore) failureResidues(operationID OperationID) []localF
 	return result
 }
 
-func (s *localFilesystemStore) markCleanupDebtRegistered(id string, generation string) error {
+func (s *localFilesystemStore) markCleanupDebtRegistered(
+	id string,
+	generation string,
+	causeOperationID OperationID,
+) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resource, ok := s.state.CleanupResources[id]
@@ -1528,6 +1546,11 @@ func (s *localFilesystemStore) markCleanupDebtRegistered(id string, generation s
 	}
 	resource.DebtRegistered = true
 	s.state.CleanupResources[id] = resource
+	if err := s.inject(LocalFaultAfterCompletionMutation, LocalFilesystemFaultEvent{
+		OperationID: causeOperationID, SubjectID: id,
+	}); err != nil {
+		return ErrDurableObjectResultAmbiguous
+	}
 	return s.persistState()
 }
 
