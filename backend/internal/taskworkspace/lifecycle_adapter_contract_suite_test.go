@@ -27,6 +27,7 @@ func runLifecycleAdapterExternalContract(t *testing.T, adapter lifecycleContract
 	runLifecycleIdentityCommitAndTerminalContract(t, adapter)
 	runLifecycleIntegrityContract(t, adapter)
 	runLifecycleResponseLossReconciliationContract(t, adapter)
+	runLifecycleContinuedReconcileFailureContract(t, adapter)
 	runLifecycleOwnershipAndFenceContract(t, adapter)
 	runLifecycleExpiryAndRestoreContract(t, adapter)
 	runLifecycleReconstructionContract(t, adapter)
@@ -40,6 +41,95 @@ func runLifecycleAdapterExternalContract(t *testing.T, adapter lifecycleContract
 	runLifecycleProjectionPanicNormalizationContract(t, adapter)
 	runLifecycleTelemetryFailureAuthorityContract(t, adapter)
 	runLifecycleTelemetryPanicRetryContract(t, adapter)
+}
+
+func runLifecycleContinuedReconcileFailureContract(t *testing.T, adapter lifecycleContractAdapter) {
+	t.Helper()
+	t.Run("continued reconcile failure stays closed and exact retry completes once", func(t *testing.T) {
+		const canary = "host=/private/c04-canary session=session-c04-canary mount=/mnt/c04-canary " +
+			"bucket=bucket-c04-canary locator=object-c04-canary vendor=vendor-c04-canary " +
+			"credential=credential-c04-canary content=user-content-c04-canary"
+		failures := 0
+		config := taskworkspaceTestConfig(nil)
+		config.FaultHook = func(event taskworkspace.FaultEvent) error {
+			if event.OperationID == "commit-continued-reconcile-contract" &&
+				event.Point == taskworkspace.FaultBeforeAuthoritativeTransaction && failures < 2 {
+				failures++
+				return errors.New(canary)
+			}
+			return nil
+		}
+		lifecycle := adapter.newConfigured(t, config)
+		confirmed, view := openRuntimeViewWithLifecycle(
+			t, lifecycle, "task-1", "confirm-continued-reconcile-contract",
+			"materialize-continued-reconcile-contract", "open-continued-reconcile-contract",
+		)
+		manifest := declaredStateManifest("content-1")
+		commit := commitRequest(
+			confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+			"commit-continued-reconcile-contract",
+		)
+		_, err := lifecycle.CommitRuntimeView(context.Background(), commit)
+		assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+		if failures != 1 {
+			t.Fatalf("initial operation failures = %d, want 1", failures)
+		}
+
+		reconcile := taskworkspace.ReconcileOperationRequest{
+			PolicyDomainID: commit.PolicyDomainID,
+			TaskID:         commit.TaskID,
+			OperationID:    commit.Operation.ID,
+		}
+		pending, err := lifecycle.ReconcileOperation(context.Background(), reconcile)
+		assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+		failure := err.(*taskworkspace.Error)
+		if failures != 2 || failure.Retryable() || !failure.ReconciliationRequired() ||
+			failure.SafeCategory() != taskworkspace.SafeErrorReconciliationRequired {
+			t.Fatalf("continued reconcile semantics = %#v, failures=%d, err=%#v", pending, failures, failure)
+		}
+		inspected, inspectErr := lifecycle.InspectOperation(context.Background(), taskworkspace.InspectOperationRequest{
+			PolicyDomainID: reconcile.PolicyDomainID,
+			TaskID:         reconcile.TaskID,
+			OperationID:    reconcile.OperationID,
+		})
+		if inspectErr != nil || inspected.Disposition != taskworkspace.OperationReconciliationRequired {
+			t.Fatalf("continued reconcile disposition = %#v, err=%v", inspected, inspectErr)
+		}
+		encoded, marshalErr := json.Marshal(struct {
+			Returned  taskworkspace.OperationInspection
+			Inspected taskworkspace.OperationInspection
+			Error     string
+		}{pending, inspected, fmt.Sprintf("%v | %+v", err, err)})
+		if marshalErr != nil {
+			t.Fatalf("marshal continued reconcile evidence: %v", marshalErr)
+		}
+		for _, forbidden := range strings.Fields(canary) {
+			if strings.Contains(string(encoded), forbidden) {
+				t.Fatalf("continued reconcile evidence leaked %q: %s", forbidden, encoded)
+			}
+		}
+
+		terminal, err := lifecycle.ReconcileOperation(context.Background(), reconcile)
+		if err != nil || terminal.Disposition != taskworkspace.OperationTerminal ||
+			terminal.CommitRuntimeView == nil {
+			t.Fatalf("exact continued reconcile retry = %#v, err=%v", terminal, err)
+		}
+		repeated, err := lifecycle.ReconcileOperation(context.Background(), reconcile)
+		if err != nil || !reflect.DeepEqual(repeated, terminal) || failures != 2 {
+			t.Fatalf("repeated continued reconcile = %#v, failures=%d, err=%v", repeated, failures, err)
+		}
+		replayed, err := lifecycle.CommitRuntimeView(context.Background(), commit)
+		if err != nil || !reflect.DeepEqual(replayed, *terminal.CommitRuntimeView) || failures != 2 {
+			t.Fatalf("exact operation replay = %#v, failures=%d, err=%v", replayed, failures, err)
+		}
+		current, err := lifecycle.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+			"policy-domain-1", "task-1", "confirm-continued-reconcile-current-contract",
+		))
+		if err != nil || current.CurrentRevisionID != terminal.CommitRuntimeView.RevisionID ||
+			current.CurrentCheckpointID != terminal.CommitRuntimeView.CheckpointID {
+			t.Fatalf("continued reconcile duplicated or changed authority: %#v, err=%v", current, err)
+		}
+	})
 }
 
 func runLifecycleProjectionFailureNormalizationContract(t *testing.T, adapter lifecycleContractAdapter) {

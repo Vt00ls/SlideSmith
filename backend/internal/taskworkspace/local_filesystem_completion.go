@@ -1,6 +1,9 @@
 package taskworkspace
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 type localCompletionOperationKind string
 type localCompletionPhase string
@@ -220,11 +223,21 @@ func (s *localFilesystemStore) completeOperation(record localCompletionRecord, r
 	return nil
 }
 
-func localCompletionError(err error) error {
-	if lifecycleErr, ok := err.(*Error); ok {
-		return lifecycleErr
+// localCompletionError is the single closed normalization point for
+// adapter-private completion mechanics before they leave the Lifecycle seam.
+func localCompletionError(err error) *Error {
+	var lifecycleErr *Error
+	if errors.As(err, &lifecycleErr) && lifecycleErr != nil &&
+		knownLifecycleErrorCode(lifecycleErr.Code) {
+		return &Error{Code: lifecycleErr.Code}
 	}
-	return &Error{Code: ErrorReconciliationRequired}
+	if errors.Is(err, ErrDurableObjectResultAmbiguous) || errors.Is(err, ErrCleanupResultAmbiguous) {
+		return &Error{Code: ErrorReconciliationRequired}
+	}
+	if errors.Is(err, ErrLocalFilesystemUnavailable) {
+		return &Error{Code: ErrorRetryableUnavailable}
+	}
+	return normalizeLifecycleError(err)
 }
 
 func runLocalCompoundOperation[Result any](
@@ -331,7 +344,8 @@ func (l *localFilesystemLifecycle) ReconcileOperation(
 	if completionErr := l.completeLocalInspection(
 		ctx, request.PolicyDomainID, request.TaskID, inspection,
 	); completionErr != nil {
-		return localPendingOperationInspection(inspection), completionErr
+		failure := localCompletionError(completionErr)
+		return localCompletionFailureInspection(inspection, failure), failure
 	}
 	return l.InspectOperation(ctx, InspectOperationRequest(request))
 }
@@ -548,6 +562,16 @@ func localInspectionCompletionResult(
 }
 
 func localPendingOperationInspection(inspection OperationInspection) OperationInspection {
+	return localCompletionFailureInspection(
+		inspection,
+		&Error{Code: ErrorReconciliationRequired},
+	)
+}
+
+func localCompletionFailureInspection(
+	inspection OperationInspection,
+	failure *Error,
+) OperationInspection {
 	inspection.Disposition = OperationReconciliationRequired
 	inspection.IntentState = OperationIntentActing
 	inspection.CommitRuntimeView = nil
@@ -555,6 +579,6 @@ func localPendingOperationInspection(inspection OperationInspection) OperationIn
 	inspection.RestoreTaskWorkspace = nil
 	inspection.ReconstructTaskWorkspace = nil
 	inspection.ExpireMaterialization = nil
-	inspection.Error = &Error{Code: ErrorReconciliationRequired}
+	inspection.Error = &Error{Code: failure.Code}
 	return inspection
 }

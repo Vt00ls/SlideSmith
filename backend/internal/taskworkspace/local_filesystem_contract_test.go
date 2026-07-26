@@ -3,6 +3,7 @@ package taskworkspace_test
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"errors"
 	"fmt"
 	"io"
@@ -376,6 +377,413 @@ func TestLocalFilesystemCoreTerminalFaultRequiresRestartReconciliation(t *testin
 	))
 	if err != nil || materialized.CheckpointID != reconciled.CommitRuntimeView.CheckpointID {
 		t.Fatalf("materialize reconciled core terminal = %#v, err = %v", materialized, err)
+	}
+}
+
+func TestLocalFilesystemReconcileOperationNormalizesCheckpointActivationPersistFailure(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	coreFaulted := false
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if !coreFaulted && event.OperationID == "commit-reconcile-activation-failure" &&
+			event.Point == taskworkspace.FaultAfterAuthoritativeTransaction {
+			coreFaulted = true
+			return errors.New("simulated crash after core terminal")
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, nil)
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-reconcile-activation-failure",
+		"materialize-reconcile-activation-failure", "open-reconcile-activation-failure",
+	)
+	manifest := declaredStateManifest("content-1")
+	commit := commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-reconcile-activation-failure",
+	)
+	_, err := first.CommitRuntimeView(context.Background(), commit)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	if !coreFaulted {
+		t.Fatal("commit did not stop after the core terminal decision")
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	completionFaulted := false
+	failing := newLocalContractLifecycleAtRoot(t, root, restartedConfig, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = func(event taskworkspace.LocalFilesystemFaultEvent) error {
+			if !completionFaulted && event.OperationID == commit.Operation.ID &&
+				event.Point == taskworkspace.LocalFaultAfterCompletionMutation && event.Ordinal == 0 {
+				completionFaulted = true
+				return errors.New("host=/private/c04-canary session=c04-canary mount=/mnt/c04-canary")
+			}
+			return nil
+		}
+	})
+	reconcile := taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: commit.PolicyDomainID,
+		TaskID:         commit.TaskID,
+		OperationID:    commit.Operation.ID,
+	}
+	pending, err := failing.ReconcileOperation(context.Background(), reconcile)
+	if !completionFaulted {
+		t.Fatal("continued reconciliation did not reach Checkpoint activation persistence")
+	}
+	failure, ok := err.(*taskworkspace.Error)
+	if !ok {
+		t.Fatalf("continued reconciliation returned non-closed error %T: %v", err, err)
+	}
+	if failure.Code != taskworkspace.ErrorReconciliationRequired || failure.Retryable() ||
+		!failure.ReconciliationRequired() ||
+		failure.SafeCategory() != taskworkspace.SafeErrorReconciliationRequired {
+		t.Fatalf("continued reconciliation error semantics = %#v", failure)
+	}
+	if pending.Disposition != taskworkspace.OperationReconciliationRequired ||
+		pending.Error == nil || pending.Error.Code != failure.Code || pending.CommitRuntimeView != nil {
+		t.Fatalf("continued reconciliation inspection disagrees with error: %#v, err=%v", pending, err)
+	}
+
+	recovered := newLocalContractLifecycleAtRoot(t, root, restartedConfig, nil)
+	terminal, err := recovered.ReconcileOperation(context.Background(), reconcile)
+	if err != nil || terminal.Disposition != taskworkspace.OperationTerminal ||
+		terminal.CommitRuntimeView == nil {
+		t.Fatalf("exact reconciliation after recovery = %#v, err=%v", terminal, err)
+	}
+	repeated, err := recovered.ReconcileOperation(context.Background(), reconcile)
+	if err != nil || !reflect.DeepEqual(repeated, terminal) {
+		t.Fatalf("repeated exact reconciliation = %#v, err=%v", repeated, err)
+	}
+}
+
+func TestLocalFilesystemReconcileOperationNormalizesCompletionRecordPersistFailure(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	coreFaulted := false
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if !coreFaulted && event.OperationID == "commit-reconcile-record-failure" &&
+			event.Point == taskworkspace.FaultAfterAuthoritativeTransaction {
+			coreFaulted = true
+			return errors.New("simulated crash after core terminal")
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, nil)
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-reconcile-record-failure",
+		"materialize-reconcile-record-failure", "open-reconcile-record-failure",
+	)
+	manifest := declaredStateManifest("content-1")
+	commit := commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-reconcile-record-failure",
+	)
+	_, err := first.CommitRuntimeView(context.Background(), commit)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	if !coreFaulted {
+		t.Fatal("commit did not stop after the core terminal decision")
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	recordFaulted := false
+	failing := newLocalContractLifecycleAtRoot(t, root, restartedConfig, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = func(event taskworkspace.LocalFilesystemFaultEvent) error {
+			if !recordFaulted && event.OperationID == commit.Operation.ID &&
+				event.Point == taskworkspace.LocalFaultAfterCompletionMutation && event.Ordinal == 2 {
+				recordFaulted = true
+				return errors.New("bucket=c04-canary locator=object-c04-canary credential=c04-canary")
+			}
+			return nil
+		}
+	})
+	reconcile := taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: commit.PolicyDomainID,
+		TaskID:         commit.TaskID,
+		OperationID:    commit.Operation.ID,
+	}
+	pending, failure := failing.ReconcileOperation(context.Background(), reconcile)
+	if !recordFaulted {
+		t.Fatal("continued reconciliation did not reach completion-record persistence")
+	}
+	assertClosedCompletionFailure(
+		t, pending, failure, taskworkspace.ErrorReconciliationRequired,
+	)
+
+	recovered := newLocalContractLifecycleAtRoot(t, root, restartedConfig, nil)
+	terminal, err := recovered.ReconcileOperation(context.Background(), reconcile)
+	if err != nil || terminal.Disposition != taskworkspace.OperationTerminal ||
+		terminal.CommitRuntimeView == nil {
+		t.Fatalf("exact reconciliation after completion-record recovery = %#v, err=%v", terminal, err)
+	}
+	repeated, err := recovered.ReconcileOperation(context.Background(), reconcile)
+	if err != nil || !reflect.DeepEqual(repeated, terminal) {
+		t.Fatalf("repeated exact completion-record reconciliation = %#v, err=%v", repeated, err)
+	}
+	current, err := recovered.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-reconcile-record-recovered-current",
+	))
+	if err != nil || current.CurrentRevisionID != terminal.CommitRuntimeView.RevisionID ||
+		current.CurrentCheckpointID != terminal.CommitRuntimeView.CheckpointID {
+		t.Fatalf("completion-record retry duplicated or changed authority: %#v, err=%v", current, err)
+	}
+}
+
+func TestLocalFilesystemReconcileOperationClosesMaterializationBindingAdapterErrors(t *testing.T) {
+	const canary = "host=/private/c04-canary session=session-c04-canary mount=/mnt/c04-canary " +
+		"bucket=bucket-c04-canary locator=object-key-c04-canary vendor=vendor-c04-canary " +
+		"credential=credential-c04-canary content=user-content-c04-canary"
+	for _, test := range []struct {
+		name string
+		err  error
+		code taskworkspace.ErrorCode
+	}{
+		{name: "raw", err: errors.New(canary), code: taskworkspace.ErrorRetryableUnavailable},
+		{name: "wrapped raw", err: fmt.Errorf("%s: %w", canary, errors.New("adapter failed")), code: taskworkspace.ErrorRetryableUnavailable},
+		{name: "ambiguous", err: taskworkspace.ErrDurableObjectResultAmbiguous, code: taskworkspace.ErrorReconciliationRequired},
+		{name: "wrapped ambiguous", err: fmt.Errorf("%s: %w", canary, taskworkspace.ErrDurableObjectResultAmbiguous), code: taskworkspace.ErrorReconciliationRequired},
+		{name: "cleanup ambiguous", err: taskworkspace.ErrCleanupResultAmbiguous, code: taskworkspace.ErrorReconciliationRequired},
+		{name: "unavailable", err: taskworkspace.ErrLocalFilesystemUnavailable, code: taskworkspace.ErrorRetryableUnavailable},
+		{name: "wrapped unavailable", err: fmt.Errorf("%s: %w", canary, taskworkspace.ErrLocalFilesystemUnavailable), code: taskworkspace.ErrorRetryableUnavailable},
+		{name: "wrapped integrity", err: fmt.Errorf("%s: %w", canary, &taskworkspace.Error{Code: taskworkspace.ErrorIntegrityConflict}), code: taskworkspace.ErrorIntegrityConflict},
+		{name: "wrapped ownership", err: fmt.Errorf("%s: %w", canary, &taskworkspace.Error{Code: taskworkspace.ErrorOwnershipDenied}), code: taskworkspace.ErrorOwnershipDenied},
+		{name: "wrapped stale authority", err: fmt.Errorf("%s: %w", canary, &taskworkspace.Error{Code: taskworkspace.ErrorStaleAuthority}), code: taskworkspace.ErrorStaleAuthority},
+		{name: "wrapped unknown typed", err: fmt.Errorf("%s: %w", canary, &taskworkspace.Error{Code: taskworkspace.ErrorCode("unknown-local-completion-code")}), code: taskworkspace.ErrorRetryableUnavailable},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			pending, failure, terminal := exerciseLocalMaterializationBindingCompletionFailure(t, test.err)
+			assertClosedCompletionFailure(t, pending, failure, test.code)
+			if terminal.Disposition != taskworkspace.OperationTerminal || terminal.Materialize == nil {
+				t.Fatalf("exact reconciliation did not recover original terminal result: %#v", terminal)
+			}
+			formatted := fmt.Sprintf("%v | %+v | %#v", failure, failure, pending)
+			for _, forbidden := range strings.Fields(canary) {
+				if strings.Contains(formatted, forbidden) {
+					t.Fatalf("completion error or inspection leaked %q: %s", forbidden, formatted)
+				}
+			}
+		})
+	}
+}
+
+func TestLocalFilesystemReconcileOperationNormalizesExpiryCleanupDebtCompletionFailure(t *testing.T) {
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	now := taskworkspace.Instant(100)
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	config.Now = func() taskworkspace.Instant { return now }
+	config.ExpiryPolicy = taskworkspace.ExpiryPolicy{
+		ID: "expiry-policy-1", MaterializationLifetime: 10, RuntimeViewLifetime: 100,
+	}
+	expiryFaultArmed := false
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if expiryFaultArmed && event.OperationID == "expire-reconcile-cleanup-debt-failure" &&
+			event.Point == taskworkspace.FaultBeforeResponse {
+			expiryFaultArmed = false
+			return errors.New("simulated crash after core expiry terminal")
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, nil)
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-reconcile-cleanup-debt-failure",
+		"materialize-reconcile-cleanup-debt-failure-base", "open-reconcile-cleanup-debt-failure",
+	)
+	manifest := declaredStateManifest("content-1")
+	if _, err := first.CommitRuntimeView(context.Background(), commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-reconcile-cleanup-debt-failure",
+	)); err != nil {
+		t.Fatalf("commit expiry Checkpoint: %v", err)
+	}
+	current, err := first.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-reconcile-cleanup-debt-failure-current",
+	))
+	if err != nil {
+		t.Fatalf("confirm expiry current state: %v", err)
+	}
+	materialized, err := first.Materialize(context.Background(), materializeRequest(
+		"policy-domain-1", "task-1", current, "materialize-reconcile-cleanup-debt-failure-current",
+	))
+	if err != nil {
+		t.Fatalf("materialize expiry Checkpoint: %v", err)
+	}
+	now = 1_000
+	expire := expireMaterializationRequest(
+		current, materialized, "expire-reconcile-cleanup-debt-failure",
+	)
+	expiryFaultArmed = true
+	_, err = first.ExpireMaterialization(context.Background(), expire)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	if expiryFaultArmed {
+		t.Fatal("expiry did not stop after the core terminal decision")
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	cleanupAttempts := 0
+	registrationFaulted := false
+	failing := newLocalContractLifecycleAtRoot(t, root, restartedConfig, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = func(event taskworkspace.LocalFilesystemFaultEvent) error {
+			if event.OperationID != expire.Operation.ID {
+				return nil
+			}
+			if event.Point == taskworkspace.LocalFaultBeforeCleanup {
+				cleanupAttempts++
+				return errors.New("host=/private/c04-canary session=c04-canary")
+			}
+			if !registrationFaulted && event.Point == taskworkspace.LocalFaultAfterCompletionMutation &&
+				event.Ordinal == 0 {
+				registrationFaulted = true
+				return errors.New("mount=/mnt/c04-canary bucket=c04-canary locator=c04-canary")
+			}
+			return nil
+		}
+	})
+	reconcile := taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: expire.PolicyDomainID,
+		TaskID:         expire.TaskID,
+		OperationID:    expire.Operation.ID,
+	}
+	pending, failure := failing.ReconcileOperation(context.Background(), reconcile)
+	if !registrationFaulted || cleanupAttempts != 1 {
+		t.Fatalf("continued reconciliation missed Cleanup Debt completion: faulted=%t attempts=%d",
+			registrationFaulted, cleanupAttempts)
+	}
+	assertClosedCompletionFailure(
+		t, pending, failure, taskworkspace.ErrorReconciliationRequired,
+	)
+
+	recovered := newLocalContractLifecycleAtRoot(t, root, restartedConfig, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.FilesystemFault = func(event taskworkspace.LocalFilesystemFaultEvent) error {
+			if event.OperationID == expire.Operation.ID && event.Point == taskworkspace.LocalFaultBeforeCleanup {
+				cleanupAttempts++
+				return errors.New("cleanup result remains ambiguous")
+			}
+			return nil
+		}
+	})
+	terminal, err := recovered.ReconcileOperation(context.Background(), reconcile)
+	if err != nil || terminal.Disposition != taskworkspace.OperationTerminal ||
+		terminal.ExpireMaterialization == nil || cleanupAttempts != 2 {
+		t.Fatalf("exact expiry reconciliation after debt recovery = %#v, attempts=%d, err=%v",
+			terminal, cleanupAttempts, err)
+	}
+	repeated, err := recovered.ReconcileOperation(context.Background(), reconcile)
+	if err != nil || !reflect.DeepEqual(repeated, terminal) || cleanupAttempts != 2 {
+		t.Fatalf("repeated expiry reconciliation duplicated cleanup: %#v, attempts=%d, err=%v",
+			repeated, cleanupAttempts, err)
+	}
+	replayed, err := recovered.ExpireMaterialization(context.Background(), expire)
+	if err != nil || !reflect.DeepEqual(replayed, *terminal.ExpireMaterialization) || cleanupAttempts != 2 {
+		t.Fatalf("exact expiry replay duplicated cleanup: %#v, attempts=%d, err=%v",
+			replayed, cleanupAttempts, err)
+	}
+}
+
+func exerciseLocalMaterializationBindingCompletionFailure(
+	t *testing.T,
+	adapterErr error,
+) (taskworkspace.OperationInspection, error, taskworkspace.OperationInspection) {
+	t.Helper()
+	root := t.TempDir()
+	persistence := taskworkspace.NewInMemoryPersistence()
+	config := taskworkspaceTestConfig(nil)
+	config.Persistence = persistence
+	materializationFaulted := false
+	config.FaultHook = func(event taskworkspace.FaultEvent) error {
+		if !materializationFaulted && event.OperationID == "materialize-reconcile-binding-error" &&
+			event.Point == taskworkspace.FaultAfterBaseMaterialization {
+			materializationFaulted = true
+			return errors.New("simulated crash after core materialization")
+		}
+		return nil
+	}
+	first := newLocalContractLifecycleAtRoot(t, root, config, nil)
+	confirmed, view := openRuntimeViewWithLifecycle(
+		t, first, "task-1", "confirm-reconcile-binding-error",
+		"materialize-reconcile-binding-error-base", "open-reconcile-binding-error",
+	)
+	manifest := declaredStateManifest("content-1")
+	if _, err := first.CommitRuntimeView(context.Background(), commitRequest(
+		confirmed, view, manifest, acceptedValidationEvidence(confirmed, view, manifest),
+		"commit-reconcile-binding-error",
+	)); err != nil {
+		t.Fatalf("commit binding Checkpoint: %v", err)
+	}
+	current, err := first.ConfirmTaskWorkspace(context.Background(), confirmRequest(
+		"policy-domain-1", "task-1", "confirm-reconcile-binding-error-current",
+	))
+	if err != nil {
+		t.Fatalf("confirm binding current state: %v", err)
+	}
+	request := materializeRequest(
+		"policy-domain-1", "task-1", current, "materialize-reconcile-binding-error",
+	)
+	_, err = first.Materialize(context.Background(), request)
+	assertLifecycleErrorCode(t, err, taskworkspace.ErrorReconciliationRequired)
+	if !materializationFaulted {
+		t.Fatal("materialize did not stop after the core physical result")
+	}
+
+	restartedConfig := config
+	restartedConfig.FaultHook = nil
+	random := &switchableLocalRandom{}
+	failing := newLocalContractLifecycleAtRoot(t, root, restartedConfig, func(local *taskworkspace.LocalFilesystemConfig) {
+		local.Random = random
+	})
+	random.err = adapterErr
+	reconcile := taskworkspace.ReconcileOperationRequest{
+		PolicyDomainID: request.PolicyDomainID,
+		TaskID:         request.TaskID,
+		OperationID:    request.Operation.ID,
+	}
+	pending, failure := failing.ReconcileOperation(context.Background(), reconcile)
+
+	recovered := newLocalContractLifecycleAtRoot(t, root, restartedConfig, nil)
+	terminal, err := recovered.ReconcileOperation(context.Background(), reconcile)
+	if err != nil {
+		t.Fatalf("exact reconciliation after adapter recovery: %v", err)
+	}
+	repeated, err := recovered.ReconcileOperation(context.Background(), reconcile)
+	if err != nil || !reflect.DeepEqual(repeated, terminal) {
+		t.Fatalf("repeated exact reconciliation = %#v, err=%v", repeated, err)
+	}
+	replayed, err := recovered.Materialize(context.Background(), request)
+	if err != nil || terminal.Materialize == nil || !reflect.DeepEqual(replayed, *terminal.Materialize) {
+		t.Fatalf("exact operation replay = %#v, err=%v, terminal=%#v", replayed, err, terminal)
+	}
+	return pending, failure, terminal
+}
+
+func assertClosedCompletionFailure(
+	t *testing.T,
+	inspection taskworkspace.OperationInspection,
+	err error,
+	wantCode taskworkspace.ErrorCode,
+) {
+	t.Helper()
+	failure, ok := err.(*taskworkspace.Error)
+	if !ok {
+		t.Fatalf("continued reconciliation returned non-closed error %T: %v", err, err)
+	}
+	want := &taskworkspace.Error{Code: wantCode}
+	if failure.Code != wantCode || failure.SafeCategory() != want.SafeCategory() ||
+		failure.Retryable() != want.Retryable() ||
+		failure.ReconciliationRequired() != want.ReconciliationRequired() {
+		t.Fatalf("continued reconciliation semantics = %#v, want %#v", failure, want)
+	}
+	if inspection.Disposition != taskworkspace.OperationReconciliationRequired ||
+		inspection.Error == nil || inspection.Error.Code != failure.Code ||
+		inspection.Materialize != nil || inspection.CommitRuntimeView != nil ||
+		inspection.ExpireMaterialization != nil {
+		t.Fatalf("continued reconciliation inspection disagrees with error: %#v, err=%v", inspection, err)
 	}
 }
 
@@ -1309,4 +1717,15 @@ func makeLocalContractTreeRemovable(root string) {
 		}
 		return nil
 	})
+}
+
+type switchableLocalRandom struct {
+	err error
+}
+
+func (r *switchableLocalRandom) Read(payload []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	return cryptorand.Read(payload)
 }
