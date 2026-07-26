@@ -87,6 +87,7 @@ type TaskWorkspaceLifecycleOutcome uint8
 const (
 	TaskWorkspaceLifecycleCommitted TaskWorkspaceLifecycleOutcome = iota + 1
 	TaskWorkspaceLifecycleRejected
+	TaskWorkspaceLifecycleFenced
 )
 
 type PublicationOutcome uint8
@@ -124,6 +125,8 @@ func taskWorkspaceLifecycleOutcomeName(outcome TaskWorkspaceLifecycleOutcome) st
 		return "committed"
 	case TaskWorkspaceLifecycleRejected:
 		return "rejected"
+	case TaskWorkspaceLifecycleFenced:
+		return "fenced"
 	default:
 		return ""
 	}

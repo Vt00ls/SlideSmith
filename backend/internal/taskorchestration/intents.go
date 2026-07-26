@@ -277,13 +277,16 @@ func NewBeginManualEditIntent(
 }
 
 type RuntimeEvidenceBinding struct {
-	Evidence     EvidenceRef
-	PhaseRunID   PhaseRunID
-	RuntimeRunID RuntimeRunID
-	OperationID  OperationID
-	Generation   ProducerGeneration
-	Fence        RuntimeFence
-	Outcome      RuntimeRunOutcome
+	Evidence           EvidenceRef
+	PhaseRunID         PhaseRunID
+	PhaseRunGeneration PhaseRunGeneration
+	PhaseRunFence      PhaseRunFence
+	RuntimeRunID       RuntimeRunID
+	OperationID        OperationID
+	Generation         RuntimeGeneration
+	Fence              RuntimeFence
+	SafetyEpoch        SafetyEpoch
+	Outcome            RuntimeRunOutcome
 }
 
 type runtimeEvidencePayload struct{ binding RuntimeEvidenceBinding }
@@ -293,13 +296,15 @@ func (payload runtimeEvidencePayload) canonical() map[string]any {
 	if payload.binding.Outcome != 0 {
 		extra["outcome"] = runtimeRunOutcomeName(payload.binding.Outcome)
 	}
+	extra["phase_run_fence"] = uint64(payload.binding.PhaseRunFence)
+	extra["phase_run_generation"] = uint64(payload.binding.PhaseRunGeneration)
+	extra["safety_epoch"] = uint64(payload.binding.SafetyEpoch)
 	return evidenceCanonical(
 		payload.binding.Evidence,
 		payload.binding.PhaseRunID,
 		payload.binding.OperationID,
-		payload.binding.Generation,
-		uint64(payload.binding.Fence),
-		extra,
+		ProducerGeneration(payload.binding.Generation),
+		uint64(payload.binding.Fence), extra,
 	)
 }
 func (payload runtimeEvidencePayload) valid() bool {
@@ -307,9 +312,11 @@ func (payload runtimeEvidencePayload) valid() bool {
 		payload.binding.Evidence,
 		payload.binding.PhaseRunID,
 		payload.binding.OperationID,
-		payload.binding.Generation,
+		ProducerGeneration(payload.binding.Generation),
 		uint64(payload.binding.Fence),
 	) && validOpaqueID(payload.binding.RuntimeRunID.value) &&
+		payload.binding.PhaseRunGeneration > 0 && payload.binding.PhaseRunFence > 0 &&
+		payload.binding.SafetyEpoch > 0 &&
 		(payload.binding.Outcome == 0 || runtimeRunOutcomeName(payload.binding.Outcome) != "")
 }
 
@@ -322,11 +329,14 @@ func NewAcceptRuntimeEvidenceIntent(
 }
 
 type ValidationEvidenceBinding struct {
-	Evidence   EvidenceRef
-	PhaseRunID PhaseRunID
-	Generation ProducerGeneration
-	Fence      ValidationFence
-	Outcome    PhaseValidationOutcome
+	Evidence           EvidenceRef
+	PhaseRunID         PhaseRunID
+	PhaseRunGeneration PhaseRunGeneration
+	PhaseRunFence      PhaseRunFence
+	Generation         ProducerGeneration
+	Fence              ValidationFence
+	SafetyEpoch        SafetyEpoch
+	Outcome            PhaseValidationOutcome
 }
 
 type validationEvidencePayload struct{ binding ValidationEvidenceBinding }
@@ -336,19 +346,26 @@ func (payload validationEvidencePayload) canonical() map[string]any {
 	if payload.binding.Outcome != 0 {
 		extra = map[string]any{"outcome": phaseValidationOutcomeName(payload.binding.Outcome)}
 	}
+	if extra == nil {
+		extra = make(map[string]any)
+	}
+	extra["phase_run_fence"] = uint64(payload.binding.PhaseRunFence)
+	extra["phase_run_generation"] = uint64(payload.binding.PhaseRunGeneration)
+	extra["safety_epoch"] = uint64(payload.binding.SafetyEpoch)
 	return evidenceCanonical(
 		payload.binding.Evidence,
 		payload.binding.PhaseRunID,
 		OperationID{},
 		payload.binding.Generation,
-		uint64(payload.binding.Fence),
-		extra,
+		uint64(payload.binding.Fence), extra,
 	)
 }
 func (payload validationEvidencePayload) valid() bool {
 	return validEvidenceRef(payload.binding.Evidence) &&
 		validOpaqueID(payload.binding.PhaseRunID.value) &&
+		payload.binding.PhaseRunGeneration > 0 && payload.binding.PhaseRunFence > 0 &&
 		payload.binding.Generation > 0 && payload.binding.Fence > 0 &&
+		payload.binding.SafetyEpoch > 0 &&
 		(payload.binding.Outcome == 0 || phaseValidationOutcomeName(payload.binding.Outcome) != "")
 }
 
@@ -366,32 +383,48 @@ func NewAcceptPhaseValidationEvidenceIntent(
 }
 
 type TaskWorkspaceLifecycleEvidenceBinding struct {
-	Evidence     EvidenceRef
-	PhaseRunID   PhaseRunID
-	OperationID  OperationID
-	Generation   ProducerGeneration
-	Fence        TaskWorkspaceLifecycleFence
-	Outcome      TaskWorkspaceLifecycleOutcome
-	RevisionID   TaskWorkspaceRevisionID
-	CheckpointID CheckpointID
+	Evidence           EvidenceRef
+	PhaseRunID         PhaseRunID
+	PhaseRunGeneration PhaseRunGeneration
+	PhaseRunFence      PhaseRunFence
+	OperationID        OperationID
+	Generation         TaskWorkspaceLifecycleGeneration
+	Fence              TaskWorkspaceLifecycleFence
+	SafetyEpoch        SafetyEpoch
+	Outcome            LifecycleEvidenceOutcome
+	RevisionID         TaskWorkspaceRevisionID
+	CheckpointID       CheckpointID
 }
 
+type LifecycleEvidenceOutcome = TaskWorkspaceLifecycleOutcome
+
+const (
+	LifecycleEvidenceCommitted = TaskWorkspaceLifecycleCommitted
+	LifecycleEvidenceFenced    = TaskWorkspaceLifecycleFenced
+)
+
 type PublicationEvidenceBinding struct {
-	Evidence          EvidenceRef
-	PhaseRunID        PhaseRunID
-	OperationID       OperationID
-	Generation        ProducerGeneration
-	Fence             PublicationFence
-	Outcome           PublicationOutcome
-	ArtifactVersionID ArtifactVersionID
+	Evidence           EvidenceRef
+	PhaseRunID         PhaseRunID
+	PhaseRunGeneration PhaseRunGeneration
+	PhaseRunFence      PhaseRunFence
+	OperationID        OperationID
+	Generation         ProducerGeneration
+	Fence              PublicationFence
+	SafetyEpoch        SafetyEpoch
+	Outcome            PublicationOutcome
+	ArtifactVersionID  ArtifactVersionID
 }
 
 type SchedulingEvidenceBinding struct {
-	Evidence    EvidenceRef
-	PhaseRunID  PhaseRunID
-	OperationID OperationID
-	Generation  ProducerGeneration
-	Fence       SchedulerFence
+	Evidence           EvidenceRef
+	PhaseRunID         PhaseRunID
+	PhaseRunGeneration PhaseRunGeneration
+	PhaseRunFence      PhaseRunFence
+	OperationID        OperationID
+	Generation         ProducerGeneration
+	Fence              SchedulerFence
+	SafetyEpoch        SafetyEpoch
 }
 
 type taskWorkspaceLifecycleEvidencePayload struct {
@@ -409,31 +442,41 @@ func (payload taskWorkspaceLifecycleEvidencePayload) canonical() map[string]any 
 			"revision_id":   payload.binding.RevisionID.value,
 		}
 	}
+	if extra == nil {
+		extra = make(map[string]any)
+	}
+	extra["phase_run_fence"] = uint64(payload.binding.PhaseRunFence)
+	extra["phase_run_generation"] = uint64(payload.binding.PhaseRunGeneration)
+	extra["safety_epoch"] = uint64(payload.binding.SafetyEpoch)
 	return evidenceCanonical(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
-		payload.binding.Generation, uint64(payload.binding.Fence), extra,
+		ProducerGeneration(payload.binding.Generation), uint64(payload.binding.Fence), extra,
 	)
 }
 func (payload taskWorkspaceLifecycleEvidencePayload) valid() bool {
 	if !validEvidenceBinding(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
-		payload.binding.Generation, uint64(payload.binding.Fence),
-	) {
+		ProducerGeneration(payload.binding.Generation), uint64(payload.binding.Fence),
+	) || payload.binding.PhaseRunGeneration == 0 || payload.binding.PhaseRunFence == 0 ||
+		payload.binding.SafetyEpoch == 0 {
 		return false
 	}
 	if payload.binding.Outcome == 0 {
 		return payload.binding.RevisionID == (TaskWorkspaceRevisionID{}) &&
 			payload.binding.CheckpointID == (CheckpointID{})
 	}
-	if taskWorkspaceLifecycleOutcomeName(payload.binding.Outcome) == "" {
-		return false
-	}
-	if payload.binding.Outcome == TaskWorkspaceLifecycleCommitted {
+	switch payload.binding.Outcome {
+	case LifecycleEvidenceCommitted:
 		return validOpaqueID(payload.binding.RevisionID.value) &&
 			validOpaqueID(payload.binding.CheckpointID.value)
+	case LifecycleEvidenceFenced:
+		return payload.binding.RevisionID == (TaskWorkspaceRevisionID{}) &&
+			payload.binding.CheckpointID == (CheckpointID{})
+	default:
+		return payload.binding.Outcome == TaskWorkspaceLifecycleRejected &&
+			payload.binding.RevisionID == (TaskWorkspaceRevisionID{}) &&
+			payload.binding.CheckpointID == (CheckpointID{})
 	}
-	return payload.binding.RevisionID == (TaskWorkspaceRevisionID{}) &&
-		payload.binding.CheckpointID == (CheckpointID{})
 }
 func (payload publicationEvidencePayload) canonical() map[string]any {
 	extra := map[string]any(nil)
@@ -443,6 +486,12 @@ func (payload publicationEvidencePayload) canonical() map[string]any {
 			"outcome":             publicationOutcomeName(payload.binding.Outcome),
 		}
 	}
+	if extra == nil {
+		extra = make(map[string]any)
+	}
+	extra["phase_run_fence"] = uint64(payload.binding.PhaseRunFence)
+	extra["phase_run_generation"] = uint64(payload.binding.PhaseRunGeneration)
+	extra["safety_epoch"] = uint64(payload.binding.SafetyEpoch)
 	return evidenceCanonical(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
 		payload.binding.Generation, uint64(payload.binding.Fence), extra,
@@ -452,7 +501,8 @@ func (payload publicationEvidencePayload) valid() bool {
 	if !validEvidenceBinding(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
 		payload.binding.Generation, uint64(payload.binding.Fence),
-	) {
+	) || payload.binding.PhaseRunGeneration == 0 || payload.binding.PhaseRunFence == 0 ||
+		payload.binding.SafetyEpoch == 0 {
 		return false
 	}
 	if payload.binding.Outcome == 0 {
@@ -469,14 +519,19 @@ func (payload publicationEvidencePayload) valid() bool {
 func (payload schedulingEvidencePayload) canonical() map[string]any {
 	return evidenceCanonical(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
-		payload.binding.Generation, uint64(payload.binding.Fence), nil,
+		payload.binding.Generation, uint64(payload.binding.Fence), map[string]any{
+			"phase_run_fence":      uint64(payload.binding.PhaseRunFence),
+			"phase_run_generation": uint64(payload.binding.PhaseRunGeneration),
+			"safety_epoch":         uint64(payload.binding.SafetyEpoch),
+		},
 	)
 }
 func (payload schedulingEvidencePayload) valid() bool {
 	return validEvidenceBinding(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
 		payload.binding.Generation, uint64(payload.binding.Fence),
-	)
+	) && payload.binding.PhaseRunGeneration > 0 && payload.binding.PhaseRunFence > 0 &&
+		payload.binding.SafetyEpoch > 0
 }
 
 func NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
@@ -533,22 +588,25 @@ func NewReconcileEnactmentIntent(
 }
 
 type OperationalFenceBinding struct {
-	Generation RecoveryGeneration
-	Fence      RecoveryFence
-	Mode       OperationalMode
+	Generation  RecoveryGeneration
+	Fence       RecoveryFence
+	SafetyEpoch SafetyEpoch
+	Mode        OperationalMode
 }
 
 type operationalFencePayload struct{ binding OperationalFenceBinding }
 
 func (payload operationalFencePayload) canonical() map[string]any {
 	return map[string]any{
-		"fence":      uint64(payload.binding.Fence),
-		"generation": uint64(payload.binding.Generation),
-		"mode":       operationalModeName(payload.binding.Mode),
+		"fence":        uint64(payload.binding.Fence),
+		"generation":   uint64(payload.binding.Generation),
+		"mode":         operationalModeName(payload.binding.Mode),
+		"safety_epoch": uint64(payload.binding.SafetyEpoch),
 	}
 }
 func (payload operationalFencePayload) valid() bool {
 	return payload.binding.Generation > 0 && payload.binding.Fence > 0 &&
+		payload.binding.SafetyEpoch > 0 &&
 		operationalModeName(payload.binding.Mode) != ""
 }
 
@@ -687,6 +745,17 @@ func evidenceKindName(kind EvidenceKind) string {
 		return "publication"
 	case EvidenceScheduling:
 		return "scheduling"
+	default:
+		return ""
+	}
+}
+
+func lifecycleEvidenceOutcomeName(outcome LifecycleEvidenceOutcome) string {
+	switch outcome {
+	case LifecycleEvidenceCommitted:
+		return "committed"
+	case LifecycleEvidenceFenced:
+		return "fenced"
 	default:
 		return ""
 	}

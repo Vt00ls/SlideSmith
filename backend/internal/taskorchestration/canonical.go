@@ -6,6 +6,8 @@ import (
 )
 
 const canonicalIntentDomain = "slidesmith.task-orchestration.intent/v1\n"
+const canonicalEvidenceReplayDomain = "slidesmith.task-orchestration.evidence-replay/v1\n"
+const canonicalEnactmentPayloadDomain = "slidesmith.task-orchestration.enactment/v1\n"
 
 func canonicalizeIntent(intent TransitionIntent) (CanonicalRequestDigest, error) {
 	digest, err := computeCanonicalIntent(intent)
@@ -51,6 +53,39 @@ func computeCanonicalIntent(intent TransitionIntent) (CanonicalRequestDigest, er
 	}
 	hashed := sha256.Sum256(append([]byte(canonicalIntentDomain), encoded...))
 	return CanonicalRequestDigest(hashed), nil
+}
+
+func computeEvidenceReplayDigest(intent TransitionIntent) (EvidenceID, [32]byte, bool, error) {
+	facts, isEvidenceIntent, err := evidenceFacts(intent)
+	if err != nil || !isEvidenceIntent {
+		return EvidenceID{}, [32]byte{}, isEvidenceIntent, err
+	}
+	header := intent.Header()
+	encoded, err := json.Marshal(map[string]any{
+		"activity_generation":    uint64(header.ActivityGeneration),
+		"authority":              intent.canonicalAuthority(),
+		"expected_task_revision": uint64(header.ExpectedTaskRevision),
+		"kind":                   intentKindName(intent.Kind()),
+		"occurred_at":            header.OccurredAt.UTC().Format(canonicalTimeFormat),
+		"payload":                intent.canonicalPayload(),
+		"schema": map[string]any{
+			"major": uint64(header.SchemaVersion.Major()),
+			"minor": uint64(header.SchemaVersion.Minor()),
+		},
+		"task_id": header.TaskID.value,
+	})
+	if err != nil {
+		return EvidenceID{}, [32]byte{}, true, invalidIntentError()
+	}
+	return facts.evidence.ID,
+		sha256.Sum256(append([]byte(canonicalEvidenceReplayDomain), encoded...)), true, nil
+}
+
+func computeEnactmentPayloadDigest(payload map[string]any) EnactmentPayloadDigest {
+	encoded, _ := json.Marshal(payload)
+	return EnactmentPayloadDigest(
+		sha256.Sum256(append([]byte(canonicalEnactmentPayloadDomain), encoded...)),
+	)
 }
 
 func validateEvidenceIntent(intent TransitionIntent) error {
