@@ -205,7 +205,7 @@ func newHarness(
 	clock *controlledClock,
 ) *DeterministicHarness {
 	controls := &harnessControls{}
-	engine := &harnessEngine{clock: clock, persistence: persistence, controls: controls}
+	engine := &decisionEngine{clock: clock, persistence: persistence, controls: controls}
 	return &DeterministicHarness{
 		Mutations:   engine,
 		Queries:     engine,
@@ -747,13 +747,15 @@ type userOwnershipBinding struct {
 	generation  AuthorizationGeneration
 }
 
-type harnessEngine struct {
+// decisionEngine owns the closed transition algorithm. Persistence adapters
+// provide its transactionally loaded state and commit the resulting snapshot.
+type decisionEngine struct {
 	clock       *controlledClock
 	persistence *memoryPersistence
 	controls    *harnessControls
 }
 
-func (engine *harnessEngine) Decide(
+func (engine *decisionEngine) Decide(
 	ctx context.Context,
 	intent TransitionIntent,
 ) (TransitionDecision, error) {
@@ -1124,7 +1126,7 @@ func isAggregateBusinessIntent(kind IntentKind) bool {
 	}
 }
 
-func (engine *harnessEngine) syncAggregateCoordination(
+func (engine *decisionEngine) syncAggregateCoordination(
 	record *taskRecord,
 	enactments []EnactmentRef,
 	activityGeneration ActivityGeneration,
@@ -1800,7 +1802,7 @@ func (record taskRecord) activePhaseRun() (PhaseRunID, bool) {
 	return PhaseRunID{}, false
 }
 
-func (engine *harnessEngine) buildCancellationEnactments(
+func (engine *decisionEngine) buildCancellationEnactments(
 	record *taskRecord,
 	phaseRunID PhaseRunID,
 	activityGeneration ActivityGeneration,
@@ -1931,7 +1933,7 @@ func (record *taskRecord) retainEvidenceDiagnostic(
 	}
 }
 
-func (engine *harnessEngine) validateCoordinationBindings(
+func (engine *decisionEngine) validateCoordinationBindings(
 	intent TransitionIntent,
 	record taskRecord,
 	exists bool,
@@ -2166,7 +2168,7 @@ func validateAuthorityBinding(expected, actual authorityValue) error {
 	return nil
 }
 
-func (engine *harnessEngine) effectiveActivityGeneration(
+func (engine *decisionEngine) effectiveActivityGeneration(
 	record taskRecord,
 ) ActivityGeneration {
 	return effectiveActivityGeneration(record, engine.persistence.recovery)
@@ -2195,7 +2197,7 @@ func isOperationalFenceCatchUp(
 		binding.Mode == recovery.mode
 }
 
-func (engine *harnessEngine) effectiveSafetyEpoch(record taskRecord) SafetyEpoch {
+func (engine *decisionEngine) effectiveSafetyEpoch(record taskRecord) SafetyEpoch {
 	return effectiveSafetyEpoch(record, engine.persistence.recovery)
 }
 
@@ -2333,7 +2335,7 @@ func authorizeUserMutation(intent TransitionIntent, record taskRecord, exists bo
 	return nil
 }
 
-func (engine *harnessEngine) Query(
+func (engine *decisionEngine) Query(
 	ctx context.Context,
 	query TaskQuery,
 ) (TaskOrchestrationView, error) {
