@@ -200,14 +200,17 @@ func TestClosedIntentFamiliesCarryExactlyOneTypedAuthority(t *testing.T) {
 				header("request-runtime"), runtimeAuthority,
 				taskorchestration.RuntimeEvidenceBinding{
 					Evidence: runtimeEvidence, PhaseRunID: phaseRunID, RuntimeRunID: runtimeRunID,
-					OperationID: operationID, Generation: 1, Fence: 1,
+					PhaseRunGeneration: 1, PhaseRunFence: 1,
+					OperationID: operationID, Generation: 1, Fence: 1, SafetyEpoch: 1,
 				},
 			)},
 		{"validation evidence", taskorchestration.IntentAcceptPhaseValidationEvidence, taskorchestration.AuthorityValidator,
 			taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
 				header("request-validation"), validator,
 				taskorchestration.ValidationEvidenceBinding{
-					Evidence: validationEvidence, PhaseRunID: phaseRunID, Generation: 1, Fence: 1,
+					Evidence: validationEvidence, PhaseRunID: phaseRunID,
+					PhaseRunGeneration: 1, PhaseRunFence: 1,
+					Generation: 1, Fence: 1, SafetyEpoch: 1,
 				},
 			)},
 		{"Task Workspace lifecycle evidence", taskorchestration.IntentAcceptTaskWorkspaceLifecycleEvidence, taskorchestration.AuthorityTaskWorkspaceLifecycle,
@@ -215,7 +218,11 @@ func TestClosedIntentFamiliesCarryExactlyOneTypedAuthority(t *testing.T) {
 				header("request-task-workspace-lifecycle"), taskWorkspaceLifecycle,
 				taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 					Evidence: taskWorkspaceLifecycleEvidence, PhaseRunID: phaseRunID, OperationID: operationID,
-					Generation: 1, Fence: 1,
+					PhaseRunGeneration: 1, PhaseRunFence: 1,
+					Generation: 1, Fence: 1, SafetyEpoch: 1,
+					Outcome:      taskorchestration.LifecycleEvidenceCommitted,
+					RevisionID:   taskWorkspaceRevisionID(t, "workspace-revision-contract"),
+					CheckpointID: checkpointID(t, "checkpoint-contract"),
 				},
 			)},
 		{"publication evidence", taskorchestration.IntentAcceptPublicationEvidence, taskorchestration.AuthorityPublication,
@@ -223,7 +230,8 @@ func TestClosedIntentFamiliesCarryExactlyOneTypedAuthority(t *testing.T) {
 				header("request-publication"), publication,
 				taskorchestration.PublicationEvidenceBinding{
 					Evidence: publicationEvidence, PhaseRunID: phaseRunID, OperationID: operationID,
-					Generation: 1, Fence: 1,
+					PhaseRunGeneration: 1, PhaseRunFence: 1,
+					Generation: 1, Fence: 1, SafetyEpoch: 1,
 				},
 			)},
 		{"scheduling evidence", taskorchestration.IntentAcceptSchedulingEvidence, taskorchestration.AuthorityScheduler,
@@ -231,7 +239,8 @@ func TestClosedIntentFamiliesCarryExactlyOneTypedAuthority(t *testing.T) {
 				header("request-scheduling"), scheduler,
 				taskorchestration.SchedulingEvidenceBinding{
 					Evidence: schedulingEvidence, PhaseRunID: phaseRunID, OperationID: operationID,
-					Generation: 1, Fence: 1,
+					PhaseRunGeneration: 1, PhaseRunFence: 1,
+					Generation: 1, Fence: 1, SafetyEpoch: 1,
 				},
 			)},
 		{"reconcile", taskorchestration.IntentReconcileEnactment, taskorchestration.AuthorityWorker,
@@ -242,7 +251,8 @@ func TestClosedIntentFamiliesCarryExactlyOneTypedAuthority(t *testing.T) {
 			taskorchestration.NewApplyOperationalFenceIntent(
 				header("request-fence"), recovery,
 				taskorchestration.OperationalFenceBinding{
-					Generation: 1, Fence: 1, Mode: taskorchestration.OperationalReadOnly,
+					Generation: 1, Fence: 1, SafetyEpoch: 1,
+					Mode: taskorchestration.OperationalReadOnly,
 				},
 			)},
 	}
@@ -297,29 +307,51 @@ func TestEvidenceIntentRejectsAMismatchedTypedKind(t *testing.T) {
 
 func TestEvidenceDecisionReportsOnlyItsAcceptedTypedFacts(t *testing.T) {
 	now := time.Date(2026, time.July, 26, 11, 17, 0, 0, time.UTC)
+	task := taskID(t, "task-accepted-evidence")
 	phaseRun := phaseRunID(t, "phase-run-accepted-evidence")
+	runtimeRun := runtimeRunID(t, "runtime-run-accepted-evidence")
+	operation := operationID(t, "operation-accepted-evidence")
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "user-authority-accepted-evidence"),
+		taskorchestration.AuthorizationGeneration(1),
+	)
+	runtimeAuthority := taskorchestration.NewRuntimeAuthority(
+		authorityID(t, "runtime-authority-accepted-evidence"),
+		taskorchestration.AuthorizationGeneration(1),
+	)
 	evidence := taskorchestration.NewEvidenceRef(
 		evidenceID(t, "accepted-runtime-evidence"),
 		taskorchestration.EvidenceRuntime,
 		evidenceDigest(t, strings.Repeat("3", 64)),
 	)
 	intent := taskorchestration.NewAcceptRuntimeEvidenceIntent(
-		intentHeader(t, "request-accepted-evidence", "task-accepted-evidence", now),
-		taskorchestration.NewRuntimeAuthority(
-			authorityID(t, "runtime-authority-accepted-evidence"),
-			taskorchestration.AuthorizationGeneration(1),
-		),
+		intentHeader(t, "request-accepted-evidence", task.String(), now),
+		runtimeAuthority,
 		taskorchestration.RuntimeEvidenceBinding{
-			Evidence:     evidence,
-			PhaseRunID:   phaseRun,
-			RuntimeRunID: runtimeRunID(t, "runtime-run-accepted-evidence"),
-			OperationID:  operationID(t, "operation-accepted-evidence"),
-			Generation:   1,
-			Fence:        1,
+			Evidence: evidence, PhaseRunID: phaseRun, PhaseRunGeneration: 1, PhaseRunFence: 1,
+			RuntimeRunID: runtimeRun, OperationID: operation, Generation: 1, Fence: 1, SafetyEpoch: 1,
 		},
 	)
-
-	decision := decideOnce(t, now, intent)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{
+		Now: now,
+		Tasks: []taskorchestration.HarnessTaskFixture{{
+			TaskID: task, Owner: owner, ActivityGeneration: 1, SafetyEpoch: 1,
+			PhaseRuns: []taskorchestration.HarnessPhaseRunFixture{{
+				PhaseRunID: phaseRun, Generation: 1, Fence: 1, Active: true,
+			}},
+			RuntimeOperations: []taskorchestration.HarnessRuntimeOperationFixture{{
+				OperationID: operation, PhaseRunID: phaseRun, RuntimeRunID: runtimeRun,
+				Authority: runtimeAuthority, Generation: 1, Fence: 1, SafetyEpoch: 1,
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("create deterministic harness: %v", err)
+	}
+	decision, err := harness.Mutations.Decide(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("decide intent: %v", err)
+	}
 	if len(decision.AffectedPhaseRuns) != 1 || decision.AffectedPhaseRuns[0] != phaseRun {
 		t.Fatal("evidence decision omitted its affected Phase Run")
 	}
@@ -771,6 +803,10 @@ func TestPublicContractUsesOpaqueSeparatedTypes(t *testing.T) {
 		reflect.TypeOf(taskorchestration.TraceID{}),
 		reflect.TypeOf(taskorchestration.TaskRevision(0)),
 		reflect.TypeOf(taskorchestration.ActivityGeneration(0)),
+		reflect.TypeOf(taskorchestration.PhaseRunGeneration(0)),
+		reflect.TypeOf(taskorchestration.PhaseRunFence(0)),
+		reflect.TypeOf(taskorchestration.RuntimeGeneration(0)),
+		reflect.TypeOf(taskorchestration.TaskWorkspaceLifecycleGeneration(0)),
 		reflect.TypeOf(taskorchestration.RuntimeFence(0)),
 		reflect.TypeOf(taskorchestration.ValidationFence(0)),
 		reflect.TypeOf(taskorchestration.TaskWorkspaceLifecycleFence(0)),
@@ -779,6 +815,7 @@ func TestPublicContractUsesOpaqueSeparatedTypes(t *testing.T) {
 		reflect.TypeOf(taskorchestration.UsageFence(0)),
 		reflect.TypeOf(taskorchestration.ReconciliationFence(0)),
 		reflect.TypeOf(taskorchestration.RecoveryFence(0)),
+		reflect.TypeOf(taskorchestration.SafetyEpoch(0)),
 		reflect.TypeOf(taskorchestration.PayloadDigest{}),
 		reflect.TypeOf(taskorchestration.EvidenceDigest{}),
 		reflect.TypeOf(taskorchestration.EnactmentPayloadDigest{}),
@@ -808,6 +845,7 @@ func TestPublicContractUsesOpaqueSeparatedTypes(t *testing.T) {
 		reflect.TypeOf(taskorchestration.TransportMetadata{}),
 		reflect.TypeOf(taskorchestration.DiagnosticMetadata{}),
 		reflect.TypeOf(taskorchestration.EvidenceRef{}),
+		reflect.TypeOf(taskorchestration.EvidenceDiagnostic{}),
 		reflect.TypeOf(taskorchestration.RuntimeEvidenceBinding{}),
 		reflect.TypeOf(taskorchestration.ValidationEvidenceBinding{}),
 		reflect.TypeOf(taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{}),

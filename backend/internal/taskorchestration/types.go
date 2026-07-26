@@ -22,22 +22,25 @@ func (version SchemaVersion) Major() uint16 { return uint16(uint32(version) >> 1
 func (version SchemaVersion) Minor() uint16 { return uint16(version) }
 
 type (
-	TaskRevision                uint64
-	ActivityGeneration          uint64
-	AuthorizationGeneration     uint64
-	ProducerGeneration          uint64
-	RuntimeFence                uint64
-	ValidationFence             uint64
-	TaskWorkspaceLifecycleFence uint64
-	PublicationFence            uint64
-	SchedulerFence              uint64
-	UsageFence                  uint64
-	ReconciliationFence         uint64
-	RecoveryGeneration          uint64
-	RecoveryFence               uint64
-	ConfirmationFence           uint64
-	PhaseRunGeneration          uint64
-	PhaseRunFence               uint64
+	TaskRevision                     uint64
+	ActivityGeneration               uint64
+	PhaseRunGeneration               uint64
+	PhaseRunFence                    uint64
+	RuntimeGeneration                uint64
+	TaskWorkspaceLifecycleGeneration uint64
+	AuthorizationGeneration          uint64
+	ProducerGeneration               uint64
+	RuntimeFence                     uint64
+	ValidationFence                  uint64
+	TaskWorkspaceLifecycleFence      uint64
+	PublicationFence                 uint64
+	SchedulerFence                   uint64
+	UsageFence                       uint64
+	ReconciliationFence              uint64
+	RecoveryGeneration               uint64
+	RecoveryFence                    uint64
+	ConfirmationFence                uint64
+	SafetyEpoch                      uint64
 )
 
 type DecisionRequestID struct{ value string }
@@ -499,6 +502,36 @@ type EvidenceRef struct {
 	Digest EvidenceDigest
 }
 
+type EvidenceDisposition uint8
+
+const (
+	EvidenceDispositionNonAuthoritative EvidenceDisposition = iota + 1
+)
+
+type EvidenceDiagnosticReason uint8
+
+const (
+	EvidenceDiagnosticScopeConflict EvidenceDiagnosticReason = iota + 1
+	EvidenceDiagnosticStale
+	EvidenceDiagnosticUnauthorized
+)
+
+// EvidenceDiagnostic reports a rejected observation without granting it Task
+// or Phase authority.
+type EvidenceDiagnostic struct {
+	EvidenceID  EvidenceID
+	Disposition EvidenceDisposition
+	Reason      EvidenceDiagnosticReason
+}
+
+type CancellationState uint8
+
+const (
+	CancellationNotRequested CancellationState = iota
+	CancellationCancelling
+	CancellationCancelled
+)
+
 func NewEvidenceRef(id EvidenceID, kind EvidenceKind, digest EvidenceDigest) EvidenceRef {
 	return EvidenceRef{ID: id, Kind: kind, Digest: digest}
 }
@@ -529,22 +562,31 @@ type TaskOrchestrationQuery interface {
 }
 
 type TaskOrchestrationView struct {
-	TaskID                  TaskID
-	TaskRevision            TaskRevision
-	ActivityGeneration      ActivityGeneration
-	LatestDecisionID        DecisionID
-	DecisionCount           uint64
-	EnactmentCount          uint64
-	Status                  TaskStatus
-	Route                   Route
-	Activity                ActivityKind
-	ExecutionLockID         ExecutionLockID
-	TemplateLockID          TemplateLockID
-	CurrentPhase            PhaseKey
-	ActivePhaseRunID        PhaseRunID
-	PhaseRuns               []PhaseRunView
-	LatestArtifactVersionID ArtifactVersionID
-	TaskWorkspaceID         TaskWorkspaceID
+	TaskID                   TaskID
+	TaskRevision             TaskRevision
+	ActivityGeneration       ActivityGeneration
+	LatestDecisionID         DecisionID
+	DecisionCount            uint64
+	EnactmentCount           uint64
+	Status                   TaskStatus
+	Route                    Route
+	Activity                 ActivityKind
+	ExecutionLockID          ExecutionLockID
+	TemplateLockID           TemplateLockID
+	CurrentPhase             PhaseKey
+	ActivePhaseRunID         PhaseRunID
+	PhaseRuns                []PhaseRunView
+	LatestArtifactVersionID  ArtifactVersionID
+	TaskWorkspaceID          TaskWorkspaceID
+	EvidenceDiagnosticCount  uint64
+	LatestEvidenceDiagnostic EvidenceDiagnostic
+	LatestRevisionID         TaskWorkspaceRevisionID
+	LatestCheckpointID       CheckpointID
+	CancellationState        CancellationState
+	PhaseRunCount            uint64
+	RuntimeRunCount          uint64
+	SafetyEpoch              SafetyEpoch
+	OperationalMode          OperationalMode
 }
 
 type PhaseRunView struct {
@@ -649,6 +691,11 @@ type TaskProjection struct {
 	ActivePhaseRunID        PhaseRunID
 	LatestArtifactVersionID ArtifactVersionID
 	TaskWorkspaceID         TaskWorkspaceID
+	LatestRevisionID        TaskWorkspaceRevisionID
+	LatestCheckpointID      CheckpointID
+	CancellationState       CancellationState
+	SafetyEpoch             SafetyEpoch
+	OperationalMode         OperationalMode
 }
 
 type AuditFactRef struct {
@@ -676,4 +723,8 @@ func nextDecisionID(sequence uint64) DecisionID {
 
 func nextAuditFactID(sequence uint64) AuditFactID {
 	return AuditFactID{value: fmt.Sprintf("audit-fact-%06d", sequence)}
+}
+
+func nextCausationID(sequence uint64) CausationID {
+	return CausationID{value: fmt.Sprintf("causation-%06d", sequence)}
 }
