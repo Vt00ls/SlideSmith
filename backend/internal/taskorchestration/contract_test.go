@@ -783,6 +783,15 @@ func TestPublicContractUsesOpaqueSeparatedTypes(t *testing.T) {
 		reflect.TypeOf(taskorchestration.EvidenceDigest{}),
 		reflect.TypeOf(taskorchestration.EnactmentPayloadDigest{}),
 		reflect.TypeOf(taskorchestration.CanonicalRequestDigest{}),
+		reflect.TypeOf(taskorchestration.PhaseKey{}),
+		reflect.TypeOf(taskorchestration.PipelineVersionID{}),
+		reflect.TypeOf(taskorchestration.ExecutionLockID{}),
+		reflect.TypeOf(taskorchestration.RuntimeReleaseID{}),
+		reflect.TypeOf(taskorchestration.CompatibilityApprovalID{}),
+		reflect.TypeOf(taskorchestration.TemplateLockID{}),
+		reflect.TypeOf(taskorchestration.TaskWorkspaceID{}),
+		reflect.TypeOf(taskorchestration.TaskWorkspaceRevisionID{}),
+		reflect.TypeOf(taskorchestration.CheckpointID{}),
 	}
 	for left := range strictTypes {
 		for right := left + 1; right < len(strictTypes); right++ {
@@ -812,9 +821,16 @@ func TestPublicContractUsesOpaqueSeparatedTypes(t *testing.T) {
 		reflect.TypeOf(taskorchestration.TaskQuery{}),
 		reflect.TypeOf(taskorchestration.TaskOrchestrationView{}),
 		reflect.TypeOf(taskorchestration.Error{}),
+		reflect.TypeOf(taskorchestration.PinnedTaskStart{}),
+		reflect.TypeOf(taskorchestration.ExecutionLock{}),
+		reflect.TypeOf(taskorchestration.PipelineContract{}),
+		reflect.TypeOf(taskorchestration.RouteDefinition{}),
+		reflect.TypeOf(taskorchestration.PhaseDefinition{}),
+		reflect.TypeOf(taskorchestration.PhaseRunView{}),
+		reflect.TypeOf(taskorchestration.RuntimeRunView{}),
 	}
 	deniedFieldTokens := []string{
-		"content", "path", "session", "mount", "workspace", "locator", "credential", "vendor",
+		"content", "path", "session", "mount", "locator", "credential", "vendor",
 	}
 	for _, structType := range publicStructs {
 		for fieldIndex := range structType.NumField() {

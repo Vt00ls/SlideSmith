@@ -35,6 +35,9 @@ type (
 	ReconciliationFence         uint64
 	RecoveryGeneration          uint64
 	RecoveryFence               uint64
+	ConfirmationFence           uint64
+	PhaseRunGeneration          uint64
+	PhaseRunFence               uint64
 )
 
 type DecisionRequestID struct{ value string }
@@ -49,6 +52,15 @@ type PhaseRunID struct{ value string }
 type RuntimeRunID struct{ value string }
 type ArtifactVersionID struct{ value string }
 type EvidenceID struct{ value string }
+type PhaseKey struct{ value string }
+type PipelineVersionID struct{ value string }
+type ExecutionLockID struct{ value string }
+type RuntimeReleaseID struct{ value string }
+type CompatibilityApprovalID struct{ value string }
+type TemplateLockID struct{ value string }
+type TaskWorkspaceRevisionID struct{ value string }
+type TaskWorkspaceID struct{ value string }
+type CheckpointID struct{ value string }
 
 type TraceID [16]byte
 type PayloadDigest [32]byte
@@ -126,6 +138,69 @@ func NewEvidenceID(value string) (EvidenceID, error) {
 	return EvidenceID{value: value}, nil
 }
 
+func NewPhaseKey(value string) (PhaseKey, error) {
+	if !validOpaqueID(value) {
+		return PhaseKey{}, invalidIntentError()
+	}
+	return PhaseKey{value: value}, nil
+}
+
+func NewPipelineVersionID(value string) (PipelineVersionID, error) {
+	if !validOpaqueID(value) {
+		return PipelineVersionID{}, invalidIntentError()
+	}
+	return PipelineVersionID{value: value}, nil
+}
+
+func NewExecutionLockID(value string) (ExecutionLockID, error) {
+	if !validOpaqueID(value) {
+		return ExecutionLockID{}, invalidIntentError()
+	}
+	return ExecutionLockID{value: value}, nil
+}
+
+func NewRuntimeReleaseID(value string) (RuntimeReleaseID, error) {
+	if !validOpaqueID(value) {
+		return RuntimeReleaseID{}, invalidIntentError()
+	}
+	return RuntimeReleaseID{value: value}, nil
+}
+
+func NewCompatibilityApprovalID(value string) (CompatibilityApprovalID, error) {
+	if !validOpaqueID(value) {
+		return CompatibilityApprovalID{}, invalidIntentError()
+	}
+	return CompatibilityApprovalID{value: value}, nil
+}
+
+func NewTemplateLockID(value string) (TemplateLockID, error) {
+	if !validOpaqueID(value) {
+		return TemplateLockID{}, invalidIntentError()
+	}
+	return TemplateLockID{value: value}, nil
+}
+
+func NewTaskWorkspaceRevisionID(value string) (TaskWorkspaceRevisionID, error) {
+	if !validOpaqueID(value) {
+		return TaskWorkspaceRevisionID{}, invalidIntentError()
+	}
+	return TaskWorkspaceRevisionID{value: value}, nil
+}
+
+func NewTaskWorkspaceID(value string) (TaskWorkspaceID, error) {
+	if !validOpaqueID(value) {
+		return TaskWorkspaceID{}, invalidIntentError()
+	}
+	return TaskWorkspaceID{value: value}, nil
+}
+
+func NewCheckpointID(value string) (CheckpointID, error) {
+	if !validOpaqueID(value) {
+		return CheckpointID{}, invalidIntentError()
+	}
+	return CheckpointID{value: value}, nil
+}
+
 func ParseTraceID(value string) (TraceID, error) {
 	var id TraceID
 	decoded, err := hex.DecodeString(value)
@@ -169,21 +244,30 @@ func ParseEnactmentPayloadDigest(value string) (EnactmentPayloadDigest, error) {
 	return digest, nil
 }
 
-func (id DecisionRequestID) String() string  { return id.value }
-func (id DecisionID) String() string         { return id.value }
-func (id AuditFactID) String() string        { return id.value }
-func (id OperationID) String() string        { return id.value }
-func (id CausationID) String() string        { return id.value }
-func (id TaskID) String() string             { return id.value }
-func (id AuthorityID) String() string        { return id.value }
-func (id GateID) String() string             { return id.value }
-func (id PhaseRunID) String() string         { return id.value }
-func (id RuntimeRunID) String() string       { return id.value }
-func (id ArtifactVersionID) String() string  { return id.value }
-func (id EvidenceID) String() string         { return id.value }
-func (id TraceID) String() string            { return hex.EncodeToString(id[:]) }
-func (digest PayloadDigest) String() string  { return hex.EncodeToString(digest[:]) }
-func (digest EvidenceDigest) String() string { return hex.EncodeToString(digest[:]) }
+func (id DecisionRequestID) String() string       { return id.value }
+func (id DecisionID) String() string              { return id.value }
+func (id AuditFactID) String() string             { return id.value }
+func (id OperationID) String() string             { return id.value }
+func (id CausationID) String() string             { return id.value }
+func (id TaskID) String() string                  { return id.value }
+func (id AuthorityID) String() string             { return id.value }
+func (id GateID) String() string                  { return id.value }
+func (id PhaseRunID) String() string              { return id.value }
+func (id RuntimeRunID) String() string            { return id.value }
+func (id ArtifactVersionID) String() string       { return id.value }
+func (id EvidenceID) String() string              { return id.value }
+func (id PhaseKey) String() string                { return id.value }
+func (id PipelineVersionID) String() string       { return id.value }
+func (id ExecutionLockID) String() string         { return id.value }
+func (id RuntimeReleaseID) String() string        { return id.value }
+func (id CompatibilityApprovalID) String() string { return id.value }
+func (id TemplateLockID) String() string          { return id.value }
+func (id TaskWorkspaceRevisionID) String() string { return id.value }
+func (id TaskWorkspaceID) String() string         { return id.value }
+func (id CheckpointID) String() string            { return id.value }
+func (id TraceID) String() string                 { return hex.EncodeToString(id[:]) }
+func (digest PayloadDigest) String() string       { return hex.EncodeToString(digest[:]) }
+func (digest EvidenceDigest) String() string      { return hex.EncodeToString(digest[:]) }
 func (digest EnactmentPayloadDigest) String() string {
 	return hex.EncodeToString(digest[:])
 }
@@ -445,12 +529,45 @@ type TaskOrchestrationQuery interface {
 }
 
 type TaskOrchestrationView struct {
-	TaskID             TaskID
-	TaskRevision       TaskRevision
-	ActivityGeneration ActivityGeneration
-	LatestDecisionID   DecisionID
-	DecisionCount      uint64
-	EnactmentCount     uint64
+	TaskID                  TaskID
+	TaskRevision            TaskRevision
+	ActivityGeneration      ActivityGeneration
+	LatestDecisionID        DecisionID
+	DecisionCount           uint64
+	EnactmentCount          uint64
+	Status                  TaskStatus
+	Route                   Route
+	Activity                ActivityKind
+	ExecutionLockID         ExecutionLockID
+	TemplateLockID          TemplateLockID
+	CurrentPhase            PhaseKey
+	ActivePhaseRunID        PhaseRunID
+	PhaseRuns               []PhaseRunView
+	LatestArtifactVersionID ArtifactVersionID
+	TaskWorkspaceID         TaskWorkspaceID
+}
+
+type PhaseRunView struct {
+	PhaseRunID             PhaseRunID
+	PhaseKey               PhaseKey
+	Attempt                uint32
+	Generation             PhaseRunGeneration
+	Fence                  PhaseRunFence
+	Outcome                PhaseRunOutcome
+	ValidationOutcome      PhaseValidationOutcome
+	LifecycleOutcome       TaskWorkspaceLifecycleOutcome
+	RevisionID             TaskWorkspaceRevisionID
+	CheckpointID           CheckpointID
+	PublicationOutcome     PublicationOutcome
+	ArtifactVersionID      ArtifactVersionID
+	TaskWorkspaceID        TaskWorkspaceID
+	InputArtifactVersionID ArtifactVersionID
+	RuntimeRuns            []RuntimeRunView
+}
+
+type RuntimeRunView struct {
+	RuntimeRunID RuntimeRunID
+	Outcome      RuntimeRunOutcome
 }
 
 type EnactmentKind uint8
@@ -461,6 +578,7 @@ const (
 	EnactmentArtifactPublication
 	EnactmentScheduling
 	EnactmentUsageAccounting
+	EnactmentPresentConfirmationGate
 )
 
 type EnactmentFenceKind uint8
@@ -471,6 +589,7 @@ const (
 	EnactmentFenceArtifactPublication
 	EnactmentFenceScheduling
 	EnactmentFenceUsageAccounting
+	EnactmentFenceConfirmation
 )
 
 // EnactmentFenceRef is closed to the downstream-specific fence types below.
@@ -484,6 +603,7 @@ func (TaskWorkspaceLifecycleFence) enactmentFenceRef() {}
 func (PublicationFence) enactmentFenceRef()            {}
 func (SchedulerFence) enactmentFenceRef()              {}
 func (UsageFence) enactmentFenceRef()                  {}
+func (ConfirmationFence) enactmentFenceRef()           {}
 
 func (RuntimeFence) EnactmentFenceKind() EnactmentFenceKind {
 	return EnactmentFenceRuntimeExecution
@@ -505,6 +625,10 @@ func (UsageFence) EnactmentFenceKind() EnactmentFenceKind {
 	return EnactmentFenceUsageAccounting
 }
 
+func (ConfirmationFence) EnactmentFenceKind() EnactmentFenceKind {
+	return EnactmentFenceConfirmation
+}
+
 type EnactmentRef struct {
 	OperationID        OperationID
 	Kind               EnactmentKind
@@ -515,9 +639,16 @@ type EnactmentRef struct {
 }
 
 type TaskProjection struct {
-	TaskID             TaskID
-	TaskRevision       TaskRevision
-	ActivityGeneration ActivityGeneration
+	TaskID                  TaskID
+	TaskRevision            TaskRevision
+	ActivityGeneration      ActivityGeneration
+	Status                  TaskStatus
+	Route                   Route
+	Activity                ActivityKind
+	CurrentPhase            PhaseKey
+	ActivePhaseRunID        PhaseRunID
+	LatestArtifactVersionID ArtifactVersionID
+	TaskWorkspaceID         TaskWorkspaceID
 }
 
 type AuditFactRef struct {

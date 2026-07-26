@@ -153,6 +153,33 @@ func NewStartTaskIntent(header IntentHeader, authority UserAuthority) Transition
 	return newIntent(header, IntentStartTask, authority.value, emptyIntentPayload{})
 }
 
+type pinnedTaskStartPayload struct{ pinned PinnedTaskStart }
+
+func (payload pinnedTaskStartPayload) canonical() map[string]any {
+	return map[string]any{
+		"execution_lock": map[string]any{
+			"compatibility_approval_id": payload.pinned.ExecutionLock.CompatibilityApprovalID.value,
+			"id":                        payload.pinned.ExecutionLock.ID.value,
+			"pipeline_contract":         payload.pinned.ExecutionLock.PipelineContract.canonical(),
+			"pipeline_version_id":       payload.pinned.ExecutionLock.PipelineVersionID.value,
+			"runtime_release_id":        payload.pinned.ExecutionLock.RuntimeReleaseID.value,
+		},
+		"route":             payload.pinned.Route.String(),
+		"task_workspace_id": payload.pinned.TaskWorkspaceID.value,
+		"template_lock_id":  payload.pinned.TemplateLockID.value,
+	}
+}
+
+func (payload pinnedTaskStartPayload) valid() bool { return payload.pinned.valid() }
+
+func NewStartPinnedTaskIntent(
+	header IntentHeader,
+	authority UserAuthority,
+	pinned PinnedTaskStart,
+) TransitionIntent {
+	return newIntent(header, IntentStartTask, authority.value, pinnedTaskStartPayload{pinned})
+}
+
 type operationPayload struct{ operationID OperationID }
 
 func (payload operationPayload) canonical() map[string]any {
@@ -256,18 +283,23 @@ type RuntimeEvidenceBinding struct {
 	OperationID  OperationID
 	Generation   ProducerGeneration
 	Fence        RuntimeFence
+	Outcome      RuntimeRunOutcome
 }
 
 type runtimeEvidencePayload struct{ binding RuntimeEvidenceBinding }
 
 func (payload runtimeEvidencePayload) canonical() map[string]any {
+	extra := map[string]any{"runtime_run_id": payload.binding.RuntimeRunID.value}
+	if payload.binding.Outcome != 0 {
+		extra["outcome"] = runtimeRunOutcomeName(payload.binding.Outcome)
+	}
 	return evidenceCanonical(
 		payload.binding.Evidence,
 		payload.binding.PhaseRunID,
 		payload.binding.OperationID,
 		payload.binding.Generation,
 		uint64(payload.binding.Fence),
-		map[string]any{"runtime_run_id": payload.binding.RuntimeRunID.value},
+		extra,
 	)
 }
 func (payload runtimeEvidencePayload) valid() bool {
@@ -277,7 +309,8 @@ func (payload runtimeEvidencePayload) valid() bool {
 		payload.binding.OperationID,
 		payload.binding.Generation,
 		uint64(payload.binding.Fence),
-	) && validOpaqueID(payload.binding.RuntimeRunID.value)
+	) && validOpaqueID(payload.binding.RuntimeRunID.value) &&
+		(payload.binding.Outcome == 0 || runtimeRunOutcomeName(payload.binding.Outcome) != "")
 }
 
 func NewAcceptRuntimeEvidenceIntent(
@@ -293,24 +326,30 @@ type ValidationEvidenceBinding struct {
 	PhaseRunID PhaseRunID
 	Generation ProducerGeneration
 	Fence      ValidationFence
+	Outcome    PhaseValidationOutcome
 }
 
 type validationEvidencePayload struct{ binding ValidationEvidenceBinding }
 
 func (payload validationEvidencePayload) canonical() map[string]any {
+	extra := map[string]any(nil)
+	if payload.binding.Outcome != 0 {
+		extra = map[string]any{"outcome": phaseValidationOutcomeName(payload.binding.Outcome)}
+	}
 	return evidenceCanonical(
 		payload.binding.Evidence,
 		payload.binding.PhaseRunID,
 		OperationID{},
 		payload.binding.Generation,
 		uint64(payload.binding.Fence),
-		nil,
+		extra,
 	)
 }
 func (payload validationEvidencePayload) valid() bool {
 	return validEvidenceRef(payload.binding.Evidence) &&
 		validOpaqueID(payload.binding.PhaseRunID.value) &&
-		payload.binding.Generation > 0 && payload.binding.Fence > 0
+		payload.binding.Generation > 0 && payload.binding.Fence > 0 &&
+		(payload.binding.Outcome == 0 || phaseValidationOutcomeName(payload.binding.Outcome) != "")
 }
 
 func NewAcceptPhaseValidationEvidenceIntent(
@@ -327,19 +366,24 @@ func NewAcceptPhaseValidationEvidenceIntent(
 }
 
 type TaskWorkspaceLifecycleEvidenceBinding struct {
-	Evidence    EvidenceRef
-	PhaseRunID  PhaseRunID
-	OperationID OperationID
-	Generation  ProducerGeneration
-	Fence       TaskWorkspaceLifecycleFence
+	Evidence     EvidenceRef
+	PhaseRunID   PhaseRunID
+	OperationID  OperationID
+	Generation   ProducerGeneration
+	Fence        TaskWorkspaceLifecycleFence
+	Outcome      TaskWorkspaceLifecycleOutcome
+	RevisionID   TaskWorkspaceRevisionID
+	CheckpointID CheckpointID
 }
 
 type PublicationEvidenceBinding struct {
-	Evidence    EvidenceRef
-	PhaseRunID  PhaseRunID
-	OperationID OperationID
-	Generation  ProducerGeneration
-	Fence       PublicationFence
+	Evidence          EvidenceRef
+	PhaseRunID        PhaseRunID
+	OperationID       OperationID
+	Generation        ProducerGeneration
+	Fence             PublicationFence
+	Outcome           PublicationOutcome
+	ArtifactVersionID ArtifactVersionID
 }
 
 type SchedulingEvidenceBinding struct {
@@ -357,28 +401,70 @@ type publicationEvidencePayload struct{ binding PublicationEvidenceBinding }
 type schedulingEvidencePayload struct{ binding SchedulingEvidenceBinding }
 
 func (payload taskWorkspaceLifecycleEvidencePayload) canonical() map[string]any {
+	extra := map[string]any(nil)
+	if payload.binding.Outcome != 0 {
+		extra = map[string]any{
+			"checkpoint_id": payload.binding.CheckpointID.value,
+			"outcome":       taskWorkspaceLifecycleOutcomeName(payload.binding.Outcome),
+			"revision_id":   payload.binding.RevisionID.value,
+		}
+	}
 	return evidenceCanonical(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
-		payload.binding.Generation, uint64(payload.binding.Fence), nil,
+		payload.binding.Generation, uint64(payload.binding.Fence), extra,
 	)
 }
 func (payload taskWorkspaceLifecycleEvidencePayload) valid() bool {
-	return validEvidenceBinding(
+	if !validEvidenceBinding(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
 		payload.binding.Generation, uint64(payload.binding.Fence),
-	)
+	) {
+		return false
+	}
+	if payload.binding.Outcome == 0 {
+		return payload.binding.RevisionID == (TaskWorkspaceRevisionID{}) &&
+			payload.binding.CheckpointID == (CheckpointID{})
+	}
+	if taskWorkspaceLifecycleOutcomeName(payload.binding.Outcome) == "" {
+		return false
+	}
+	if payload.binding.Outcome == TaskWorkspaceLifecycleCommitted {
+		return validOpaqueID(payload.binding.RevisionID.value) &&
+			validOpaqueID(payload.binding.CheckpointID.value)
+	}
+	return payload.binding.RevisionID == (TaskWorkspaceRevisionID{}) &&
+		payload.binding.CheckpointID == (CheckpointID{})
 }
 func (payload publicationEvidencePayload) canonical() map[string]any {
+	extra := map[string]any(nil)
+	if payload.binding.Outcome != 0 {
+		extra = map[string]any{
+			"artifact_version_id": payload.binding.ArtifactVersionID.value,
+			"outcome":             publicationOutcomeName(payload.binding.Outcome),
+		}
+	}
 	return evidenceCanonical(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
-		payload.binding.Generation, uint64(payload.binding.Fence), nil,
+		payload.binding.Generation, uint64(payload.binding.Fence), extra,
 	)
 }
 func (payload publicationEvidencePayload) valid() bool {
-	return validEvidenceBinding(
+	if !validEvidenceBinding(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
 		payload.binding.Generation, uint64(payload.binding.Fence),
-	)
+	) {
+		return false
+	}
+	if payload.binding.Outcome == 0 {
+		return payload.binding.ArtifactVersionID == (ArtifactVersionID{})
+	}
+	if publicationOutcomeName(payload.binding.Outcome) == "" {
+		return false
+	}
+	if payload.binding.Outcome == PublicationActivated {
+		return validOpaqueID(payload.binding.ArtifactVersionID.value)
+	}
+	return payload.binding.ArtifactVersionID == (ArtifactVersionID{})
 }
 func (payload schedulingEvidencePayload) canonical() map[string]any {
 	return evidenceCanonical(
