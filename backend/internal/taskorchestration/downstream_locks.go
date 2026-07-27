@@ -34,10 +34,11 @@ const (
 	PinnedLockRetry PinnedLockPurpose = iota + 1
 	PinnedLockRecovery
 	PinnedLockManualEdit
+	PinnedLockStart
 )
 
 func validPinnedLockPurpose(purpose PinnedLockPurpose) bool {
-	return purpose >= PinnedLockRetry && purpose <= PinnedLockManualEdit
+	return purpose >= PinnedLockRetry && purpose <= PinnedLockStart
 }
 
 type PublishedExecutionContract struct {
@@ -57,10 +58,13 @@ type PinnedExecutionLockRequest struct {
 }
 
 type ResolvedExecutionContract struct {
-	ExecutionLock  ExecutionLock
-	ContractDigest EvidenceDigest
-	Producer       EvidenceProducer
-	SafetyEpoch    SafetyEpoch
+	ExecutionLock      ExecutionLock
+	ContractDigest     EvidenceDigest
+	Producer           EvidenceProducer
+	SafetyEpoch        SafetyEpoch
+	verifiedTask       TaskID
+	verifiedPurpose    PinnedLockPurpose
+	verificationDigest EvidenceDigest
 }
 
 type ReleaseManagementPort interface {
@@ -122,10 +126,14 @@ func (adapter *releaseManagementAdapter) Resolve(
 			return validatePublishedExecutionContract(record, request)
 		},
 		func(record PublishedExecutionContract) ResolvedExecutionContract {
-			return ResolvedExecutionContract{
+			resolved := ResolvedExecutionContract{
 				ExecutionLock: cloneExecutionLock(record.ExecutionLock), ContractDigest: record.ContractDigest,
 				Producer: record.Producer, SafetyEpoch: record.SafetyEpoch,
 			}
+			resolved.verifiedTask = request.TaskID
+			resolved.verifiedPurpose = request.Purpose
+			resolved.verificationDigest = executionAdmissionVerificationDigest(resolved)
+			return resolved
 		},
 		cloneResolvedExecutionContract,
 	)
@@ -252,6 +260,9 @@ type ResolvedTemplateLockContract struct {
 	SafetyEpoch                  SafetyEpoch
 	Producer                     EvidenceProducer
 	BundleClosure                []ResourceBundleContract
+	verifiedTask                 TaskID
+	verifiedPurpose              PinnedLockPurpose
+	verificationDigest           EvidenceDigest
 }
 
 type CatalogPublicationPort interface {
@@ -296,7 +307,7 @@ func (adapter *catalogPublicationAdapter) Resolve(
 			return validatePublishedTemplateLockContract(record, request)
 		},
 		func(record PublishedTemplateLockContract) ResolvedTemplateLockContract {
-			return ResolvedTemplateLockContract{
+			resolved := ResolvedTemplateLockContract{
 				TemplateLockID: record.TemplateLockID, TemplateVersionID: record.TemplateVersionID,
 				TemplateManifestDigest:       record.TemplateManifestDigest,
 				TemplatePackageDigest:        record.TemplatePackageDigest,
@@ -307,6 +318,10 @@ func (adapter *catalogPublicationAdapter) Resolve(
 				SafetyEpoch: record.SafetyEpoch, Producer: record.Producer,
 				BundleClosure: append([]ResourceBundleContract(nil), record.BundleClosure...),
 			}
+			resolved.verifiedTask = request.TaskID
+			resolved.verifiedPurpose = request.Purpose
+			resolved.verificationDigest = templateAdmissionVerificationDigest(resolved)
+			return resolved
 		},
 		cloneResolvedTemplateLockContract,
 	)
@@ -415,4 +430,100 @@ func cloneResolvedTemplateLockContract(
 ) ResolvedTemplateLockContract {
 	resolved.BundleClosure = append([]ResourceBundleContract(nil), resolved.BundleClosure...)
 	return resolved
+}
+
+// TaskStartAdmission is an opaque proof that a Route transaction consumed the
+// exact Task-bound results of the Release Management and, for Generation,
+// Catalog Publication adapters. Callers cannot fabricate it from lock values.
+type TaskStartAdmission struct {
+	taskID                      TaskID
+	pinned                      PinnedTaskStart
+	safetyEpoch                 SafetyEpoch
+	executionVerificationDigest EvidenceDigest
+	templateVerificationDigest  EvidenceDigest
+}
+
+func NewTaskStartAdmission(
+	taskID TaskID,
+	route Route,
+	taskWorkspaceID TaskWorkspaceID,
+	authorities DownstreamAuthorityBindings,
+	execution ResolvedExecutionContract,
+	template *ResolvedTemplateLockContract,
+) (TaskStartAdmission, error) {
+	if !validOpaqueID(taskID.String()) || !validOpaqueID(taskWorkspaceID.String()) ||
+		route.String() == "" || !authorities.valid() ||
+		execution.verifiedTask != taskID || execution.verifiedPurpose != PinnedLockStart ||
+		execution.verificationDigest == (EvidenceDigest{}) ||
+		execution.verificationDigest != executionAdmissionVerificationDigest(execution) ||
+		!validExecutionLock(execution.ExecutionLock) ||
+		execution.ContractDigest != ExecutionLockContractDigest(execution.ExecutionLock) ||
+		execution.SafetyEpoch == 0 {
+		return TaskStartAdmission{}, invalidIntentError()
+	}
+	pinned := PinnedTaskStart{
+		Route: route, TaskWorkspaceID: taskWorkspaceID,
+		ExecutionLock: cloneExecutionLock(execution.ExecutionLock), Authorities: authorities,
+	}
+	if route == RouteGeneration {
+		if template == nil || template.verifiedTask != taskID ||
+			template.verifiedPurpose != PinnedLockStart ||
+			template.verificationDigest == (EvidenceDigest{}) ||
+			template.verificationDigest != templateAdmissionVerificationDigest(*template) ||
+			template.SafetyEpoch != execution.SafetyEpoch ||
+			template.CompatibilityExecutionLockID != execution.ExecutionLock.ID ||
+			!validOpaqueID(template.TemplateLockID.String()) ||
+			template.LockDigest == (EvidenceDigest{}) || len(template.BundleClosure) == 0 {
+			return TaskStartAdmission{}, invalidIntentError()
+		}
+		pinned.TemplateLockID = template.TemplateLockID
+	} else if template != nil {
+		return TaskStartAdmission{}, invalidIntentError()
+	}
+	if !pinned.valid() {
+		return TaskStartAdmission{}, invalidIntentError()
+	}
+	return TaskStartAdmission{
+		taskID: taskID, pinned: clonePinnedTaskStart(pinned), safetyEpoch: execution.SafetyEpoch,
+		executionVerificationDigest: execution.verificationDigest,
+		templateVerificationDigest: func() EvidenceDigest {
+			if template == nil {
+				return EvidenceDigest{}
+			}
+			return template.verificationDigest
+		}(),
+	}, nil
+}
+
+func (admission TaskStartAdmission) validFor(taskID TaskID) bool {
+	if admission.taskID != taskID || !admission.pinned.valid() || admission.safetyEpoch == 0 ||
+		admission.executionVerificationDigest == (EvidenceDigest{}) {
+		return false
+	}
+	if admission.pinned.Route == RouteGeneration {
+		return admission.templateVerificationDigest != (EvidenceDigest{})
+	}
+	return admission.templateVerificationDigest == (EvidenceDigest{})
+}
+
+func executionAdmissionVerificationDigest(resolved ResolvedExecutionContract) EvidenceDigest {
+	encoded, _ := json.Marshal(map[string]any{
+		"contract_digest":       resolved.ContractDigest.String(),
+		"producer_authority_id": resolved.Producer.AuthorityID.String(),
+		"producer_generation":   uint64(resolved.Producer.Generation),
+		"purpose":               uint64(resolved.verifiedPurpose), "safety_epoch": uint64(resolved.SafetyEpoch),
+		"task_id": resolved.verifiedTask.String(),
+	})
+	return EvidenceDigest(sha256.Sum256(encoded))
+}
+
+func templateAdmissionVerificationDigest(resolved ResolvedTemplateLockContract) EvidenceDigest {
+	encoded, _ := json.Marshal(map[string]any{
+		"lock_digest":           resolved.LockDigest.String(),
+		"producer_authority_id": resolved.Producer.AuthorityID.String(),
+		"producer_generation":   uint64(resolved.Producer.Generation),
+		"purpose":               uint64(resolved.verifiedPurpose), "safety_epoch": uint64(resolved.SafetyEpoch),
+		"task_id": resolved.verifiedTask.String(),
+	})
+	return EvidenceDigest(sha256.Sum256(encoded))
 }

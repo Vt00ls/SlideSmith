@@ -470,6 +470,8 @@ const (
 	IntentAcceptSchedulingEvidence
 	IntentReconcileEnactment
 	IntentApplyOperationalFence
+	IntentRetryRuntimeRun
+	IntentAcceptTaskWorkspaceReconstructionEvidence
 )
 
 type AuthorityKind uint8
@@ -563,31 +565,33 @@ type TaskOrchestrationQuery interface {
 }
 
 type TaskOrchestrationView struct {
-	TaskID                   TaskID
-	TaskRevision             TaskRevision
-	ActivityGeneration       ActivityGeneration
-	LatestDecisionID         DecisionID
-	DecisionCount            uint64
-	EnactmentCount           uint64
-	Status                   TaskStatus
-	Route                    Route
-	Activity                 ActivityKind
-	ExecutionLockID          ExecutionLockID
-	TemplateLockID           TemplateLockID
-	CurrentPhase             PhaseKey
-	ActivePhaseRunID         PhaseRunID
-	PhaseRuns                []PhaseRunView
-	LatestArtifactVersionID  ArtifactVersionID
-	TaskWorkspaceID          TaskWorkspaceID
-	EvidenceDiagnosticCount  uint64
-	LatestEvidenceDiagnostic EvidenceDiagnostic
-	LatestRevisionID         TaskWorkspaceRevisionID
-	LatestCheckpointID       CheckpointID
-	CancellationState        CancellationState
-	PhaseRunCount            uint64
-	RuntimeRunCount          uint64
-	SafetyEpoch              SafetyEpoch
-	OperationalMode          OperationalMode
+	TaskID                           TaskID
+	TaskRevision                     TaskRevision
+	ActivityGeneration               ActivityGeneration
+	LatestDecisionID                 DecisionID
+	DecisionCount                    uint64
+	EnactmentCount                   uint64
+	Status                           TaskStatus
+	Route                            Route
+	Activity                         ActivityKind
+	ExecutionLockID                  ExecutionLockID
+	TemplateLockID                   TemplateLockID
+	CurrentPhase                     PhaseKey
+	ActivePhaseRunID                 PhaseRunID
+	PhaseRuns                        []PhaseRunView
+	LatestArtifactVersionID          ArtifactVersionID
+	TaskWorkspaceID                  TaskWorkspaceID
+	EvidenceDiagnosticCount          uint64
+	LatestEvidenceDiagnostic         EvidenceDiagnostic
+	LatestRevisionID                 TaskWorkspaceRevisionID
+	LatestCheckpointID               CheckpointID
+	TaskWorkspaceLifecycleGeneration TaskWorkspaceLifecycleGeneration
+	TaskWorkspaceLifecycleFence      TaskWorkspaceLifecycleFence
+	CancellationState                CancellationState
+	PhaseRunCount                    uint64
+	RuntimeRunCount                  uint64
+	SafetyEpoch                      SafetyEpoch
+	OperationalMode                  OperationalMode
 }
 
 type PhaseRunView struct {
@@ -682,25 +686,25 @@ type EnactmentRef struct {
 }
 
 type TaskProjection struct {
-	TaskID                  TaskID
-	TaskRevision            TaskRevision
-	ActivityGeneration      ActivityGeneration
-	Status                  TaskStatus
-	Route                   Route
-	Activity                ActivityKind
-	CurrentPhase            PhaseKey
-	ActivePhaseRunID        PhaseRunID
-	LatestArtifactVersionID ArtifactVersionID
-	TaskWorkspaceID         TaskWorkspaceID
-	LatestRevisionID        TaskWorkspaceRevisionID
-	LatestCheckpointID      CheckpointID
-	CancellationState       CancellationState
-	SafetyEpoch             SafetyEpoch
-	OperationalMode         OperationalMode
-}
-
-type AuditFactRef struct {
-	AuditFactID AuditFactID
+	TaskID                           TaskID
+	TaskRevision                     TaskRevision
+	ActivityGeneration               ActivityGeneration
+	Status                           TaskStatus
+	Route                            Route
+	Activity                         ActivityKind
+	ExecutionLockID                  ExecutionLockID
+	TemplateLockID                   TemplateLockID
+	CurrentPhase                     PhaseKey
+	ActivePhaseRunID                 PhaseRunID
+	LatestArtifactVersionID          ArtifactVersionID
+	TaskWorkspaceID                  TaskWorkspaceID
+	LatestRevisionID                 TaskWorkspaceRevisionID
+	LatestCheckpointID               CheckpointID
+	TaskWorkspaceLifecycleGeneration TaskWorkspaceLifecycleGeneration
+	TaskWorkspaceLifecycleFence      TaskWorkspaceLifecycleFence
+	CancellationState                CancellationState
+	SafetyEpoch                      SafetyEpoch
+	OperationalMode                  OperationalMode
 }
 
 // TransitionDecision reports only facts committed by Decide.

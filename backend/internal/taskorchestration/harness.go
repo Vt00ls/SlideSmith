@@ -90,6 +90,7 @@ type LifecycleOperationPurpose uint8
 const (
 	LifecycleOperationCommit LifecycleOperationPurpose = iota + 1
 	LifecycleOperationCancellationFence
+	LifecycleOperationReconstruction
 )
 
 type HarnessLifecycleOperationFixture struct {
@@ -490,6 +491,11 @@ type taskAggregate struct {
 	phaseRuns                       []phaseRunRecord
 	latestArtifactVersionID         ArtifactVersionID
 	activitySourceArtifactVersionID ArtifactVersionID
+	reconstructionRequired          bool
+	reconstructionAccepted          bool
+	reconstructionOperationID       OperationID
+	lifecycleGeneration             TaskWorkspaceLifecycleGeneration
+	lifecycleFence                  TaskWorkspaceLifecycleFence
 }
 
 type phaseRunRecord struct {
@@ -840,6 +846,13 @@ func (engine *decisionEngine) Decide(
 		return TransitionDecision{}, err
 	}
 	if !exists && intent.Kind() == IntentStartTask {
+		payload, ok := intent.(intentValue).payload.(pinnedTaskStartPayload)
+		if !ok || payload.verifiedTask != header.TaskID {
+			return TransitionDecision{}, invalidIntentError()
+		}
+		if payload.safetyEpoch != engine.effectiveSafetyEpoch(record) {
+			return TransitionDecision{}, newError(ErrorStaleAuthority)
+		}
 		record.initializeNewTask(
 			engine.effectiveSafetyEpoch(record),
 			engine.persistence.recovery.activityGenerationFence,
@@ -925,7 +938,7 @@ func (engine *decisionEngine) Decide(
 		engine.effectiveSafetyEpoch(updatedRecord),
 	)
 	if facts, isEvidenceIntent, factsErr := evidenceFacts(intent); factsErr == nil && isEvidenceIntent {
-		if len(affectedPhaseRuns) == 0 {
+		if len(affectedPhaseRuns) == 0 && validOpaqueID(facts.phaseRunID.value) {
 			affectedPhaseRuns = append(affectedPhaseRuns, facts.phaseRunID)
 		}
 		acceptedEvidenceRefs = append(acceptedEvidenceRefs, facts.evidence)
@@ -944,10 +957,14 @@ func (engine *decisionEngine) Decide(
 			if !containsPhaseRunID(affectedPhaseRuns, activePhaseRunID) {
 				affectedPhaseRuns = append(affectedPhaseRuns, activePhaseRunID)
 			}
-			cancellationEnactments := engine.buildCancellationEnactments(
-				&updatedRecord, activePhaseRunID, acceptedActivityGeneration,
-				engine.effectiveSafetyEpoch(updatedRecord), &ids,
+			cancel := intent.(intentValue).payload.(cancelPayload)
+			cancellationEnactments, cancellationErr := engine.buildCancellationEnactments(
+				&updatedRecord, header.TaskID, activePhaseRunID, acceptedActivityGeneration,
+				engine.effectiveSafetyEpoch(updatedRecord), &ids, cancel.lifecycleFence,
 			)
+			if cancellationErr != nil {
+				return TransitionDecision{}, cancellationErr
+			}
 			enactmentRefs = append(enactmentRefs, cancellationEnactments...)
 			newEnactmentCount += uint64(len(cancellationEnactments))
 		}
@@ -985,10 +1002,14 @@ func (engine *decisionEngine) Decide(
 				if !containsPhaseRunID(affectedPhaseRuns, activePhaseRunID) {
 					affectedPhaseRuns = append(affectedPhaseRuns, activePhaseRunID)
 				}
-				cancellationEnactments := engine.buildCancellationEnactments(
-					&updatedRecord, activePhaseRunID, acceptedActivityGeneration,
+				cancellationEnactments, cancellationErr := engine.buildCancellationEnactments(
+					&updatedRecord, header.TaskID, activePhaseRunID, acceptedActivityGeneration,
 					effectiveSafetyEpoch(updatedRecord, updatedRecovery), &ids,
+					binding.LifecycleFence,
 				)
+				if cancellationErr != nil {
+					return TransitionDecision{}, cancellationErr
+				}
 				enactmentRefs = append(enactmentRefs, cancellationEnactments...)
 				newEnactmentCount += uint64(len(cancellationEnactments))
 			}
@@ -1007,6 +1028,12 @@ func (engine *decisionEngine) Decide(
 	projection.CancellationState = updatedRecord.cancellationState
 	projection.SafetyEpoch = effectiveSafetyEpoch
 	projection.OperationalMode = updatedRecovery.mode
+	committedAt := engine.clock.current()
+	mandatoryAudit := newMandatoryAuditFact(
+		auditFactID, intent.(intentValue), decisionID, record, updatedRecord,
+		engine.persistence.recovery, updatedRecovery, current, accepted,
+		acceptedEvidenceRefs, enactmentRefs, committedAt,
+	)
 	decision := TransitionDecision{
 		DecisionID:             decisionID,
 		DecisionRequestID:      header.DecisionRequestID,
@@ -1016,9 +1043,9 @@ func (engine *decisionEngine) Decide(
 		TaskProjection:         projection,
 		AffectedPhaseRuns:      affectedPhaseRuns,
 		AcceptedEvidenceRefs:   acceptedEvidenceRefs,
-		CommittedAt:            engine.clock.current(),
+		CommittedAt:            committedAt,
 		EnactmentRefs:          enactmentRefs,
-		MandatoryAuditFactRef:  AuditFactRef{AuditFactID: auditFactID},
+		MandatoryAuditFactRef:  mandatoryAudit,
 	}
 	if updatedRecord.owner == (userOwnershipBinding{}) && intent.Kind() == IntentStartTask {
 		typed := intent.(intentValue)
@@ -1154,7 +1181,7 @@ func containsPhaseRunID(values []PhaseRunID, target PhaseRunID) bool {
 func isAggregateBusinessIntent(kind IntentKind) bool {
 	switch kind {
 	case IntentStartTask, IntentMakeWorkAvailable, IntentSubmitConfirmationGate,
-		IntentRetryPhase, IntentCancelTask, IntentBeginManualEdit:
+		IntentRetryPhase, IntentRetryRuntimeRun, IntentCancelTask, IntentBeginManualEdit:
 		return true
 	default:
 		return false
@@ -1173,6 +1200,20 @@ func (engine *decisionEngine) syncAggregateCoordination(
 	for _, ref := range enactments {
 		record.enactments[ref.OperationID] = ref
 	}
+	if record.aggregate.reconstructionRequired &&
+		record.aggregate.reconstructionOperationID != (OperationID{}) {
+		operationID := record.aggregate.reconstructionOperationID
+		if _, exists := record.lifecycleOperations[operationID]; !exists {
+			record.lifecycleOperations[operationID] = lifecycleOperationBinding{
+				authority:          record.aggregate.pinned.Authorities.TaskWorkspaceLifecycle.value,
+				generation:         record.aggregate.lifecycleGeneration,
+				fence:              record.aggregate.lifecycleFence,
+				safetyEpoch:        safetyEpoch,
+				purpose:            LifecycleOperationReconstruction,
+				activityGeneration: activityGeneration,
+			}
+		}
+	}
 	for index := range record.aggregate.phaseRuns {
 		run := &record.aggregate.phaseRuns[index]
 		record.phaseRuns[run.id] = phaseRunBinding{
@@ -1182,6 +1223,7 @@ func (engine *decisionEngine) syncAggregateCoordination(
 		}
 		if _, exists := record.validationBindings[run.id]; !exists {
 			record.validationBindings[run.id] = validationBinding{
+				authority:          record.aggregate.pinned.Authorities.Validator.value,
 				generation:         ProducerGeneration(run.generation),
 				fence:              ValidationFence(run.fence),
 				safetyEpoch:        safetyEpoch,
@@ -1189,41 +1231,71 @@ func (engine *decisionEngine) syncAggregateCoordination(
 			}
 		}
 		for _, runtimeRun := range run.runtimeRuns {
-			if _, exists := record.runtimeOperations[runtimeRun.operationID]; exists {
-				continue
+			if _, exists := record.runtimeOperations[runtimeRun.operationID]; !exists {
+				record.runtimeOperations[runtimeRun.operationID] = runtimeOperationBinding{
+					phaseRunID:         run.id,
+					runtimeRunID:       runtimeRun.id,
+					authority:          record.aggregate.pinned.Authorities.Runtime.value,
+					generation:         RuntimeGeneration(run.generation),
+					fence:              RuntimeFence(run.fence),
+					safetyEpoch:        safetyEpoch,
+					activityGeneration: activityGeneration,
+				}
 			}
-			record.runtimeOperations[runtimeRun.operationID] = runtimeOperationBinding{
-				phaseRunID:         run.id,
-				runtimeRunID:       runtimeRun.id,
-				generation:         RuntimeGeneration(run.generation),
-				fence:              RuntimeFence(run.fence),
-				safetyEpoch:        safetyEpoch,
-				activityGeneration: activityGeneration,
-			}
+			record.bindAggregateSchedulingOperation(
+				runtimeRun.operationID, *run, activityGeneration, safetyEpoch,
+			)
 		}
 		if run.lifecycleOperationID != (OperationID{}) {
 			if _, exists := record.lifecycleOperations[run.lifecycleOperationID]; !exists {
 				record.lifecycleOperations[run.lifecycleOperationID] = lifecycleOperationBinding{
 					phaseRunID:         run.id,
-					generation:         TaskWorkspaceLifecycleGeneration(run.generation),
-					fence:              TaskWorkspaceLifecycleFence(run.fence),
+					authority:          record.aggregate.pinned.Authorities.TaskWorkspaceLifecycle.value,
+					generation:         record.aggregate.lifecycleGeneration,
+					fence:              record.aggregate.lifecycleFence,
 					safetyEpoch:        safetyEpoch,
 					purpose:            LifecycleOperationCommit,
 					activityGeneration: activityGeneration,
 				}
 			}
+			record.bindAggregateSchedulingOperation(
+				run.lifecycleOperationID, *run, activityGeneration, safetyEpoch,
+			)
 		}
 		if run.publicationOperationID != (OperationID{}) {
 			if _, exists := record.publicationOperations[run.publicationOperationID]; !exists {
 				record.publicationOperations[run.publicationOperationID] = publicationOperationBinding{
 					phaseRunID:         run.id,
+					authority:          record.aggregate.pinned.Authorities.Publication.value,
 					generation:         ProducerGeneration(run.generation),
 					fence:              PublicationFence(run.fence),
 					safetyEpoch:        safetyEpoch,
 					activityGeneration: activityGeneration,
 				}
 			}
+			record.bindAggregateSchedulingOperation(
+				run.publicationOperationID, *run, activityGeneration, safetyEpoch,
+			)
 		}
+	}
+}
+
+func (record *taskRecord) bindAggregateSchedulingOperation(
+	operationID OperationID,
+	run phaseRunRecord,
+	activityGeneration ActivityGeneration,
+	safetyEpoch SafetyEpoch,
+) {
+	if _, exists := record.schedulingOperations[operationID]; exists {
+		return
+	}
+	record.schedulingOperations[operationID] = schedulingOperationBinding{
+		phaseRunID:         run.id,
+		authority:          record.aggregate.pinned.Authorities.Scheduler.value,
+		generation:         ProducerGeneration(run.generation),
+		fence:              SchedulerFence(run.fence),
+		safetyEpoch:        safetyEpoch,
+		activityGeneration: activityGeneration,
 	}
 }
 
@@ -1237,7 +1309,7 @@ func applyAggregateIntent(
 	if typed.kind == IntentStartTask {
 		pinnedPayload, pinned := typed.payload.(pinnedTaskStartPayload)
 		if !pinned {
-			return record, nil, nil, nil
+			return record, nil, nil, invalidIntentError()
 		}
 		if record.aggregate != nil {
 			return record, nil, nil, newError(ErrorTerminalConflict)
@@ -1280,14 +1352,18 @@ func applyAggregateIntent(
 		return acceptAggregateValidationEvidence(record, typed, ids, decisionID)
 	case IntentAcceptTaskWorkspaceLifecycleEvidence:
 		return acceptAggregateTaskWorkspaceLifecycleEvidence(record, typed)
+	case IntentAcceptTaskWorkspaceReconstructionEvidence:
+		return acceptAggregateTaskWorkspaceReconstructionEvidence(record, typed)
 	case IntentAcceptPublicationEvidence:
 		return acceptAggregatePublicationEvidence(record, typed)
 	case IntentSubmitConfirmationGate:
 		return acceptAggregateConfirmation(record, typed)
 	case IntentRetryPhase:
 		return retryAggregatePhase(record, typed, ids, decisionID)
+	case IntentRetryRuntimeRun:
+		return retryAggregateRuntimeRun(record, typed, ids, decisionID)
 	case IntentBeginManualEdit:
-		return beginAggregateManualEdit(record, typed)
+		return beginAggregateManualEdit(record, typed, ids, decisionID)
 	case IntentCancelTask:
 		return cancelAggregateTask(record)
 	case IntentAcceptSchedulingEvidence, IntentReconcileEnactment, IntentApplyOperationalFence:
@@ -1349,6 +1425,8 @@ func cancelAggregateTask(record taskRecord) (taskRecord, []PhaseRunID, []Enactme
 func beginAggregateManualEdit(
 	record taskRecord,
 	intent intentValue,
+	ids *deterministicIDAllocator,
+	decisionID DecisionID,
 ) (taskRecord, []PhaseRunID, []EnactmentRef, error) {
 	payload := intent.payload.(manualEditPayload)
 	aggregate := record.aggregate
@@ -1366,7 +1444,34 @@ func beginAggregateManualEdit(
 	aggregate.currentPhase = entry
 	aggregate.activePhaseRunID = PhaseRunID{}
 	aggregate.activitySourceArtifactVersionID = payload.artifactVersionID
-	return record, nil, nil, nil
+	aggregate.reconstructionRequired = payload.reconstructionRequired
+	aggregate.reconstructionAccepted = !payload.reconstructionRequired
+	aggregate.reconstructionOperationID = OperationID{}
+	if !payload.reconstructionRequired {
+		return record, nil, nil, nil
+	}
+	binding := payload.reconstructionRequest
+	if !binding.valid() || binding.taskID != intent.header.TaskID ||
+		binding.taskWorkspaceID != aggregate.pinned.TaskWorkspaceID ||
+		binding.artifactVersionID != payload.artifactVersionID ||
+		record.hasOperationID(binding.operationID) ||
+		(record.latestRevisionID != (TaskWorkspaceRevisionID{}) &&
+			binding.expectedRevision != record.latestRevisionID) ||
+		(record.latestCheckpointID != (CheckpointID{}) &&
+			binding.expectedCheckpoint != record.latestCheckpointID) ||
+		(aggregate.lifecycleGeneration != 0 && binding.generation != aggregate.lifecycleGeneration) ||
+		(aggregate.lifecycleFence != 0 && binding.fence != aggregate.lifecycleFence) {
+		return record, nil, nil, newError(ErrorEvidenceScopeConflict)
+	}
+	aggregate.lifecycleGeneration = binding.generation
+	aggregate.lifecycleFence = binding.fence
+	operationID := binding.operationID
+	aggregate.reconstructionOperationID = operationID
+	enactment := harnessEnactmentWithPayload(
+		operationID, EnactmentTaskWorkspaceLifecycle, binding.payloadDigest, binding.fence,
+		intent.header.ActivityGeneration, decisionID, PhaseRunID{}, RuntimeRunID{},
+	)
+	return record, nil, []EnactmentRef{enactment}, nil
 }
 
 func beginAggregatePhase(
@@ -1378,6 +1483,9 @@ func beginAggregatePhase(
 	aggregate := record.aggregate
 	if aggregate.status != TaskReady && aggregate.status != TaskRunning ||
 		aggregate.activePhaseRunID != (PhaseRunID{}) {
+		return record, nil, nil, newError(ErrorTerminalConflict)
+	}
+	if aggregate.reconstructionRequired && !aggregate.reconstructionAccepted {
 		return record, nil, nil, newError(ErrorTerminalConflict)
 	}
 	phase, ok := currentPhaseDefinition(aggregate)
@@ -1463,6 +1571,47 @@ func retryAggregatePhase(
 	return beginAggregatePhase(record, intent, ids, decisionID)
 }
 
+func retryAggregateRuntimeRun(
+	record taskRecord,
+	intent intentValue,
+	ids *deterministicIDAllocator,
+	decisionID DecisionID,
+) (taskRecord, []PhaseRunID, []EnactmentRef, error) {
+	payload := intent.payload.(runtimeRunRetryPayload)
+	aggregate := record.aggregate
+	if aggregate.status != TaskRunning || aggregate.activePhaseRunID != payload.phaseRunID {
+		return record, nil, nil, newError(ErrorTerminalConflict)
+	}
+	phase, ok := currentPhaseDefinition(aggregate)
+	if !ok || !phase.RetryEligible || phase.RequiredRuntimeRuns == 0 {
+		return record, nil, nil, newError(ErrorTerminalConflict)
+	}
+	run, ok := activePhaseRun(aggregate, payload.phaseRunID)
+	if !ok || run.phaseKey != phase.Key || run.outcome != PhaseRunRunning ||
+		run.validationOutcome != 0 {
+		return record, nil, nil, newError(ErrorTerminalConflict)
+	}
+	failed := false
+	for _, runtimeRun := range run.runtimeRuns {
+		if runtimeRun.id == payload.runtimeRunID && runtimeRun.outcome == RuntimeRunFailed {
+			failed = true
+			break
+		}
+	}
+	if !failed {
+		return record, nil, nil, newError(ErrorTerminalConflict)
+	}
+	runtimeRun := runtimeRunRecord{id: ids.nextRuntimeRunID(), outcome: RuntimeRunPending}
+	runtimeRun.operationID = ids.nextOperationID()
+	run.runtimeRuns = append(run.runtimeRuns, runtimeRun)
+	enactment := harnessEnactment(
+		runtimeRun.operationID, EnactmentRuntimeExecution, RuntimeFence(run.fence),
+		intent.header.ActivityGeneration, decisionID, run.id, runtimeRun.id,
+		run.taskWorkspaceID, run.inputArtifactVersionID,
+	)
+	return record, []PhaseRunID{run.id}, []EnactmentRef{enactment}, nil
+}
+
 func acceptAggregateConfirmation(
 	record taskRecord,
 	intent intentValue,
@@ -1533,25 +1682,46 @@ func acceptAggregateValidationEvidence(
 	}
 	switch phase.ValidationContract {
 	case PhaseValidationAllRuntimeRunsSucceeded:
+		succeeded := uint32(0)
 		for _, runtimeRun := range run.runtimeRuns {
-			if runtimeRun.outcome != RuntimeRunSucceeded {
+			if runtimeRun.outcome == RuntimeRunPending {
 				return record, nil, nil, newError(ErrorEvidenceInvalid)
 			}
+			if runtimeRun.outcome == RuntimeRunSucceeded {
+				succeeded++
+			}
+		}
+		if succeeded < phase.RequiredRuntimeRuns {
+			return record, nil, nil, newError(ErrorEvidenceInvalid)
 		}
 	default:
 		return record, nil, nil, newError(ErrorUnsupportedPipelineContract)
 	}
 	run.validationOutcome = payload.binding.Outcome
 	if phase.Kind == PhaseNonMutating {
+		if payload.binding.LifecycleCommit.valid() {
+			return record, nil, nil, newError(ErrorEvidenceScopeConflict)
+		}
 		finishAggregatePhase(record.aggregate, run, phase)
 		return record, []PhaseRunID{run.id}, nil, nil
 	}
-	operationID := ids.nextOperationID()
+	binding := payload.binding.LifecycleCommit
+	if !binding.valid() || binding.taskID != intent.header.TaskID || binding.phaseRunID != run.id ||
+		binding.taskWorkspaceID != run.taskWorkspaceID || record.hasOperationID(binding.operationID) ||
+		(record.latestRevisionID != (TaskWorkspaceRevisionID{}) &&
+			binding.expectedRevision != record.latestRevisionID) ||
+		(record.aggregate.lifecycleGeneration != 0 &&
+			binding.generation != record.aggregate.lifecycleGeneration) ||
+		(record.aggregate.lifecycleFence != 0 && binding.fence != record.aggregate.lifecycleFence) {
+		return record, nil, nil, newError(ErrorEvidenceScopeConflict)
+	}
+	record.aggregate.lifecycleGeneration = binding.generation
+	record.aggregate.lifecycleFence = binding.fence
+	operationID := binding.operationID
 	run.lifecycleOperationID = operationID
-	enactment := harnessEnactment(
-		operationID, EnactmentTaskWorkspaceLifecycle, TaskWorkspaceLifecycleFence(run.fence),
+	enactment := harnessEnactmentWithPayload(
+		operationID, EnactmentTaskWorkspaceLifecycle, binding.payloadDigest, binding.fence,
 		intent.header.ActivityGeneration, decisionID, run.id, RuntimeRunID{},
-		run.taskWorkspaceID, run.inputArtifactVersionID,
 	)
 	return record, []PhaseRunID{run.id}, []EnactmentRef{enactment}, nil
 }
@@ -1572,6 +1742,8 @@ func acceptAggregateTaskWorkspaceLifecycleEvidence(
 	if !ok || phase.Kind != PhaseMutating {
 		return record, nil, nil, newError(ErrorEvidenceScopeConflict)
 	}
+	record.aggregate.lifecycleGeneration = payload.binding.ObservedGeneration
+	record.aggregate.lifecycleFence = payload.binding.ObservedFence
 	if record.aggregate.status == TaskCancelling {
 		operation, operationExists := record.lifecycleOperations[payload.binding.OperationID]
 		if !operationExists || operation.phaseRunID != run.id {
@@ -1617,6 +1789,24 @@ func acceptAggregateTaskWorkspaceLifecycleEvidence(
 	run.checkpointID = payload.binding.CheckpointID
 	finishAggregatePhase(record.aggregate, run, phase)
 	return record, []PhaseRunID{run.id}, nil, nil
+}
+
+func acceptAggregateTaskWorkspaceReconstructionEvidence(
+	record taskRecord,
+	intent intentValue,
+) (taskRecord, []PhaseRunID, []EnactmentRef, error) {
+	payload := intent.payload.(taskWorkspaceReconstructionEvidencePayload)
+	aggregate := record.aggregate
+	if aggregate.activity != ActivityManualEdit || !aggregate.reconstructionRequired ||
+		aggregate.reconstructionAccepted ||
+		aggregate.reconstructionOperationID != payload.binding.OperationID ||
+		aggregate.activitySourceArtifactVersionID != payload.binding.ArtifactVersionID {
+		return record, nil, nil, newError(ErrorEvidenceScopeConflict)
+	}
+	aggregate.reconstructionAccepted = true
+	aggregate.lifecycleGeneration = payload.binding.ObservedGeneration
+	aggregate.lifecycleFence = payload.binding.ObservedFence
+	return record, nil, nil, nil
 }
 
 func acceptAggregatePublicationEvidence(
@@ -1722,6 +1912,23 @@ func harnessEnactment(
 	}
 }
 
+func harnessEnactmentWithPayload(
+	operationID OperationID,
+	kind EnactmentKind,
+	payloadDigest EnactmentPayloadDigest,
+	fence EnactmentFenceRef,
+	activityGeneration ActivityGeneration,
+	decisionID DecisionID,
+	phaseRunID PhaseRunID,
+	runtimeRunID RuntimeRunID,
+) EnactmentRef {
+	return EnactmentRef{
+		OperationID: operationID, Kind: kind, PayloadDigest: payloadDigest,
+		ActivityGeneration: activityGeneration, Fence: fence,
+		CausationID: CausationID{value: "causation-" + decisionID.value},
+	}
+}
+
 func taskProjection(
 	taskID TaskID,
 	revision TaskRevision,
@@ -1735,10 +1942,14 @@ func taskProjection(
 		projection.Status = aggregate.status
 		projection.Route = aggregate.route
 		projection.Activity = aggregate.activity
+		projection.ExecutionLockID = aggregate.pinned.ExecutionLock.ID
+		projection.TemplateLockID = aggregate.pinned.TemplateLockID
 		projection.CurrentPhase = aggregate.currentPhase
 		projection.ActivePhaseRunID = aggregate.activePhaseRunID
 		projection.LatestArtifactVersionID = aggregate.latestArtifactVersionID
 		projection.TaskWorkspaceID = aggregate.pinned.TaskWorkspaceID
+		projection.TaskWorkspaceLifecycleGeneration = aggregate.lifecycleGeneration
+		projection.TaskWorkspaceLifecycleFence = aggregate.lifecycleFence
 	}
 	return projection
 }
@@ -1763,6 +1974,12 @@ func cloneTransitionDecision(decision TransitionDecision) TransitionDecision {
 	decision.AffectedPhaseRuns = cloneValues(decision.AffectedPhaseRuns)
 	decision.AcceptedEvidenceRefs = cloneValues(decision.AcceptedEvidenceRefs)
 	decision.EnactmentRefs = cloneValues(decision.EnactmentRefs)
+	decision.MandatoryAuditFactRef.EvidenceRefs = cloneValues(
+		decision.MandatoryAuditFactRef.EvidenceRefs,
+	)
+	decision.MandatoryAuditFactRef.EnactmentRefs = cloneValues(
+		decision.MandatoryAuditFactRef.EnactmentRefs,
+	)
 	return decision
 }
 
@@ -1839,12 +2056,18 @@ func (record taskRecord) activePhaseRun() (PhaseRunID, bool) {
 
 func (engine *decisionEngine) buildCancellationEnactments(
 	record *taskRecord,
+	taskID TaskID,
 	phaseRunID PhaseRunID,
 	activityGeneration ActivityGeneration,
 	safetyEpoch SafetyEpoch,
 	ids *deterministicIDAllocator,
-) []EnactmentRef {
+	lifecycleFenceRequest TaskWorkspaceLifecycleFenceRequestBinding,
+) ([]EnactmentRef, error) {
 	refs := make([]EnactmentRef, 0, 2)
+	schedulerAuthority := authorityValue{}
+	if record.aggregate != nil {
+		schedulerAuthority = record.aggregate.pinned.Authorities.Scheduler.value
+	}
 	runtimeOperationByRun := make(map[RuntimeRunID]runtimeOperationBinding)
 	for _, operation := range record.runtimeOperations {
 		if operation.phaseRunID != phaseRunID {
@@ -1888,6 +2111,13 @@ func (engine *decisionEngine) buildCancellationEnactments(
 			safetyEpoch:        safetyEpoch,
 			activityGeneration: activityGeneration,
 		}
+		record.schedulingOperations[operationID] = schedulingOperationBinding{
+			phaseRunID: phaseRunID,
+			authority:  schedulerAuthority,
+			generation: ProducerGeneration(operation.generation),
+			fence:      SchedulerFence(fence), safetyEpoch: safetyEpoch,
+			activityGeneration: activityGeneration,
+		}
 		record.enactments[operationID] = ref
 		refs = append(refs, ref)
 	}
@@ -1908,6 +2138,7 @@ func (engine *decisionEngine) buildCancellationEnactments(
 		if runExists && phaseExists && phase.Key == run.phaseKey && phase.Kind == PhaseMutating {
 			lifecycleOperation = lifecycleOperationBinding{
 				phaseRunID:  phaseRunID,
+				authority:   record.aggregate.pinned.Authorities.TaskWorkspaceLifecycle.value,
 				generation:  TaskWorkspaceLifecycleGeneration(run.generation),
 				fence:       TaskWorkspaceLifecycleFence(run.fence),
 				safetyEpoch: safetyEpoch,
@@ -1916,16 +2147,26 @@ func (engine *decisionEngine) buildCancellationEnactments(
 		}
 	}
 	if hasLifecycleOperation {
-		operationID := nextUniqueOperationID(record, ids)
-		fence := lifecycleOperation.fence + 1
+		if !lifecycleFenceRequest.valid() ||
+			lifecycleFenceRequest.taskID != taskID ||
+			lifecycleFenceRequest.phaseRunID != phaseRunID ||
+			record.aggregate == nil ||
+			lifecycleFenceRequest.taskWorkspaceID != record.aggregate.pinned.TaskWorkspaceID ||
+			record.hasOperationID(lifecycleFenceRequest.operationID) ||
+			(record.latestRevisionID != (TaskWorkspaceRevisionID{}) &&
+				lifecycleFenceRequest.expectedRevision != record.latestRevisionID) ||
+			(record.aggregate.lifecycleGeneration != 0 &&
+				lifecycleFenceRequest.generation != record.aggregate.lifecycleGeneration) ||
+			(record.aggregate.lifecycleFence != 0 &&
+				lifecycleFenceRequest.fence != record.aggregate.lifecycleFence) {
+			return nil, newError(ErrorEvidenceScopeConflict)
+		}
+		operationID := lifecycleFenceRequest.operationID
+		fence := lifecycleFenceRequest.fence
 		ref := EnactmentRef{
-			OperationID: operationID,
-			Kind:        EnactmentTaskWorkspaceLifecycle,
-			PayloadDigest: computeEnactmentPayloadDigest(map[string]any{
-				"activity_generation": uint64(activityGeneration),
-				"phase_run_id":        phaseRunID.value,
-				"purpose":             "fence_discard",
-			}),
+			OperationID:        operationID,
+			Kind:               EnactmentTaskWorkspaceLifecycle,
+			PayloadDigest:      lifecycleFenceRequest.payloadDigest,
 			ActivityGeneration: activityGeneration,
 			Fence:              fence,
 			CausationID:        ids.nextCausationID(),
@@ -1933,16 +2174,25 @@ func (engine *decisionEngine) buildCancellationEnactments(
 		record.lifecycleOperations[operationID] = lifecycleOperationBinding{
 			phaseRunID:         phaseRunID,
 			authority:          lifecycleOperation.authority,
-			generation:         lifecycleOperation.generation,
+			generation:         lifecycleFenceRequest.generation,
 			fence:              fence,
 			safetyEpoch:        safetyEpoch,
 			purpose:            LifecycleOperationCancellationFence,
 			activityGeneration: activityGeneration,
 		}
+		record.schedulingOperations[operationID] = schedulingOperationBinding{
+			phaseRunID: phaseRunID,
+			authority:  schedulerAuthority,
+			generation: ProducerGeneration(lifecycleOperation.generation),
+			fence:      SchedulerFence(fence), safetyEpoch: safetyEpoch,
+			activityGeneration: activityGeneration,
+		}
 		record.enactments[operationID] = ref
+		record.aggregate.lifecycleGeneration = lifecycleFenceRequest.generation
+		record.aggregate.lifecycleFence = lifecycleFenceRequest.fence
 		refs = append(refs, ref)
 	}
-	return refs
+	return refs, nil
 }
 
 func nextUniqueOperationID(
@@ -1978,6 +2228,16 @@ func (engine *decisionEngine) validateCoordinationBindings(
 		return invalidIntentError()
 	}
 	switch typed.kind {
+	case IntentRetryRuntimeRun:
+		if _, ok := typed.payload.(runtimeRunRetryPayload); !ok {
+			return invalidIntentError()
+		}
+		if !exists || record.reconciler == (authorityValue{}) {
+			return newError(ErrorAuthorizationDenied)
+		}
+		if err := validateAuthorityBinding(record.reconciler, typed.authority); err != nil {
+			return err
+		}
 	case IntentAcceptRuntimeEvidence:
 		payload, ok := typed.payload.(runtimeEvidencePayload)
 		if !ok {
@@ -1995,10 +2255,8 @@ func (engine *decisionEngine) validateCoordinationBindings(
 		if operation.terminal {
 			return newError(ErrorEvidenceScopeConflict)
 		}
-		if operation.authority != (authorityValue{}) {
-			if err := validateAuthorityBinding(operation.authority, typed.authority); err != nil {
-				return err
-			}
+		if err := validateAuthorityBinding(operation.authority, typed.authority); err != nil {
+			return err
 		}
 		phaseRunBindingValidator := validatePhaseRunBinding
 		if record.cancellationState == CancellationCancelled &&
@@ -2032,10 +2290,8 @@ func (engine *decisionEngine) validateCoordinationBindings(
 		if expected.terminal {
 			return newError(ErrorEvidenceScopeConflict)
 		}
-		if expected.authority != (authorityValue{}) {
-			if err := validateAuthorityBinding(expected.authority, typed.authority); err != nil {
-				return err
-			}
+		if err := validateAuthorityBinding(expected.authority, typed.authority); err != nil {
+			return err
 		}
 		if err := validatePhaseRunBinding(
 			record, binding.PhaseRunID, binding.PhaseRunGeneration, binding.PhaseRunFence,
@@ -2064,10 +2320,8 @@ func (engine *decisionEngine) validateCoordinationBindings(
 		if operation.terminal {
 			return newError(ErrorEvidenceScopeConflict)
 		}
-		if operation.authority != (authorityValue{}) {
-			if err := validateAuthorityBinding(operation.authority, typed.authority); err != nil {
-				return err
-			}
+		if err := validateAuthorityBinding(operation.authority, typed.authority); err != nil {
+			return err
 		}
 		if operation.purpose == LifecycleOperationCommit &&
 			binding.Outcome != LifecycleEvidenceCommitted &&
@@ -2087,6 +2341,41 @@ func (engine *decisionEngine) validateCoordinationBindings(
 			operation.activityGeneration != intent.Header().ActivityGeneration {
 			return newError(ErrorStaleAuthority)
 		}
+		if record.aggregate != nil &&
+			(binding.ObservedGeneration < record.aggregate.lifecycleGeneration ||
+				binding.ObservedFence < record.aggregate.lifecycleFence) {
+			return newError(ErrorStaleAuthority)
+		}
+	case IntentAcceptTaskWorkspaceReconstructionEvidence:
+		payload, ok := typed.payload.(taskWorkspaceReconstructionEvidencePayload)
+		if !ok {
+			return invalidIntentError()
+		}
+		if !exists || record.aggregate == nil {
+			return newError(ErrorEvidenceScopeConflict)
+		}
+		binding := payload.binding
+		operation, operationExists := record.lifecycleOperations[binding.OperationID]
+		if !operationExists || operation.phaseRunID != (PhaseRunID{}) ||
+			operation.purpose != LifecycleOperationReconstruction || operation.terminal ||
+			record.aggregate.reconstructionOperationID != binding.OperationID ||
+			record.aggregate.activitySourceArtifactVersionID != binding.ArtifactVersionID ||
+			record.aggregate.reconstructionAccepted {
+			return newError(ErrorEvidenceScopeConflict)
+		}
+		if err := validateAuthorityBinding(operation.authority, typed.authority); err != nil {
+			return err
+		}
+		if operation.generation != binding.Generation || operation.fence != binding.Fence ||
+			operation.safetyEpoch != binding.SafetyEpoch ||
+			engine.effectiveSafetyEpoch(record) != binding.SafetyEpoch ||
+			operation.activityGeneration != intent.Header().ActivityGeneration {
+			return newError(ErrorStaleAuthority)
+		}
+		if binding.ObservedGeneration < record.aggregate.lifecycleGeneration ||
+			binding.ObservedFence < record.aggregate.lifecycleFence {
+			return newError(ErrorStaleAuthority)
+		}
 	case IntentAcceptPublicationEvidence:
 		payload, ok := typed.payload.(publicationEvidencePayload)
 		if !ok {
@@ -2103,10 +2392,8 @@ func (engine *decisionEngine) validateCoordinationBindings(
 		if operation.terminal {
 			return newError(ErrorEvidenceScopeConflict)
 		}
-		if operation.authority != (authorityValue{}) {
-			if err := validateAuthorityBinding(operation.authority, typed.authority); err != nil {
-				return err
-			}
+		if err := validateAuthorityBinding(operation.authority, typed.authority); err != nil {
+			return err
 		}
 		if err := validatePhaseRunBinding(
 			record, binding.PhaseRunID, binding.PhaseRunGeneration, binding.PhaseRunFence,
@@ -2298,6 +2585,11 @@ func markAcceptedEvidenceTerminal(intent TransitionIntent, record *taskRecord) {
 		operation := record.lifecycleOperations[payload.binding.OperationID]
 		operation.terminal = true
 		record.lifecycleOperations[payload.binding.OperationID] = operation
+	case IntentAcceptTaskWorkspaceReconstructionEvidence:
+		payload := typed.payload.(taskWorkspaceReconstructionEvidencePayload)
+		operation := record.lifecycleOperations[payload.binding.OperationID]
+		operation.terminal = true
+		record.lifecycleOperations[payload.binding.OperationID] = operation
 	case IntentAcceptPublicationEvidence:
 		payload := typed.payload.(publicationEvidencePayload)
 		operation := record.publicationOperations[payload.binding.OperationID]
@@ -2313,21 +2605,31 @@ func markAcceptedEvidenceTerminal(intent TransitionIntent, record *taskRecord) {
 
 func applyAcceptedCoordinationOutcome(intent TransitionIntent, record *taskRecord) {
 	typed, ok := intent.(intentValue)
-	if !ok || typed.kind != IntentAcceptTaskWorkspaceLifecycleEvidence {
-		return
-	}
-	payload, ok := typed.payload.(taskWorkspaceLifecycleEvidencePayload)
 	if !ok {
 		return
 	}
-	switch payload.binding.Outcome {
-	case LifecycleEvidenceCommitted:
+	switch typed.kind {
+	case IntentAcceptTaskWorkspaceLifecycleEvidence:
+		payload, ok := typed.payload.(taskWorkspaceLifecycleEvidencePayload)
+		if !ok {
+			return
+		}
+		switch payload.binding.Outcome {
+		case LifecycleEvidenceCommitted:
+			record.latestRevisionID = payload.binding.RevisionID
+			record.latestCheckpointID = payload.binding.CheckpointID
+		case LifecycleEvidenceFenced:
+			if record.cancellationState == CancellationCancelling {
+				record.cancellationState = CancellationCancelled
+			}
+		}
+	case IntentAcceptTaskWorkspaceReconstructionEvidence:
+		payload, ok := typed.payload.(taskWorkspaceReconstructionEvidencePayload)
+		if !ok {
+			return
+		}
 		record.latestRevisionID = payload.binding.RevisionID
 		record.latestCheckpointID = payload.binding.CheckpointID
-	case LifecycleEvidenceFenced:
-		if record.cancellationState == CancellationCancelling {
-			record.cancellationState = CancellationCancelled
-		}
 	}
 }
 
@@ -2421,6 +2723,8 @@ func (engine *decisionEngine) Query(
 		view.ActivePhaseRunID = record.aggregate.activePhaseRunID
 		view.LatestArtifactVersionID = record.aggregate.latestArtifactVersionID
 		view.TaskWorkspaceID = record.aggregate.pinned.TaskWorkspaceID
+		view.TaskWorkspaceLifecycleGeneration = record.aggregate.lifecycleGeneration
+		view.TaskWorkspaceLifecycleFence = record.aggregate.lifecycleFence
 		view.PhaseRuns = make([]PhaseRunView, len(record.aggregate.phaseRuns))
 		for index, run := range record.aggregate.phaseRuns {
 			view.PhaseRuns[index] = PhaseRunView{

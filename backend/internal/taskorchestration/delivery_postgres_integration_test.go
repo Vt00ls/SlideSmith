@@ -82,7 +82,7 @@ func TestPostgresDispatcherDeliversCommittedOutboxAndRetainsDispositionAcrossRes
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-delivery-start", "postgres-delivery-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -181,7 +181,7 @@ func TestPostgresConcurrentDeliverUsesOneTransportSendPerClaim(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-concurrent-deliver-start", "postgres-concurrent-deliver-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -300,7 +300,7 @@ func TestPostgresClaimSupersedesPendingWorkBehindCommittedCancellationFence(t *t
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-supersede-start", "postgres-supersede-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -365,7 +365,7 @@ func TestPostgresClaimResponseLossRecoversOriginalOperationAfterLeaseExpiry(t *t
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-claim-loss-start", "postgres-claim-loss-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -441,7 +441,7 @@ func TestPostgresCrashAfterSendThenCancellationStillRequiresInspection(t *testin
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-send-crash-start", "postgres-send-crash-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -557,7 +557,7 @@ func TestPostgresCancellationAfterReclaimSupersedesOperationWhenInspectionProved
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-inspected-unknown-start", "postgres-inspected-unknown-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -643,7 +643,7 @@ func TestPostgresDispositionResponseLossRetainsTerminalAcceptance(t *testing.T) 
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-disposition-loss-start", "postgres-disposition-loss-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -734,7 +734,7 @@ func TestPostgresCrashBeforeSendReclaimsWithoutReconciliation(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-before-send-start", "postgres-before-send-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -821,7 +821,7 @@ func TestPostgresConcurrentDispatchersProduceOneLeaseWinner(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-claim-race-start", "postgres-claim-race-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -913,7 +913,7 @@ func TestPostgresDecisionAndClaimNeverPerformRemoteIO(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-remote-boundary-start", "postgres-remote-boundary-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -963,7 +963,7 @@ func TestPostgresTimeoutDuringSendPersistsReconciliationRequired(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-timeout-start", "postgres-timeout-task", now), owner, pinned,
 	))
 	if err != nil {

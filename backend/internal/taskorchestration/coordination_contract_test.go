@@ -21,7 +21,7 @@ func TestExactReplayPrecedesCurrentRevisionValidation(t *testing.T) {
 	authority := taskorchestration.NewUserAuthority(
 		authorityID(t, "user-authority-replay"), taskorchestration.AuthorizationGeneration(1),
 	)
-	originalIntent := taskorchestration.NewStartTaskIntent(
+	originalIntent := minimalPinnedStartIntent(t,
 		intentHeader(t, "request-exact-replay", "task-exact-replay", now),
 		authority,
 	)
@@ -34,7 +34,7 @@ func TestExactReplayPrecedesCurrentRevisionValidation(t *testing.T) {
 	advanceHeader.ExpectedTaskRevision = 1
 	if _, err := harness.Mutations.Decide(
 		context.Background(),
-		taskorchestration.NewStartTaskIntent(advanceHeader, authority),
+		minimalWorkIntent(t, advanceHeader),
 	); err != nil {
 		t.Fatalf("advance Task revision: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestDecisionRequestIdentityCannotBeReboundToAnotherPayload(t *testing.T) {
 	authority := taskorchestration.NewUserAuthority(
 		authorityID(t, "user-authority-integrity"), taskorchestration.AuthorizationGeneration(1),
 	)
-	originalIntent := taskorchestration.NewStartTaskIntent(
+	originalIntent := minimalPinnedStartIntent(t,
 		intentHeader(t, "request-integrity", "task-integrity", now), authority,
 	)
 	if _, err := harness.Mutations.Decide(context.Background(), originalIntent); err != nil {
@@ -79,7 +79,7 @@ func TestDecisionRequestIdentityCannotBeReboundToAnotherPayload(t *testing.T) {
 	changedHeader := originalIntent.Header()
 	changedHeader.ExpectedTaskRevision = 1
 	changedHeader.OccurredAt = now.Add(time.Second)
-	changedIntent := taskorchestration.NewStartTaskIntent(changedHeader, authority)
+	changedIntent := minimalPinnedStartIntent(t, changedHeader, authority)
 	_, err = harness.Mutations.Decide(context.Background(), changedIntent)
 	var decisionError *taskorchestration.Error
 	if !errors.As(err, &decisionError) || decisionError.Code() != taskorchestration.ErrorIntegrityConflict {
@@ -111,7 +111,7 @@ func TestCancellationAdvancesActivityGenerationAndRejectsStaleWork(t *testing.T)
 	)
 	if _, err := harness.Mutations.Decide(
 		context.Background(),
-		taskorchestration.NewStartTaskIntent(
+		minimalPinnedStartIntent(t,
 			intentHeader(t, "request-generation-start", "task-generation", now), authority,
 		),
 	); err != nil {
@@ -522,7 +522,8 @@ func TestTerminalOperationRejectsFreshEvidenceWithoutOverwritingItsResult(t *tes
 					evidenceDigest(t, "1212121212121212121212121212121212121212121212121212121212121212"),
 				),
 				PhaseRunID: phaseRun, PhaseRunGeneration: 1, PhaseRunFence: 2,
-				OperationID: operation, Generation: 3, Fence: 4, SafetyEpoch: 1,
+				OperationID: operation, Generation: 3, Fence: 4,
+				ObservedGeneration: 3, ObservedFence: 5, SafetyEpoch: 1,
 				Outcome:    taskorchestration.LifecycleEvidenceCommitted,
 				RevisionID: firstRevision, CheckpointID: firstCheckpoint,
 			},
@@ -546,7 +547,8 @@ func TestTerminalOperationRejectsFreshEvidenceWithoutOverwritingItsResult(t *tes
 					evidenceDigest(t, "3434343434343434343434343434343434343434343434343434343434343434"),
 				),
 				PhaseRunID: phaseRun, PhaseRunGeneration: 1, PhaseRunFence: 2,
-				OperationID: operation, Generation: 3, Fence: 4, SafetyEpoch: 1,
+				OperationID: operation, Generation: 3, Fence: 4,
+				ObservedGeneration: 3, ObservedFence: 5, SafetyEpoch: 1,
 				Outcome:      taskorchestration.LifecycleEvidenceCommitted,
 				RevisionID:   taskWorkspaceRevisionID(t, "workspace-revision-terminal-operation-second"),
 				CheckpointID: checkpointID(t, "checkpoint-terminal-operation-second"),
@@ -681,7 +683,8 @@ func TestExactLifecycleCommitEvidenceRecordsRevisionAndCheckpoint(t *testing.T) 
 			lifecycleAuthority,
 			taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 				Evidence: evidence, PhaseRunID: phaseRun, PhaseRunGeneration: 3, PhaseRunFence: 5,
-				OperationID: operation, Generation: 7, Fence: 11, SafetyEpoch: 2,
+				OperationID: operation, Generation: 7, Fence: 11,
+				ObservedGeneration: 7, ObservedFence: 12, SafetyEpoch: 2,
 				Outcome:    taskorchestration.LifecycleEvidenceCommitted,
 				RevisionID: revisionID, CheckpointID: checkpoint,
 			},
@@ -708,328 +711,94 @@ func TestExactLifecycleCommitEvidenceRecordsRevisionAndCheckpoint(t *testing.T) 
 	}
 }
 
-func TestCommitFirstCancellationRetainsCommitAndFencesFurtherWork(t *testing.T) {
-	now := time.Date(2026, time.July, 26, 16, 10, 0, 0, time.UTC)
-	task := taskID(t, "task-cancel-commit-first")
-	phaseRun := phaseRunID(t, "phase-run-cancel-commit-first")
-	runtimeRun := runtimeRunID(t, "runtime-run-cancel-commit-first")
-	runtimeOperation := operationID(t, "operation-runtime-cancel-commit-first")
-	lifecycleOperation := operationID(t, "operation-lifecycle-cancel-commit-first")
-	owner := taskorchestration.NewUserAuthority(
-		authorityID(t, "user-authority-cancel-commit-first"), taskorchestration.AuthorizationGeneration(1),
-	)
-	runtimeAuthority := taskorchestration.NewRuntimeAuthority(
-		authorityID(t, "runtime-authority-cancel-commit-first"), taskorchestration.AuthorizationGeneration(1),
-	)
-	lifecycleAuthority := taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-		authorityID(t, "lifecycle-authority-cancel-commit-first"), taskorchestration.AuthorizationGeneration(1),
-	)
-	revisionID := taskWorkspaceRevisionID(t, "workspace-revision-cancel-commit-first")
-	checkpoint := checkpointID(t, "checkpoint-cancel-commit-first")
-	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{
-		Now: now,
-		Tasks: []taskorchestration.HarnessTaskFixture{{
-			TaskID: task, Owner: owner, TaskRevision: 20, ActivityGeneration: 4, SafetyEpoch: 2,
-			PhaseRuns: []taskorchestration.HarnessPhaseRunFixture{{
-				PhaseRunID: phaseRun, Generation: 3, Fence: 5, Active: true,
-			}},
-			RuntimeOperations: []taskorchestration.HarnessRuntimeOperationFixture{{
-				OperationID: runtimeOperation, PhaseRunID: phaseRun, RuntimeRunID: runtimeRun,
-				Authority: runtimeAuthority, Generation: 8, Fence: 13, SafetyEpoch: 2,
-			}},
-			LifecycleOperations: []taskorchestration.HarnessLifecycleOperationFixture{{
-				OperationID: lifecycleOperation, PhaseRunID: phaseRun, Authority: lifecycleAuthority,
-				Generation: 7, Fence: 11, SafetyEpoch: 2,
-				Purpose: taskorchestration.LifecycleOperationCommit,
-			}},
-		}},
+func TestCancellationCommitFirstAndFenceFirstOrdering(t *testing.T) {
+	runCancellationOrderingContract(t, sharedDecisionFaultAdapterFactory{
+		name: "in_memory", new: newInMemoryDecisionFaultAdapter,
 	})
-	if err != nil {
-		t.Fatalf("create deterministic harness: %v", err)
-	}
-	commitHeader := intentHeader(t, "request-cancel-commit-first-evidence", task.String(), now)
-	commitHeader.ExpectedTaskRevision = 20
-	commitHeader.ActivityGeneration = 4
-	if _, err := harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
-			commitHeader,
-			lifecycleAuthority,
-			taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
-				Evidence: taskorchestration.NewEvidenceRef(
-					evidenceID(t, "lifecycle-evidence-cancel-commit-first"),
-					taskorchestration.EvidenceTaskWorkspaceLifecycle,
-					evidenceDigest(t, "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"),
-				),
-				PhaseRunID: phaseRun, PhaseRunGeneration: 3, PhaseRunFence: 5,
-				OperationID: lifecycleOperation, Generation: 7, Fence: 11, SafetyEpoch: 2,
-				Outcome:    taskorchestration.LifecycleEvidenceCommitted,
-				RevisionID: revisionID, CheckpointID: checkpoint,
-			},
-		),
-	); err != nil {
-		t.Fatalf("accept commit-first lifecycle evidence: %v", err)
-	}
-
-	cancelHeader := intentHeader(t, "request-cancel-commit-first", task.String(), now.Add(time.Second))
-	cancelHeader.ExpectedTaskRevision = 21
-	cancelHeader.ActivityGeneration = 4
-	cancelled, err := harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewCancelTaskByUserIntent(
-			cancelHeader, owner, taskorchestration.CancelReasonUserRequested,
-		),
-	)
-	if err != nil {
-		t.Fatalf("accept commit-first cancellation: %v", err)
-	}
-	if cancelled.TaskProjection.CancellationState != taskorchestration.CancellationCancelling ||
-		cancelled.TaskProjection.ActivityGeneration != 5 ||
-		cancelled.TaskProjection.LatestRevisionID != revisionID ||
-		cancelled.TaskProjection.LatestCheckpointID != checkpoint {
-		t.Fatal("commit-first cancellation lost the committed state or cancellation fence")
-	}
-	if len(cancelled.EnactmentRefs) != 2 {
-		t.Fatalf("cancellation enactments = %d, want Runtime cancel and C04 fence/discard", len(cancelled.EnactmentRefs))
-	}
-	kinds := map[taskorchestration.EnactmentKind]bool{}
-	operationIDs := map[string]bool{}
-	for _, enactment := range cancelled.EnactmentRefs {
-		kinds[enactment.Kind] = true
-		operationIDs[enactment.OperationID.String()] = true
-		if enactment.ActivityGeneration != 5 {
-			t.Fatal("cancellation enactment did not bind the fenced activity generation")
-		}
-	}
-	if !kinds[taskorchestration.EnactmentRuntimeExecution] ||
-		!kinds[taskorchestration.EnactmentTaskWorkspaceLifecycle] || len(operationIDs) != 2 {
-		t.Fatal("cancellation did not create distinct Runtime and C04 operation identities")
-	}
-	view, err := harness.Queries.Query(
-		context.Background(), taskorchestration.TaskQuery{
-			TaskID: task, Authority: taskorchestration.NewUserQueryAuthority(owner),
-		},
-	)
-	if err != nil {
-		t.Fatalf("query commit-first cancellation: %v", err)
-	}
-	if view.TaskRevision != 22 || view.CancellationState != taskorchestration.CancellationCancelling ||
-		view.PhaseRunCount != 1 || view.RuntimeRunCount != 1 || view.EnactmentCount != 2 {
-		t.Fatal("commit-first cancellation created a business attempt or omitted its fences")
-	}
 }
 
-func TestCommitFirstEvidenceMayArriveAfterCancellationDecision(t *testing.T) {
-	now := time.Date(2026, time.July, 26, 16, 15, 0, 0, time.UTC)
-	task := taskID(t, "task-cancel-commit-response-late")
-	phaseRun := phaseRunID(t, "phase-run-cancel-commit-response-late")
-	commitOperation := operationID(t, "operation-cancel-commit-response-late")
+func TestCancellationResponseLossReplaysAndReconcilesExactOperations(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 23, 0, 0, 0, time.UTC)
 	owner := taskorchestration.NewUserAuthority(
-		authorityID(t, "user-authority-cancel-commit-response-late"),
-		taskorchestration.AuthorizationGeneration(1),
+		authorityID(t, "exact-cancel-response-loss-owner"), taskorchestration.AuthorizationGeneration(1),
 	)
-	lifecycleAuthority := taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-		authorityID(t, "lifecycle-authority-cancel-commit-response-late"),
-		taskorchestration.AuthorizationGeneration(1),
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "exact-cancel-response-loss-worker"), taskorchestration.AuthorizationGeneration(1),
 	)
-	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{
-		Now: now,
-		Tasks: []taskorchestration.HarnessTaskFixture{{
-			TaskID: task, Owner: owner, TaskRevision: 60, ActivityGeneration: 1, SafetyEpoch: 1,
-			PhaseRuns: []taskorchestration.HarnessPhaseRunFixture{{
-				PhaseRunID: phaseRun, Generation: 1, Fence: 3, Active: true,
-			}},
-			LifecycleOperations: []taskorchestration.HarnessLifecycleOperationFixture{{
-				OperationID: commitOperation, PhaseRunID: phaseRun, Authority: lifecycleAuthority,
-				Generation: 2, Fence: 4, SafetyEpoch: 1,
-				Purpose: taskorchestration.LifecycleOperationCommit,
-			}},
-		}},
-	})
+	harness, err := taskorchestration.NewDeterministicHarness(
+		taskorchestration.HarnessConfig{Now: now},
+	)
 	if err != nil {
-		t.Fatalf("create deterministic harness: %v", err)
+		t.Fatal(err)
 	}
-	cancelHeader := intentHeader(t, "request-cancel-before-commit-response", task.String(), now)
-	cancelHeader.ExpectedTaskRevision = 60
-	if _, err := harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewCancelTaskByUserIntent(
-			cancelHeader, owner, taskorchestration.CancelReasonUserRequested,
-		),
-	); err != nil {
-		t.Fatalf("accept cancellation while commit response is pending: %v", err)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "exact-cancel-response-loss-phase"), Kind: taskorchestration.PhaseMutating,
+		ValidationContract: taskorchestration.PhaseValidationAllRuntimeRunsSucceeded, RequiredRuntimeRuns: 1,
+	}})
+	started, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(
+		t, intentHeader(t, "exact-cancel-response-loss-start", "exact-cancel-response-loss-task", now),
+		owner, pinned,
+	))
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	revisionID := taskWorkspaceRevisionID(t, "workspace-revision-commit-response-late")
-	checkpoint := checkpointID(t, "checkpoint-commit-response-late")
-	commitHeader := intentHeader(t, "request-commit-response-late", task.String(), now.Add(time.Second))
-	commitHeader.ExpectedTaskRevision = 61
-	commitHeader.ActivityGeneration = 1
-	committed, err := harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
-			commitHeader,
-			lifecycleAuthority,
-			taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
-				Evidence: taskorchestration.NewEvidenceRef(
-					evidenceID(t, "lifecycle-evidence-commit-response-late"),
-					taskorchestration.EvidenceTaskWorkspaceLifecycle,
-					evidenceDigest(t, "7777777777777777777777777777777777777777777777777777777777777777"),
-				),
-				PhaseRunID: phaseRun, PhaseRunGeneration: 1, PhaseRunFence: 3,
-				OperationID: commitOperation, Generation: 2, Fence: 4, SafetyEpoch: 1,
-				Outcome:    taskorchestration.LifecycleEvidenceCommitted,
-				RevisionID: revisionID, CheckpointID: checkpoint,
-			},
+	workHeader := intentHeader(
+		t, "exact-cancel-response-loss-work", "exact-cancel-response-loss-task", now.Add(time.Second),
+	)
+	workHeader.ExpectedTaskRevision = started.AcceptedTaskRevision
+	work, err := harness.Mutations.Decide(
+		context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+			workHeader, worker, operationID(t, "exact-cancel-response-loss-runtime-operation"),
 		),
 	)
 	if err != nil {
-		t.Fatalf("accept commit-first evidence after cancellation Decision: %v", err)
+		t.Fatal(err)
 	}
-	if committed.TaskProjection.ActivityGeneration != 2 ||
-		committed.TaskProjection.CancellationState != taskorchestration.CancellationCancelling ||
-		committed.TaskProjection.LatestRevisionID != revisionID ||
-		committed.TaskProjection.LatestCheckpointID != checkpoint {
-		t.Fatal("late commit response lost the cancellation fence or committed state")
-	}
-	view, err := harness.Queries.Query(
-		context.Background(), taskorchestration.TaskQuery{
-			TaskID: task, Authority: taskorchestration.NewUserQueryAuthority(owner),
-		},
+	view := queryAggregate(t, harness, "exact-cancel-response-loss-task", owner)
+	run := view.PhaseRuns[0]
+	fenceBinding := exactC04FenceRequestBinding(
+		t, "exact-cancel-response-loss-task", run.PhaseRunID, pinned.TaskWorkspaceID,
+		"exact-cancel-response-loss-c04-operation",
+		taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
+		taskorchestration.TaskWorkspaceLifecycleFence(run.Fence), view.LatestRevisionID,
 	)
-	if err != nil {
-		t.Fatalf("query commit-first late response: %v", err)
-	}
-	if view.TaskRevision != 62 || view.ActivityGeneration != 2 ||
-		view.CancellationState != taskorchestration.CancellationCancelling ||
-		view.PhaseRunCount != 1 {
-		t.Fatal("commit-first response advanced later work or removed the cancellation fence")
-	}
-}
-
-func TestFenceFirstCancellationRejectsLateCommitAndTerminatesCancelled(t *testing.T) {
-	now := time.Date(2026, time.July, 26, 16, 20, 0, 0, time.UTC)
-	task := taskID(t, "task-cancel-fence-first")
-	phaseRun := phaseRunID(t, "phase-run-cancel-fence-first")
-	commitOperation := operationID(t, "operation-lifecycle-cancel-fence-first")
-	owner := taskorchestration.NewUserAuthority(
-		authorityID(t, "user-authority-cancel-fence-first"), taskorchestration.AuthorizationGeneration(1),
+	cancelHeader := intentHeader(
+		t, "exact-cancel-response-loss-cancel", "exact-cancel-response-loss-task", now.Add(2*time.Second),
 	)
-	lifecycleAuthority := taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-		authorityID(t, "lifecycle-authority-cancel-fence-first"), taskorchestration.AuthorizationGeneration(1),
+	cancelHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
+	cancelIntent := taskorchestration.NewCancelTaskByUserWithLifecycleFenceIntent(
+		cancelHeader, owner, taskorchestration.CancelReasonUserRequested, fenceBinding,
 	)
-	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{
-		Now: now,
-		Tasks: []taskorchestration.HarnessTaskFixture{{
-			TaskID: task, Owner: owner, TaskRevision: 30, ActivityGeneration: 4, SafetyEpoch: 2,
-			PhaseRuns: []taskorchestration.HarnessPhaseRunFixture{{
-				PhaseRunID: phaseRun, Generation: 3, Fence: 5, Active: true,
-			}},
-			LifecycleOperations: []taskorchestration.HarnessLifecycleOperationFixture{{
-				OperationID: commitOperation, PhaseRunID: phaseRun, Authority: lifecycleAuthority,
-				Generation: 7, Fence: 11, SafetyEpoch: 2,
-				Purpose: taskorchestration.LifecycleOperationCommit,
-			}},
-		}},
-	})
-	if err != nil {
-		t.Fatalf("create deterministic harness: %v", err)
-	}
-	cancelHeader := intentHeader(t, "request-cancel-fence-first", task.String(), now)
-	cancelHeader.ExpectedTaskRevision = 30
-	cancelHeader.ActivityGeneration = 4
+	harness.LoseNextResponse()
+	_, err = harness.Mutations.Decide(context.Background(), cancelIntent)
+	assertDecisionErrorCode(t, err, taskorchestration.ErrorReconciliationRequired)
+	retryHeader := cancelHeader
+	retryHeader.Metadata.Transport.DeliveryAttempt = 2
+	retryHeader.Metadata.Transport.Deadline = now.Add(time.Minute)
 	cancelled, err := harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewCancelTaskByUserIntent(
-			cancelHeader, owner, taskorchestration.CancelReasonUserRequested,
+		context.Background(), taskorchestration.NewCancelTaskByUserWithLifecycleFenceIntent(
+			retryHeader, owner, taskorchestration.CancelReasonUserRequested, fenceBinding,
 		),
 	)
-	if err != nil {
-		t.Fatalf("accept fence-first cancellation: %v", err)
+	if err != nil || len(cancelled.EnactmentRefs) != 2 {
+		t.Fatalf("replay exact lost cancellation: decision=%+v err=%v", cancelled, err)
 	}
-	var fenceOperation taskorchestration.EnactmentRef
-	for _, enactment := range cancelled.EnactmentRefs {
-		if enactment.Kind == taskorchestration.EnactmentTaskWorkspaceLifecycle {
-			fenceOperation = enactment
-			break
-		}
-	}
-	if fenceOperation.OperationID.String() == "" {
-		t.Fatal("cancellation omitted its C04 fence/discard operation")
-	}
-	lifecycleFence, ok := fenceOperation.Fence.(taskorchestration.TaskWorkspaceLifecycleFence)
-	if !ok {
-		t.Fatal("cancellation C04 enactment did not retain its typed fence")
-	}
-	fenceHeader := intentHeader(t, "request-cancel-fence-evidence", task.String(), now.Add(time.Second))
-	fenceHeader.ExpectedTaskRevision = 31
-	fenceHeader.ActivityGeneration = 5
-	terminal, err := harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
-			fenceHeader,
-			lifecycleAuthority,
-			taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
-				Evidence: taskorchestration.NewEvidenceRef(
-					evidenceID(t, "lifecycle-evidence-cancel-fenced"),
-					taskorchestration.EvidenceTaskWorkspaceLifecycle,
-					evidenceDigest(t, "1111111111111111111111111111111111111111111111111111111111111111"),
-				),
-				PhaseRunID: phaseRun, PhaseRunGeneration: 3, PhaseRunFence: 5,
-				OperationID: fenceOperation.OperationID,
-				Generation:  7, Fence: lifecycleFence, SafetyEpoch: 2,
-				Outcome: taskorchestration.LifecycleEvidenceFenced,
-			},
-		),
+	original := cancelled.EnactmentRefs[0]
+	reconcileHeader := intentHeader(
+		t, "exact-cancel-response-loss-reconcile", "exact-cancel-response-loss-task", now.Add(3*time.Second),
 	)
-	if err != nil {
-		t.Fatalf("accept C04 fencing evidence: %v", err)
-	}
-	if terminal.TaskProjection.CancellationState != taskorchestration.CancellationCancelled {
-		t.Fatal("C04 fencing evidence did not terminally cancel the Task")
-	}
-
-	lateHeader := intentHeader(t, "request-cancel-late-commit", task.String(), now.Add(2*time.Second))
-	lateHeader.ExpectedTaskRevision = 32
-	lateHeader.ActivityGeneration = 5
-	lateEvidence := taskorchestration.NewEvidenceRef(
-		evidenceID(t, "lifecycle-evidence-cancel-late-commit"),
-		taskorchestration.EvidenceTaskWorkspaceLifecycle,
-		evidenceDigest(t, "2222222222222222222222222222222222222222222222222222222222222222"),
+	reconcileHeader.ExpectedTaskRevision = cancelled.AcceptedTaskRevision
+	reconcileHeader.ActivityGeneration = cancelled.TaskProjection.ActivityGeneration
+	reconcileIntent := taskorchestration.NewReconcileEnactmentIntent(
+		reconcileHeader, worker, original.OperationID, taskorchestration.ReconciliationFence(1),
 	)
-	_, err = harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
-			lateHeader,
-			lifecycleAuthority,
-			taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
-				Evidence:   lateEvidence,
-				PhaseRunID: phaseRun, PhaseRunGeneration: 3, PhaseRunFence: 5,
-				OperationID: commitOperation, Generation: 7, Fence: 11, SafetyEpoch: 2,
-				Outcome:      taskorchestration.LifecycleEvidenceCommitted,
-				RevisionID:   taskWorkspaceRevisionID(t, "workspace-revision-cancel-late"),
-				CheckpointID: checkpointID(t, "checkpoint-cancel-late"),
-			},
-		),
-	)
-	var decisionError *taskorchestration.Error
-	if !errors.As(err, &decisionError) || decisionError.Code() != taskorchestration.ErrorStaleAuthority {
-		t.Fatalf("late commit error = %T, want stale authority", err)
-	}
-	view, err := harness.Queries.Query(
-		context.Background(), taskorchestration.TaskQuery{
-			TaskID: task, Authority: taskorchestration.NewUserQueryAuthority(owner),
-		},
-	)
-	if err != nil {
-		t.Fatalf("query fence-first cancellation: %v", err)
-	}
-	if view.TaskRevision != 32 || view.CancellationState != taskorchestration.CancellationCancelled ||
-		view.LatestRevisionID.String() != "" || view.LatestCheckpointID.String() != "" ||
-		view.EvidenceDiagnosticCount != 1 ||
-		view.LatestEvidenceDiagnostic.EvidenceID != lateEvidence.ID ||
-		view.LatestEvidenceDiagnostic.Reason != taskorchestration.EvidenceDiagnosticStale {
-		t.Fatal("late commit changed the terminal Task or was not retained as non-authoritative diagnostic")
+	harness.LoseNextResponse()
+	_, err = harness.Mutations.Decide(context.Background(), reconcileIntent)
+	assertDecisionErrorCode(t, err, taskorchestration.ErrorReconciliationRequired)
+	reconciled, err := harness.Mutations.Decide(context.Background(), reconcileIntent)
+	if err != nil || len(reconciled.EnactmentRefs) != 1 ||
+		!reflect.DeepEqual(reconciled.EnactmentRefs[0], original) {
+		t.Fatalf("reconcile did not redeliver exact original operation: decision=%+v err=%v", reconciled, err)
 	}
 }
 
@@ -1093,7 +862,7 @@ func TestRecoveryReadOnlyAndPostRecoverySafetyEpochFenceOldEvidence(t *testing.T
 	blockedHeader.ExpectedTaskRevision = 41
 	blockedHeader.ActivityGeneration = 2
 	_, err = harness.Mutations.Decide(
-		context.Background(), taskorchestration.NewStartTaskIntent(blockedHeader, owner),
+		context.Background(), minimalPinnedStartIntent(t, blockedHeader, owner),
 	)
 	var decisionError *taskorchestration.Error
 	if !errors.As(err, &decisionError) || decisionError.Code() != taskorchestration.ErrorOperationalReadOnly {
@@ -1162,7 +931,7 @@ func TestRecoveryReadOnlyAndPostRecoverySafetyEpochFenceOldEvidence(t *testing.T
 	resumedHeader.ExpectedTaskRevision = 42
 	resumedHeader.ActivityGeneration = 4
 	if _, err := harness.Mutations.Decide(
-		context.Background(), taskorchestration.NewStartTaskIntent(resumedHeader, owner),
+		context.Background(), minimalPinnedStartIntent(t, resumedHeader, owner),
 	); err != nil {
 		t.Fatalf("mutate safely after full-ready recovery: %v", err)
 	}
@@ -1271,8 +1040,12 @@ func TestRecoveryFenceProjectsGloballyWithoutAdvancingUnrelatedTasks(t *testing.
 	}
 
 	newHeader := intentHeader(t, "request-recovery-new-task", newTask.String(), now.Add(time.Second))
+	newPinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "recovery-new-task-publication"), Kind: taskorchestration.PhasePublication,
+	}})
 	created, err := harness.Mutations.Decide(
-		context.Background(), taskorchestration.NewStartTaskIntent(newHeader, newOwner),
+		context.Background(),
+		verifiedPinnedStartIntentAtSafetyEpoch(t, newHeader, newOwner, newPinned, 2),
 	)
 	if err != nil {
 		t.Fatalf("create Task after global recovery fence: %v", err)
@@ -1285,170 +1058,126 @@ func TestRecoveryFenceProjectsGloballyWithoutAdvancingUnrelatedTasks(t *testing.
 	}
 }
 
-func TestResponseLossReconciliationRedeliversTheOriginalOperationOnly(t *testing.T) {
-	now := time.Date(2026, time.July, 26, 16, 40, 0, 0, time.UTC)
-	task := taskID(t, "task-response-loss-reconciliation")
-	phaseRun := phaseRunID(t, "phase-run-response-loss-reconciliation")
-	runtimeRun := runtimeRunID(t, "runtime-run-response-loss-reconciliation")
-	owner := taskorchestration.NewUserAuthority(
-		authorityID(t, "user-authority-response-loss-reconciliation"),
-		taskorchestration.AuthorizationGeneration(1),
-	)
-	runtimeAuthority := taskorchestration.NewRuntimeAuthority(
-		authorityID(t, "runtime-authority-response-loss-reconciliation"),
-		taskorchestration.AuthorizationGeneration(1),
-	)
-	lifecycleAuthority := taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-		authorityID(t, "lifecycle-authority-response-loss-reconciliation"),
-		taskorchestration.AuthorizationGeneration(1),
-	)
-	reconciler := taskorchestration.NewWorkerAuthority(
-		authorityID(t, "worker-authority-response-loss-reconciliation"),
-		taskorchestration.AuthorizationGeneration(1),
-	)
-	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{
-		Now: now,
-		Tasks: []taskorchestration.HarnessTaskFixture{{
-			TaskID: task, Owner: owner, Reconciler: reconciler,
-			TaskRevision: 50, ActivityGeneration: 1, SafetyEpoch: 1,
-			PhaseRuns: []taskorchestration.HarnessPhaseRunFixture{{
-				PhaseRunID: phaseRun, Generation: 1, Fence: 1, Active: true,
-			}},
-			RuntimeOperations: []taskorchestration.HarnessRuntimeOperationFixture{{
-				OperationID: operationID(t, "operation-runtime-response-loss-reconciliation"),
-				PhaseRunID:  phaseRun, RuntimeRunID: runtimeRun, Authority: runtimeAuthority,
-				Generation: 1, Fence: 1, SafetyEpoch: 1,
-			}},
-			LifecycleOperations: []taskorchestration.HarnessLifecycleOperationFixture{{
-				OperationID: operationID(t, "operation-lifecycle-response-loss-reconciliation"),
-				PhaseRunID:  phaseRun, Authority: lifecycleAuthority,
-				Generation: 1, Fence: 1, SafetyEpoch: 1,
-				Purpose: taskorchestration.LifecycleOperationCommit,
-			}},
-		}},
+func TestConcurrentConfirmationCancelAndRetryCancelHaveOneRevisionWinner(t *testing.T) {
+	now := time.Date(2026, time.July, 26, 16, 50, 0, 0, time.UTC)
+	t.Run("confirmation versus cancel", func(t *testing.T) {
+		harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+		if err != nil {
+			t.Fatalf("create deterministic harness: %v", err)
+		}
+		owner := taskorchestration.NewUserAuthority(authorityID(t, "concurrent-gate-owner"), 1)
+		gate := gateID(t, "concurrent-gate")
+		pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+			Key: phaseKey(t, "concurrent-gate-phase"), Kind: taskorchestration.PhaseConfirmationGate,
+			GateID: gate,
+		}})
+		if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
+			intentHeader(t, "concurrent-gate-start", "concurrent-gate-task", now), owner, pinned,
+		)); err != nil {
+			t.Fatalf("start confirmation Task: %v", err)
+		}
+		workHeader := intentHeader(t, "concurrent-gate-work", "concurrent-gate-task", now.Add(time.Second))
+		workHeader.ExpectedTaskRevision = 1
+		if _, err := harness.Mutations.Decide(context.Background(), minimalWorkIntent(t, workHeader)); err != nil {
+			t.Fatalf("make confirmation available: %v", err)
+		}
+		header := func(request string) taskorchestration.IntentHeader {
+			value := intentHeader(t, request, "concurrent-gate-task", now.Add(2*time.Second))
+			value.ExpectedTaskRevision = 2
+			return value
+		}
+		assertOneConcurrentRevisionWinner(t, harness, owner, "concurrent-gate-task", 2, 3, []taskorchestration.TransitionIntent{
+			taskorchestration.NewSubmitConfirmationGateIntent(
+				header("concurrent-gate-confirm"), owner, gate,
+				payloadDigest(t, "4444444444444444444444444444444444444444444444444444444444444444"),
+			),
+			taskorchestration.NewCancelTaskByUserIntent(
+				header("concurrent-gate-cancel"), owner, taskorchestration.CancelReasonUserRequested,
+			),
+		})
 	})
-	if err != nil {
-		t.Fatalf("create deterministic harness: %v", err)
-	}
-	cancelHeader := intentHeader(t, "request-response-loss-cancel", task.String(), now)
-	cancelHeader.ExpectedTaskRevision = 50
-	cancelIntent := taskorchestration.NewCancelTaskByUserIntent(
-		cancelHeader, owner, taskorchestration.CancelReasonUserRequested,
-	)
-	harness.LoseNextResponse()
-	if _, err := harness.Mutations.Decide(context.Background(), cancelIntent); err == nil {
-		t.Fatal("lost cancellation response did not remain ambiguous")
-	} else {
-		var decisionError *taskorchestration.Error
-		if !errors.As(err, &decisionError) ||
-			decisionError.Code() != taskorchestration.ErrorReconciliationRequired {
-			t.Fatalf("lost cancellation response error = %T, want reconciliation required", err)
-		}
-	}
-	deliveryRetryHeader := cancelHeader
-	deliveryRetryHeader.Metadata.Transport.DeliveryAttempt = 2
-	deliveryRetryHeader.Metadata.Transport.Deadline = now.Add(time.Minute)
-	cancelled, err := harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewCancelTaskByUserIntent(
-			deliveryRetryHeader, owner, taskorchestration.CancelReasonUserRequested,
-		),
-	)
-	if err != nil {
-		t.Fatalf("exact replay lost cancellation response: %v", err)
-	}
-	if len(cancelled.EnactmentRefs) != 2 {
-		t.Fatalf("replayed cancellation enactments = %d, want 2", len(cancelled.EnactmentRefs))
-	}
-	originalOperation := cancelled.EnactmentRefs[0].OperationID
 
-	reconcileHeader := intentHeader(t, "request-response-loss-reconcile", task.String(), now.Add(time.Second))
-	reconcileHeader.ExpectedTaskRevision = 51
-	reconcileHeader.ActivityGeneration = 2
-	reconcileIntent := taskorchestration.NewReconcileEnactmentIntent(
-		reconcileHeader, reconciler, originalOperation, taskorchestration.ReconciliationFence(1),
-	)
-	harness.LoseNextResponse()
-	if _, err := harness.Mutations.Decide(context.Background(), reconcileIntent); err == nil {
-		t.Fatal("lost reconciliation response did not remain ambiguous")
-	} else {
-		var decisionError *taskorchestration.Error
-		if !errors.As(err, &decisionError) ||
-			decisionError.Code() != taskorchestration.ErrorReconciliationRequired {
-			t.Fatalf("lost reconciliation response error = %T, want reconciliation required", err)
+	t.Run("retry versus cancel", func(t *testing.T) {
+		harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+		if err != nil {
+			t.Fatalf("create deterministic harness: %v", err)
 		}
-	}
-	reconcileDeliveryRetryHeader := reconcileHeader
-	reconcileDeliveryRetryHeader.Metadata.Transport.DeliveryAttempt = 2
-	reconcileDeliveryRetryHeader.Metadata.Transport.Deadline = now.Add(2 * time.Minute)
-	reconciled, err := harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewReconcileEnactmentIntent(
-			reconcileDeliveryRetryHeader,
-			reconciler,
-			originalOperation,
-			taskorchestration.ReconciliationFence(1),
-		),
-	)
-	if err != nil {
-		t.Fatalf("exact replay reconciliation: %v", err)
-	}
-	if len(reconciled.EnactmentRefs) != 1 ||
-		reconciled.EnactmentRefs[0].OperationID != originalOperation {
-		t.Fatal("reconciliation did not redeliver the original OperationID")
-	}
-	view, err := harness.Queries.Query(
-		context.Background(), taskorchestration.TaskQuery{
-			TaskID: task, Authority: taskorchestration.NewUserQueryAuthority(owner),
-		},
-	)
-	if err != nil {
-		t.Fatalf("query response-loss reconciliation: %v", err)
-	}
-	if view.TaskRevision != 52 || view.DecisionCount != 2 || view.EnactmentCount != 2 ||
-		view.PhaseRunCount != 1 || view.RuntimeRunCount != 1 ||
-		view.CancellationState != taskorchestration.CancellationCancelling {
-		t.Fatal("response-loss reconciliation created a new business attempt or operation")
-	}
+		owner := taskorchestration.NewUserAuthority(authorityID(t, "concurrent-retry-owner"), 1)
+		pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+			Key: phaseKey(t, "concurrent-retry-phase"), Kind: taskorchestration.PhaseNonMutating,
+			ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+			RequiredRuntimeRuns: 1, RetryEligible: true,
+		}})
+		if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
+			intentHeader(t, "concurrent-retry-start", "concurrent-retry-task", now), owner, pinned,
+		)); err != nil {
+			t.Fatalf("start retry Task: %v", err)
+		}
+		workHeader := intentHeader(t, "concurrent-retry-work", "concurrent-retry-task", now.Add(time.Second))
+		workHeader.ExpectedTaskRevision = 1
+		work, err := harness.Mutations.Decide(context.Background(), minimalWorkIntent(t, workHeader))
+		if err != nil {
+			t.Fatalf("make retry work available: %v", err)
+		}
+		view := queryAggregate(t, harness, "concurrent-retry-task", owner)
+		run := view.PhaseRuns[0]
+		runtimeHeader := intentHeader(t, "concurrent-retry-runtime", "concurrent-retry-task", now.Add(2*time.Second))
+		runtimeHeader.ExpectedTaskRevision = 2
+		if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
+			runtimeHeader, pinned.Authorities.Runtime, taskorchestration.RuntimeEvidenceBinding{
+				Evidence: taskorchestration.NewEvidenceRef(
+					evidenceID(t, "concurrent-retry-runtime-evidence"), taskorchestration.EvidenceRuntime,
+					evidenceDigest(t, "4545454545454545454545454545454545454545454545454545454545454545"),
+				),
+				PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
+				RuntimeRunID: run.RuntimeRuns[0].RuntimeRunID, OperationID: work.EnactmentRefs[0].OperationID,
+				Generation: taskorchestration.RuntimeGeneration(run.Generation),
+				Fence:      taskorchestration.RuntimeFence(run.Fence), SafetyEpoch: view.SafetyEpoch,
+				Outcome: taskorchestration.RuntimeRunFailed,
+			},
+		)); err != nil {
+			t.Fatalf("accept failed Runtime evidence: %v", err)
+		}
+		validationHeader := intentHeader(t, "concurrent-retry-validation", "concurrent-retry-task", now.Add(3*time.Second))
+		validationHeader.ExpectedTaskRevision = 3
+		if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
+			validationHeader, pinned.Authorities.Validator, taskorchestration.ValidationEvidenceBinding{
+				Evidence: taskorchestration.NewEvidenceRef(
+					evidenceID(t, "concurrent-retry-validation-evidence"), taskorchestration.EvidencePhaseValidation,
+					evidenceDigest(t, "4646464646464646464646464646464646464646464646464646464646464646"),
+				),
+				PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
+				Generation: taskorchestration.ProducerGeneration(run.Generation),
+				Fence:      taskorchestration.ValidationFence(run.Fence), SafetyEpoch: view.SafetyEpoch,
+				Outcome: taskorchestration.PhaseValidationRejected,
+			},
+		)); err != nil {
+			t.Fatalf("reject retryable Phase: %v", err)
+		}
+		header := func(request string) taskorchestration.IntentHeader {
+			value := intentHeader(t, request, "concurrent-retry-task", now.Add(4*time.Second))
+			value.ExpectedTaskRevision = 4
+			return value
+		}
+		assertOneConcurrentRevisionWinner(t, harness, owner, "concurrent-retry-task", 4, 5, []taskorchestration.TransitionIntent{
+			taskorchestration.NewRetryPhaseIntent(header("concurrent-retry-command"), owner, run.PhaseRunID),
+			taskorchestration.NewCancelTaskByUserIntent(
+				header("concurrent-retry-cancel"), owner, taskorchestration.CancelReasonUserRequested,
+			),
+		})
+	})
 }
 
-func TestConcurrentConfirmCancelAndRetryHaveOneRevisionWinner(t *testing.T) {
-	now := time.Date(2026, time.July, 26, 16, 50, 0, 0, time.UTC)
-	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
-	if err != nil {
-		t.Fatalf("create deterministic harness: %v", err)
-	}
-	authority := taskorchestration.NewUserAuthority(
-		authorityID(t, "user-authority-concurrent-decisions"),
-		taskorchestration.AuthorizationGeneration(1),
-	)
-	if _, err := harness.Mutations.Decide(
-		context.Background(),
-		taskorchestration.NewStartTaskIntent(
-			intentHeader(t, "request-concurrent-start", "task-concurrent-decisions", now), authority,
-		),
-	); err != nil {
-		t.Fatalf("start Task: %v", err)
-	}
-	header := func(request string) taskorchestration.IntentHeader {
-		value := intentHeader(t, request, "task-concurrent-decisions", now.Add(time.Second))
-		value.ExpectedTaskRevision = 1
-		return value
-	}
-	intents := []taskorchestration.TransitionIntent{
-		taskorchestration.NewSubmitConfirmationGateIntent(
-			header("request-concurrent-confirm"),
-			authority,
-			gateID(t, "gate-concurrent"),
-			payloadDigest(t, "4444444444444444444444444444444444444444444444444444444444444444"),
-		),
-		taskorchestration.NewCancelTaskByUserIntent(
-			header("request-concurrent-cancel"), authority, taskorchestration.CancelReasonUserRequested,
-		),
-		taskorchestration.NewRetryPhaseIntent(
-			header("request-concurrent-retry"), authority, phaseRunID(t, "phase-run-concurrent"),
-		),
-	}
+func assertOneConcurrentRevisionWinner(
+	t *testing.T,
+	harness *taskorchestration.DeterministicHarness,
+	owner taskorchestration.UserAuthority,
+	taskName string,
+	expectedRevision taskorchestration.TaskRevision,
+	expectedDecisionCount uint64,
+	intents []taskorchestration.TransitionIntent,
+) {
+	t.Helper()
 	type result struct {
 		decision taskorchestration.TransitionDecision
 		err      error
@@ -1474,7 +1203,8 @@ func TestConcurrentConfirmCancelAndRetryHaveOneRevisionWinner(t *testing.T) {
 	for result := range results {
 		if result.err == nil {
 			winners++
-			if result.decision.PreviousTaskRevision != 1 || result.decision.AcceptedTaskRevision != 2 {
+			if result.decision.PreviousTaskRevision != expectedRevision ||
+				result.decision.AcceptedTaskRevision != expectedRevision+1 {
 				t.Fatal("concurrent winner committed outside the expected revision")
 			}
 			continue
@@ -1487,16 +1217,18 @@ func TestConcurrentConfirmCancelAndRetryHaveOneRevisionWinner(t *testing.T) {
 		}
 		t.Fatalf("concurrent loser error = %T, want stale revision", result.err)
 	}
-	if winners != 1 || stale != 2 {
-		t.Fatalf("concurrent outcomes = %d winners, %d stale; want 1, 2", winners, stale)
+	if winners != 1 || stale != len(intents)-1 {
+		t.Fatalf("concurrent outcomes = %d winners, %d stale; want 1, %d", winners, stale, len(intents)-1)
 	}
 	view, err := harness.Queries.Query(
-		context.Background(), taskQuery(t, "task-concurrent-decisions", "user-authority-concurrent-decisions"),
+		context.Background(), taskorchestration.TaskQuery{
+			TaskID: taskID(t, taskName), Authority: taskorchestration.NewUserQueryAuthority(owner),
+		},
 	)
 	if err != nil {
 		t.Fatalf("query concurrent decisions: %v", err)
 	}
-	if view.TaskRevision != 2 || view.DecisionCount != 2 {
+	if view.TaskRevision != expectedRevision+1 || view.DecisionCount != expectedDecisionCount {
 		t.Fatal("concurrent decisions committed more than one expected-revision winner")
 	}
 }
@@ -1829,6 +1561,7 @@ func TestLifecycleEvidenceRejectsStaleGenerationFenceAndSafetyEpoch(t *testing.T
 						),
 						PhaseRunID: phaseRun, PhaseRunGeneration: 4, PhaseRunFence: 6,
 						OperationID: operation, Generation: test.generation, Fence: test.fence,
+						ObservedGeneration: test.generation, ObservedFence: test.fence + 1,
 						SafetyEpoch: test.safety, Outcome: taskorchestration.LifecycleEvidenceCommitted,
 						RevisionID:   taskWorkspaceRevisionID(t, "workspace-revision-lifecycle-stale"),
 						CheckpointID: checkpointID(t, "checkpoint-lifecycle-stale"),
@@ -1866,7 +1599,7 @@ func TestDecisionRequestIdentityIsScopedToItsTask(t *testing.T) {
 	)
 	first, err := harness.Mutations.Decide(
 		context.Background(),
-		taskorchestration.NewStartTaskIntent(
+		minimalPinnedStartIntent(t,
 			intentHeader(t, "shared-request-scope", "task-request-scope-a", now), authority,
 		),
 	)
@@ -1875,7 +1608,7 @@ func TestDecisionRequestIdentityIsScopedToItsTask(t *testing.T) {
 	}
 	second, err := harness.Mutations.Decide(
 		context.Background(),
-		taskorchestration.NewStartTaskIntent(
+		minimalPinnedStartIntent(t,
 			intentHeader(t, "shared-request-scope", "task-request-scope-b", now), authority,
 		),
 	)
@@ -1901,7 +1634,7 @@ func TestDecisionRequestScopeDoesNotDiscloseKeysAcrossAuthorities(t *testing.T) 
 	)
 	if _, err := harness.Mutations.Decide(
 		context.Background(),
-		taskorchestration.NewStartTaskIntent(
+		minimalPinnedStartIntent(t,
 			intentHeader(t, "shared-authority-request", "task-authority-request", now), owner,
 		),
 	); err != nil {
@@ -1964,7 +1697,7 @@ func TestPostCommitFaultsRecoverByExactReplay(t *testing.T) {
 			} else if err := harness.CrashNextAt(test.crash); err != nil {
 				t.Fatalf("configure crash: %v", err)
 			}
-			intent := taskorchestration.NewStartTaskIntent(
+			intent := minimalPinnedStartIntent(t,
 				intentHeader(t, "request-post-commit-replay", "task-post-commit-replay", now),
 				taskorchestration.NewUserAuthority(
 					authorityID(t, "user-authority-post-commit-replay"),

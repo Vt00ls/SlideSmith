@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 
 	"github.com/slidesmith/slidesmith/backend/internal/taskworkspace"
@@ -17,6 +18,7 @@ import (
 type TaskWorkspaceLifecyclePort interface {
 	CommitRuntimeView(context.Context, taskworkspace.CommitRuntimeViewRequest) (taskworkspace.CommitRuntimeViewResult, error)
 	FenceRuntimeView(context.Context, taskworkspace.FenceRuntimeViewRequest) (taskworkspace.FenceRuntimeViewResult, error)
+	ReconstructTaskWorkspace(context.Context, taskworkspace.ReconstructTaskWorkspaceRequest) (taskworkspace.ReconstructTaskWorkspaceResult, error)
 	InspectOperation(context.Context, taskworkspace.InspectOperationRequest) (taskworkspace.OperationInspection, error)
 	ReconcileOperation(context.Context, taskworkspace.ReconcileOperationRequest) (taskworkspace.OperationInspection, error)
 }
@@ -34,6 +36,182 @@ type TaskWorkspaceLifecycleAdapterBinding struct {
 	Prerequisites      []EvidencePrerequisite
 	Commit             *taskworkspace.CommitRuntimeViewRequest
 	Fence              *taskworkspace.FenceRuntimeViewRequest
+}
+
+// TaskWorkspaceLifecycleCommitRequestBinding is the opaque, fully canonical
+// C04 request selected before a mutating validation decision. Task
+// Orchestration retains only its public identities and digest; callers cannot
+// manufacture the binding without a complete canonical C04 request.
+type TaskWorkspaceLifecycleCommitRequestBinding struct {
+	operationID      OperationID
+	payloadDigest    EnactmentPayloadDigest
+	taskID           TaskID
+	phaseRunID       PhaseRunID
+	taskWorkspaceID  TaskWorkspaceID
+	expectedRevision TaskWorkspaceRevisionID
+	generation       TaskWorkspaceLifecycleGeneration
+	fence            TaskWorkspaceLifecycleFence
+}
+
+func NewTaskWorkspaceLifecycleCommitRequestBinding(
+	request taskworkspace.CommitRuntimeViewRequest,
+) (TaskWorkspaceLifecycleCommitRequestBinding, error) {
+	if request.Operation.RequestDigest == "" ||
+		request.Operation.RequestDigest != request.CanonicalRequestDigest() ||
+		request.Generation == 0 || request.Fence == 0 {
+		return TaskWorkspaceLifecycleCommitRequestBinding{}, invalidIntentError()
+	}
+	operationID, operationErr := NewOperationID(string(request.Operation.ID))
+	taskID, taskErr := NewTaskID(string(request.TaskID))
+	phaseRunID, phaseErr := NewPhaseRunID(string(request.ValidationEvidence.PhaseRunID))
+	taskWorkspaceID, workspaceErr := NewTaskWorkspaceID(string(request.TaskWorkspaceID))
+	expectedRevision, revisionErr := NewTaskWorkspaceRevisionID(string(request.ExpectedCurrentRevision))
+	payloadDigest, digestErr := taskWorkspaceRequestPayloadDigest(request.Operation.RequestDigest)
+	if operationErr != nil || taskErr != nil || phaseErr != nil || workspaceErr != nil ||
+		revisionErr != nil || digestErr != nil {
+		return TaskWorkspaceLifecycleCommitRequestBinding{}, invalidIntentError()
+	}
+	binding := TaskWorkspaceLifecycleCommitRequestBinding{
+		operationID: operationID, payloadDigest: payloadDigest, taskID: taskID,
+		phaseRunID: phaseRunID, taskWorkspaceID: taskWorkspaceID, expectedRevision: expectedRevision,
+		generation: TaskWorkspaceLifecycleGeneration(request.Generation),
+		fence:      TaskWorkspaceLifecycleFence(request.Fence),
+	}
+	requestCopy := request
+	if failure := validateTaskWorkspaceLifecycleBinding(TaskWorkspaceLifecycleAdapterBinding{
+		Enactment: exactTaskWorkspaceBindingEnactment(
+			binding.operationID, binding.payloadDigest, binding.fence,
+		),
+		Producer:           exactTaskWorkspaceBindingProducer(),
+		TaskID:             binding.taskID,
+		PhaseRunID:         binding.phaseRunID,
+		PhaseRunGeneration: 1,
+		PhaseRunFence:      1,
+		SafetyEpoch:        1,
+		Commit:             &requestCopy,
+	}); failure != nil {
+		return TaskWorkspaceLifecycleCommitRequestBinding{}, invalidIntentError()
+	}
+	return binding, nil
+}
+
+func (binding TaskWorkspaceLifecycleCommitRequestBinding) valid() bool {
+	return validOpaqueID(binding.operationID.value) && binding.payloadDigest != (EnactmentPayloadDigest{}) &&
+		validOpaqueID(binding.taskID.value) && validOpaqueID(binding.phaseRunID.value) &&
+		validOpaqueID(binding.taskWorkspaceID.value) && validOpaqueID(binding.expectedRevision.value) &&
+		binding.generation > 0 && binding.fence > 0
+}
+
+func (binding TaskWorkspaceLifecycleCommitRequestBinding) canonical() map[string]any {
+	if !binding.valid() {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"operation_id": binding.operationID.value, "payload_digest": binding.payloadDigest.String(),
+		"generation": uint64(binding.generation), "fence": uint64(binding.fence),
+	}
+}
+
+// TaskWorkspaceLifecycleFenceRequestBinding is the opaque exact C04 fence
+// request admitted into a cancellation decision.
+type TaskWorkspaceLifecycleFenceRequestBinding struct {
+	operationID      OperationID
+	payloadDigest    EnactmentPayloadDigest
+	taskID           TaskID
+	phaseRunID       PhaseRunID
+	taskWorkspaceID  TaskWorkspaceID
+	expectedRevision TaskWorkspaceRevisionID
+	generation       TaskWorkspaceLifecycleGeneration
+	fence            TaskWorkspaceLifecycleFence
+}
+
+func NewTaskWorkspaceLifecycleFenceRequestBinding(
+	request taskworkspace.FenceRuntimeViewRequest,
+) (TaskWorkspaceLifecycleFenceRequestBinding, error) {
+	if request.Operation.RequestDigest == "" ||
+		request.Operation.RequestDigest != request.CanonicalRequestDigest() ||
+		request.Generation == 0 || request.Fence == 0 {
+		return TaskWorkspaceLifecycleFenceRequestBinding{}, invalidIntentError()
+	}
+	operationID, operationErr := NewOperationID(string(request.Operation.ID))
+	taskID, taskErr := NewTaskID(string(request.TaskID))
+	phaseRunID, phaseErr := NewPhaseRunID(string(request.SandboxLeaseAuthority.PhaseRunID))
+	taskWorkspaceID, workspaceErr := NewTaskWorkspaceID(string(request.TaskWorkspaceID))
+	expectedRevision, revisionErr := NewTaskWorkspaceRevisionID(string(request.ExpectedCurrentRevision))
+	payloadDigest, digestErr := taskWorkspaceRequestPayloadDigest(request.Operation.RequestDigest)
+	if operationErr != nil || taskErr != nil || phaseErr != nil || workspaceErr != nil ||
+		revisionErr != nil || digestErr != nil {
+		return TaskWorkspaceLifecycleFenceRequestBinding{}, invalidIntentError()
+	}
+	binding := TaskWorkspaceLifecycleFenceRequestBinding{
+		operationID: operationID, payloadDigest: payloadDigest, taskID: taskID,
+		phaseRunID: phaseRunID, taskWorkspaceID: taskWorkspaceID, expectedRevision: expectedRevision,
+		generation: TaskWorkspaceLifecycleGeneration(request.Generation),
+		fence:      TaskWorkspaceLifecycleFence(request.Fence),
+	}
+	requestCopy := request
+	if failure := validateTaskWorkspaceLifecycleBinding(TaskWorkspaceLifecycleAdapterBinding{
+		Enactment: exactTaskWorkspaceBindingEnactment(
+			binding.operationID, binding.payloadDigest, binding.fence,
+		),
+		Producer:           exactTaskWorkspaceBindingProducer(),
+		TaskID:             binding.taskID,
+		PhaseRunID:         binding.phaseRunID,
+		PhaseRunGeneration: 1,
+		PhaseRunFence:      1,
+		SafetyEpoch:        1,
+		Fence:              &requestCopy,
+	}); failure != nil {
+		return TaskWorkspaceLifecycleFenceRequestBinding{}, invalidIntentError()
+	}
+	return binding, nil
+}
+
+func exactTaskWorkspaceBindingEnactment(
+	operationID OperationID,
+	payloadDigest EnactmentPayloadDigest,
+	fence TaskWorkspaceLifecycleFence,
+) EnactmentRef {
+	return EnactmentRef{
+		OperationID: operationID, Kind: EnactmentTaskWorkspaceLifecycle,
+		PayloadDigest: payloadDigest, ActivityGeneration: 1, Fence: fence,
+		CausationID: CausationID{value: "c04-exact-request-binding"},
+	}
+}
+
+func exactTaskWorkspaceBindingProducer() EvidenceProducer {
+	return EvidenceProducer{
+		AuthorityID: AuthorityID{value: "c04-exact-request-binding-authority"},
+		Generation:  1,
+	}
+}
+
+func (binding TaskWorkspaceLifecycleFenceRequestBinding) valid() bool {
+	return validOpaqueID(binding.operationID.value) && binding.payloadDigest != (EnactmentPayloadDigest{}) &&
+		validOpaqueID(binding.taskID.value) && validOpaqueID(binding.phaseRunID.value) &&
+		validOpaqueID(binding.taskWorkspaceID.value) && validOpaqueID(binding.expectedRevision.value) &&
+		binding.generation > 0 && binding.fence > 0
+}
+
+func (binding TaskWorkspaceLifecycleFenceRequestBinding) canonical() map[string]any {
+	if !binding.valid() {
+		return map[string]any{}
+	}
+	return map[string]any{
+		"operation_id": binding.operationID.value, "payload_digest": binding.payloadDigest.String(),
+		"generation": uint64(binding.generation), "fence": uint64(binding.fence),
+	}
+}
+
+func taskWorkspaceRequestPayloadDigest(
+	digest taskworkspace.Digest,
+) (EnactmentPayloadDigest, error) {
+	const prefix = "sha256:"
+	value := string(digest)
+	if !strings.HasPrefix(value, prefix) {
+		return EnactmentPayloadDigest{}, invalidIntentError()
+	}
+	return ParseEnactmentPayloadDigest(strings.TrimPrefix(value, prefix))
 }
 
 type TaskWorkspaceLifecycleEvidenceAdapter interface {
@@ -68,7 +246,7 @@ func (evidence TaskWorkspaceLifecycleAdapterEvidence) Intent(header IntentHeader
 		evidence.SchemaVersion.Major() != EvidenceSchemaV1.Major() ||
 		!validEvidenceRef(evidence.Evidence) || evidence.Evidence.Kind != EvidenceTaskWorkspaceLifecycle ||
 		!validOpaqueID(evidence.Producer.AuthorityID.String()) || evidence.Producer.Generation == 0 ||
-		evidence.ObservedGeneration == 0 || evidence.ObservedFence <= evidence.Fence ||
+		evidence.ObservedGeneration < evidence.Generation || evidence.ObservedFence <= evidence.Fence ||
 		(evidence.Outcome == LifecycleEvidenceCommitted &&
 			(evidence.CommitProofDigest == (EvidenceDigest{}) || evidence.FenceProofDigest != (EvidenceDigest{}))) ||
 		(evidence.Outcome == LifecycleEvidenceFenced &&
@@ -85,6 +263,7 @@ func (evidence TaskWorkspaceLifecycleAdapterEvidence) Intent(header IntentHeader
 			Evidence: evidence.Evidence, PhaseRunID: evidence.PhaseRunID,
 			PhaseRunGeneration: evidence.PhaseRunGeneration, PhaseRunFence: evidence.PhaseRunFence,
 			OperationID: evidence.OperationID, Generation: evidence.Generation, Fence: evidence.Fence,
+			ObservedGeneration: evidence.ObservedGeneration, ObservedFence: evidence.ObservedFence,
 			SafetyEpoch: evidence.SafetyEpoch, Outcome: evidence.Outcome,
 			RevisionID: evidence.RevisionID, CheckpointID: evidence.CheckpointID,
 		},

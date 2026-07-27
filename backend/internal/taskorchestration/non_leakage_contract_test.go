@@ -57,7 +57,7 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 		RequiredRuntimeRuns: 1,
 	}})
 	start, err := harness.Mutations.Decide(context.Background(),
-		taskorchestration.NewStartPinnedTaskIntent(
+		verifiedPinnedStartIntent(t,
 			intentHeader(t, "canary-start", "canary-task", now), owner, pinned,
 		))
 	if err != nil {
@@ -84,7 +84,7 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 	})
 	if _, err := postgres.Decide(
 		context.Background(),
-		taskorchestration.NewStartTaskIntent(
+		minimalPinnedStartIntent(t,
 			intentHeader(t, "canary-postgres-start", "canary-postgres-task", now), owner,
 		),
 	); err != nil {

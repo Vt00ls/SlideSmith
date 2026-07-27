@@ -10,7 +10,26 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/taskorchestration"
 )
 
-func TestPinnedPipelineCreatesTheEntryPhaseFromItsContract(t *testing.T) {
+func TestBareTaskStartFailsClosedWithoutPinnedRouteAndLocks(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 9, 0, 0, 0, time.UTC)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+	if err != nil {
+		t.Fatalf("create deterministic harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "bare-start-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+
+	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+		intentHeader(t, "bare-start-request", "bare-start-task", now), owner,
+	))
+	var decisionError *taskorchestration.Error
+	if !errors.As(err, &decisionError) || decisionError.Code() != taskorchestration.ErrorInvalidIntent {
+		t.Fatalf("bare Start error = %v, want invalid intent", err)
+	}
+}
+
+func TestPinnedPipelineVersionCreatesTheEntryPhaseFromItsContract(t *testing.T) {
 	now := time.Date(2026, time.July, 26, 15, 0, 0, 0, time.UTC)
 	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
 	if err != nil {
@@ -34,16 +53,18 @@ func TestPinnedPipelineCreatesTheEntryPhaseFromItsContract(t *testing.T) {
 		},
 	})
 
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "aggregate-start", "aggregate-task", now), owner, pinned,
 	))
 	if err != nil {
 		t.Fatalf("start pinned Task: %v", err)
 	}
 	if start.TaskProjection.Status != taskorchestration.TaskReady ||
+		start.TaskProjection.ExecutionLockID != pinned.ExecutionLock.ID ||
+		start.TaskProjection.TemplateLockID != pinned.TemplateLockID ||
 		start.TaskProjection.CurrentPhase != phaseKey(t, "contract-entry") ||
 		start.TaskProjection.TaskWorkspaceID != pinned.TaskWorkspaceID {
-		t.Fatal("start decision did not project the pinned contract entry Phase")
+		t.Fatal("start decision did not project the pinned route, locks, and entry Phase")
 	}
 
 	workHeader := intentHeader(t, "aggregate-work", "aggregate-task", now.Add(time.Second))
@@ -82,6 +103,64 @@ func TestPinnedPipelineCreatesTheEntryPhaseFromItsContract(t *testing.T) {
 	}
 }
 
+func TestDecisionCreatedRuntimeBindingRejectsAnUnpinnedProducer(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 9, 10, 0, 0, time.UTC)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+	if err != nil {
+		t.Fatalf("create deterministic harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "producer-binding-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "producer-binding-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
+		intentHeader(t, "producer-binding-start", "producer-binding-task", now), owner, pinned,
+	)); err != nil {
+		t.Fatalf("start pinned Task: %v", err)
+	}
+	workHeader := intentHeader(t, "producer-binding-work", "producer-binding-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = 1
+	work, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader,
+		taskorchestration.NewWorkerAuthority(
+			authorityID(t, "producer-binding-worker"), taskorchestration.AuthorizationGeneration(1),
+		),
+		operationID(t, "producer-binding-work-available"),
+	))
+	if err != nil {
+		t.Fatalf("make work available: %v", err)
+	}
+	view := queryAggregate(t, harness, "producer-binding-task", owner)
+	run := view.PhaseRuns[0]
+	runtimeRun := run.RuntimeRuns[0]
+	header := intentHeader(t, "producer-binding-forged", "producer-binding-task", now.Add(2*time.Second))
+	header.ExpectedTaskRevision = work.AcceptedTaskRevision
+	header.ActivityGeneration = work.TaskProjection.ActivityGeneration
+
+	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
+		header,
+		taskorchestration.NewRuntimeAuthority(
+			authorityID(t, "producer-binding-forged-runtime"), taskorchestration.AuthorizationGeneration(1),
+		),
+		taskorchestration.RuntimeEvidenceBinding{
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, "producer-binding-forged-evidence"), taskorchestration.EvidenceRuntime,
+				evidenceDigest(t, "6767676767676767676767676767676767676767676767676767676767676767"),
+			),
+			PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
+			RuntimeRunID: runtimeRun.RuntimeRunID, OperationID: work.EnactmentRefs[0].OperationID,
+			Generation: taskorchestration.RuntimeGeneration(run.Generation),
+			Fence:      taskorchestration.RuntimeFence(run.Fence), SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.RuntimeRunSucceeded,
+		},
+	))
+	assertDecisionErrorCode(t, err, taskorchestration.ErrorAuthorizationDenied)
+}
+
 func TestAggregateEnactmentReconciliationRedeliversTheOriginalOperation(t *testing.T) {
 	now := time.Date(2026, time.July, 26, 15, 10, 0, 0, time.UTC)
 	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
@@ -99,7 +178,7 @@ func TestAggregateEnactmentReconciliationRedeliversTheOriginalOperation(t *testi
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "aggregate-reconcile-start", "aggregate-reconcile-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start pinned Task: %v", err)
@@ -139,7 +218,7 @@ func TestAggregateEnactmentReconciliationRedeliversTheOriginalOperation(t *testi
 	}
 }
 
-func TestPinnedPipelineFailsClosedWithoutItsValidationContract(t *testing.T) {
+func TestPinnedPipelineVersionFailsClosedWithoutItsValidationContract(t *testing.T) {
 	now := time.Date(2026, time.July, 26, 15, 15, 0, 0, time.UTC)
 	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
 	if err != nil {
@@ -155,7 +234,7 @@ func TestPinnedPipelineFailsClosedWithoutItsValidationContract(t *testing.T) {
 		},
 		{Key: phaseKey(t, "missing-validation-publication"), Kind: taskorchestration.PhasePublication},
 	})
-	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	_, err = harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "missing-validation-start", "missing-validation-task", now), owner, pinned,
 	))
 	var decisionError *taskorchestration.Error
@@ -184,7 +263,7 @@ func TestRuntimeSuccessWaitsForValidationBeforeAdvancingANonMutatingPhase(t *tes
 		},
 		{Key: phaseKey(t, "publish-deck"), Kind: taskorchestration.PhasePublication},
 	})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "validation-start", "validation-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start pinned Task: %v", err)
@@ -209,9 +288,7 @@ func TestRuntimeSuccessWaitsForValidationBeforeAdvancingANonMutatingPhase(t *tes
 	runtimeHeader.ExpectedTaskRevision = 2
 	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
 		runtimeHeader,
-		taskorchestration.NewRuntimeAuthority(
-			authorityID(t, "validation-runtime-authority"), taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.Runtime,
 		taskorchestration.RuntimeEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "validation-runtime-evidence"), taskorchestration.EvidenceRuntime,
@@ -238,9 +315,7 @@ func TestRuntimeSuccessWaitsForValidationBeforeAdvancingANonMutatingPhase(t *tes
 		context.Background(),
 		taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
 			validationHeader,
-			taskorchestration.NewValidatorAuthority(
-				authorityID(t, "validation-authority"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Validator,
 			taskorchestration.ValidationEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "validation-accepted-evidence"),
@@ -285,7 +360,7 @@ func TestConfirmationGateHasNoRuntimeRunsAndReplaysOnlyExactOwningUserSubmission
 		},
 		{Key: phaseKey(t, "publish-confirmed-deck"), Kind: taskorchestration.PhasePublication},
 	})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "gate-start", "gate-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start pinned Task: %v", err)
@@ -369,7 +444,7 @@ func TestMutatingPhaseWaitsForValidatedC04CommitEvidence(t *testing.T) {
 		},
 		{Key: phaseKey(t, "publish-realized-deck"), Kind: taskorchestration.PhasePublication},
 	})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "mutation-start", "mutation-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start pinned Task: %v", err)
@@ -393,9 +468,7 @@ func TestMutatingPhaseWaitsForValidatedC04CommitEvidence(t *testing.T) {
 	runtimeHeader.ExpectedTaskRevision = 2
 	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
 		runtimeHeader,
-		taskorchestration.NewRuntimeAuthority(
-			authorityID(t, "mutation-runtime-authority"), taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.Runtime,
 		taskorchestration.RuntimeEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "mutation-runtime-evidence"), taskorchestration.EvidenceRuntime,
@@ -411,13 +484,15 @@ func TestMutatingPhaseWaitsForValidatedC04CommitEvidence(t *testing.T) {
 	}
 	validationHeader := intentHeader(t, "mutation-validation", "mutation-task", now.Add(3*time.Second))
 	validationHeader.ExpectedTaskRevision = 3
+	commitBinding := exactC04CommitRequestBinding(
+		t, "mutation-task", phaseRunID, pinned.TaskWorkspaceID, "mutation-c04-operation",
+		1, 1, taskorchestration.TaskWorkspaceRevisionID{},
+	)
 	validation, err := harness.Mutations.Decide(
 		context.Background(),
 		taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
 			validationHeader,
-			taskorchestration.NewValidatorAuthority(
-				authorityID(t, "mutation-validator"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Validator,
 			taskorchestration.ValidationEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "mutation-validation-evidence"),
@@ -426,7 +501,7 @@ func TestMutatingPhaseWaitsForValidatedC04CommitEvidence(t *testing.T) {
 				),
 				PhaseRunID: phaseRunID, PhaseRunGeneration: 1, PhaseRunFence: 1,
 				Generation: 1, Fence: 1, SafetyEpoch: 1,
-				Outcome: taskorchestration.PhaseValidationAccepted,
+				Outcome: taskorchestration.PhaseValidationAccepted, LifecycleCommit: commitBinding,
 			},
 		),
 	)
@@ -445,9 +520,7 @@ func TestMutatingPhaseWaitsForValidatedC04CommitEvidence(t *testing.T) {
 		context.Background(),
 		taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
 			lifecycleHeader,
-			taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-				authorityID(t, "mutation-c04-authority"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.TaskWorkspaceLifecycle,
 			taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "mutation-c04-evidence"),
@@ -456,7 +529,8 @@ func TestMutatingPhaseWaitsForValidatedC04CommitEvidence(t *testing.T) {
 				),
 				PhaseRunID: phaseRunID, PhaseRunGeneration: 1, PhaseRunFence: 1,
 				OperationID: validation.EnactmentRefs[0].OperationID,
-				Generation:  1, Fence: 1, SafetyEpoch: 1,
+				Generation:  1, Fence: 1, ObservedGeneration: 1, ObservedFence: 2,
+				SafetyEpoch:  1,
 				Outcome:      taskorchestration.TaskWorkspaceLifecycleCommitted,
 				RevisionID:   taskWorkspaceRevisionID(t, "revision-realized-deck"),
 				CheckpointID: checkpointID(t, "checkpoint-realized-deck"),
@@ -472,7 +546,8 @@ func TestMutatingPhaseWaitsForValidatedC04CommitEvidence(t *testing.T) {
 	view = queryAggregate(t, harness, "mutation-task", owner)
 	if view.PhaseRuns[0].Outcome != taskorchestration.PhaseRunSucceeded ||
 		view.PhaseRuns[0].RevisionID != taskWorkspaceRevisionID(t, "revision-realized-deck") ||
-		view.PhaseRuns[0].CheckpointID != checkpointID(t, "checkpoint-realized-deck") {
+		view.PhaseRuns[0].CheckpointID != checkpointID(t, "checkpoint-realized-deck") ||
+		view.TaskWorkspaceLifecycleGeneration != 1 || view.TaskWorkspaceLifecycleFence != 2 {
 		t.Fatal("mutating Phase history omitted its authoritative C04 result")
 	}
 }
@@ -491,7 +566,7 @@ func TestMutatingPhaseRecordsTerminalC04RejectionEvidence(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1, RetryEligible: true,
 	}})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "rejected-c04-start", "rejected-c04-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start pinned Task: %v", err)
@@ -518,10 +593,7 @@ func TestMutatingPhaseRecordsTerminalC04RejectionEvidence(t *testing.T) {
 		context.Background(),
 		taskorchestration.NewAcceptRuntimeEvidenceIntent(
 			runtimeHeader,
-			taskorchestration.NewRuntimeAuthority(
-				authorityID(t, "rejected-c04-runtime-authority"),
-				taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Runtime,
 			taskorchestration.RuntimeEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "rejected-c04-runtime-evidence"),
@@ -542,13 +614,15 @@ func TestMutatingPhaseRecordsTerminalC04RejectionEvidence(t *testing.T) {
 		t, "rejected-c04-validation", "rejected-c04-task", now.Add(3*time.Second),
 	)
 	validationHeader.ExpectedTaskRevision = 3
+	commitBinding := exactC04CommitRequestBinding(
+		t, "rejected-c04-task", run.PhaseRunID, pinned.TaskWorkspaceID,
+		"rejected-c04-commit-operation", 1, 1, taskorchestration.TaskWorkspaceRevisionID{},
+	)
 	validation, err := harness.Mutations.Decide(
 		context.Background(),
 		taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
 			validationHeader,
-			taskorchestration.NewValidatorAuthority(
-				authorityID(t, "rejected-c04-validator"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Validator,
 			taskorchestration.ValidationEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "rejected-c04-validation-evidence"),
@@ -558,7 +632,7 @@ func TestMutatingPhaseRecordsTerminalC04RejectionEvidence(t *testing.T) {
 				PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation,
 				PhaseRunFence: run.Fence, Generation: 1,
 				Fence: taskorchestration.ValidationFence(run.Fence), SafetyEpoch: 1,
-				Outcome: taskorchestration.PhaseValidationAccepted,
+				Outcome: taskorchestration.PhaseValidationAccepted, LifecycleCommit: commitBinding,
 			},
 		),
 	)
@@ -573,9 +647,7 @@ func TestMutatingPhaseRecordsTerminalC04RejectionEvidence(t *testing.T) {
 		context.Background(),
 		taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
 			rejectionHeader,
-			taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-				authorityID(t, "rejected-c04-authority"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.TaskWorkspaceLifecycle,
 			taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "rejected-c04-terminal-evidence"),
@@ -585,6 +657,7 @@ func TestMutatingPhaseRecordsTerminalC04RejectionEvidence(t *testing.T) {
 				PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation,
 				PhaseRunFence: run.Fence, OperationID: validation.EnactmentRefs[0].OperationID,
 				Generation: 1, Fence: taskorchestration.TaskWorkspaceLifecycleFence(run.Fence),
+				ObservedGeneration: 1, ObservedFence: taskorchestration.TaskWorkspaceLifecycleFence(run.Fence + 1),
 				SafetyEpoch: 1, Outcome: taskorchestration.TaskWorkspaceLifecycleRejected,
 			},
 		),
@@ -615,7 +688,7 @@ func TestPublicationPhaseCompletesOnlyFromArtifactActivationEvidence(t *testing.
 	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{
 		{Key: phaseKey(t, "activate-artifact"), Kind: taskorchestration.PhasePublication},
 	})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "publication-start", "publication-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start pinned Task: %v", err)
@@ -646,9 +719,7 @@ func TestPublicationPhaseCompletesOnlyFromArtifactActivationEvidence(t *testing.
 		context.Background(),
 		taskorchestration.NewAcceptPublicationEvidenceIntent(
 			publicationHeader,
-			taskorchestration.NewPublicationAuthority(
-				authorityID(t, "publication-authority"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Publication,
 			taskorchestration.PublicationEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "publication-evidence"), taskorchestration.EvidencePublication,
@@ -695,7 +766,7 @@ func TestRetryCreatesANewAttemptAndPreservesLocksAndHistory(t *testing.T) {
 		},
 		{Key: phaseKey(t, "retry-publication"), Kind: taskorchestration.PhasePublication},
 	})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "retry-start", "retry-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start pinned Task: %v", err)
@@ -718,9 +789,7 @@ func TestRetryCreatesANewAttemptAndPreservesLocksAndHistory(t *testing.T) {
 	runtimeHeader.ExpectedTaskRevision = 2
 	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
 		runtimeHeader,
-		taskorchestration.NewRuntimeAuthority(
-			authorityID(t, "retry-runtime-authority"), taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.Runtime,
 		taskorchestration.RuntimeEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "retry-runtime-failed-evidence"), taskorchestration.EvidenceRuntime,
@@ -741,9 +810,7 @@ func TestRetryCreatesANewAttemptAndPreservesLocksAndHistory(t *testing.T) {
 		context.Background(),
 		taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
 			validationHeader,
-			taskorchestration.NewValidatorAuthority(
-				authorityID(t, "retry-validator"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Validator,
 			taskorchestration.ValidationEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "retry-validation-rejected-evidence"),
@@ -782,6 +849,144 @@ func TestRetryCreatesANewAttemptAndPreservesLocksAndHistory(t *testing.T) {
 	}
 }
 
+func TestRuntimeRetryCreatesANewRuntimeRunInsideTheSamePhaseRun(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 10, 0, 0, 0, time.UTC)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+	if err != nil {
+		t.Fatalf("create deterministic harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(authorityID(t, "runtime-retry-owner"), 1)
+	worker := taskorchestration.NewWorkerAuthority(authorityID(t, "runtime-retry-worker"), 1)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "runtime-retry-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1, RetryEligible: true,
+	}})
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
+		intentHeader(t, "runtime-retry-start", "runtime-retry-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start runtime-retry Task: %v", err)
+	}
+	workHeader := intentHeader(t, "runtime-retry-work", "runtime-retry-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	work, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "runtime-retry-work-available"),
+	))
+	if err != nil {
+		t.Fatalf("make initial Runtime work available: %v", err)
+	}
+	view := queryAggregate(t, harness, "runtime-retry-task", owner)
+	phase := view.PhaseRuns[0]
+	failedRuntime := phase.RuntimeRuns[0]
+	failedHeader := intentHeader(t, "runtime-retry-failed", "runtime-retry-task", now.Add(2*time.Second))
+	failedHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
+	failed, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
+		failedHeader, pinned.Authorities.Runtime, taskorchestration.RuntimeEvidenceBinding{
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, "runtime-retry-failed-evidence"), taskorchestration.EvidenceRuntime,
+				evidenceDigest(t, "6868686868686868686868686868686868686868686868686868686868686868"),
+			),
+			PhaseRunID: phase.PhaseRunID, PhaseRunGeneration: phase.Generation, PhaseRunFence: phase.Fence,
+			RuntimeRunID: failedRuntime.RuntimeRunID, OperationID: work.EnactmentRefs[0].OperationID,
+			Generation: taskorchestration.RuntimeGeneration(phase.Generation),
+			Fence:      taskorchestration.RuntimeFence(phase.Fence), SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.RuntimeRunFailed,
+		},
+	))
+	if err != nil {
+		t.Fatalf("accept failed Runtime evidence: %v", err)
+	}
+	retryHeader := intentHeader(t, "runtime-retry-command", "runtime-retry-task", now.Add(3*time.Second))
+	retryHeader.ExpectedTaskRevision = failed.AcceptedTaskRevision
+	retryIntent := taskorchestration.NewRetryRuntimeRunIntent(
+		retryHeader, worker, phase.PhaseRunID, failedRuntime.RuntimeRunID,
+	)
+	retried, err := harness.Mutations.Decide(context.Background(), retryIntent)
+	if err != nil {
+		t.Fatalf("retry failed Runtime Run: %v", err)
+	}
+	view = queryAggregate(t, harness, "runtime-retry-task", owner)
+	if len(view.PhaseRuns) != 1 || view.PhaseRuns[0].PhaseRunID != phase.PhaseRunID ||
+		view.PhaseRuns[0].Attempt != phase.Attempt || view.PhaseRuns[0].Generation != phase.Generation ||
+		view.PhaseRuns[0].Fence != phase.Fence || len(view.PhaseRuns[0].RuntimeRuns) != 2 ||
+		view.PhaseRuns[0].RuntimeRuns[0].RuntimeRunID != failedRuntime.RuntimeRunID ||
+		view.PhaseRuns[0].RuntimeRuns[0].Outcome != taskorchestration.RuntimeRunFailed ||
+		view.PhaseRuns[0].RuntimeRuns[1].RuntimeRunID == failedRuntime.RuntimeRunID ||
+		view.PhaseRuns[0].RuntimeRuns[1].Outcome != taskorchestration.RuntimeRunPending ||
+		len(retried.EnactmentRefs) != 1 ||
+		retried.EnactmentRefs[0].Kind != taskorchestration.EnactmentRuntimeExecution ||
+		retried.EnactmentRefs[0].OperationID == work.EnactmentRefs[0].OperationID ||
+		retried.TaskProjection.ExecutionLockID != pinned.ExecutionLock.ID ||
+		retried.TaskProjection.TemplateLockID != pinned.TemplateLockID ||
+		retried.MandatoryAuditFactRef.RetryRuntimeRunID != failedRuntime.RuntimeRunID {
+		t.Fatalf("Runtime retry changed Phase attempt/history/locks: decision=%+v view=%+v", retried, view)
+	}
+
+	retriedRuntime := view.PhaseRuns[0].RuntimeRuns[1]
+	invalidRetryHeader := intentHeader(t, "runtime-retry-pending", "runtime-retry-task", now.Add(3500*time.Millisecond))
+	invalidRetryHeader.ExpectedTaskRevision = retried.AcceptedTaskRevision
+	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewRetryRuntimeRunIntent(
+		invalidRetryHeader, worker, phase.PhaseRunID, retriedRuntime.RuntimeRunID,
+	))
+	assertDecisionErrorCode(t, err, taskorchestration.ErrorTerminalConflict)
+	unauthorizedHeader := intentHeader(t, "runtime-retry-unauthorized", "runtime-retry-task", now.Add(3600*time.Millisecond))
+	unauthorizedHeader.ExpectedTaskRevision = retried.AcceptedTaskRevision
+	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewRetryRuntimeRunIntent(
+		unauthorizedHeader,
+		taskorchestration.NewWorkerAuthority(authorityID(t, "runtime-retry-foreign-worker"), 1),
+		phase.PhaseRunID, failedRuntime.RuntimeRunID,
+	))
+	assertDecisionErrorCode(t, err, taskorchestration.ErrorAuthorizationDenied)
+	crossScopeHeader := intentHeader(t, "runtime-retry-cross-scope", "runtime-retry-task", now.Add(3700*time.Millisecond))
+	crossScopeHeader.ExpectedTaskRevision = retried.AcceptedTaskRevision
+	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewRetryRuntimeRunIntent(
+		crossScopeHeader, worker, phaseRunID(t, "runtime-retry-other-phase"), failedRuntime.RuntimeRunID,
+	))
+	assertDecisionErrorCode(t, err, taskorchestration.ErrorTerminalConflict)
+
+	successHeader := intentHeader(t, "runtime-retry-success", "runtime-retry-task", now.Add(4*time.Second))
+	successHeader.ExpectedTaskRevision = retried.AcceptedTaskRevision
+	succeeded, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
+		successHeader, pinned.Authorities.Runtime, taskorchestration.RuntimeEvidenceBinding{
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, "runtime-retry-success-evidence"), taskorchestration.EvidenceRuntime,
+				evidenceDigest(t, "6969696969696969696969696969696969696969696969696969696969696969"),
+			),
+			PhaseRunID: phase.PhaseRunID, PhaseRunGeneration: phase.Generation, PhaseRunFence: phase.Fence,
+			RuntimeRunID: retriedRuntime.RuntimeRunID, OperationID: retried.EnactmentRefs[0].OperationID,
+			Generation: taskorchestration.RuntimeGeneration(phase.Generation),
+			Fence:      taskorchestration.RuntimeFence(phase.Fence), SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.RuntimeRunSucceeded,
+		},
+	))
+	if err != nil {
+		t.Fatalf("accept retried Runtime evidence: %v", err)
+	}
+	validationHeader := intentHeader(t, "runtime-retry-validation", "runtime-retry-task", now.Add(5*time.Second))
+	validationHeader.ExpectedTaskRevision = succeeded.AcceptedTaskRevision
+	completed, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
+		validationHeader, pinned.Authorities.Validator, taskorchestration.ValidationEvidenceBinding{
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, "runtime-retry-validation-evidence"), taskorchestration.EvidencePhaseValidation,
+				evidenceDigest(t, "7070707070707070707070707070707070707070707070707070707070707070"),
+			),
+			PhaseRunID: phase.PhaseRunID, PhaseRunGeneration: phase.Generation, PhaseRunFence: phase.Fence,
+			Generation: taskorchestration.ProducerGeneration(phase.Generation),
+			Fence:      taskorchestration.ValidationFence(phase.Fence), SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.PhaseValidationAccepted,
+		},
+	))
+	if err != nil || completed.TaskProjection.Status != taskorchestration.TaskCompleted {
+		t.Fatalf("validation did not aggregate the successful retry: decision=%+v err=%v", completed, err)
+	}
+	replayed, err := harness.Mutations.Decide(context.Background(), retryIntent)
+	if err != nil || replayed.DecisionID != retried.DecisionID ||
+		replayed.EnactmentRefs[0].OperationID != retried.EnactmentRefs[0].OperationID {
+		t.Fatalf("Runtime retry exact replay changed its Runtime Run or OperationID: %+v err=%v", replayed, err)
+	}
+}
+
 func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing.T) {
 	now := time.Date(2026, time.July, 26, 18, 0, 0, 0, time.UTC)
 	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
@@ -804,7 +1009,7 @@ func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing
 		},
 		{Key: phaseKey(t, "manual-publication"), Kind: taskorchestration.PhasePublication},
 	}
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "manual-start", "manual-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start pinned Task: %v", err)
@@ -829,9 +1034,7 @@ func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing
 		context.Background(),
 		taskorchestration.NewAcceptPublicationEvidenceIntent(
 			publicationHeader,
-			taskorchestration.NewPublicationAuthority(
-				authorityID(t, "manual-publication-authority"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Publication,
 			taskorchestration.PublicationEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "manual-initial-publication-evidence"),
@@ -913,9 +1116,7 @@ func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing
 	runtimeHeader.ActivityGeneration = 2
 	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
 		runtimeHeader,
-		taskorchestration.NewRuntimeAuthority(
-			authorityID(t, "manual-runtime-authority"), taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.Runtime,
 		taskorchestration.RuntimeEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "manual-runtime-evidence"), taskorchestration.EvidenceRuntime,
@@ -933,11 +1134,14 @@ func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing
 	validationHeader := intentHeader(t, "manual-validation", "manual-task", now.Add(8*time.Second))
 	validationHeader.ExpectedTaskRevision = 6
 	validationHeader.ActivityGeneration = 2
+	manualCommitBinding := exactC04CommitRequestBinding(
+		t, "manual-task", manualRun.PhaseRunID, pinned.TaskWorkspaceID,
+		"manual-lifecycle-operation", 1, taskorchestration.TaskWorkspaceLifecycleFence(manualRun.Fence),
+		view.LatestRevisionID,
+	)
 	validation, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
 		validationHeader,
-		taskorchestration.NewValidatorAuthority(
-			authorityID(t, "manual-validator"), taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.Validator,
 		taskorchestration.ValidationEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "manual-validation-evidence"), taskorchestration.EvidencePhaseValidation,
@@ -946,7 +1150,7 @@ func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing
 			PhaseRunID: manualRun.PhaseRunID, PhaseRunGeneration: manualRun.Generation,
 			PhaseRunFence: manualRun.Fence, Generation: 1,
 			Fence: taskorchestration.ValidationFence(manualRun.Fence), SafetyEpoch: 1,
-			Outcome: taskorchestration.PhaseValidationAccepted,
+			Outcome: taskorchestration.PhaseValidationAccepted, LifecycleCommit: manualCommitBinding,
 		},
 	))
 	if err != nil {
@@ -957,9 +1161,7 @@ func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing
 	lifecycleHeader.ActivityGeneration = 2
 	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
 		lifecycleHeader,
-		taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-			authorityID(t, "manual-c04-authority"), taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.TaskWorkspaceLifecycle,
 		taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "manual-lifecycle-evidence"),
@@ -968,7 +1170,9 @@ func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing
 			),
 			PhaseRunID: manualRun.PhaseRunID, PhaseRunGeneration: manualRun.Generation,
 			PhaseRunFence: manualRun.Fence, OperationID: validation.EnactmentRefs[0].OperationID,
-			Generation: 1, Fence: taskorchestration.TaskWorkspaceLifecycleFence(manualRun.Fence), SafetyEpoch: 1,
+			Generation: 1, Fence: taskorchestration.TaskWorkspaceLifecycleFence(manualRun.Fence),
+			ObservedGeneration: 1, ObservedFence: taskorchestration.TaskWorkspaceLifecycleFence(manualRun.Fence + 1),
+			SafetyEpoch:  1,
 			Outcome:      taskorchestration.TaskWorkspaceLifecycleCommitted,
 			RevisionID:   taskWorkspaceRevisionID(t, "manual-revision-v2"),
 			CheckpointID: checkpointID(t, "manual-checkpoint-v2"),
@@ -997,9 +1201,7 @@ func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing
 	childPublicationHeader.ActivityGeneration = 2
 	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptPublicationEvidenceIntent(
 		childPublicationHeader,
-		taskorchestration.NewPublicationAuthority(
-			authorityID(t, "manual-publication-authority"), taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.Publication,
 		taskorchestration.PublicationEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "manual-child-publication-evidence"), taskorchestration.EvidencePublication,
@@ -1021,6 +1223,138 @@ func TestManualEditUsesLatestArtifactAndThePinnedPostPublicationGraph(t *testing
 	}
 }
 
+func TestManualEditAfterExpiryRequiresExactC04ReconstructionEvidence(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 11, 0, 0, 0, time.UTC)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+	if err != nil {
+		t.Fatalf("create deterministic harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(authorityID(t, "manual-expiry-owner"), 1)
+	worker := taskorchestration.NewWorkerAuthority(authorityID(t, "manual-expiry-worker"), 1)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "manual-expiry-initial-publication"), Kind: taskorchestration.PhasePublication,
+	}})
+	pinned.ExecutionLock.PipelineContract.ManualEditEntryPhase = phaseKey(t, "manual-expiry-apply")
+	pinned.ExecutionLock.PipelineContract.ManualEditPhases = []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "manual-expiry-apply"), Kind: taskorchestration.PhaseMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}}
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
+		intentHeader(t, "manual-expiry-start", "manual-expiry-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start manual-expiry Task: %v", err)
+	}
+	publicationWorkHeader := intentHeader(
+		t, "manual-expiry-publication-work", "manual-expiry-task", now.Add(time.Second),
+	)
+	publicationWorkHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	publicationWork, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		publicationWorkHeader, worker, operationID(t, "manual-expiry-publication-work-available"),
+	))
+	if err != nil {
+		t.Fatalf("make initial publication available: %v", err)
+	}
+	view := queryAggregate(t, harness, "manual-expiry-task", owner)
+	publicationRun := view.PhaseRuns[0]
+	reconstructionRef := downstreamEnactmentRef(
+		t, "manual-expiry-reconstruction-operation",
+		taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(2),
+	)
+	reconstructionRequest, _ := c04ReconstructionContractFixture(
+		t, reconstructionRef, "manual-expiry-task", pinned.TaskWorkspaceID.String(), 2, 2,
+	)
+	reconstructionBinding, err := taskorchestration.NewTaskWorkspaceReconstructionRequestBinding(
+		reconstructionRequest,
+	)
+	if err != nil {
+		t.Fatalf("bind exact manual-expiry C04 reconstruction request: %v", err)
+	}
+	artifact := artifactVersionID(
+		t, string(reconstructionRequest.Intent.ArtifactVersionInput.ArtifactVersionID),
+	)
+	publicationHeader := intentHeader(
+		t, "manual-expiry-publication", "manual-expiry-task", now.Add(2*time.Second),
+	)
+	publicationHeader.ExpectedTaskRevision = publicationWork.AcceptedTaskRevision
+	published, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptPublicationEvidenceIntent(
+		publicationHeader, pinned.Authorities.Publication, taskorchestration.PublicationEvidenceBinding{
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, "manual-expiry-publication-evidence"), taskorchestration.EvidencePublication,
+				evidenceDigest(t, "7272727272727272727272727272727272727272727272727272727272727272"),
+			),
+			PhaseRunID: publicationRun.PhaseRunID, PhaseRunGeneration: publicationRun.Generation,
+			PhaseRunFence: publicationRun.Fence, OperationID: publicationWork.EnactmentRefs[0].OperationID,
+			Generation: taskorchestration.ProducerGeneration(publicationRun.Generation),
+			Fence:      taskorchestration.PublicationFence(publicationRun.Fence), SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.PublicationActivated, ArtifactVersionID: artifact,
+		},
+	))
+	if err != nil {
+		t.Fatalf("complete initial publication: %v", err)
+	}
+	beginHeader := intentHeader(t, "manual-expiry-begin", "manual-expiry-task", now.Add(3*time.Second))
+	beginHeader.ExpectedTaskRevision = published.AcceptedTaskRevision
+	beginHeader.ActivityGeneration = 2
+	reconstruction, err := harness.Mutations.Decide(
+		context.Background(),
+		taskorchestration.NewBeginManualEditAfterExpiryIntent(
+			beginHeader, owner, artifact, reconstructionBinding,
+		),
+	)
+	if err != nil || len(reconstruction.EnactmentRefs) != 1 ||
+		reconstruction.EnactmentRefs[0].Kind != taskorchestration.EnactmentTaskWorkspaceLifecycle {
+		t.Fatalf("expired manual edit did not request C04 reconstruction: %+v err=%v", reconstruction, err)
+	}
+	blockedHeader := intentHeader(t, "manual-expiry-blocked-work", "manual-expiry-task", now.Add(4*time.Second))
+	blockedHeader.ExpectedTaskRevision = reconstruction.AcceptedTaskRevision
+	blockedHeader.ActivityGeneration = 2
+	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		blockedHeader, worker, operationID(t, "manual-expiry-blocked-work-available"),
+	))
+	assertDecisionErrorCode(t, err, taskorchestration.ErrorTerminalConflict)
+
+	revision := taskWorkspaceRevisionID(t, "manual-expiry-reconstructed-revision")
+	checkpoint := checkpointID(t, "manual-expiry-reconstructed-checkpoint")
+	evidenceHeader := intentHeader(t, "manual-expiry-reconstructed", "manual-expiry-task", now.Add(5*time.Second))
+	evidenceHeader.ExpectedTaskRevision = reconstruction.AcceptedTaskRevision
+	evidenceHeader.ActivityGeneration = 2
+	reconstructed, err := harness.Mutations.Decide(
+		context.Background(),
+		taskorchestration.NewAcceptTaskWorkspaceReconstructionEvidenceIntent(
+			evidenceHeader, pinned.Authorities.TaskWorkspaceLifecycle,
+			taskorchestration.TaskWorkspaceReconstructionEvidenceBinding{
+				Evidence: taskorchestration.NewEvidenceRef(
+					evidenceID(t, "manual-expiry-reconstruction-evidence"),
+					taskorchestration.EvidenceTaskWorkspaceLifecycle,
+					evidenceDigest(t, "7373737373737373737373737373737373737373737373737373737373737373"),
+				),
+				OperationID:       reconstruction.EnactmentRefs[0].OperationID,
+				ArtifactVersionID: artifact, RevisionID: revision, CheckpointID: checkpoint,
+				Generation: 2, Fence: 2, ObservedGeneration: 3, ObservedFence: 3,
+				SafetyEpoch: view.SafetyEpoch,
+			},
+		),
+	)
+	if err != nil || len(reconstructed.AcceptedEvidenceRefs) != 1 ||
+		reconstructed.TaskProjection.LatestRevisionID != revision ||
+		reconstructed.TaskProjection.LatestCheckpointID != checkpoint {
+		t.Fatalf("exact C04 reconstruction evidence was not accepted: %+v err=%v", reconstructed, err)
+	}
+	manualWorkHeader := intentHeader(t, "manual-expiry-work", "manual-expiry-task", now.Add(6*time.Second))
+	manualWorkHeader.ExpectedTaskRevision = reconstructed.AcceptedTaskRevision
+	manualWorkHeader.ActivityGeneration = 2
+	manualWork, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		manualWorkHeader, worker, operationID(t, "manual-expiry-work-available"),
+	))
+	if err != nil || len(manualWork.EnactmentRefs) != 1 ||
+		manualWork.EnactmentRefs[0].Kind != taskorchestration.EnactmentRuntimeExecution {
+		t.Fatalf("manual mutation did not wait for reconstruction evidence: %+v err=%v", manualWork, err)
+	}
+}
+
 func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testing.T) {
 	now := time.Date(2026, time.July, 26, 18, 30, 0, 0, time.UTC)
 	t.Run("before a mutation-bearing Phase Run", func(t *testing.T) {
@@ -1038,7 +1372,7 @@ func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testin
 				RequiredRuntimeRuns: 1,
 			},
 		})
-		if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 			intentHeader(t, "cancel-ready-start", "cancel-ready-task", now), owner, pinned,
 		)); err != nil {
 			t.Fatalf("start pinned Task: %v", err)
@@ -1072,7 +1406,7 @@ func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testin
 				RequiredRuntimeRuns: 1,
 			},
 		})
-		if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 			intentHeader(t, "cancel-analysis-start", "cancel-analysis-task", now), owner, pinned,
 		)); err != nil {
 			t.Fatalf("start pinned Task: %v", err)
@@ -1124,10 +1458,7 @@ func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testin
 			context.Background(),
 			taskorchestration.NewAcceptRuntimeEvidenceIntent(
 				evidenceHeader,
-				taskorchestration.NewRuntimeAuthority(
-					authorityID(t, "cancel-analysis-runtime"),
-					taskorchestration.AuthorizationGeneration(1),
-				),
+				pinned.Authorities.Runtime,
 				taskorchestration.RuntimeEvidenceBinding{
 					Evidence: taskorchestration.NewEvidenceRef(
 						evidenceID(t, "cancel-analysis-runtime-terminal-evidence"),
@@ -1170,7 +1501,7 @@ func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testin
 				RequiredRuntimeRuns: 1,
 			},
 		})
-		if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 			intentHeader(t, "cancel-active-start", "cancel-active-task", now), owner, pinned,
 		)); err != nil {
 			t.Fatalf("start pinned Task: %v", err)
@@ -1190,9 +1521,18 @@ func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testin
 		before := queryAggregate(t, harness, "cancel-active-task", owner)
 		cancelHeader := intentHeader(t, "cancel-active", "cancel-active-task", now.Add(2*time.Second))
 		cancelHeader.ExpectedTaskRevision = 2
-		decision, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewCancelTaskByUserIntent(
-			cancelHeader, owner, taskorchestration.CancelReasonUserRequested,
-		))
+		cancelBinding := exactC04FenceRequestBinding(
+			t, "cancel-active-task", before.PhaseRuns[0].PhaseRunID, pinned.TaskWorkspaceID,
+			"cancel-active-c04-fence-operation",
+			taskorchestration.TaskWorkspaceLifecycleGeneration(before.PhaseRuns[0].Generation),
+			taskorchestration.TaskWorkspaceLifecycleFence(before.PhaseRuns[0].Fence),
+			before.LatestRevisionID,
+		)
+		decision, err := harness.Mutations.Decide(
+			context.Background(), taskorchestration.NewCancelTaskByUserWithLifecycleFenceIntent(
+				cancelHeader, owner, taskorchestration.CancelReasonUserRequested, cancelBinding,
+			),
+		)
 		if err != nil {
 			t.Fatalf("cancel active mutation: %v", err)
 		}
@@ -1238,9 +1578,7 @@ func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testin
 		lateRuntimeHeader.ExpectedTaskRevision = 3
 		_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
 			lateRuntimeHeader,
-			taskorchestration.NewRuntimeAuthority(
-				authorityID(t, "cancel-active-runtime"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Runtime,
 			taskorchestration.RuntimeEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "cancel-active-late-runtime-evidence"), taskorchestration.EvidenceRuntime,
@@ -1279,10 +1617,7 @@ func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testin
 			context.Background(),
 			taskorchestration.NewAcceptRuntimeEvidenceIntent(
 				cancelEvidenceHeader,
-				taskorchestration.NewRuntimeAuthority(
-					authorityID(t, "cancel-active-runtime"),
-					taskorchestration.AuthorizationGeneration(1),
-				),
+				pinned.Authorities.Runtime,
 				taskorchestration.RuntimeEvidenceBinding{
 					Evidence: taskorchestration.NewEvidenceRef(
 						evidenceID(t, "cancel-active-runtime-fenced-evidence"),
@@ -1322,10 +1657,7 @@ func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testin
 			context.Background(),
 			taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
 				lifecycleEvidenceHeader,
-				taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-					authorityID(t, "cancel-active-c04"),
-					taskorchestration.AuthorizationGeneration(1),
-				),
+				pinned.Authorities.TaskWorkspaceLifecycle,
 				taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 					Evidence: taskorchestration.NewEvidenceRef(
 						evidenceID(t, "cancel-active-c04-fenced-evidence"),
@@ -1339,9 +1671,13 @@ func TestCancelProjectsTerminalOrCancellingWithoutRepinningOrAdvancing(t *testin
 					Generation: taskorchestration.TaskWorkspaceLifecycleGeneration(
 						before.PhaseRuns[0].Generation,
 					),
-					Fence:       lifecycleFenceValue,
-					SafetyEpoch: 1,
-					Outcome:     taskorchestration.LifecycleEvidenceFenced,
+					Fence: lifecycleFenceValue,
+					ObservedGeneration: taskorchestration.TaskWorkspaceLifecycleGeneration(
+						before.PhaseRuns[0].Generation,
+					),
+					ObservedFence: lifecycleFenceValue + 1,
+					SafetyEpoch:   1,
+					Outcome:       taskorchestration.LifecycleEvidenceFenced,
 				},
 			),
 		)
@@ -1382,7 +1718,7 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "cancel-recovery-start", "cancel-recovery-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start pinned Task: %v", err)
@@ -1394,13 +1730,19 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 	)); err != nil {
 		t.Fatalf("make mutation work available: %v", err)
 	}
-	run := queryAggregate(t, harness, "cancel-recovery-task", owner).PhaseRuns[0]
+	firstView := queryAggregate(t, harness, "cancel-recovery-task", owner)
+	run := firstView.PhaseRuns[0]
 	cancelHeader := intentHeader(t, "cancel-recovery-cancel", "cancel-recovery-task", now.Add(2*time.Second))
 	cancelHeader.ExpectedTaskRevision = 2
+	initialFenceBinding := exactC04FenceRequestBinding(
+		t, "cancel-recovery-task", run.PhaseRunID, pinned.TaskWorkspaceID,
+		"cancel-recovery-initial-c04-fence", taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
+		taskorchestration.TaskWorkspaceLifecycleFence(run.Fence), firstView.LatestRevisionID,
+	)
 	cancelled, err := harness.Mutations.Decide(
 		context.Background(),
-		taskorchestration.NewCancelTaskByUserIntent(
-			cancelHeader, owner, taskorchestration.CancelReasonUserRequested,
+		taskorchestration.NewCancelTaskByUserWithLifecycleFenceIntent(
+			cancelHeader, owner, taskorchestration.CancelReasonUserRequested, initialFenceBinding,
 		),
 	)
 	if err != nil {
@@ -1416,7 +1758,7 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 	secondPinned.TaskWorkspaceID = taskWorkspaceID(t, "cancel-recovery-second-workspace")
 	secondPinned.ExecutionLock.ID = executionLockID(t, "cancel-recovery-second-execution-lock")
 	secondPinned.TemplateLockID = templateLockID(t, "cancel-recovery-second-template-lock")
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "cancel-recovery-second-start", "cancel-recovery-second-task", now),
 		secondOwner, secondPinned,
 	)); err != nil {
@@ -1431,17 +1773,23 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 	)); err != nil {
 		t.Fatalf("make second mutation work available: %v", err)
 	}
-	secondRun := queryAggregate(
-		t, harness, "cancel-recovery-second-task", secondOwner,
-	).PhaseRuns[0]
+	secondView := queryAggregate(t, harness, "cancel-recovery-second-task", secondOwner)
+	secondRun := secondView.PhaseRuns[0]
 	secondCancelHeader := intentHeader(
 		t, "cancel-recovery-second-cancel", "cancel-recovery-second-task", now.Add(2*time.Second),
 	)
 	secondCancelHeader.ExpectedTaskRevision = 2
+	secondInitialFenceBinding := exactC04FenceRequestBinding(
+		t, "cancel-recovery-second-task", secondRun.PhaseRunID, secondPinned.TaskWorkspaceID,
+		"cancel-recovery-second-initial-c04-fence",
+		taskorchestration.TaskWorkspaceLifecycleGeneration(secondRun.Generation),
+		taskorchestration.TaskWorkspaceLifecycleFence(secondRun.Fence), secondView.LatestRevisionID,
+	)
 	if _, err := harness.Mutations.Decide(
 		context.Background(),
-		taskorchestration.NewCancelTaskByUserIntent(
+		taskorchestration.NewCancelTaskByUserWithLifecycleFenceIntent(
 			secondCancelHeader, secondOwner, taskorchestration.CancelReasonUserRequested,
+			secondInitialFenceBinding,
 		),
 	); err != nil {
 		t.Fatalf("cancel second active mutation: %v", err)
@@ -1452,6 +1800,11 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 	)
 	recoveryHeader.ExpectedTaskRevision = 3
 	recoveryHeader.ActivityGeneration = 2
+	recoveryFenceBinding := exactC04FenceRequestBinding(
+		t, "cancel-recovery-task", run.PhaseRunID, pinned.TaskWorkspaceID,
+		"cancel-recovery-reissued-c04-fence", taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
+		taskorchestration.TaskWorkspaceLifecycleFence(run.Fence), firstView.LatestRevisionID,
+	)
 	recovered, err := harness.Mutations.Decide(
 		context.Background(),
 		taskorchestration.NewApplyOperationalFenceIntent(
@@ -1459,7 +1812,7 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 			recoveryAuthority,
 			taskorchestration.OperationalFenceBinding{
 				Generation: 2, Fence: 2, SafetyEpoch: 2,
-				Mode: taskorchestration.OperationalFullReady,
+				Mode: taskorchestration.OperationalFullReady, LifecycleFence: recoveryFenceBinding,
 			},
 		),
 	)
@@ -1471,6 +1824,12 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 	)
 	secondRecoveryHeader.ExpectedTaskRevision = 3
 	secondRecoveryHeader.ActivityGeneration = 3
+	secondRecoveryFenceBinding := exactC04FenceRequestBinding(
+		t, "cancel-recovery-second-task", secondRun.PhaseRunID, secondPinned.TaskWorkspaceID,
+		"cancel-recovery-second-reissued-c04-fence",
+		taskorchestration.TaskWorkspaceLifecycleGeneration(secondRun.Generation),
+		taskorchestration.TaskWorkspaceLifecycleFence(secondRun.Fence), secondView.LatestRevisionID,
+	)
 	secondRecovered, err := harness.Mutations.Decide(
 		context.Background(),
 		taskorchestration.NewApplyOperationalFenceIntent(
@@ -1478,7 +1837,7 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 			recoveryAuthority,
 			taskorchestration.OperationalFenceBinding{
 				Generation: 2, Fence: 2, SafetyEpoch: 2,
-				Mode: taskorchestration.OperationalFullReady,
+				Mode: taskorchestration.OperationalFullReady, LifecycleFence: secondRecoveryFenceBinding,
 			},
 		),
 	)
@@ -1540,10 +1899,7 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 		context.Background(),
 		taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
 			lifecycleHeader,
-			taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-				authorityID(t, "cancel-recovery-c04-authority"),
-				taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.TaskWorkspaceLifecycle,
 			taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "cancel-recovery-c04-evidence"),
@@ -1552,8 +1908,10 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 				),
 				PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation,
 				PhaseRunFence: run.Fence, OperationID: lifecycleFence.OperationID,
-				Generation: taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
-				Fence:      lifecycleFenceValue, SafetyEpoch: 2,
+				Generation:         taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
+				Fence:              lifecycleFenceValue,
+				ObservedGeneration: taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
+				ObservedFence:      lifecycleFenceValue + 1, SafetyEpoch: 2,
 				Outcome: taskorchestration.LifecycleEvidenceFenced,
 			},
 		),
@@ -1579,10 +1937,7 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 		context.Background(),
 		taskorchestration.NewAcceptRuntimeEvidenceIntent(
 			runtimeHeader,
-			taskorchestration.NewRuntimeAuthority(
-				authorityID(t, "cancel-recovery-runtime-authority"),
-				taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Runtime,
 			taskorchestration.RuntimeEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "cancel-recovery-runtime-evidence"), taskorchestration.EvidenceRuntime,
@@ -1619,10 +1974,7 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 		context.Background(),
 		taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
 			secondLifecycleHeader,
-			taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-				authorityID(t, "cancel-recovery-second-c04-authority"),
-				taskorchestration.AuthorizationGeneration(1),
-			),
+			secondPinned.Authorities.TaskWorkspaceLifecycle,
 			taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, "cancel-recovery-second-c04-evidence"),
@@ -1631,8 +1983,10 @@ func TestRecoveryFenceReissuesCancellationOperationsWithoutANewBusinessAttempt(t
 				),
 				PhaseRunID: secondRun.PhaseRunID, PhaseRunGeneration: secondRun.Generation,
 				PhaseRunFence: secondRun.Fence, OperationID: secondLifecycleFence.OperationID,
-				Generation: taskorchestration.TaskWorkspaceLifecycleGeneration(secondRun.Generation),
-				Fence:      secondLifecycleFenceValue, SafetyEpoch: 2,
+				Generation:         taskorchestration.TaskWorkspaceLifecycleGeneration(secondRun.Generation),
+				Fence:              secondLifecycleFenceValue,
+				ObservedGeneration: taskorchestration.TaskWorkspaceLifecycleGeneration(secondRun.Generation),
+				ObservedFence:      secondLifecycleFenceValue + 1, SafetyEpoch: 2,
 				Outcome: taskorchestration.LifecycleEvidenceFenced,
 			},
 		),
@@ -1740,7 +2094,7 @@ func drivePinnedRouteToPublication(
 	)
 	pinned := routePinnedPipeline(t, route, phases)
 	taskName := prefix + "-scenario-task"
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, prefix+"-scenario-start", taskName, now), owner, pinned,
 	)); err != nil {
 		t.Fatalf("start %s Route: %v", prefix, err)
@@ -1780,9 +2134,7 @@ func drivePinnedRouteToPublication(
 			header.ExpectedTaskRevision = view.TaskRevision
 			if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptPublicationEvidenceIntent(
 				header,
-				taskorchestration.NewPublicationAuthority(
-					authorityID(t, prefix+"-scenario-publication"), taskorchestration.AuthorizationGeneration(1),
-				),
+				pinned.Authorities.Publication,
 				taskorchestration.PublicationEvidenceBinding{
 					Evidence: taskorchestration.NewEvidenceRef(
 						evidenceID(t, fmt.Sprintf("%s-publication-evidence-%d", prefix, phaseIndex)),
@@ -1806,9 +2158,7 @@ func drivePinnedRouteToPublication(
 				header.ExpectedTaskRevision = view.TaskRevision
 				if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
 					header,
-					taskorchestration.NewRuntimeAuthority(
-						authorityID(t, prefix+"-scenario-runtime"), taskorchestration.AuthorizationGeneration(1),
-					),
+					pinned.Authorities.Runtime,
 					taskorchestration.RuntimeEvidenceBinding{
 						Evidence: taskorchestration.NewEvidenceRef(
 							evidenceID(t, fmt.Sprintf("%s-runtime-evidence-%d-%d", prefix, phaseIndex, runtimeIndex)),
@@ -1829,11 +2179,25 @@ func drivePinnedRouteToPublication(
 			view = queryAggregate(t, harness, taskName, owner)
 			header := intentHeader(t, fmt.Sprintf("%s-validation-%d", prefix, phaseIndex), taskName, now.Add(time.Duration(step)*time.Second))
 			header.ExpectedTaskRevision = view.TaskRevision
+			lifecycleCommit := taskorchestration.TaskWorkspaceLifecycleCommitRequestBinding{}
+			lifecycleGeneration := view.TaskWorkspaceLifecycleGeneration
+			lifecycleFence := view.TaskWorkspaceLifecycleFence
+			if phase.Kind == taskorchestration.PhaseMutating {
+				if lifecycleGeneration == 0 {
+					lifecycleGeneration = taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation)
+				}
+				if lifecycleFence == 0 {
+					lifecycleFence = taskorchestration.TaskWorkspaceLifecycleFence(run.Fence)
+				}
+				lifecycleCommit = exactC04CommitRequestBinding(
+					t, taskName, run.PhaseRunID, pinned.TaskWorkspaceID,
+					fmt.Sprintf("%s-lifecycle-operation-%d", prefix, phaseIndex),
+					lifecycleGeneration, lifecycleFence, view.LatestRevisionID,
+				)
+			}
 			validation, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
 				header,
-				taskorchestration.NewValidatorAuthority(
-					authorityID(t, prefix+"-scenario-validator"), taskorchestration.AuthorizationGeneration(1),
-				),
+				pinned.Authorities.Validator,
 				taskorchestration.ValidationEvidenceBinding{
 					Evidence: taskorchestration.NewEvidenceRef(
 						evidenceID(t, fmt.Sprintf("%s-validation-evidence-%d", prefix, phaseIndex)),
@@ -1843,7 +2207,7 @@ func drivePinnedRouteToPublication(
 					PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation,
 					PhaseRunFence: run.Fence, Generation: 1,
 					Fence: taskorchestration.ValidationFence(run.Fence), SafetyEpoch: 1,
-					Outcome: taskorchestration.PhaseValidationAccepted,
+					Outcome: taskorchestration.PhaseValidationAccepted, LifecycleCommit: lifecycleCommit,
 				},
 			))
 			if err != nil {
@@ -1856,9 +2220,7 @@ func drivePinnedRouteToPublication(
 				header.ExpectedTaskRevision = view.TaskRevision
 				if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
 					header,
-					taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-						authorityID(t, prefix+"-scenario-c04"), taskorchestration.AuthorizationGeneration(1),
-					),
+					pinned.Authorities.TaskWorkspaceLifecycle,
 					taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 						Evidence: taskorchestration.NewEvidenceRef(
 							evidenceID(t, fmt.Sprintf("%s-lifecycle-evidence-%d", prefix, phaseIndex)),
@@ -1867,7 +2229,9 @@ func drivePinnedRouteToPublication(
 						),
 						PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation,
 						PhaseRunFence: run.Fence, OperationID: validation.EnactmentRefs[0].OperationID,
-						Generation: 1, Fence: taskorchestration.TaskWorkspaceLifecycleFence(run.Fence), SafetyEpoch: 1,
+						Generation: lifecycleGeneration, Fence: lifecycleFence,
+						ObservedGeneration: lifecycleGeneration, ObservedFence: lifecycleFence + 1,
+						SafetyEpoch:  1,
 						Outcome:      taskorchestration.TaskWorkspaceLifecycleCommitted,
 						RevisionID:   taskWorkspaceRevisionID(t, fmt.Sprintf("%s-revision-%d", prefix, phaseIndex)),
 						CheckpointID: checkpointID(t, fmt.Sprintf("%s-checkpoint-%d", prefix, phaseIndex)),
@@ -1892,6 +2256,7 @@ func routePinnedPipeline(
 	pinned := taskorchestration.PinnedTaskStart{
 		Route:           route,
 		TaskWorkspaceID: taskWorkspaceID(t, prefix+"-scenario-task-workspace"),
+		Authorities:     downstreamAuthorityBindings(t, prefix+"-scenario"),
 		ExecutionLock: taskorchestration.ExecutionLock{
 			ID:                      executionLockID(t, prefix+"-scenario-execution-lock"),
 			PipelineVersionID:       pipelineID,
@@ -1936,6 +2301,7 @@ func generationPinnedPipeline(
 	return taskorchestration.PinnedTaskStart{
 		Route:           taskorchestration.RouteGeneration,
 		TaskWorkspaceID: taskWorkspaceID(t, "task-workspace-generation"),
+		Authorities:     downstreamAuthorityBindings(t, "generation"),
 		ExecutionLock: taskorchestration.ExecutionLock{
 			ID:                      executionLockID(t, "execution-lock-generation"),
 			PipelineVersionID:       pipelineVersionID(t, "pipeline-generation-v1"),
@@ -1955,6 +2321,134 @@ func generationPinnedPipeline(
 		},
 		TemplateLockID: templateLockID(t, "template-lock-generation"),
 	}
+}
+
+func downstreamAuthorityBindings(
+	t *testing.T,
+	prefix string,
+) taskorchestration.DownstreamAuthorityBindings {
+	t.Helper()
+	return taskorchestration.DownstreamAuthorityBindings{
+		Runtime: taskorchestration.NewRuntimeAuthority(
+			authorityID(t, prefix+"-runtime-authority"), 1,
+		),
+		Validator: taskorchestration.NewValidatorAuthority(
+			authorityID(t, prefix+"-validator-authority"), 1,
+		),
+		TaskWorkspaceLifecycle: taskorchestration.NewTaskWorkspaceLifecycleAuthority(
+			authorityID(t, prefix+"-lifecycle-authority"), 1,
+		),
+		Publication: taskorchestration.NewPublicationAuthority(
+			authorityID(t, prefix+"-publication-authority"), 1,
+		),
+		Scheduler: taskorchestration.NewSchedulerAuthority(
+			authorityID(t, prefix+"-scheduler-authority"), 1,
+		),
+	}
+}
+
+// verifiedPinnedStartIntent keeps tests on the production admission path:
+// Release and Catalog adapters verify exact Task-bound contracts before the
+// opaque admission can enter the closed Start intent.
+func verifiedPinnedStartIntent(
+	t *testing.T,
+	header taskorchestration.IntentHeader,
+	authority taskorchestration.UserAuthority,
+	candidate any,
+) taskorchestration.TransitionIntent {
+	return verifiedPinnedStartIntentAtSafetyEpoch(t, header, authority, candidate, 1)
+}
+
+func verifiedPinnedStartIntentAtSafetyEpoch(
+	t *testing.T,
+	header taskorchestration.IntentHeader,
+	authority taskorchestration.UserAuthority,
+	candidate any,
+	safetyEpoch taskorchestration.SafetyEpoch,
+) taskorchestration.TransitionIntent {
+	t.Helper()
+	if admission, ok := candidate.(taskorchestration.TaskStartAdmission); ok {
+		return taskorchestration.NewStartPinnedTaskIntent(header, authority, admission)
+	}
+	pinned, ok := candidate.(taskorchestration.PinnedTaskStart)
+	if !ok {
+		return taskorchestration.NewStartPinnedTaskIntent(
+			header, authority, taskorchestration.TaskStartAdmission{},
+		)
+	}
+	executionRecord := taskorchestration.PublishedExecutionContract{
+		SchemaVersion: taskorchestration.EvidenceSchemaV1,
+		Producer: taskorchestration.EvidenceProducer{
+			AuthorityID: authorityID(t, "test-start-release-authority"), Generation: 1,
+		},
+		ExecutionLock: pinned.ExecutionLock, SafetyEpoch: safetyEpoch,
+	}
+	executionRecord.ContractDigest = taskorchestration.ExecutionLockContractDigest(executionRecord.ExecutionLock)
+	execution, err := taskorchestration.NewReleaseManagementAdapter(
+		&releaseManagementPortDouble{record: executionRecord},
+	).Resolve(context.Background(), taskorchestration.PinnedExecutionLockRequest{
+		TaskID: header.TaskID, ExecutionLock: pinned.ExecutionLock,
+		ContractDigest: executionRecord.ContractDigest, SafetyEpoch: safetyEpoch,
+		Purpose: taskorchestration.PinnedLockStart,
+	})
+	if err != nil {
+		return taskorchestration.NewStartPinnedTaskIntent(
+			header, authority, taskorchestration.TaskStartAdmission{},
+		)
+	}
+	var template *taskorchestration.ResolvedTemplateLockContract
+	if pinned.Route == taskorchestration.RouteGeneration {
+		record := validPublishedTemplateLockContract(
+			t, pinned.TemplateLockID, pinned.ExecutionLock.ID,
+			"test-start", taskorchestration.ProducerGeneration(1), safetyEpoch,
+		)
+		resolved, resolveErr := taskorchestration.NewCatalogPublicationAdapter(
+			&catalogPublicationPortDouble{record: record},
+		).Resolve(context.Background(), taskorchestration.PinnedTemplateLockRequest{
+			TaskID: header.TaskID, TemplateLockID: pinned.TemplateLockID,
+			LockDigest: record.LockDigest, ObservedGeneration: record.ObservedGeneration,
+			SafetyEpoch: safetyEpoch, Purpose: taskorchestration.PinnedLockStart,
+		})
+		if resolveErr != nil {
+			return taskorchestration.NewStartPinnedTaskIntent(
+				header, authority, taskorchestration.TaskStartAdmission{},
+			)
+		}
+		template = &resolved
+	}
+	admission, err := taskorchestration.NewTaskStartAdmission(
+		header.TaskID, pinned.Route, pinned.TaskWorkspaceID, pinned.Authorities, execution, template,
+	)
+	if err != nil {
+		return taskorchestration.NewStartPinnedTaskIntent(
+			header, authority, taskorchestration.TaskStartAdmission{},
+		)
+	}
+	return taskorchestration.NewStartPinnedTaskIntent(header, authority, admission)
+}
+
+func minimalPinnedStartIntent(
+	t *testing.T,
+	header taskorchestration.IntentHeader,
+	authority taskorchestration.UserAuthority,
+) taskorchestration.TransitionIntent {
+	t.Helper()
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "minimal-start-publication"), Kind: taskorchestration.PhasePublication,
+	}})
+	return verifiedPinnedStartIntent(t, header, authority, pinned)
+}
+
+func minimalWorkIntent(
+	t *testing.T,
+	header taskorchestration.IntentHeader,
+) taskorchestration.TransitionIntent {
+	t.Helper()
+	return taskorchestration.NewMakeWorkAvailableIntent(
+		header,
+		taskorchestration.NewWorkerAuthority(authorityID(t, "minimal-start-worker"), 1),
+		operationID(t, header.DecisionRequestID.String()+"-work"),
+	)
 }
 
 func phaseKey(t *testing.T, value string) taskorchestration.PhaseKey {

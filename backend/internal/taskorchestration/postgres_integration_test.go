@@ -1,11 +1,14 @@
 package taskorchestration_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -44,7 +47,7 @@ func TestPostgresAdapterCommitsAndRecoversOwnedTaskState(t *testing.T) {
 		RequiredRuntimeRuns: 1,
 	}})
 
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-start", "postgres-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -128,7 +131,7 @@ func TestPostgresRejectedEvidenceDiagnosticSurvivesRestart(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-diagnostic-start", "postgres-diagnostic-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -197,7 +200,7 @@ func TestPostgresSnapshotMismatchFailsClosedAsCorruptPersistence(t *testing.T) {
 	owner := taskorchestration.NewUserAuthority(
 		authorityID(t, "postgres-corrupt-owner"), taskorchestration.AuthorizationGeneration(1),
 	)
-	startIntent := taskorchestration.NewStartTaskIntent(
+	startIntent := minimalPinnedStartIntent(t,
 		intentHeader(t, "postgres-corrupt-start", "postgres-corrupt-task", now), owner,
 	)
 	if _, err := adapter.Decide(context.Background(), startIntent); err != nil {
@@ -234,7 +237,7 @@ func TestPostgresMissingTaskSnapshotWithJournalFailsClosed(t *testing.T) {
 	owner := taskorchestration.NewUserAuthority(
 		authorityID(t, "postgres-missing-snapshot-owner"), taskorchestration.AuthorizationGeneration(1),
 	)
-	startIntent := taskorchestration.NewStartTaskIntent(
+	startIntent := minimalPinnedStartIntent(t,
 		intentHeader(t, "postgres-missing-snapshot-start", "postgres-missing-snapshot-task", now), owner,
 	)
 	if _, err := adapter.Decide(context.Background(), startIntent); err != nil {
@@ -280,7 +283,7 @@ func TestPostgresOperationIdentityCollisionFailsClosed(t *testing.T) {
 	worker := taskorchestration.NewWorkerAuthority(
 		authorityID(t, "postgres-operation-worker"), taskorchestration.AuthorizationGeneration(1),
 	)
-	startA, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	startA, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-operation-start-a", "postgres-operation-task-a", now), ownerA, pinned,
 	))
 	if err != nil {
@@ -298,7 +301,7 @@ func TestPostgresOperationIdentityCollisionFailsClosed(t *testing.T) {
 	ownerB := taskorchestration.NewUserAuthority(
 		authorityID(t, "postgres-operation-owner-b"), taskorchestration.AuthorizationGeneration(1),
 	)
-	startB, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	startB, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-operation-start-b", "postgres-operation-task-b", now), ownerB, pinned,
 	))
 	if err != nil {
@@ -350,7 +353,7 @@ func TestPostgresReconciliationReusesVerifiedOutboxOperation(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-reconcile-start", "postgres-reconcile-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -417,7 +420,7 @@ func TestPostgresMandatoryAuditFailureRollsBackProtectedDecisionAndOutbox(t *tes
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-audit-start", "postgres-audit-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -467,6 +470,78 @@ func TestPostgresMandatoryAuditFailureRollsBackProtectedDecisionAndOutbox(t *tes
 	}
 }
 
+func TestPostgresMandatoryAuditFactPersistsTheCompleteAuthoritativeEnvelope(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 9, 45, 0, 0, time.UTC)
+	db, schema := isolatedPostgresSchema(t)
+	adapter := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
+		Now: func() time.Time { return now },
+	})
+	owner := taskorchestration.NewUserAuthority(authorityID(t, "postgres-audit-envelope-owner"), 1)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "postgres-audit-envelope-publication"), Kind: taskorchestration.PhasePublication,
+	}})
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
+		intentHeader(t, "postgres-audit-envelope-start", "postgres-audit-envelope-task", now),
+		owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start audited Task: %v", err)
+	}
+	administrator := taskorchestration.NewAdministratorAuthority(
+		authorityID(t, "postgres-audit-envelope-administrator"), 2,
+		taskorchestration.AdministratorReasonSafety,
+	)
+	cancelHeader := intentHeader(
+		t, "postgres-audit-envelope-cancel", "postgres-audit-envelope-task", now.Add(time.Second),
+	)
+	cancelHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	cancelled, err := adapter.Decide(context.Background(), taskorchestration.NewCancelTaskByAdministratorIntent(
+		cancelHeader, administrator, taskorchestration.CancelReasonSafety,
+	))
+	if err != nil {
+		t.Fatalf("commit reason-bound administrative cancel: %v", err)
+	}
+	fact := cancelled.MandatoryAuditFactRef
+	if fact.SchemaVersion != taskorchestration.AuditSchemaV1 ||
+		fact.IntegrityVersion != taskorchestration.AuditIntegrityV1 ||
+		fact.CanonicalDigest == (taskorchestration.AuditFactDigest{}) ||
+		fact.OwningModule != taskorchestration.AuditModuleTaskOrchestration ||
+		fact.DecisionID != cancelled.DecisionID || fact.TaskID != cancelled.TaskProjection.TaskID ||
+		fact.Action != taskorchestration.IntentCancelTask || fact.Result != taskorchestration.AuditAccepted ||
+		fact.AuthorityKind != taskorchestration.AuthorityAdministrator ||
+		fact.AuthorityID != authorityID(t, "postgres-audit-envelope-administrator") ||
+		fact.AuthorizationGeneration != 2 ||
+		fact.AuthorityReason != taskorchestration.AdministratorReasonSafety ||
+		fact.ReasonCode != taskorchestration.AuditReasonAdministratorSafety ||
+		fact.BeforeTaskRevision != 1 || fact.AfterTaskRevision != 2 ||
+		fact.BeforeStatus != taskorchestration.TaskReady || fact.AfterStatus != taskorchestration.TaskCancelled ||
+		fact.BeforeActivityGeneration != 1 || fact.AfterActivityGeneration != 2 ||
+		fact.RecoveryGeneration != 0 || fact.BeforeSafetyEpoch != 1 || fact.AfterSafetyEpoch != 1 ||
+		fact.IdempotencyDecisionRequestID != cancelHeader.DecisionRequestID ||
+		!fact.OccurredAt.Equal(cancelHeader.OccurredAt) || !fact.RecordedAt.Equal(now) ||
+		fact.SourceClock != taskorchestration.AuditSourceTaskOrchestrationClock ||
+		len(fact.EvidenceRefs) != 0 || len(fact.EnactmentRefs) != 0 ||
+		fact.CanonicalDigest != taskorchestration.MandatoryAuditFactDigest(fact) {
+		t.Fatalf("mandatory audit envelope is incomplete: %+v", fact)
+	}
+
+	var persistedDigest, persistedState []byte
+	err = db.QueryRowContext(context.Background(), fmt.Sprintf(`SELECT canonical_digest, audit_state
+		FROM %s.task_orchestration_mandatory_audit_facts WHERE audit_fact_id=$1`, schema),
+		fact.AuditFactID.String(),
+	).Scan(&persistedDigest, &persistedState)
+	if err != nil {
+		t.Fatalf("read authoritative audit row: %v", err)
+	}
+	var stored map[string]any
+	if json.Unmarshal(persistedState, &stored) != nil ||
+		!bytes.Equal(persistedDigest, fact.CanonicalDigest[:]) ||
+		stored["AuthorityReason"] != float64(taskorchestration.AdministratorReasonSafety) ||
+		stored["BeforeTaskRevision"] != float64(1) || stored["AfterTaskRevision"] != float64(2) {
+		t.Fatalf("authoritative PostgreSQL audit row lost required bindings: %s", persistedState)
+	}
+}
+
 func TestPostgresSchedulerParticipantFailureRollsBackTaskAndWorkItem(t *testing.T) {
 	now := time.Date(2026, time.July, 27, 10, 0, 0, 0, time.UTC)
 	db, schema := isolatedPostgresSchema(t)
@@ -484,7 +559,7 @@ func TestPostgresSchedulerParticipantFailureRollsBackTaskAndWorkItem(t *testing.
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := good.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := good.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-scheduler-start", "postgres-scheduler-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -571,7 +646,7 @@ func TestPostgresProjectionObserverFailureDoesNotRollBackCommittedDecision(t *te
 	owner := taskorchestration.NewUserAuthority(
 		authorityID(t, "postgres-observer-owner"), taskorchestration.AuthorizationGeneration(1),
 	)
-	decision, err := adapter.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	decision, err := adapter.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "postgres-observer-start", "postgres-observer-task", now), owner,
 	))
 	if err != nil {
@@ -633,7 +708,7 @@ func TestPostgresCommitAndResponseCrashBoundariesRecoverByExactReplay(t *testing
 				ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 				RequiredRuntimeRuns: 1,
 			}})
-			start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+			start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 				intentHeader(t, "postgres-crash-start", "postgres-crash-task", now), owner, pinned,
 			))
 			if err != nil {
@@ -730,7 +805,7 @@ func TestPostgresConcurrentWritersProduceOneExpectedRevisionWinner(t *testing.T)
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := firstAdapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := firstAdapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-concurrent-start", "postgres-concurrent-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -813,10 +888,10 @@ func TestPostgresWritersForDifferentTasksDoNotContendOnRecoveryState(t *testing.
 		),
 	}
 	intents := []taskorchestration.TransitionIntent{
-		taskorchestration.NewStartTaskIntent(
+		minimalPinnedStartIntent(t,
 			intentHeader(t, "postgres-independent-start-a", "postgres-independent-task-a", now), owners[0],
 		),
-		taskorchestration.NewStartTaskIntent(
+		minimalPinnedStartIntent(t,
 			intentHeader(t, "postgres-independent-start-b", "postgres-independent-task-b", now), owners[1],
 		),
 	}
@@ -860,15 +935,12 @@ func TestPostgresPersistsEvidenceAndReplaysAfterRevisionAdvances(t *testing.T) {
 	worker := taskorchestration.NewWorkerAuthority(
 		authorityID(t, "postgres-evidence-worker"), taskorchestration.AuthorizationGeneration(1),
 	)
-	runtimeAuthority := taskorchestration.NewRuntimeAuthority(
-		authorityID(t, "postgres-evidence-runtime"), taskorchestration.AuthorizationGeneration(1),
-	)
 	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
 		Key: phaseKey(t, "postgres-evidence-phase"), Kind: taskorchestration.PhaseNonMutating,
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-evidence-start", "postgres-evidence-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -883,6 +955,11 @@ func TestPostgresPersistsEvidenceAndReplaysAfterRevisionAdvances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("make evidence work available: %v", err)
 	}
+	if len(work.MandatoryAuditFactRef.EnactmentRefs) != len(work.EnactmentRefs) ||
+		len(work.MandatoryAuditFactRef.EnactmentRefs) != 1 {
+		t.Fatalf("work audit fact omitted enactment bindings: %+v", work.MandatoryAuditFactRef)
+	}
+	assertPostgresMandatoryAuditRefs(t, db, schema, work.MandatoryAuditFactRef)
 	query := taskorchestration.TaskQuery{
 		TaskID:    taskID(t, "postgres-evidence-task"),
 		Authority: taskorchestration.NewUserQueryAuthority(owner),
@@ -899,7 +976,7 @@ func TestPostgresPersistsEvidenceAndReplaysAfterRevisionAdvances(t *testing.T) {
 	evidenceHeader := intentHeader(t, "postgres-evidence-runtime-result", "postgres-evidence-task", now.Add(2*time.Second))
 	evidenceHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
 	evidenceIntent := taskorchestration.NewAcceptRuntimeEvidenceIntent(
-		evidenceHeader, runtimeAuthority, taskorchestration.RuntimeEvidenceBinding{
+		evidenceHeader, pinned.Authorities.Runtime, taskorchestration.RuntimeEvidenceBinding{
 			Evidence: evidence, PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation,
 			PhaseRunFence: run.Fence, RuntimeRunID: run.RuntimeRuns[0].RuntimeRunID,
 			OperationID: work.EnactmentRefs[0].OperationID,
@@ -916,6 +993,10 @@ func TestPostgresPersistsEvidenceAndReplaysAfterRevisionAdvances(t *testing.T) {
 		accepted.AcceptedEvidenceRefs[0].ID != evidence.ID {
 		t.Fatal("evidence decision did not report its committed evidence reference")
 	}
+	if !reflect.DeepEqual(accepted.MandatoryAuditFactRef.EvidenceRefs, accepted.AcceptedEvidenceRefs) {
+		t.Fatalf("evidence audit fact omitted accepted evidence: %+v", accepted.MandatoryAuditFactRef)
+	}
+	assertPostgresMandatoryAuditRefs(t, db, schema, accepted.MandatoryAuditFactRef)
 	committedFacts, err := adapter.InspectPersistence(context.Background(), query)
 	if err != nil {
 		t.Fatalf("inspect evidence persistence: %v", err)
@@ -946,7 +1027,7 @@ func TestPostgresPersistsEvidenceAndReplaysAfterRevisionAdvances(t *testing.T) {
 	duplicateHeader := evidenceHeader
 	duplicateHeader.DecisionRequestID = decisionRequestID(t, "postgres-evidence-runtime-duplicate")
 	duplicateEvidenceIntent := taskorchestration.NewAcceptRuntimeEvidenceIntent(
-		duplicateHeader, runtimeAuthority, taskorchestration.RuntimeEvidenceBinding{
+		duplicateHeader, pinned.Authorities.Runtime, taskorchestration.RuntimeEvidenceBinding{
 			Evidence: evidence, PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation,
 			PhaseRunFence: run.Fence, RuntimeRunID: run.RuntimeRuns[0].RuntimeRunID,
 			OperationID: work.EnactmentRefs[0].OperationID,
@@ -971,6 +1052,57 @@ func TestPostgresPersistsEvidenceAndReplaysAfterRevisionAdvances(t *testing.T) {
 	}
 }
 
+func assertPostgresMandatoryAuditRefs(
+	t *testing.T,
+	db *sql.DB,
+	schema string,
+	fact taskorchestration.AuditFactRef,
+) {
+	t.Helper()
+	var persistedState []byte
+	if err := db.QueryRowContext(context.Background(), fmt.Sprintf(`SELECT audit_state
+		FROM %s.task_orchestration_mandatory_audit_facts WHERE audit_fact_id=$1`, schema),
+		fact.AuditFactID.String(),
+	).Scan(&persistedState); err != nil {
+		t.Fatalf("read mandatory audit refs: %v", err)
+	}
+	var stored map[string]any
+	if err := json.Unmarshal(persistedState, &stored); err != nil {
+		t.Fatalf("decode mandatory audit refs: %v", err)
+	}
+	var expectedEvidence []map[string]any
+	for _, ref := range fact.EvidenceRefs {
+		expectedEvidence = append(expectedEvidence, map[string]any{
+			"ID": ref.ID.String(), "Kind": ref.Kind, "Digest": ref.Digest,
+		})
+	}
+	var expectedEnactments []map[string]any
+	for _, ref := range fact.EnactmentRefs {
+		expectedEnactments = append(expectedEnactments, map[string]any{
+			"OperationID": ref.OperationID.String(), "Kind": ref.Kind,
+			"PayloadDigest": ref.PayloadDigest, "ActivityGeneration": ref.ActivityGeneration,
+			"FenceKind": ref.FenceKind, "Fence": ref.Fence, "CausationID": ref.CausationID.String(),
+		})
+	}
+	if !reflect.DeepEqual(stored["EvidenceRefs"], normalizedJSONValue(t, expectedEvidence)) ||
+		!reflect.DeepEqual(stored["EnactmentRefs"], normalizedJSONValue(t, expectedEnactments)) {
+		t.Fatalf("PostgreSQL audit refs differ from authoritative fact: stored=%s fact=%+v", persistedState, fact)
+	}
+}
+
+func normalizedJSONValue(t *testing.T, value any) any {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatalf("encode expected JSON value: %v", err)
+	}
+	var normalized any
+	if err := json.Unmarshal(encoded, &normalized); err != nil {
+		t.Fatalf("normalize expected JSON value: %v", err)
+	}
+	return normalized
+}
+
 func TestPostgresDecisionRequestCannotBeReboundToDifferentPayload(t *testing.T) {
 	now := time.Date(2026, time.July, 27, 13, 0, 0, 0, time.UTC)
 	db, schema := isolatedPostgresSchema(t)
@@ -981,7 +1113,7 @@ func TestPostgresDecisionRequestCannotBeReboundToDifferentPayload(t *testing.T) 
 		authorityID(t, "postgres-integrity-owner"), taskorchestration.AuthorizationGeneration(1),
 	)
 	originalHeader := intentHeader(t, "postgres-integrity-request", "postgres-integrity-task", now)
-	if _, err := adapter.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	if _, err := adapter.Decide(context.Background(), minimalPinnedStartIntent(t,
 		originalHeader, owner,
 	)); err != nil {
 		t.Fatalf("commit original idempotent request: %v", err)
@@ -996,7 +1128,7 @@ func TestPostgresDecisionRequestCannotBeReboundToDifferentPayload(t *testing.T) 
 	}
 	changedHeader := originalHeader
 	changedHeader.OccurredAt = now.Add(time.Second)
-	_, err = adapter.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	_, err = adapter.Decide(context.Background(), minimalPinnedStartIntent(t,
 		changedHeader, owner,
 	))
 	var decisionError *taskorchestration.Error
@@ -1026,7 +1158,7 @@ func TestPostgresPersistsOpaqueLifecycleRevisionAndCheckpointEvidence(t *testing
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "postgres-lifecycle-start", "postgres-lifecycle-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -1056,10 +1188,7 @@ func TestPostgresPersistsOpaqueLifecycleRevisionAndCheckpointEvidence(t *testing
 	runtimeHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
 	runtimeDecision, err := adapter.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
 		runtimeHeader,
-		taskorchestration.NewRuntimeAuthority(
-			authorityID(t, "postgres-lifecycle-runtime-authority"),
-			taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.Runtime,
 		taskorchestration.RuntimeEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "postgres-lifecycle-runtime-evidence"), taskorchestration.EvidenceRuntime,
@@ -1077,11 +1206,15 @@ func TestPostgresPersistsOpaqueLifecycleRevisionAndCheckpointEvidence(t *testing
 	}
 	validationHeader := intentHeader(t, "postgres-lifecycle-validation", "postgres-lifecycle-task", now.Add(3*time.Second))
 	validationHeader.ExpectedTaskRevision = runtimeDecision.AcceptedTaskRevision
+	commitBinding := exactC04CommitRequestBinding(
+		t, "postgres-lifecycle-task", run.PhaseRunID, pinned.TaskWorkspaceID,
+		"postgres-lifecycle-commit-operation",
+		taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
+		taskorchestration.TaskWorkspaceLifecycleFence(run.Fence), view.LatestRevisionID,
+	)
 	validationDecision, err := adapter.Decide(context.Background(), taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
 		validationHeader,
-		taskorchestration.NewValidatorAuthority(
-			authorityID(t, "postgres-lifecycle-validator"), taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.Validator,
 		taskorchestration.ValidationEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "postgres-lifecycle-validation-evidence"),
@@ -1091,7 +1224,7 @@ func TestPostgresPersistsOpaqueLifecycleRevisionAndCheckpointEvidence(t *testing
 			PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
 			Generation: taskorchestration.ProducerGeneration(run.Generation),
 			Fence:      taskorchestration.ValidationFence(run.Fence), SafetyEpoch: view.SafetyEpoch,
-			Outcome: taskorchestration.PhaseValidationAccepted,
+			Outcome: taskorchestration.PhaseValidationAccepted, LifecycleCommit: commitBinding,
 		},
 	))
 	if err != nil {
@@ -1107,9 +1240,7 @@ func TestPostgresPersistsOpaqueLifecycleRevisionAndCheckpointEvidence(t *testing
 	checkpoint := checkpointID(t, "postgres-lifecycle-checkpoint")
 	committed, err := adapter.Decide(context.Background(), taskorchestration.NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
 		lifecycleHeader,
-		taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-			authorityID(t, "postgres-lifecycle-authority"), taskorchestration.AuthorizationGeneration(1),
-		),
+		pinned.Authorities.TaskWorkspaceLifecycle,
 		taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(
 				evidenceID(t, "postgres-lifecycle-commit-evidence"),
@@ -1117,11 +1248,14 @@ func TestPostgresPersistsOpaqueLifecycleRevisionAndCheckpointEvidence(t *testing
 				evidenceDigest(t, "3333333333333333333333333333333333333333333333333333333333333333"),
 			),
 			PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
-			OperationID: validationDecision.EnactmentRefs[0].OperationID,
-			Generation:  taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
-			Fence:       taskorchestration.TaskWorkspaceLifecycleFence(run.Fence), SafetyEpoch: view.SafetyEpoch,
-			Outcome:    taskorchestration.TaskWorkspaceLifecycleCommitted,
-			RevisionID: revisionID, CheckpointID: checkpoint,
+			OperationID:        validationDecision.EnactmentRefs[0].OperationID,
+			Generation:         taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
+			Fence:              taskorchestration.TaskWorkspaceLifecycleFence(run.Fence),
+			ObservedGeneration: taskorchestration.TaskWorkspaceLifecycleGeneration(run.Generation),
+			ObservedFence:      taskorchestration.TaskWorkspaceLifecycleFence(run.Fence + 1),
+			SafetyEpoch:        view.SafetyEpoch,
+			Outcome:            taskorchestration.TaskWorkspaceLifecycleCommitted,
+			RevisionID:         revisionID, CheckpointID: checkpoint,
 		},
 	))
 	if err != nil {

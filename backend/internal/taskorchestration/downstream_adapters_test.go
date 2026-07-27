@@ -92,7 +92,7 @@ func TestRuntimeAdapterEvidenceCannotCompletePhaseWithoutValidation(t *testing.T
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "runtime-start", "runtime-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatal(err)
@@ -110,7 +110,7 @@ func TestRuntimeAdapterEvidenceCannotCompletePhaseWithoutValidation(t *testing.T
 	run := view.PhaseRuns[0]
 	record := taskorchestration.RuntimeEvidenceRecord{
 		SchemaVersion: taskorchestration.EvidenceSchemaV1, EvidenceID: downstreamEvidenceID(t, "runtime-success-evidence"),
-		Producer: taskorchestration.EvidenceProducer{AuthorityID: downstreamAuthorityID(t, "runtime-producer"), Generation: 1},
+		Producer: taskorchestration.EvidenceProducer{AuthorityID: downstreamAuthorityID(t, "generation-runtime-authority"), Generation: 1},
 		TaskID:   view.TaskID, PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation,
 		PhaseRunFence: run.Fence, RuntimeRunID: run.RuntimeRuns[0].RuntimeRunID,
 		OperationID: work.EnactmentRefs[0].OperationID, ActivityGeneration: view.ActivityGeneration,
@@ -419,7 +419,7 @@ func TestPublicationAdapterRequiresExactActivationEvidence(t *testing.T) {
 	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
 		Key: phaseKey(t, "publication-phase"), Kind: taskorchestration.PhasePublication,
 	}})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "publication-start", "publication-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatal(err)
@@ -439,7 +439,7 @@ func TestPublicationAdapterRequiresExactActivationEvidence(t *testing.T) {
 		SchemaVersion: taskorchestration.EvidenceSchemaV1,
 		EvidenceID:    downstreamEvidenceID(t, "publication-activation-evidence"),
 		Producer: taskorchestration.EvidenceProducer{
-			AuthorityID: downstreamAuthorityID(t, "publication-authority"), Generation: 1,
+			AuthorityID: downstreamAuthorityID(t, "generation-publication-authority"), Generation: 1,
 		},
 		TaskID: view.TaskID, PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation,
 		PhaseRunFence: run.Fence, OperationID: work.EnactmentRefs[0].OperationID,
@@ -493,7 +493,7 @@ func TestLatePublicationAdapterEvidenceCannotResurrectCancelledTask(t *testing.T
 	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
 		Key: phaseKey(t, "late-publication-phase"), Kind: taskorchestration.PhasePublication,
 	}})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "late-publication-start", "late-publication-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatal(err)
@@ -672,6 +672,714 @@ func TestTaskWorkspaceLifecycleAdapterUsesOpaqueC04CommitEvidence(t *testing.T) 
 	if err != nil || len(decision.AcceptedEvidenceRefs) != 1 ||
 		decision.AcceptedEvidenceRefs[0] != evidence.Evidence {
 		t.Fatalf("C04 evidence with advanced result fence was not accepted: %#v err=%v", decision, err)
+	}
+}
+
+func TestDecideGeneratedC04CommitEnactmentBindsTheExactCanonicalRequest(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 19, 0, 0, 0, time.UTC)
+	harness, err := taskorchestration.NewDeterministicHarness(
+		taskorchestration.HarnessConfig{Now: now},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "decide-c04-commit-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "decide-c04-commit-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "decide-c04-commit-phase"), Kind: taskorchestration.PhaseMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(
+		t, intentHeader(t, "decide-c04-commit-start", "decide-c04-commit-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workHeader := intentHeader(t, "decide-c04-commit-work", "decide-c04-commit-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	work, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "decide-c04-commit-work-operation"),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := queryAggregate(t, harness, "decide-c04-commit-task", owner)
+	run := view.PhaseRuns[0]
+	runtimeHeader := intentHeader(
+		t, "decide-c04-commit-runtime", "decide-c04-commit-task", now.Add(2*time.Second),
+	)
+	runtimeHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
+	acceptedRuntime, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
+		runtimeHeader, pinned.Authorities.Runtime, taskorchestration.RuntimeEvidenceBinding{
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, "decide-c04-commit-runtime-evidence"), taskorchestration.EvidenceRuntime,
+				evidenceDigest(t, "9191919191919191919191919191919191919191919191919191919191919191"),
+			),
+			PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
+			RuntimeRunID: run.RuntimeRuns[0].RuntimeRunID, OperationID: work.EnactmentRefs[0].OperationID,
+			Generation: taskorchestration.RuntimeGeneration(run.Generation),
+			Fence:      taskorchestration.RuntimeFence(run.Fence), SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.RuntimeRunSucceeded,
+		},
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestRef := downstreamEnactmentRef(
+		t, "decide-c04-commit-operation", taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(7),
+	)
+	request, result := c04CommitContractFixture(
+		t, requestRef, "decide-c04-commit-task", run.PhaseRunID.String(), pinned.TaskWorkspaceID.String(), 7, 7,
+	)
+	commitBinding, err := taskorchestration.NewTaskWorkspaceLifecycleCommitRequestBinding(request)
+	if err != nil {
+		t.Fatalf("bind exact C04 commit request: %v", err)
+	}
+	validationHeader := intentHeader(
+		t, "decide-c04-commit-validation", "decide-c04-commit-task", now.Add(3*time.Second),
+	)
+	validationHeader.ExpectedTaskRevision = acceptedRuntime.AcceptedTaskRevision
+	decision, err := harness.Mutations.Decide(
+		context.Background(), taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
+			validationHeader, pinned.Authorities.Validator, taskorchestration.ValidationEvidenceBinding{
+				Evidence: taskorchestration.NewEvidenceRef(
+					evidenceID(t, "decide-c04-commit-validation-evidence"), taskorchestration.EvidencePhaseValidation,
+					evidenceDigest(t, "9292929292929292929292929292929292929292929292929292929292929292"),
+				),
+				PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
+				Generation: taskorchestration.ProducerGeneration(run.Generation),
+				Fence:      taskorchestration.ValidationFence(run.Fence), SafetyEpoch: view.SafetyEpoch,
+				Outcome: taskorchestration.PhaseValidationAccepted, LifecycleCommit: commitBinding,
+			},
+		),
+	)
+	if err != nil || len(decision.EnactmentRefs) != 1 {
+		t.Fatalf("commit exact C04 enactment: decision=%+v err=%v", decision, err)
+	}
+	ref := decision.EnactmentRefs[0]
+	if ref.OperationID.String() != string(request.Operation.ID) ||
+		"sha256:"+ref.PayloadDigest.String() != string(request.Operation.RequestDigest) {
+		t.Fatalf("Decide changed the exact C04 request binding: ref=%+v request=%+v", ref, request.Operation)
+	}
+	port := &taskWorkspaceLifecyclePortDouble{commit: result}
+	adapter := taskorchestration.NewTaskWorkspaceLifecycleEvidenceAdapter(
+		port, taskorchestration.TaskWorkspaceLifecycleAdapterBinding{
+			Enactment: ref,
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: authorityID(t, "generation-lifecycle-authority"), Generation: 1,
+			},
+			TaskID: taskID(t, "decide-c04-commit-task"), PhaseRunID: run.PhaseRunID,
+			PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
+			SafetyEpoch: view.SafetyEpoch, Commit: &request,
+		},
+	)
+	if _, err := adapter.Enact(context.Background(), ref); err != nil || port.commitCalls != 1 {
+		t.Fatalf("Decide-generated C04 enactment was not consumable: calls=%d err=%v", port.commitCalls, err)
+	}
+}
+
+func TestDecideGeneratedC04CancellationEnactmentBindsTheExactCanonicalRequest(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 19, 15, 0, 0, time.UTC)
+	harness, err := taskorchestration.NewDeterministicHarness(
+		taskorchestration.HarnessConfig{Now: now},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "decide-c04-fence-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "decide-c04-fence-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "decide-c04-fence-phase"), Kind: taskorchestration.PhaseMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(
+		t, intentHeader(t, "decide-c04-fence-start", "decide-c04-fence-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workHeader := intentHeader(t, "decide-c04-fence-work", "decide-c04-fence-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	work, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "decide-c04-fence-work-operation"),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := queryAggregate(t, harness, "decide-c04-fence-task", owner)
+	run := view.PhaseRuns[0]
+	requestRef := downstreamEnactmentRef(
+		t, "decide-c04-fence-operation", taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(1),
+	)
+	request, result := c04FenceContractFixture(
+		t, requestRef, "decide-c04-fence-task", run.PhaseRunID.String(), pinned.TaskWorkspaceID.String(), 1, 1,
+	)
+	fenceBinding, err := taskorchestration.NewTaskWorkspaceLifecycleFenceRequestBinding(request)
+	if err != nil {
+		t.Fatalf("bind exact C04 fence request: %v", err)
+	}
+	cancelHeader := intentHeader(t, "decide-c04-fence-cancel", "decide-c04-fence-task", now.Add(2*time.Second))
+	cancelHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
+	cancelled, err := harness.Mutations.Decide(
+		context.Background(), taskorchestration.NewCancelTaskByUserWithLifecycleFenceIntent(
+			cancelHeader, owner, taskorchestration.CancelReasonUserRequested, fenceBinding,
+		),
+	)
+	if err != nil {
+		t.Fatalf("commit exact C04 fence enactment: %v", err)
+	}
+	var ref taskorchestration.EnactmentRef
+	for _, candidate := range cancelled.EnactmentRefs {
+		if candidate.Kind == taskorchestration.EnactmentTaskWorkspaceLifecycle {
+			ref = candidate
+			break
+		}
+	}
+	if ref.OperationID.String() != string(request.Operation.ID) ||
+		"sha256:"+ref.PayloadDigest.String() != string(request.Operation.RequestDigest) {
+		t.Fatalf("Decide changed the exact C04 fence binding: ref=%+v request=%+v", ref, request.Operation)
+	}
+	port := &taskWorkspaceLifecyclePortDouble{fence: result}
+	adapter := taskorchestration.NewTaskWorkspaceLifecycleEvidenceAdapter(
+		port, taskorchestration.TaskWorkspaceLifecycleAdapterBinding{
+			Enactment: ref,
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: authorityID(t, "generation-lifecycle-authority"), Generation: 1,
+			},
+			TaskID: taskID(t, "decide-c04-fence-task"), PhaseRunID: run.PhaseRunID,
+			PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
+			SafetyEpoch: view.SafetyEpoch, Fence: &request,
+		},
+	)
+	if _, err := adapter.Enact(context.Background(), ref); err != nil || port.fenceCalls != 1 {
+		t.Fatalf("Decide-generated C04 fence was not consumable: calls=%d err=%v", port.fenceCalls, err)
+	}
+}
+
+func TestC04ReconstructionAdvancesLifecycleLineageForTheNextExactCommit(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 19, 30, 0, 0, time.UTC)
+	harness, err := taskorchestration.NewDeterministicHarness(
+		taskorchestration.HarnessConfig{Now: now},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "reconstruction-lineage-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "reconstruction-lineage-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "reconstruction-lineage-publication"), Kind: taskorchestration.PhasePublication,
+	}})
+	pinned.ExecutionLock.PipelineContract.ManualEditEntryPhase = phaseKey(
+		t, "reconstruction-lineage-manual-edit",
+	)
+	pinned.ExecutionLock.PipelineContract.ManualEditPhases = []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "reconstruction-lineage-manual-edit"), Kind: taskorchestration.PhaseMutating,
+		ValidationContract: taskorchestration.PhaseValidationAllRuntimeRunsSucceeded, RequiredRuntimeRuns: 1,
+	}}
+	started, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(
+		t, intentHeader(t, "reconstruction-lineage-start", "reconstruction-lineage-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicationHeader := intentHeader(
+		t, "reconstruction-lineage-publication-work", "reconstruction-lineage-task", now.Add(time.Second),
+	)
+	publicationHeader.ExpectedTaskRevision = started.AcceptedTaskRevision
+	publicationWork, err := harness.Mutations.Decide(
+		context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+			publicationHeader, worker, operationID(t, "reconstruction-lineage-publication-operation"),
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view := queryAggregate(t, harness, "reconstruction-lineage-task", owner)
+	publicationRun := view.PhaseRuns[0]
+	reconstructionSeed := downstreamEnactmentRef(
+		t, "reconstruction-lineage-operation", taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(4),
+	)
+	reconstructionRequest, reconstructionResult := c04ReconstructionContractFixture(
+		t, reconstructionSeed, "reconstruction-lineage-task", pinned.TaskWorkspaceID.String(), 4, 4,
+	)
+	artifact := artifactVersionID(
+		t, string(reconstructionRequest.Intent.ArtifactVersionInput.ArtifactVersionID),
+	)
+	publishedHeader := intentHeader(
+		t, "reconstruction-lineage-published", "reconstruction-lineage-task", now.Add(2*time.Second),
+	)
+	publishedHeader.ExpectedTaskRevision = publicationWork.AcceptedTaskRevision
+	published, err := harness.Mutations.Decide(
+		context.Background(), taskorchestration.NewAcceptPublicationEvidenceIntent(
+			publishedHeader, pinned.Authorities.Publication, taskorchestration.PublicationEvidenceBinding{
+				Evidence: taskorchestration.NewEvidenceRef(
+					evidenceID(t, "reconstruction-lineage-publication-evidence"),
+					taskorchestration.EvidencePublication,
+					evidenceDigest(t, "9393939393939393939393939393939393939393939393939393939393939393"),
+				),
+				PhaseRunID: publicationRun.PhaseRunID, PhaseRunGeneration: publicationRun.Generation,
+				PhaseRunFence: publicationRun.Fence, OperationID: publicationWork.EnactmentRefs[0].OperationID,
+				Generation: taskorchestration.ProducerGeneration(publicationRun.Generation),
+				Fence:      taskorchestration.PublicationFence(publicationRun.Fence), SafetyEpoch: view.SafetyEpoch,
+				Outcome: taskorchestration.PublicationActivated, ArtifactVersionID: artifact,
+			},
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconstructionBinding, err := taskorchestration.NewTaskWorkspaceReconstructionRequestBinding(
+		reconstructionRequest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beginHeader := intentHeader(
+		t, "reconstruction-lineage-begin", "reconstruction-lineage-task", now.Add(3*time.Second),
+	)
+	beginHeader.ExpectedTaskRevision = published.AcceptedTaskRevision
+	beginHeader.ActivityGeneration = 2
+	reconstructionDecision, err := harness.Mutations.Decide(
+		context.Background(), taskorchestration.NewBeginManualEditAfterExpiryIntent(
+			beginHeader, owner, artifact, reconstructionBinding,
+		),
+	)
+	if err != nil || len(reconstructionDecision.EnactmentRefs) != 1 {
+		t.Fatalf("begin exact reconstruction: decision=%+v err=%v", reconstructionDecision, err)
+	}
+	reconstructionRef := reconstructionDecision.EnactmentRefs[0]
+	if reconstructionRef.OperationID.String() != string(reconstructionRequest.Operation.ID) ||
+		"sha256:"+reconstructionRef.PayloadDigest.String() != string(reconstructionRequest.Operation.RequestDigest) {
+		t.Fatalf("reconstruction outbox changed exact request: ref=%+v", reconstructionRef)
+	}
+	reconstructionPort := &taskWorkspaceLifecyclePortDouble{reconstruction: reconstructionResult}
+	reconstructionAdapter := taskorchestration.NewTaskWorkspaceReconstructionEvidenceAdapter(
+		reconstructionPort, taskorchestration.TaskWorkspaceReconstructionAdapterBinding{
+			Enactment: reconstructionRef,
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: authorityID(t, "generation-lifecycle-authority"), Generation: 1,
+			},
+			TaskID: taskID(t, "reconstruction-lineage-task"), SafetyEpoch: view.SafetyEpoch,
+			Request: &reconstructionRequest,
+		},
+	)
+	reconstructionEvidence, err := reconstructionAdapter.Enact(context.Background(), reconstructionRef)
+	if err != nil {
+		t.Fatalf("enact exact reconstruction: %v", err)
+	}
+	evidenceHeader := intentHeader(
+		t, "reconstruction-lineage-evidence", "reconstruction-lineage-task", now.Add(4*time.Second),
+	)
+	evidenceHeader.ExpectedTaskRevision = reconstructionDecision.AcceptedTaskRevision
+	evidenceHeader.ActivityGeneration = 2
+	reconstructionIntent, err := reconstructionEvidence.Intent(evidenceHeader)
+	if err != nil {
+		t.Fatalf("convert C04 reconstruction evidence: %v", err)
+	}
+	acceptedReconstruction, err := harness.Mutations.Decide(context.Background(), reconstructionIntent)
+	if err != nil {
+		t.Fatalf("accept C04 reconstruction evidence: %v", err)
+	}
+	view = queryAggregate(t, harness, "reconstruction-lineage-task", owner)
+	if view.TaskWorkspaceLifecycleGeneration != reconstructionEvidence.ObservedGeneration ||
+		view.TaskWorkspaceLifecycleFence != reconstructionEvidence.ObservedFence {
+		t.Fatalf("advanced C04 lineage was not projected: view=%+v evidence=%+v", view, reconstructionEvidence)
+	}
+	manualHeader := intentHeader(
+		t, "reconstruction-lineage-manual-work", "reconstruction-lineage-task", now.Add(5*time.Second),
+	)
+	manualHeader.ExpectedTaskRevision = acceptedReconstruction.AcceptedTaskRevision
+	manualHeader.ActivityGeneration = 2
+	manualWork, err := harness.Mutations.Decide(
+		context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+			manualHeader, worker, operationID(t, "reconstruction-lineage-runtime-operation"),
+		),
+	)
+	if err != nil {
+		t.Fatalf("start manual-edit mutation after reconstruction: %v", err)
+	}
+	view = queryAggregate(t, harness, "reconstruction-lineage-task", owner)
+	manualRun := view.PhaseRuns[len(view.PhaseRuns)-1]
+	runtimeHeader := intentHeader(
+		t, "reconstruction-lineage-runtime-evidence", "reconstruction-lineage-task", now.Add(6*time.Second),
+	)
+	runtimeHeader.ExpectedTaskRevision = manualWork.AcceptedTaskRevision
+	runtimeHeader.ActivityGeneration = 2
+	acceptedRuntime, err := harness.Mutations.Decide(
+		context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
+			runtimeHeader, pinned.Authorities.Runtime, taskorchestration.RuntimeEvidenceBinding{
+				Evidence: taskorchestration.NewEvidenceRef(
+					evidenceID(t, "reconstruction-lineage-runtime-evidence-ref"), taskorchestration.EvidenceRuntime,
+					evidenceDigest(t, "9494949494949494949494949494949494949494949494949494949494949494"),
+				),
+				PhaseRunID: manualRun.PhaseRunID, PhaseRunGeneration: manualRun.Generation,
+				PhaseRunFence: manualRun.Fence, RuntimeRunID: manualRun.RuntimeRuns[0].RuntimeRunID,
+				OperationID: manualWork.EnactmentRefs[0].OperationID,
+				Generation:  taskorchestration.RuntimeGeneration(manualRun.Generation),
+				Fence:       taskorchestration.RuntimeFence(manualRun.Fence), SafetyEpoch: view.SafetyEpoch,
+				Outcome: taskorchestration.RuntimeRunSucceeded,
+			},
+		),
+	)
+	if err != nil {
+		t.Fatalf("accept manual-edit Runtime evidence: %v", err)
+	}
+	commitSeed := downstreamEnactmentRef(
+		t, "reconstruction-lineage-commit-operation", taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(view.TaskWorkspaceLifecycleFence),
+	)
+	commitRequest, commitResult := c04CommitContractFixture(
+		t, commitSeed, "reconstruction-lineage-task", manualRun.PhaseRunID.String(),
+		pinned.TaskWorkspaceID.String(), taskworkspace.Generation(view.TaskWorkspaceLifecycleGeneration),
+		taskworkspace.Fence(view.TaskWorkspaceLifecycleFence),
+	)
+	currentRevision := taskworkspace.RevisionID(view.LatestRevisionID.String())
+	commitRequest.BaseRevisionID = currentRevision
+	commitRequest.ExpectedCurrentRevision = currentRevision
+	commitRequest.ValidationEvidence.BaseRevisionID = currentRevision
+	commitRequest.ValidationEvidence.Digest = commitRequest.ValidationEvidence.CanonicalDigest()
+	commitRequest.Operation.RequestDigest = commitRequest.CanonicalRequestDigest()
+	commitResult.BaseRevisionID = currentRevision
+	commitResult.PredecessorRevisionID = currentRevision
+	commitResult.ValidationEvidenceDigest = commitRequest.ValidationEvidence.Digest
+	commitResult.Operation = commitRequest.Operation
+	commitBinding, err := taskorchestration.NewTaskWorkspaceLifecycleCommitRequestBinding(commitRequest)
+	if err != nil {
+		t.Fatalf("bind post-reconstruction commit request: %v", err)
+	}
+	validationHeader := intentHeader(
+		t, "reconstruction-lineage-validation", "reconstruction-lineage-task", now.Add(7*time.Second),
+	)
+	validationHeader.ExpectedTaskRevision = acceptedRuntime.AcceptedTaskRevision
+	validationHeader.ActivityGeneration = 2
+	commitDecision, err := harness.Mutations.Decide(
+		context.Background(), taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
+			validationHeader, pinned.Authorities.Validator, taskorchestration.ValidationEvidenceBinding{
+				Evidence: taskorchestration.NewEvidenceRef(
+					evidenceID(t, "reconstruction-lineage-validation-evidence"),
+					taskorchestration.EvidencePhaseValidation,
+					evidenceDigest(t, "9595959595959595959595959595959595959595959595959595959595959595"),
+				),
+				PhaseRunID: manualRun.PhaseRunID, PhaseRunGeneration: manualRun.Generation,
+				PhaseRunFence: manualRun.Fence, Generation: taskorchestration.ProducerGeneration(manualRun.Generation),
+				Fence: taskorchestration.ValidationFence(manualRun.Fence), SafetyEpoch: view.SafetyEpoch,
+				Outcome: taskorchestration.PhaseValidationAccepted, LifecycleCommit: commitBinding,
+			},
+		),
+	)
+	if err != nil || len(commitDecision.EnactmentRefs) != 1 {
+		t.Fatalf("commit post-reconstruction C04 outbox: decision=%+v err=%v", commitDecision, err)
+	}
+	commitRef := commitDecision.EnactmentRefs[0]
+	commitPort := &taskWorkspaceLifecyclePortDouble{commit: commitResult}
+	commitAdapter := taskorchestration.NewTaskWorkspaceLifecycleEvidenceAdapter(
+		commitPort, taskorchestration.TaskWorkspaceLifecycleAdapterBinding{
+			Enactment: commitRef,
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: authorityID(t, "generation-lifecycle-authority"), Generation: 1,
+			},
+			TaskID: taskID(t, "reconstruction-lineage-task"), PhaseRunID: manualRun.PhaseRunID,
+			PhaseRunGeneration: manualRun.Generation, PhaseRunFence: manualRun.Fence,
+			SafetyEpoch: view.SafetyEpoch, Commit: &commitRequest,
+		},
+	)
+	if _, err := commitAdapter.Enact(context.Background(), commitRef); err != nil || commitPort.commitCalls != 1 {
+		t.Fatalf("advanced-lineage C04 commit was not consumable: calls=%d err=%v", commitPort.commitCalls, err)
+	}
+}
+
+func TestExactC04RequestBindingsRejectSelfConsistentButUnconsumableScope(t *testing.T) {
+	t.Run("commit validation Task", func(t *testing.T) {
+		seed := downstreamEnactmentRef(
+			t, "binding-scope-commit", taskorchestration.EnactmentTaskWorkspaceLifecycle,
+			taskorchestration.TaskWorkspaceLifecycleFence(2),
+		)
+		request, _ := c04CommitContractFixture(
+			t, seed, "binding-scope-task", "binding-scope-phase", "binding-scope-workspace", 2, 2,
+		)
+		request.ValidationEvidence.TaskID = taskworkspace.TaskID("other-binding-scope-task")
+		request.ValidationEvidence.Digest = request.ValidationEvidence.CanonicalDigest()
+		request.Operation.RequestDigest = request.CanonicalRequestDigest()
+		if _, err := taskorchestration.NewTaskWorkspaceLifecycleCommitRequestBinding(request); err == nil {
+			t.Fatal("self-consistent commit with cross-Task validation scope was admitted")
+		}
+	})
+
+	t.Run("fence lease Task", func(t *testing.T) {
+		seed := downstreamEnactmentRef(
+			t, "binding-scope-fence", taskorchestration.EnactmentTaskWorkspaceLifecycle,
+			taskorchestration.TaskWorkspaceLifecycleFence(2),
+		)
+		request, _ := c04FenceContractFixture(
+			t, seed, "binding-scope-task", "binding-scope-phase", "binding-scope-workspace", 2, 2,
+		)
+		request.SandboxLeaseAuthority.TaskID = taskworkspace.TaskID("other-binding-scope-task")
+		request.SandboxLeaseAuthority.Digest = request.SandboxLeaseAuthority.CanonicalDigest()
+		request.Operation.RequestDigest = request.CanonicalRequestDigest()
+		if _, err := taskorchestration.NewTaskWorkspaceLifecycleFenceRequestBinding(request); err == nil {
+			t.Fatal("self-consistent fence with cross-Task lease scope was admitted")
+		}
+	})
+
+	t.Run("reconstruction Artifact input Task", func(t *testing.T) {
+		seed := downstreamEnactmentRef(
+			t, "binding-scope-reconstruction", taskorchestration.EnactmentTaskWorkspaceLifecycle,
+			taskorchestration.TaskWorkspaceLifecycleFence(2),
+		)
+		request, _ := c04ReconstructionContractFixture(
+			t, seed, "binding-scope-task", "binding-scope-workspace", 2, 2,
+		)
+		request.Intent.ArtifactVersionInput.TaskID = taskworkspace.TaskID("other-binding-scope-task")
+		request.Intent.ArtifactVersionInput.Digest = request.Intent.ArtifactVersionInput.CanonicalDigest()
+		request.Intent.Digest = request.Intent.CanonicalDigest()
+		request.Operation.RequestDigest = request.CanonicalRequestDigest()
+		if _, err := taskorchestration.NewTaskWorkspaceReconstructionRequestBinding(request); err == nil {
+			t.Fatal("self-consistent reconstruction with cross-Task Artifact input was admitted")
+		}
+	})
+}
+
+func TestTaskWorkspaceReconstructionAdapterUsesExactOpaqueC04EvidenceAndReplays(t *testing.T) {
+	ref := downstreamEnactmentRef(
+		t, "c04-reconstruction-operation", taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(2),
+	)
+	request, result := c04ReconstructionContractFixture(
+		t, ref, "c04-reconstruction-task", "c04-reconstruction-workspace", 2, 2,
+	)
+	ref.PayloadDigest = taskorchestration.TaskWorkspaceReconstructionEnactmentPayloadDigest(request)
+	port := &taskWorkspaceLifecyclePortDouble{reconstruction: result}
+	adapter := taskorchestration.NewTaskWorkspaceReconstructionEvidenceAdapter(
+		port,
+		taskorchestration.TaskWorkspaceReconstructionAdapterBinding{
+			Enactment: ref,
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: downstreamAuthorityID(t, "c04-reconstruction-authority"), Generation: 5,
+			},
+			TaskID: downstreamTaskID(t, "c04-reconstruction-task"), SafetyEpoch: 3,
+			Request: &request,
+		},
+	)
+
+	evidence, err := adapter.Enact(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("enact C04 reconstruction: %v", err)
+	}
+	if evidence.TaskID.String() != string(request.Intent.TaskID) ||
+		evidence.OperationID != ref.OperationID ||
+		evidence.ArtifactVersionID.String() != string(request.Intent.ArtifactVersionInput.ArtifactVersionID) ||
+		evidence.RevisionID.String() != string(result.CurrentRevisionID) ||
+		evidence.CheckpointID.String() != string(result.CurrentCheckpointID) ||
+		evidence.Generation != taskorchestration.TaskWorkspaceLifecycleGeneration(request.Intent.Generation) ||
+		evidence.Fence != taskorchestration.TaskWorkspaceLifecycleFence(request.Intent.Fence) ||
+		evidence.ObservedGeneration != taskorchestration.TaskWorkspaceLifecycleGeneration(result.Generation) ||
+		evidence.ObservedFence != taskorchestration.TaskWorkspaceLifecycleFence(result.Fence) ||
+		evidence.ReconstructionProofDigest == (taskorchestration.EvidenceDigest{}) ||
+		evidence.Evidence.Kind != taskorchestration.EvidenceTaskWorkspaceLifecycle ||
+		port.reconstructionCalls != 1 {
+		t.Fatalf("opaque C04 reconstruction evidence = %#v calls=%d", evidence, port.reconstructionCalls)
+	}
+	replayed, err := adapter.Enact(context.Background(), ref)
+	if err != nil || !reflect.DeepEqual(replayed, evidence) || port.reconstructionCalls != 1 {
+		t.Fatalf("C04 reconstruction replay = %#v calls=%d err=%v", replayed, port.reconstructionCalls, err)
+	}
+}
+
+func TestTaskWorkspaceReconstructionAdapterRecoversEvidenceAfterResponseLoss(t *testing.T) {
+	for _, scenario := range []struct {
+		name           string
+		inspectPending bool
+		wantReconcile  int
+	}{
+		{name: "inspect terminal"},
+		{name: "reconcile pending inspection", inspectPending: true, wantReconcile: 1},
+	} {
+		scenario := scenario
+		t.Run(scenario.name, func(t *testing.T) {
+			ref := downstreamEnactmentRef(
+				t, "c04-reconstruction-response-loss-"+strings.ReplaceAll(scenario.name, " ", "-"),
+				taskorchestration.EnactmentTaskWorkspaceLifecycle,
+				taskorchestration.TaskWorkspaceLifecycleFence(2),
+			)
+			request, result := c04ReconstructionContractFixture(
+				t, ref, "c04-reconstruction-response-loss-task", "c04-reconstruction-response-loss-workspace", 2, 2,
+			)
+			ref.PayloadDigest = taskorchestration.TaskWorkspaceReconstructionEnactmentPayloadDigest(request)
+			terminal := taskworkspace.OperationInspection{
+				Operation: request.Operation, Disposition: taskworkspace.OperationTerminal,
+				ReconstructTaskWorkspace: &result,
+			}
+			port := &taskWorkspaceLifecyclePortDouble{
+				reconstructionErr: &taskworkspace.Error{Code: taskworkspace.ErrorReconciliationRequired},
+				inspection:        terminal,
+			}
+			if scenario.inspectPending {
+				port.inspection = taskworkspace.OperationInspection{Disposition: taskworkspace.OperationPending}
+				port.reconciled = terminal
+			}
+			adapter := taskorchestration.NewTaskWorkspaceReconstructionEvidenceAdapter(
+				port, taskorchestration.TaskWorkspaceReconstructionAdapterBinding{
+					Enactment: ref,
+					Producer: taskorchestration.EvidenceProducer{
+						AuthorityID: downstreamAuthorityID(t, "c04-reconstruction-response-loss-authority"),
+						Generation:  5,
+					},
+					TaskID:      downstreamTaskID(t, "c04-reconstruction-response-loss-task"),
+					SafetyEpoch: 3, Request: &request,
+				},
+			)
+			evidence, err := adapter.Enact(context.Background(), ref)
+			if err != nil || evidence.RevisionID.String() != string(result.CurrentRevisionID) ||
+				port.reconstructionCalls != 1 || port.inspectCalls != 1 ||
+				port.reconcileCalls != scenario.wantReconcile {
+				t.Fatalf("reconstruction response-loss evidence=%#v calls=(%d,%d,%d) err=%v",
+					evidence, port.reconstructionCalls, port.inspectCalls, port.reconcileCalls, err)
+			}
+		})
+	}
+}
+
+func TestTaskWorkspaceReconstructionAdapterRejectsMismatchedOpaqueResult(t *testing.T) {
+	for _, scenario := range []struct {
+		name string
+		edit func(*taskworkspace.ReconstructTaskWorkspaceResult)
+	}{
+		{name: "operation", edit: func(result *taskworkspace.ReconstructTaskWorkspaceResult) {
+			result.Operation.ID = "other-reconstruction-operation"
+		}},
+		{name: "Artifact Version", edit: func(result *taskworkspace.ReconstructTaskWorkspaceResult) {
+			result.ArtifactVersionID = "other-artifact-version"
+		}},
+		{name: "generation", edit: func(result *taskworkspace.ReconstructTaskWorkspaceResult) {
+			result.Generation++
+		}},
+		{name: "fence", edit: func(result *taskworkspace.ReconstructTaskWorkspaceResult) {
+			result.Fence++
+		}},
+		{name: "Task Workspace", edit: func(result *taskworkspace.ReconstructTaskWorkspaceResult) {
+			result.TaskWorkspaceID = "other-task-workspace"
+		}},
+	} {
+		scenario := scenario
+		t.Run(scenario.name, func(t *testing.T) {
+			ref := downstreamEnactmentRef(
+				t, "c04-reconstruction-mismatch-"+strings.ReplaceAll(scenario.name, " ", "-"),
+				taskorchestration.EnactmentTaskWorkspaceLifecycle,
+				taskorchestration.TaskWorkspaceLifecycleFence(2),
+			)
+			request, result := c04ReconstructionContractFixture(
+				t, ref, "c04-reconstruction-mismatch-task", "c04-reconstruction-mismatch-workspace", 2, 2,
+			)
+			ref.PayloadDigest = taskorchestration.TaskWorkspaceReconstructionEnactmentPayloadDigest(request)
+			scenario.edit(&result)
+			adapter := taskorchestration.NewTaskWorkspaceReconstructionEvidenceAdapter(
+				&taskWorkspaceLifecyclePortDouble{reconstruction: result},
+				taskorchestration.TaskWorkspaceReconstructionAdapterBinding{
+					Enactment: ref,
+					Producer: taskorchestration.EvidenceProducer{
+						AuthorityID: downstreamAuthorityID(t, "c04-reconstruction-mismatch-authority"),
+						Generation:  5,
+					},
+					TaskID:      downstreamTaskID(t, "c04-reconstruction-mismatch-task"),
+					SafetyEpoch: 3, Request: &request,
+				},
+			)
+			_, err := adapter.Enact(context.Background(), ref)
+			assertDownstreamErrorCode(t, err, taskorchestration.DownstreamCorruptEvidence)
+		})
+	}
+}
+
+func TestTaskWorkspaceReconstructionAdapterRejectsNonExactReadOnlyInputs(t *testing.T) {
+	for _, scenario := range []struct {
+		name string
+		edit func(*taskworkspace.ReconstructTaskWorkspaceResult)
+	}{
+		{name: "missing", edit: func(result *taskworkspace.ReconstructTaskWorkspaceResult) {
+			result.ReadOnlyInputs = nil
+		}},
+		{name: "different immutable input", edit: func(result *taskworkspace.ReconstructTaskWorkspaceResult) {
+			result.ReadOnlyInputs[0].InputID = "other-runtime-release"
+			result.ReadOnlyInputs[0].Digest = result.ReadOnlyInputs[0].CanonicalDigest()
+		}},
+		{name: "duplicate", edit: func(result *taskworkspace.ReconstructTaskWorkspaceResult) {
+			result.ReadOnlyInputs = append(result.ReadOnlyInputs, result.ReadOnlyInputs[0])
+		}},
+	} {
+		scenario := scenario
+		t.Run(scenario.name, func(t *testing.T) {
+			ref := downstreamEnactmentRef(
+				t, "c04-reconstruction-input-"+strings.ReplaceAll(scenario.name, " ", "-"),
+				taskorchestration.EnactmentTaskWorkspaceLifecycle,
+				taskorchestration.TaskWorkspaceLifecycleFence(2),
+			)
+			request, result := c04ReconstructionContractFixture(
+				t, ref, "c04-reconstruction-input-task", "c04-reconstruction-input-workspace", 2, 2,
+			)
+			capability := taskworkspace.ReadOnlyInputCapability{
+				ID:             "runtime-release-capability",
+				AuthorityID:    "release-authority",
+				PolicyDomainID: request.Intent.PolicyDomainID,
+				TaskID:         request.Intent.TaskID,
+				Kind:           taskworkspace.ImmutableInputRuntimeRelease,
+				InputID:        "runtime-release-v1",
+				ManifestDigest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+				ExpiresAt:      100,
+			}
+			capability.Digest = capability.CanonicalDigest()
+			request.Intent.ReadOnlyInputs = []taskworkspace.ReadOnlyInputCapability{capability}
+			request.Intent.Digest = request.Intent.CanonicalDigest()
+			request.Operation.RequestDigest = request.CanonicalRequestDigest()
+			result.Operation = request.Operation
+			materialization := taskworkspace.ReadOnlyInputMaterialization{
+				ID:             "runtime-release-materialization",
+				CapabilityID:   capability.ID,
+				Kind:           capability.Kind,
+				InputID:        capability.InputID,
+				ManifestDigest: capability.ManifestDigest,
+				EvidenceID:     "runtime-release-evidence",
+				Access:         taskworkspace.InputAccessReadOnly,
+				Generation:     result.Generation,
+				Fence:          result.Fence,
+			}
+			materialization.Digest = materialization.CanonicalDigest()
+			result.ReadOnlyInputs = []taskworkspace.ReadOnlyInputMaterialization{materialization}
+			ref.PayloadDigest = taskorchestration.TaskWorkspaceReconstructionEnactmentPayloadDigest(request)
+			scenario.edit(&result)
+
+			adapter := taskorchestration.NewTaskWorkspaceReconstructionEvidenceAdapter(
+				&taskWorkspaceLifecyclePortDouble{reconstruction: result},
+				taskorchestration.TaskWorkspaceReconstructionAdapterBinding{
+					Enactment: ref,
+					Producer: taskorchestration.EvidenceProducer{
+						AuthorityID: downstreamAuthorityID(t, "c04-reconstruction-input-authority"),
+						Generation:  5,
+					},
+					TaskID:      downstreamTaskID(t, "c04-reconstruction-input-task"),
+					SafetyEpoch: 3,
+					Request:     &request,
+				},
+			)
+			_, err := adapter.Enact(context.Background(), ref)
+			assertDownstreamErrorCode(t, err, taskorchestration.DownstreamCorruptEvidence)
+		})
 	}
 }
 
@@ -978,19 +1686,92 @@ func (port *c04RacePort) ReconcileOperation(
 	return taskworkspace.OperationInspection{}, &taskworkspace.Error{Code: taskworkspace.ErrorViewTerminalConflict}
 }
 
+func (port *c04RacePort) ReconstructTaskWorkspace(
+	_ context.Context,
+	_ taskworkspace.ReconstructTaskWorkspaceRequest,
+) (taskworkspace.ReconstructTaskWorkspaceResult, error) {
+	return taskworkspace.ReconstructTaskWorkspaceResult{}, &taskworkspace.Error{
+		Code: taskworkspace.ErrorViewTerminalConflict,
+	}
+}
+
 type taskWorkspaceLifecyclePortDouble struct {
-	commit         taskworkspace.CommitRuntimeViewResult
-	fence          taskworkspace.FenceRuntimeViewResult
-	inspection     taskworkspace.OperationInspection
-	reconciled     taskworkspace.OperationInspection
-	commitErr      error
-	fenceErr       error
-	inspectErr     error
-	reconcileErr   error
-	commitCalls    int
-	fenceCalls     int
-	inspectCalls   int
-	reconcileCalls int
+	commit              taskworkspace.CommitRuntimeViewResult
+	fence               taskworkspace.FenceRuntimeViewResult
+	reconstruction      taskworkspace.ReconstructTaskWorkspaceResult
+	inspection          taskworkspace.OperationInspection
+	reconciled          taskworkspace.OperationInspection
+	commitErr           error
+	fenceErr            error
+	reconstructionErr   error
+	inspectErr          error
+	reconcileErr        error
+	commitCalls         int
+	fenceCalls          int
+	reconstructionCalls int
+	inspectCalls        int
+	reconcileCalls      int
+}
+
+func c04ReconstructionContractFixture(
+	t *testing.T,
+	ref taskorchestration.EnactmentRef,
+	taskID string,
+	workspaceID string,
+	generation taskworkspace.Generation,
+	fence taskworkspace.Fence,
+) (taskworkspace.ReconstructTaskWorkspaceRequest, taskworkspace.ReconstructTaskWorkspaceResult) {
+	t.Helper()
+	policyDomainID := taskworkspace.PolicyDomainID("policy-" + taskID)
+	publicationAuthorityID := taskworkspace.PublicationAuthorityID("publication-" + taskID)
+	artifactInput := taskworkspace.ArtifactVersionReconstructionInput{
+		ID:                     taskworkspace.ArtifactVersionInputCapabilityID("artifact-input-" + ref.OperationID.String()),
+		PublicationAuthorityID: publicationAuthorityID, PolicyDomainID: policyDomainID,
+		TaskID:            taskworkspace.TaskID(taskID),
+		ArtifactVersionID: taskworkspace.ArtifactVersionID("artifact-" + ref.OperationID.String()),
+		ManifestDigest:    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		ExpiresAt:         100,
+	}
+	artifactInput.Digest = artifactInput.CanonicalDigest()
+	intent := taskworkspace.AuthorizedRecoveryIntent{
+		ID:                  taskworkspace.RecoveryIntentID("recovery-" + ref.OperationID.String()),
+		RecoveryAuthorityID: taskworkspace.RecoveryAuthorityID("recovery-authority-" + taskID),
+		PolicyDomainID:      policyDomainID, TaskID: taskworkspace.TaskID(taskID),
+		TaskWorkspaceID:             taskworkspace.TaskWorkspaceID(workspaceID),
+		TargetKind:                  taskworkspace.RecoveryTargetArtifactVersion,
+		ExpectedCurrentRevisionID:   taskworkspace.RevisionID("revision-" + taskID),
+		ExpectedCurrentCheckpointID: taskworkspace.CheckpointID("checkpoint-" + taskID),
+		ArtifactVersionInput:        artifactInput, PublicationAuthorityID: publicationAuthorityID,
+		Generation: generation, Fence: fence, Mode: taskworkspace.RecoveryModeWritable, ExpiresAt: 100,
+	}
+	intent.Digest = intent.CanonicalDigest()
+	request := taskworkspace.ReconstructTaskWorkspaceRequest{
+		Intent: intent, Operation: taskworkspace.Operation{ID: taskworkspace.OperationID(ref.OperationID.String())},
+	}
+	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	artifactEvidence := taskworkspace.ArtifactVersionReconstructionEvidence{
+		ID:                     taskworkspace.EvidenceID("artifact-evidence-" + ref.OperationID.String()),
+		PublicationAuthorityID: publicationAuthorityID, PolicyDomainID: policyDomainID,
+		TaskID: intent.TaskID, ArtifactVersionID: artifactInput.ArtifactVersionID,
+		ManifestDigest: artifactInput.ManifestDigest, InputCapabilityID: artifactInput.ID,
+		ContentEvidenceRoot: taskworkspace.EvidenceRoot("content-root-" + ref.OperationID.String()),
+		Decision:            taskworkspace.ReconstructionInputVerified, RecoveryIntentID: intent.ID,
+		Generation: generation + 1, Fence: fence + 1, OperationID: request.Operation.ID,
+	}
+	artifactEvidence.Digest = artifactEvidence.CanonicalDigest()
+	result := taskworkspace.ReconstructTaskWorkspaceResult{
+		TaskWorkspaceID:                intent.TaskWorkspaceID,
+		MaterializationID:              taskworkspace.MaterializationID("materialization-" + ref.OperationID.String()),
+		CurrentRevisionID:              intent.ExpectedCurrentRevisionID,
+		CurrentCheckpointID:            intent.ExpectedCurrentCheckpointID,
+		ArtifactVersionID:              artifactInput.ArtifactVersionID,
+		ArtifactManifestDigest:         artifactInput.ManifestDigest,
+		ArtifactReconstructionEvidence: artifactEvidence,
+		PublicationAuthorityID:         publicationAuthorityID,
+		Generation:                     generation + 1, PreviousFence: fence, Fence: fence + 1,
+		RecoveryIntentID: intent.ID, Operation: request.Operation,
+	}
+	return request, result
 }
 
 func c04CommitContractFixture(
@@ -1083,6 +1864,70 @@ func c04FenceContractFixture(
 	}
 }
 
+func exactC04CommitRequestBinding(
+	t *testing.T,
+	taskID string,
+	phaseRunID taskorchestration.PhaseRunID,
+	workspaceID taskorchestration.TaskWorkspaceID,
+	operation string,
+	generation taskorchestration.TaskWorkspaceLifecycleGeneration,
+	fence taskorchestration.TaskWorkspaceLifecycleFence,
+	expectedRevision taskorchestration.TaskWorkspaceRevisionID,
+) taskorchestration.TaskWorkspaceLifecycleCommitRequestBinding {
+	t.Helper()
+	seed := downstreamEnactmentRef(
+		t, operation, taskorchestration.EnactmentTaskWorkspaceLifecycle, fence,
+	)
+	request, _ := c04CommitContractFixture(
+		t, seed, taskID, phaseRunID.String(), workspaceID.String(),
+		taskworkspace.Generation(generation), taskworkspace.Fence(fence),
+	)
+	if expectedRevision != (taskorchestration.TaskWorkspaceRevisionID{}) {
+		currentRevision := taskworkspace.RevisionID(expectedRevision.String())
+		request.BaseRevisionID = currentRevision
+		request.ExpectedCurrentRevision = currentRevision
+		request.ValidationEvidence.BaseRevisionID = currentRevision
+		request.ValidationEvidence.Digest = request.ValidationEvidence.CanonicalDigest()
+		request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	}
+	binding, err := taskorchestration.NewTaskWorkspaceLifecycleCommitRequestBinding(request)
+	if err != nil {
+		t.Fatalf("bind exact C04 commit request %q: %v", operation, err)
+	}
+	return binding
+}
+
+func exactC04FenceRequestBinding(
+	t *testing.T,
+	taskID string,
+	phaseRunID taskorchestration.PhaseRunID,
+	workspaceID taskorchestration.TaskWorkspaceID,
+	operation string,
+	generation taskorchestration.TaskWorkspaceLifecycleGeneration,
+	fence taskorchestration.TaskWorkspaceLifecycleFence,
+	expectedRevision taskorchestration.TaskWorkspaceRevisionID,
+) taskorchestration.TaskWorkspaceLifecycleFenceRequestBinding {
+	t.Helper()
+	seed := downstreamEnactmentRef(
+		t, operation, taskorchestration.EnactmentTaskWorkspaceLifecycle, fence,
+	)
+	request, _ := c04FenceContractFixture(
+		t, seed, taskID, phaseRunID.String(), workspaceID.String(),
+		taskworkspace.Generation(generation), taskworkspace.Fence(fence),
+	)
+	if expectedRevision != (taskorchestration.TaskWorkspaceRevisionID{}) {
+		currentRevision := taskworkspace.RevisionID(expectedRevision.String())
+		request.BaseRevisionID = currentRevision
+		request.ExpectedCurrentRevision = currentRevision
+		request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	}
+	binding, err := taskorchestration.NewTaskWorkspaceLifecycleFenceRequestBinding(request)
+	if err != nil {
+		t.Fatalf("bind exact C04 fence request %q: %v", operation, err)
+	}
+	return binding
+}
+
 func bindC04EnactmentPayload(
 	t *testing.T,
 	ref *taskorchestration.EnactmentRef,
@@ -1111,6 +1956,14 @@ func (port *taskWorkspaceLifecyclePortDouble) FenceRuntimeView(
 ) (taskworkspace.FenceRuntimeViewResult, error) {
 	port.fenceCalls++
 	return port.fence, port.fenceErr
+}
+
+func (port *taskWorkspaceLifecyclePortDouble) ReconstructTaskWorkspace(
+	_ context.Context,
+	_ taskworkspace.ReconstructTaskWorkspaceRequest,
+) (taskworkspace.ReconstructTaskWorkspaceResult, error) {
+	port.reconstructionCalls++
+	return port.reconstruction, port.reconstructionErr
 }
 
 func (port *taskWorkspaceLifecyclePortDouble) InspectOperation(
@@ -1236,6 +2089,84 @@ func TestReleaseAndCatalogAdaptersNeverRepinExistingTaskLocks(t *testing.T) {
 	}
 }
 
+func TestTaskStartAdmissionRequiresExactTaskBoundReleaseAndCatalogVerification(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 17, 0, 0, 0, time.UTC)
+	task := downstreamTaskID(t, "verified-admission-task")
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "verified-admission-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract: taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+	}})
+	safetyEpoch := taskorchestration.SafetyEpoch(1)
+	executionRecord := taskorchestration.PublishedExecutionContract{
+		SchemaVersion: taskorchestration.EvidenceSchemaV1,
+		Producer: taskorchestration.EvidenceProducer{
+			AuthorityID: downstreamAuthorityID(t, "verified-admission-release-authority"), Generation: 2,
+		},
+		ExecutionLock: pinned.ExecutionLock, SafetyEpoch: safetyEpoch,
+	}
+	executionRecord.ContractDigest = taskorchestration.ExecutionLockContractDigest(executionRecord.ExecutionLock)
+	execution, err := taskorchestration.NewReleaseManagementAdapter(
+		&releaseManagementPortDouble{record: executionRecord},
+	).Resolve(context.Background(), taskorchestration.PinnedExecutionLockRequest{
+		TaskID: task, ExecutionLock: pinned.ExecutionLock, ContractDigest: executionRecord.ContractDigest,
+		SafetyEpoch: safetyEpoch, Purpose: taskorchestration.PinnedLockStart,
+	})
+	if err != nil {
+		t.Fatalf("verify exact Execution Lock for Start: %v", err)
+	}
+	templateRecord := validPublishedTemplateLockContract(
+		t, pinned.TemplateLockID, pinned.ExecutionLock.ID, "verified-admission", 3, safetyEpoch,
+	)
+	template, err := taskorchestration.NewCatalogPublicationAdapter(
+		&catalogPublicationPortDouble{record: templateRecord},
+	).Resolve(context.Background(), taskorchestration.PinnedTemplateLockRequest{
+		TaskID: task, TemplateLockID: pinned.TemplateLockID, LockDigest: templateRecord.LockDigest,
+		ObservedGeneration: templateRecord.ObservedGeneration, SafetyEpoch: safetyEpoch,
+		Purpose: taskorchestration.PinnedLockStart,
+	})
+	if err != nil {
+		t.Fatalf("verify exact Template Lock for Start: %v", err)
+	}
+	admission, err := taskorchestration.NewTaskStartAdmission(
+		task, pinned.Route, pinned.TaskWorkspaceID, pinned.Authorities, execution, &template,
+	)
+	if err != nil {
+		t.Fatalf("bind verified Task Start admission: %v", err)
+	}
+	constructor := reflect.TypeOf(taskorchestration.NewStartPinnedTaskIntent)
+	if constructor.In(2) != reflect.TypeOf(taskorchestration.TaskStartAdmission{}) {
+		t.Fatalf("Start constructor still accepts caller-built pins: %v", constructor.In(2))
+	}
+	owner := taskorchestration.NewUserAuthority(downstreamAuthorityID(t, "verified-admission-owner"), 1)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := intentHeader(t, "verified-admission-start", task.String(), now)
+	started, err := harness.Mutations.Decide(
+		context.Background(), verifiedPinnedStartIntent(t, header, owner, admission),
+	)
+	if err != nil || started.TaskProjection.ExecutionLockID != pinned.ExecutionLock.ID ||
+		started.TaskProjection.TemplateLockID != pinned.TemplateLockID {
+		t.Fatalf("verified admission did not atomically pin exact locks: decision=%+v err=%v", started, err)
+	}
+	zeroHeader := intentHeader(t, "zero-admission-start", "zero-admission-task", now.Add(time.Second))
+	_, err = harness.Mutations.Decide(
+		context.Background(),
+		verifiedPinnedStartIntent(t, zeroHeader, owner, taskorchestration.TaskStartAdmission{}),
+	)
+	var decisionError *taskorchestration.Error
+	if !errors.As(err, &decisionError) || decisionError.Code() != taskorchestration.ErrorInvalidIntent {
+		t.Fatalf("zero/unverified admission = %T %v, want invalid intent", err, err)
+	}
+	otherTask := downstreamTaskID(t, "verified-admission-other-task")
+	if _, err := taskorchestration.NewTaskStartAdmission(
+		otherTask, pinned.Route, pinned.TaskWorkspaceID, pinned.Authorities, execution, &template,
+	); err == nil {
+		t.Fatal("Task-bound Release/Catalog verification was reusable for another Task")
+	}
+}
+
 func TestReleaseManagementAdapterRejectsStaleSafetyEpoch(t *testing.T) {
 	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
 		Key: phaseKey(t, "release-stale-phase"), Kind: taskorchestration.PhaseNonMutating,
@@ -1358,6 +2289,7 @@ func assertDownstreamAdapterPublicSurfaces(t *testing.T) {
 		reflect.TypeOf((*taskorchestration.PublicationEvidenceAdapter)(nil)).Elem(),
 		reflect.TypeOf((*taskorchestration.UsageAccountingEvidenceAdapter)(nil)).Elem(),
 		reflect.TypeOf((*taskorchestration.TaskWorkspaceLifecycleEvidenceAdapter)(nil)).Elem(),
+		reflect.TypeOf((*taskorchestration.TaskWorkspaceReconstructionEvidenceAdapter)(nil)).Elem(),
 	}
 	for _, adapter := range interfaces {
 		if adapter.NumMethod() != 1 || adapter.Method(0).Name != "Enact" {
@@ -1383,6 +2315,7 @@ func assertDownstreamAdapterPublicSurfaces(t *testing.T) {
 		reflect.TypeOf(taskorchestration.PublicationAdapterEvidence{}),
 		reflect.TypeOf(taskorchestration.UsageAccountingAdapterEvidence{}),
 		reflect.TypeOf(taskorchestration.TaskWorkspaceLifecycleAdapterEvidence{}),
+		reflect.TypeOf(taskorchestration.TaskWorkspaceReconstructionAdapterEvidence{}),
 		reflect.TypeOf(taskorchestration.ResolvedExecutionContract{}),
 		reflect.TypeOf(taskorchestration.ResolvedTemplateLockContract{}),
 		reflect.TypeOf(taskorchestration.DownstreamError{}),
@@ -1437,7 +2370,7 @@ func TestUsageAccountingEvidenceCannotReopenTerminalPhase(t *testing.T) {
 	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
 		Key: phaseKey(t, "usage-terminal-publication"), Kind: taskorchestration.PhasePublication,
 	}})
-	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	if _, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "usage-start", "usage-task", now), owner, pinned,
 	)); err != nil {
 		t.Fatal(err)
@@ -1457,7 +2390,7 @@ func TestUsageAccountingEvidenceCannotReopenTerminalPhase(t *testing.T) {
 	publicationHeader.ExpectedTaskRevision = 2
 	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewAcceptPublicationEvidenceIntent(
 		publicationHeader,
-		taskorchestration.NewPublicationAuthority(downstreamAuthorityID(t, "usage-publication-authority"), 1),
+		pinned.Authorities.Publication,
 		taskorchestration.PublicationEvidenceBinding{
 			Evidence:   downstreamEvidenceRef(t, "usage-publication-evidence", taskorchestration.EvidencePublication),
 			PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
@@ -1747,4 +2680,32 @@ func bindTemplatePublishedContract(
 	record.CompatibilityEvidenceID = downstreamEvidenceID(t, prefix+"-compatibility")
 	record.CompatibilityEvidenceDigest = downstreamEvidenceRef(t, prefix+"-compatibility-digest", taskorchestration.EvidencePublication).Digest
 	record.CompatibilityExecutionLockID = executionLockID
+}
+
+func validPublishedTemplateLockContract(
+	t *testing.T,
+	templateLockID taskorchestration.TemplateLockID,
+	executionLockID taskorchestration.ExecutionLockID,
+	prefix string,
+	observedGeneration taskorchestration.ProducerGeneration,
+	safetyEpoch taskorchestration.SafetyEpoch,
+) taskorchestration.PublishedTemplateLockContract {
+	t.Helper()
+	record := taskorchestration.PublishedTemplateLockContract{
+		SchemaVersion: taskorchestration.EvidenceSchemaV1,
+		Producer: taskorchestration.EvidenceProducer{
+			AuthorityID: downstreamAuthorityID(t, prefix+"-catalog-authority"), Generation: 3,
+		},
+		TemplateLockID:     templateLockID,
+		TemplateVersionID:  downstreamTemplateVersionID(t, prefix+"-template-version"),
+		ObservedGeneration: observedGeneration, SafetyEpoch: safetyEpoch,
+		BundleClosure: []taskorchestration.ResourceBundleContract{{
+			ResourceBundleID: downstreamResourceBundleID(t, prefix+"-bundle"),
+			ManifestDigest:   downstreamEvidenceRef(t, prefix+"-bundle-manifest", taskorchestration.EvidencePublication).Digest,
+			PackageDigest:    downstreamEvidenceRef(t, prefix+"-bundle-package", taskorchestration.EvidencePublication).Digest,
+		}},
+	}
+	bindTemplatePublishedContract(t, &record, executionLockID, prefix)
+	record.LockDigest = taskorchestration.TemplateLockContractDigest(record)
+	return record
 }

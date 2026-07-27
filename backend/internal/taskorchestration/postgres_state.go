@@ -59,25 +59,75 @@ type postgresDecisionState struct {
 	AcceptedEvidenceRefs   []postgresEvidenceRefState
 	CommittedAt            string
 	EnactmentRefs          []postgresEnactmentState
-	MandatoryAuditFactID   string
+	MandatoryAuditFact     postgresAuditFactState
+}
+
+type postgresAuditFactState struct {
+	SchemaVersion                AuditSchemaVersion
+	AuditFactID                  string
+	CanonicalDigest              AuditFactDigest
+	IntegrityVersion             AuditIntegrityVersion
+	OwningModule                 AuditOwningModule
+	DecisionID                   string
+	TaskID                       string
+	IdempotencyDecisionRequestID string
+	Action                       IntentKind
+	Result                       AuditResult
+	AuthorityKind                AuthorityKind
+	AuthorityID                  string
+	AuthorizationGeneration      AuthorizationGeneration
+	AuthorityReason              AdministratorReason
+	ReasonCode                   AuditReasonCode
+	BeforeTaskRevision           TaskRevision
+	AfterTaskRevision            TaskRevision
+	BeforeStatus                 TaskStatus
+	AfterStatus                  TaskStatus
+	BeforeActivityGeneration     ActivityGeneration
+	AfterActivityGeneration      ActivityGeneration
+	RecoveryGeneration           RecoveryGeneration
+	BeforeSafetyEpoch            SafetyEpoch
+	AfterSafetyEpoch             SafetyEpoch
+	EvidenceRefs                 []postgresEvidenceRefState
+	EnactmentRefs                []postgresAuditEnactmentState
+	RetryPhaseRunID              string
+	RetryRuntimeRunID            string
+	ReconciliationOperationID    string
+	ReconciliationFence          ReconciliationFence
+	OccurredAt                   string
+	RecordedAt                   string
+	SourceClock                  AuditSourceClock
+}
+
+type postgresAuditEnactmentState struct {
+	OperationID        string
+	Kind               EnactmentKind
+	PayloadDigest      EnactmentPayloadDigest
+	ActivityGeneration ActivityGeneration
+	FenceKind          EnactmentFenceKind
+	Fence              uint64
+	CausationID        string
 }
 
 type postgresTaskProjectionState struct {
-	TaskID                  string
-	TaskRevision            TaskRevision
-	ActivityGeneration      ActivityGeneration
-	Status                  TaskStatus
-	Route                   Route
-	Activity                ActivityKind
-	CurrentPhase            string
-	ActivePhaseRunID        string
-	LatestArtifactVersionID string
-	TaskWorkspaceID         string
-	LatestRevisionID        string
-	LatestCheckpointID      string
-	CancellationState       CancellationState
-	SafetyEpoch             SafetyEpoch
-	OperationalMode         OperationalMode
+	TaskID                           string
+	TaskRevision                     TaskRevision
+	ActivityGeneration               ActivityGeneration
+	Status                           TaskStatus
+	Route                            Route
+	Activity                         ActivityKind
+	ExecutionLockID                  string
+	TemplateLockID                   string
+	CurrentPhase                     string
+	ActivePhaseRunID                 string
+	LatestArtifactVersionID          string
+	TaskWorkspaceID                  string
+	LatestRevisionID                 string
+	LatestCheckpointID               string
+	TaskWorkspaceLifecycleGeneration TaskWorkspaceLifecycleGeneration
+	TaskWorkspaceLifecycleFence      TaskWorkspaceLifecycleFence
+	CancellationState                CancellationState
+	SafetyEpoch                      SafetyEpoch
+	OperationalMode                  OperationalMode
 }
 
 type postgresEvidenceRefState struct {
@@ -186,6 +236,11 @@ type postgresAggregateState struct {
 	PhaseRuns                       []postgresPhaseRunState
 	LatestArtifactVersionID         string
 	ActivitySourceArtifactVersionID string
+	ReconstructionRequired          bool
+	ReconstructionAccepted          bool
+	ReconstructionOperationID       string
+	LifecycleGeneration             TaskWorkspaceLifecycleGeneration
+	LifecycleFence                  TaskWorkspaceLifecycleFence
 }
 
 type postgresPinnedTaskState struct {
@@ -193,6 +248,15 @@ type postgresPinnedTaskState struct {
 	TaskWorkspaceID string
 	ExecutionLock   postgresExecutionLockState
 	TemplateLockID  string
+	Authorities     postgresDownstreamAuthorityBindingsState
+}
+
+type postgresDownstreamAuthorityBindingsState struct {
+	Runtime                postgresAuthorityState
+	Validator              postgresAuthorityState
+	TaskWorkspaceLifecycle postgresAuthorityState
+	Publication            postgresAuthorityState
+	Scheduler              postgresAuthorityState
 }
 
 type postgresExecutionLockState struct {
@@ -306,11 +370,14 @@ func validPostgresTaskRecord(record taskRecord) bool {
 		}
 	}
 	for id, operation := range record.lifecycleOperations {
-		if !validOpaqueID(id.value) || !validOpaqueID(operation.phaseRunID.value) ||
+		validPhaseScope := validOpaqueID(operation.phaseRunID.value) ||
+			(operation.purpose == LifecycleOperationReconstruction && operation.phaseRunID == (PhaseRunID{}))
+		if !validOpaqueID(id.value) || !validPhaseScope ||
 			operation.generation == 0 || operation.fence == 0 || operation.safetyEpoch == 0 ||
 			operation.activityGeneration == 0 || !validOptionalAuthority(operation.authority) ||
 			(operation.purpose != LifecycleOperationCommit &&
-				operation.purpose != LifecycleOperationCancellationFence) {
+				operation.purpose != LifecycleOperationCancellationFence &&
+				operation.purpose != LifecycleOperationReconstruction) {
 			return false
 		}
 	}
@@ -361,6 +428,18 @@ func validPostgresAggregate(aggregate taskAggregate) bool {
 	if !aggregate.pinned.valid() || !validOptionalOpaqueID(aggregate.currentPhase.value) {
 		return false
 	}
+	if aggregate.reconstructionRequired {
+		if aggregate.activity != ActivityManualEdit ||
+			!validOpaqueID(aggregate.reconstructionOperationID.value) ||
+			!validOpaqueID(aggregate.activitySourceArtifactVersionID.value) {
+			return false
+		}
+	} else if aggregate.reconstructionOperationID != (OperationID{}) {
+		return false
+	}
+	if (aggregate.lifecycleGeneration == 0) != (aggregate.lifecycleFence == 0) {
+		return false
+	}
 	for _, run := range aggregate.phaseRuns {
 		if !validOpaqueID(run.id.value) || !validOpaqueID(run.phaseKey.value) ||
 			run.attempt == 0 || run.generation == 0 || run.fence == 0 ||
@@ -396,7 +475,7 @@ func validPersistedDecision(decision TransitionDecision) bool {
 		!validOpaqueID(decision.TaskProjection.TaskID.value) ||
 		decision.TaskProjection.TaskRevision != decision.AcceptedTaskRevision ||
 		decision.TaskProjection.ActivityGeneration == 0 || decision.CommittedAt.IsZero() ||
-		!validOpaqueID(decision.MandatoryAuditFactRef.AuditFactID.value) {
+		!validMandatoryAuditFact(decision.MandatoryAuditFactRef, decision) {
 		return false
 	}
 	for _, id := range decision.AffectedPhaseRuns {
@@ -605,7 +684,7 @@ func postgresDecisionStateFromDecision(decision TransitionDecision) postgresDeci
 		AcceptedTaskRevision:   decision.AcceptedTaskRevision,
 		TaskProjection:         postgresTaskProjectionStateFromProjection(decision.TaskProjection),
 		CommittedAt:            decision.CommittedAt.UTC().Format(canonicalTimeFormat),
-		MandatoryAuditFactID:   decision.MandatoryAuditFactRef.AuditFactID.value,
+		MandatoryAuditFact:     postgresAuditFactStateFromFact(decision.MandatoryAuditFactRef),
 	}
 	for _, id := range decision.AffectedPhaseRuns {
 		state.AffectedPhaseRuns = append(state.AffectedPhaseRuns, id.value)
@@ -629,7 +708,7 @@ func (state postgresDecisionState) decision() TransitionDecision {
 		AcceptedTaskRevision:   state.AcceptedTaskRevision,
 		TaskProjection:         state.TaskProjection.projection(),
 		CommittedAt:            parsePostgresStateTime(state.CommittedAt),
-		MandatoryAuditFactRef:  AuditFactRef{AuditFactID: AuditFactID{state.MandatoryAuditFactID}},
+		MandatoryAuditFactRef:  state.MandatoryAuditFact.fact(),
 	}
 	for _, id := range state.AffectedPhaseRuns {
 		decision.AffectedPhaseRuns = append(decision.AffectedPhaseRuns, PhaseRunID{id})
@@ -645,17 +724,96 @@ func (state postgresDecisionState) decision() TransitionDecision {
 	return decision
 }
 
+func postgresAuditFactStateFromFact(fact AuditFactRef) postgresAuditFactState {
+	state := postgresAuditFactState{
+		SchemaVersion: fact.SchemaVersion, AuditFactID: fact.AuditFactID.value,
+		CanonicalDigest: fact.CanonicalDigest, IntegrityVersion: fact.IntegrityVersion,
+		OwningModule: fact.OwningModule, DecisionID: fact.DecisionID.value, TaskID: fact.TaskID.value,
+		IdempotencyDecisionRequestID: fact.IdempotencyDecisionRequestID.value,
+		Action:                       fact.Action, Result: fact.Result, AuthorityKind: fact.AuthorityKind,
+		AuthorityID: fact.AuthorityID.value, AuthorizationGeneration: fact.AuthorizationGeneration,
+		AuthorityReason: fact.AuthorityReason, ReasonCode: fact.ReasonCode,
+		BeforeTaskRevision: fact.BeforeTaskRevision, AfterTaskRevision: fact.AfterTaskRevision,
+		BeforeStatus: fact.BeforeStatus, AfterStatus: fact.AfterStatus,
+		BeforeActivityGeneration: fact.BeforeActivityGeneration,
+		AfterActivityGeneration:  fact.AfterActivityGeneration,
+		RecoveryGeneration:       fact.RecoveryGeneration, BeforeSafetyEpoch: fact.BeforeSafetyEpoch,
+		AfterSafetyEpoch: fact.AfterSafetyEpoch, RetryPhaseRunID: fact.RetryPhaseRunID.value,
+		RetryRuntimeRunID:         fact.RetryRuntimeRunID.value,
+		ReconciliationOperationID: fact.ReconciliationOperationID.value,
+		ReconciliationFence:       fact.ReconciliationFence,
+		OccurredAt:                fact.OccurredAt.UTC().Format(canonicalTimeFormat),
+		RecordedAt:                fact.RecordedAt.UTC().Format(canonicalTimeFormat), SourceClock: fact.SourceClock,
+	}
+	for _, evidence := range fact.EvidenceRefs {
+		state.EvidenceRefs = append(state.EvidenceRefs, postgresEvidenceRefState{
+			ID: evidence.ID.value, Kind: evidence.Kind, Digest: evidence.Digest,
+		})
+	}
+	for _, enactment := range fact.EnactmentRefs {
+		state.EnactmentRefs = append(state.EnactmentRefs, postgresAuditEnactmentState{
+			OperationID: enactment.OperationID.value, Kind: enactment.Kind,
+			PayloadDigest: enactment.PayloadDigest, ActivityGeneration: enactment.ActivityGeneration,
+			FenceKind: enactment.FenceKind, Fence: enactment.Fence,
+			CausationID: enactment.CausationID.value,
+		})
+	}
+	return state
+}
+
+func (state postgresAuditFactState) fact() AuditFactRef {
+	fact := AuditFactRef{
+		SchemaVersion: state.SchemaVersion, AuditFactID: AuditFactID{state.AuditFactID},
+		CanonicalDigest: state.CanonicalDigest, IntegrityVersion: state.IntegrityVersion,
+		OwningModule: state.OwningModule, DecisionID: DecisionID{state.DecisionID},
+		TaskID:                       TaskID{state.TaskID},
+		IdempotencyDecisionRequestID: DecisionRequestID{state.IdempotencyDecisionRequestID},
+		Action:                       state.Action, Result: state.Result, AuthorityKind: state.AuthorityKind,
+		AuthorityID: AuthorityID{state.AuthorityID}, AuthorizationGeneration: state.AuthorizationGeneration,
+		AuthorityReason: state.AuthorityReason, ReasonCode: state.ReasonCode,
+		BeforeTaskRevision: state.BeforeTaskRevision, AfterTaskRevision: state.AfterTaskRevision,
+		BeforeStatus: state.BeforeStatus, AfterStatus: state.AfterStatus,
+		BeforeActivityGeneration: state.BeforeActivityGeneration,
+		AfterActivityGeneration:  state.AfterActivityGeneration,
+		RecoveryGeneration:       state.RecoveryGeneration, BeforeSafetyEpoch: state.BeforeSafetyEpoch,
+		AfterSafetyEpoch: state.AfterSafetyEpoch, RetryPhaseRunID: PhaseRunID{state.RetryPhaseRunID},
+		RetryRuntimeRunID:         RuntimeRunID{state.RetryRuntimeRunID},
+		ReconciliationOperationID: OperationID{state.ReconciliationOperationID},
+		ReconciliationFence:       state.ReconciliationFence,
+		OccurredAt:                parsePostgresStateTime(state.OccurredAt),
+		RecordedAt:                parsePostgresStateTime(state.RecordedAt), SourceClock: state.SourceClock,
+	}
+	for _, evidence := range state.EvidenceRefs {
+		fact.EvidenceRefs = append(fact.EvidenceRefs, EvidenceRef{
+			ID: EvidenceID{evidence.ID}, Kind: evidence.Kind, Digest: evidence.Digest,
+		})
+	}
+	for _, enactment := range state.EnactmentRefs {
+		fact.EnactmentRefs = append(fact.EnactmentRefs, AuditEnactmentBinding{
+			OperationID: OperationID{enactment.OperationID}, Kind: enactment.Kind,
+			PayloadDigest: enactment.PayloadDigest, ActivityGeneration: enactment.ActivityGeneration,
+			FenceKind: enactment.FenceKind, Fence: enactment.Fence,
+			CausationID: CausationID{enactment.CausationID},
+		})
+	}
+	return fact
+}
+
 func postgresTaskProjectionStateFromProjection(projection TaskProjection) postgresTaskProjectionState {
 	return postgresTaskProjectionState{
 		TaskID: projection.TaskID.value, TaskRevision: projection.TaskRevision,
 		ActivityGeneration: projection.ActivityGeneration, Status: projection.Status,
 		Route: projection.Route, Activity: projection.Activity, CurrentPhase: projection.CurrentPhase.value,
-		ActivePhaseRunID:        projection.ActivePhaseRunID.value,
-		LatestArtifactVersionID: projection.LatestArtifactVersionID.value,
-		TaskWorkspaceID:         projection.TaskWorkspaceID.value,
-		LatestRevisionID:        projection.LatestRevisionID.value,
-		LatestCheckpointID:      projection.LatestCheckpointID.value,
-		CancellationState:       projection.CancellationState, SafetyEpoch: projection.SafetyEpoch,
+		ExecutionLockID:                  projection.ExecutionLockID.value,
+		TemplateLockID:                   projection.TemplateLockID.value,
+		ActivePhaseRunID:                 projection.ActivePhaseRunID.value,
+		LatestArtifactVersionID:          projection.LatestArtifactVersionID.value,
+		TaskWorkspaceID:                  projection.TaskWorkspaceID.value,
+		LatestRevisionID:                 projection.LatestRevisionID.value,
+		LatestCheckpointID:               projection.LatestCheckpointID.value,
+		TaskWorkspaceLifecycleGeneration: projection.TaskWorkspaceLifecycleGeneration,
+		TaskWorkspaceLifecycleFence:      projection.TaskWorkspaceLifecycleFence,
+		CancellationState:                projection.CancellationState, SafetyEpoch: projection.SafetyEpoch,
 		OperationalMode: projection.OperationalMode,
 	}
 }
@@ -665,12 +823,16 @@ func (state postgresTaskProjectionState) projection() TaskProjection {
 		TaskID: TaskID{state.TaskID}, TaskRevision: state.TaskRevision,
 		ActivityGeneration: state.ActivityGeneration, Status: state.Status, Route: state.Route,
 		Activity: state.Activity, CurrentPhase: PhaseKey{state.CurrentPhase},
-		ActivePhaseRunID:        PhaseRunID{state.ActivePhaseRunID},
-		LatestArtifactVersionID: ArtifactVersionID{state.LatestArtifactVersionID},
-		TaskWorkspaceID:         TaskWorkspaceID{state.TaskWorkspaceID},
-		LatestRevisionID:        TaskWorkspaceRevisionID{state.LatestRevisionID},
-		LatestCheckpointID:      CheckpointID{state.LatestCheckpointID},
-		CancellationState:       state.CancellationState, SafetyEpoch: state.SafetyEpoch,
+		ExecutionLockID:                  ExecutionLockID{state.ExecutionLockID},
+		TemplateLockID:                   TemplateLockID{state.TemplateLockID},
+		ActivePhaseRunID:                 PhaseRunID{state.ActivePhaseRunID},
+		LatestArtifactVersionID:          ArtifactVersionID{state.LatestArtifactVersionID},
+		TaskWorkspaceID:                  TaskWorkspaceID{state.TaskWorkspaceID},
+		LatestRevisionID:                 TaskWorkspaceRevisionID{state.LatestRevisionID},
+		LatestCheckpointID:               CheckpointID{state.LatestCheckpointID},
+		TaskWorkspaceLifecycleGeneration: state.TaskWorkspaceLifecycleGeneration,
+		TaskWorkspaceLifecycleFence:      state.TaskWorkspaceLifecycleFence,
+		CancellationState:                state.CancellationState, SafetyEpoch: state.SafetyEpoch,
 		OperationalMode: state.OperationalMode,
 	}
 }
@@ -737,6 +899,11 @@ func postgresAggregateStateFromAggregate(aggregate taskAggregate) *postgresAggre
 		ActivePhaseRunID:                aggregate.activePhaseRunID.value,
 		LatestArtifactVersionID:         aggregate.latestArtifactVersionID.value,
 		ActivitySourceArtifactVersionID: aggregate.activitySourceArtifactVersionID.value,
+		ReconstructionRequired:          aggregate.reconstructionRequired,
+		ReconstructionAccepted:          aggregate.reconstructionAccepted,
+		ReconstructionOperationID:       aggregate.reconstructionOperationID.value,
+		LifecycleGeneration:             aggregate.lifecycleGeneration,
+		LifecycleFence:                  aggregate.lifecycleFence,
 	}
 	for _, run := range aggregate.phaseRuns {
 		item := postgresPhaseRunState{
@@ -767,6 +934,11 @@ func (state postgresAggregateState) aggregate() *taskAggregate {
 		activePhaseRunID:                PhaseRunID{state.ActivePhaseRunID},
 		latestArtifactVersionID:         ArtifactVersionID{state.LatestArtifactVersionID},
 		activitySourceArtifactVersionID: ArtifactVersionID{state.ActivitySourceArtifactVersionID},
+		reconstructionRequired:          state.ReconstructionRequired,
+		reconstructionAccepted:          state.ReconstructionAccepted,
+		reconstructionOperationID:       OperationID{state.ReconstructionOperationID},
+		lifecycleGeneration:             state.LifecycleGeneration,
+		lifecycleFence:                  state.LifecycleFence,
 	}
 	for _, item := range state.PhaseRuns {
 		run := phaseRunRecord{
@@ -803,6 +975,15 @@ func postgresPinnedTaskStateFromPinned(pinned PinnedTaskStart) postgresPinnedTas
 			PipelineContract:        postgresPipelineContractStateFromContract(pinned.ExecutionLock.PipelineContract),
 		},
 		TemplateLockID: pinned.TemplateLockID.value,
+		Authorities: postgresDownstreamAuthorityBindingsState{
+			Runtime:   postgresAuthorityStateFromAuthority(pinned.Authorities.Runtime.value),
+			Validator: postgresAuthorityStateFromAuthority(pinned.Authorities.Validator.value),
+			TaskWorkspaceLifecycle: postgresAuthorityStateFromAuthority(
+				pinned.Authorities.TaskWorkspaceLifecycle.value,
+			),
+			Publication: postgresAuthorityStateFromAuthority(pinned.Authorities.Publication.value),
+			Scheduler:   postgresAuthorityStateFromAuthority(pinned.Authorities.Scheduler.value),
+		},
 	}
 }
 
@@ -817,6 +998,15 @@ func (state postgresPinnedTaskState) pinned() PinnedTaskStart {
 			PipelineContract:        state.ExecutionLock.PipelineContract.contract(),
 		},
 		TemplateLockID: TemplateLockID{state.TemplateLockID},
+		Authorities: DownstreamAuthorityBindings{
+			Runtime:   RuntimeAuthority{value: state.Authorities.Runtime.authority()},
+			Validator: ValidatorAuthority{value: state.Authorities.Validator.authority()},
+			TaskWorkspaceLifecycle: TaskWorkspaceLifecycleAuthority{
+				value: state.Authorities.TaskWorkspaceLifecycle.authority(),
+			},
+			Publication: PublicationAuthority{value: state.Authorities.Publication.authority()},
+			Scheduler:   SchedulerAuthority{value: state.Authorities.Scheduler.authority()},
+		},
 	}
 }
 

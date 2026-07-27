@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -33,7 +34,7 @@ func TestExternalAuditAndTelemetryProjectionDeliveryIsAsynchronousAndRebuildable
 	owner := taskorchestration.NewUserAuthority(
 		authorityID(t, "projection-owner"), taskorchestration.AuthorizationGeneration(1),
 	)
-	decision, err := adapter.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	decision, err := adapter.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "projection-start", "projection-task", now), owner,
 	))
 	if err != nil {
@@ -42,7 +43,7 @@ func TestExternalAuditAndTelemetryProjectionDeliveryIsAsynchronousAndRebuildable
 	if decision.AcceptedTaskRevision != 1 || sink.auditCount() != 0 || sink.telemetryCount() != 0 {
 		t.Fatalf("projection delivery ran in protected Decide path: decision=%+v", decision)
 	}
-	if _, err := adapter.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	if _, err := adapter.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "projection-other-start", "projection-other-task", now), owner,
 	)); err != nil {
 		t.Fatalf("commit other Task used to prove scoped backlog: %v", err)
@@ -124,6 +125,52 @@ func TestExternalAuditAndTelemetryProjectionDeliveryIsAsynchronousAndRebuildable
 	}
 }
 
+func TestExternalAuditProjectionCarriesTheExactMandatoryFact(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 22, 12, 0, 0, time.UTC)
+	harness, err := taskorchestration.NewDeterministicHarness(
+		taskorchestration.HarnessConfig{Now: now},
+	)
+	if err != nil {
+		t.Fatalf("create projection harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "exact-audit-projection-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	start, err := harness.Mutations.Decide(context.Background(), minimalPinnedStartIntent(
+		t, intentHeader(t, "exact-audit-projection-start", "exact-audit-projection-task", now), owner,
+	))
+	if err != nil {
+		t.Fatalf("start projection Task: %v", err)
+	}
+	workHeader := intentHeader(
+		t, "exact-audit-projection-work", "exact-audit-projection-task", now.Add(time.Second),
+	)
+	workHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	work, err := harness.Mutations.Decide(context.Background(), minimalWorkIntent(t, workHeader))
+	if err != nil || len(work.MandatoryAuditFactRef.EnactmentRefs) != 1 {
+		t.Fatalf("commit projection work: decision=%+v err=%v", work, err)
+	}
+	sink := &failingDecisionProjectionSink{healthy: true}
+	projector, err := taskorchestration.NewDecisionProjectionAdapter(
+		taskorchestration.DecisionProjectionConfig{ExternalAudit: sink, Telemetry: sink},
+	)
+	if err != nil {
+		t.Fatalf("create projection adapter: %v", err)
+	}
+	if err := projector.ObserveCommittedDecision(context.Background(), work); err != nil {
+		t.Fatalf("project work decision: %v", err)
+	}
+	projection, ok := sink.auditFor(work.MandatoryAuditFactRef.AuditFactID)
+	if !ok || !reflect.DeepEqual(projection.AuthoritativeFact, work.MandatoryAuditFactRef) {
+		t.Fatalf("external audit projection changed mandatory fact: projection=%+v fact=%+v",
+			projection.AuthoritativeFact, work.MandatoryAuditFactRef)
+	}
+	projection.AuthoritativeFact.EnactmentRefs[0].Fence++
+	if reflect.DeepEqual(projection.AuthoritativeFact, work.MandatoryAuditFactRef) {
+		t.Fatal("external audit projection aliases the authoritative Decision fact")
+	}
+}
+
 func TestTelemetryOnlyProjectionRetryPreservesExternalAuditDeliveryTimes(t *testing.T) {
 	now := time.Date(2026, time.July, 27, 22, 18, 0, 0, time.UTC)
 	db, schema := isolatedPostgresSchema(t)
@@ -140,7 +187,7 @@ func TestTelemetryOnlyProjectionRetryPreservesExternalAuditDeliveryTimes(t *test
 	owner := taskorchestration.NewUserAuthority(
 		authorityID(t, "split-projection-owner"), taskorchestration.AuthorizationGeneration(1),
 	)
-	decision, err := adapter.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	decision, err := adapter.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "split-projection-start", "split-projection-task", now), owner,
 	))
 	if err != nil {
@@ -216,7 +263,7 @@ func TestProtectedDiagnosticAccessAuditDeliveryIsRebuildable(t *testing.T) {
 		authorityID(t, "diagnostic-projection-owner"),
 		taskorchestration.AuthorizationGeneration(1),
 	)
-	decision, err := adapter.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	decision, err := adapter.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "diagnostic-projection-start", "diagnostic-projection-task", now), owner,
 	))
 	if err != nil {
@@ -283,7 +330,7 @@ func TestProjectionDeliverySuccessIsMonotonicAcrossConcurrentRebuilds(t *testing
 		authorityID(t, "concurrent-projection-owner"),
 		taskorchestration.AuthorizationGeneration(1),
 	)
-	decision, err := older.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	decision, err := older.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "concurrent-projection-start", "concurrent-projection-task", now), owner,
 	))
 	if err != nil {
@@ -390,7 +437,7 @@ func TestBoundedTelemetryUsesTypedLabelsAndAllowlistedLogsAndTraces(t *testing.T
 		RequiredRuntimeRuns: 1,
 	}})
 	start, err := harness.Mutations.Decide(context.Background(),
-		taskorchestration.NewStartPinnedTaskIntent(
+		verifiedPinnedStartIntent(t,
 			intentHeader(t, "telemetry-start", "telemetry-task", now), owner, pinned,
 		))
 	if err != nil {
@@ -546,7 +593,7 @@ func TestTelemetryDiagnosticSnapshotIsolatesEverySignalToTheAuthorizedTask(t *te
 	for _, value := range []string{"scoped-telemetry-task-a", "scoped-telemetry-task-b"} {
 		decision, decideErr := harness.Mutations.Decide(
 			context.Background(),
-			taskorchestration.NewStartTaskIntent(
+			minimalPinnedStartIntent(t,
 				intentHeader(t, value+"-start", value, now), owner,
 			),
 		)

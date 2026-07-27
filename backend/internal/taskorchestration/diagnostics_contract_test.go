@@ -77,7 +77,7 @@ func runAuthorizedDiagnosticContract(
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "diagnostic-start", "diagnostic-task", now), owner, pinned,
 	))
 	if err != nil {

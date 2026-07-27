@@ -59,6 +59,7 @@ type ExternalAuditProjection struct {
 	ResultLimit             uint32
 	Outcome                 ProjectionOutcome
 	RecordedAt              time.Time
+	AuthoritativeFact       AuditFactRef
 }
 
 // ExternalAuditProjectionDigest returns the canonical delivery identity for a
@@ -81,6 +82,7 @@ func ExternalAuditProjectionDigest(projection ExternalAuditProjection) Projectio
 		ResultLimit             uint32
 		Outcome                 ProjectionOutcome
 		RecordedAt              int64
+		AuthoritativeDigest     AuditFactDigest
 	}{
 		SchemaVersion:           projection.SchemaVersion,
 		FactKind:                projection.FactKind,
@@ -98,6 +100,7 @@ func ExternalAuditProjectionDigest(projection ExternalAuditProjection) Projectio
 		ResultLimit:             projection.ResultLimit,
 		Outcome:                 projection.Outcome,
 		RecordedAt:              projection.RecordedAt.UnixNano(),
+		AuthoritativeDigest:     projection.AuthoritativeFact.CanonicalDigest,
 	})
 	return sha256.Sum256(encoded)
 }
@@ -802,6 +805,11 @@ func (adapter *DecisionProjectionAdapter) ObserveCommittedDecision(
 func decisionProjections(
 	decision TransitionDecision,
 ) (ExternalAuditProjection, DecisionTelemetryProjection) {
+	authoritativeFact := decision.MandatoryAuditFactRef
+	authoritativeFact.EvidenceRefs = append([]EvidenceRef(nil), authoritativeFact.EvidenceRefs...)
+	authoritativeFact.EnactmentRefs = append(
+		[]AuditEnactmentBinding(nil), authoritativeFact.EnactmentRefs...,
+	)
 	audit := ExternalAuditProjection{
 		SchemaVersion:     ProjectionSchemaV1,
 		FactKind:          ExternalAuditDecisionFact,
@@ -812,6 +820,7 @@ func decisionProjections(
 		AcceptedRevision:  decision.AcceptedTaskRevision,
 		Outcome:           ProjectionAccepted,
 		RecordedAt:        decision.CommittedAt,
+		AuthoritativeFact: authoritativeFact,
 	}
 	audit.CanonicalDigest = ExternalAuditProjectionDigest(audit)
 	enactments := make([]TelemetryEnactmentProjection, len(decision.EnactmentRefs))
@@ -840,7 +849,8 @@ func validProjectionDecision(decision TransitionDecision) bool {
 		decision.AcceptedTaskRevision == 0 ||
 		decision.AcceptedTaskRevision != decision.PreviousTaskRevision+1 ||
 		decision.CanonicalRequestDigest == (CanonicalRequestDigest{}) ||
-		decision.CommittedAt.IsZero() || projectionDecisionOutcomeInvalid(decision) {
+		decision.CommittedAt.IsZero() || !validMandatoryAuditFact(decision.MandatoryAuditFactRef, decision) ||
+		projectionDecisionOutcomeInvalid(decision) {
 		return false
 	}
 	for _, enactment := range decision.EnactmentRefs {

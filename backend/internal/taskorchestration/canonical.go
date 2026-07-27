@@ -143,6 +143,14 @@ func evidenceFacts(intent TransitionIntent) (acceptedEvidenceFacts, bool, error)
 			evidence:     payload.binding.Evidence,
 			expectedKind: EvidenceTaskWorkspaceLifecycle,
 		}, true, nil
+	case IntentAcceptTaskWorkspaceReconstructionEvidence:
+		payload, ok := typed.payload.(taskWorkspaceReconstructionEvidencePayload)
+		if !ok {
+			return acceptedEvidenceFacts{}, false, invalidIntentError()
+		}
+		return acceptedEvidenceFacts{
+			evidence: payload.binding.Evidence, expectedKind: EvidenceTaskWorkspaceLifecycle,
+		}, true, nil
 	case IntentAcceptPublicationEvidence:
 		payload, ok := typed.payload.(publicationEvidencePayload)
 		if !ok {
@@ -198,6 +206,10 @@ func intentKindName(kind IntentKind) string {
 		return "reconcile_enactment"
 	case IntentApplyOperationalFence:
 		return "apply_operational_fence"
+	case IntentRetryRuntimeRun:
+		return "retry_runtime_run"
+	case IntentAcceptTaskWorkspaceReconstructionEvidence:
+		return "accept_task_workspace_reconstruction_evidence"
 	default:
 		return ""
 	}
@@ -227,13 +239,13 @@ func authorityAllowed(kind IntentKind, authority AuthorityKind) bool {
 		return authority == AuthorityUser
 	case IntentCancelTask:
 		return authority == AuthorityUser || authority == AuthorityAdministrator
-	case IntentMakeWorkAvailable, IntentReconcileEnactment:
+	case IntentMakeWorkAvailable, IntentReconcileEnactment, IntentRetryRuntimeRun:
 		return authority == AuthorityWorker
 	case IntentAcceptRuntimeEvidence:
 		return authority == AuthorityRuntime
 	case IntentAcceptPhaseValidationEvidence:
 		return authority == AuthorityValidator
-	case IntentAcceptTaskWorkspaceLifecycleEvidence:
+	case IntentAcceptTaskWorkspaceLifecycleEvidence, IntentAcceptTaskWorkspaceReconstructionEvidence:
 		return authority == AuthorityTaskWorkspaceLifecycle
 	case IntentAcceptPublicationEvidence:
 		return authority == AuthorityPublication

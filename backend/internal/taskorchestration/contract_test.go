@@ -11,6 +11,17 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/taskorchestration"
 )
 
+func TestTaskOrchestrationPublicMutationSeamIsOnlyDecide(t *testing.T) {
+	mutation := reflect.TypeOf((*taskorchestration.TaskOrchestration)(nil)).Elem()
+	if mutation.NumMethod() != 1 || mutation.Method(0).Name != "Decide" {
+		t.Fatalf("Task Orchestration gained another public mutation operation: %v", mutation)
+	}
+	query := reflect.TypeOf((*taskorchestration.TaskOrchestrationQuery)(nil)).Elem()
+	if query.NumMethod() != 1 || query.Method(0).Name != "Query" {
+		t.Fatalf("Task Orchestration query seam is not independently read-only: %v", query)
+	}
+}
+
 func TestDecideCommitsThroughTheTaskOrchestrationSeam(t *testing.T) {
 	startedAt := time.Date(2026, time.July, 26, 9, 30, 0, 0, time.UTC)
 	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{
@@ -20,16 +31,16 @@ func TestDecideCommitsThroughTheTaskOrchestrationSeam(t *testing.T) {
 		t.Fatalf("create deterministic harness: %v", err)
 	}
 
-	intent := taskorchestration.NewStartTaskIntent(
+	intent := minimalPinnedStartIntent(t,
 		intentHeader(t, "decision-request-1", "task-1", startedAt),
 		taskorchestration.NewUserAuthority(
 			authorityID(t, "user-authority-1"),
 			taskorchestration.AuthorizationGeneration(1),
 		),
 	)
-	const canonicalGolden = "9bf9ff50d13eb1d1e1a5587bb8e983454c0866616b973e02599da68b1509d5d0"
+	const canonicalGolden = "726c9c7dbbccfa56a86f1e767c01bf95fe4f6986d3c7606f8fce0d3d77d1680e"
 	if intent.Header().CanonicalRequestDigest.String() != canonicalGolden {
-		t.Fatal("intent header does not carry the schema-v1 canonical golden digest")
+		t.Fatalf("intent canonical digest = %s, want schema-v1 golden %s", intent.Header().CanonicalRequestDigest.String(), canonicalGolden)
 	}
 	decision, err := harness.Mutations.Decide(context.Background(), intent)
 	if err != nil {
@@ -54,17 +65,19 @@ func TestDecideCommitsThroughTheTaskOrchestrationSeam(t *testing.T) {
 	}
 	if decision.TaskProjection.TaskID != intent.Header().TaskID ||
 		decision.TaskProjection.TaskRevision != decision.AcceptedTaskRevision ||
-		decision.TaskProjection.ActivityGeneration != 1 {
-		t.Fatal("decision omitted its committed TO-01 Task projection")
+		decision.TaskProjection.ActivityGeneration != 1 ||
+		decision.TaskProjection.ExecutionLockID.String() == "" ||
+		decision.TaskProjection.TemplateLockID.String() == "" {
+		t.Fatal("decision omitted its committed pinned Task projection")
 	}
 	if decision.CommittedAt != startedAt {
 		t.Fatalf("commit time = %s, want controlled time", decision.CommittedAt)
 	}
 	if len(decision.EnactmentRefs) != 0 {
-		t.Fatal("TO-01 shell created an enactment")
+		t.Fatal("pinned Start created work before availability")
 	}
 	if len(decision.AffectedPhaseRuns) != 0 || len(decision.AcceptedEvidenceRefs) != 0 {
-		t.Fatal("start shell invented Phase Run or evidence changes")
+		t.Fatal("pinned Start invented Phase Run or evidence changes")
 	}
 	if decision.MandatoryAuditFactRef.AuditFactID.String() != "audit-fact-000001" {
 		t.Fatal("decision omitted its deterministic mandatory audit fact")
@@ -75,7 +88,7 @@ func TestDecideFailsClosedForUnknownSchemaMajor(t *testing.T) {
 	now := time.Date(2026, time.July, 26, 10, 30, 0, 0, time.UTC)
 	header := intentHeader(t, "decision-request-unknown", "task-unknown", now)
 	header.SchemaVersion = taskorchestration.NewSchemaVersion(2, 0)
-	intent := taskorchestration.NewStartTaskIntent(
+	intent := minimalPinnedStartIntent(t,
 		header,
 		taskorchestration.NewUserAuthority(
 			authorityID(t, "user-authority-unknown"),
@@ -178,7 +191,7 @@ func TestClosedIntentFamiliesCarryExactlyOneTypedAuthority(t *testing.T) {
 		intent    taskorchestration.TransitionIntent
 	}{
 		{"start", taskorchestration.IntentStartTask, taskorchestration.AuthorityUser,
-			taskorchestration.NewStartTaskIntent(header("request-start"), user)},
+			minimalPinnedStartIntent(t, header("request-start"), user)},
 		{"work available", taskorchestration.IntentMakeWorkAvailable, taskorchestration.AuthorityWorker,
 			taskorchestration.NewMakeWorkAvailableIntent(header("request-work"), worker, operationID)},
 		{"confirmation", taskorchestration.IntentSubmitConfirmationGate, taskorchestration.AuthorityUser,
@@ -219,7 +232,8 @@ func TestClosedIntentFamiliesCarryExactlyOneTypedAuthority(t *testing.T) {
 				taskorchestration.TaskWorkspaceLifecycleEvidenceBinding{
 					Evidence: taskWorkspaceLifecycleEvidence, PhaseRunID: phaseRunID, OperationID: operationID,
 					PhaseRunGeneration: 1, PhaseRunFence: 1,
-					Generation: 1, Fence: 1, SafetyEpoch: 1,
+					Generation: 1, Fence: 1, ObservedGeneration: 1, ObservedFence: 2,
+					SafetyEpoch:  1,
 					Outcome:      taskorchestration.LifecycleEvidenceCommitted,
 					RevisionID:   taskWorkspaceRevisionID(t, "workspace-revision-contract"),
 					CheckpointID: checkpointID(t, "checkpoint-contract"),
@@ -387,7 +401,7 @@ func TestQueryDeniesMissingAndForeignTasksWithoutDisclosingExistence(t *testing.
 		t.Fatalf("missing Task query error = %T, want safe authorization denial", missingErr)
 	}
 
-	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	_, err = harness.Mutations.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "request-query-owner", "task-query-scope", now),
 		owner,
 	))
@@ -427,7 +441,7 @@ func TestUserMutationDeniesMissingAndForeignTasksBeforeRevisionChecks(t *testing
 	foreign := taskorchestration.NewUserAuthority(
 		authorityID(t, "user-authority-mutation-foreign"), taskorchestration.AuthorizationGeneration(1),
 	)
-	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	_, err = harness.Mutations.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "request-mutation-owner", "task-mutation-owned", now),
 		owner,
 	))
@@ -492,7 +506,7 @@ func TestQueryIsReadOnlyAndDoesNotAllocateMutationFacts(t *testing.T) {
 		}
 	}
 
-	first := taskorchestration.NewStartTaskIntent(
+	first := minimalPinnedStartIntent(t,
 		intentHeader(t, "request-query-1", "task-query-1", now),
 		taskorchestration.NewUserAuthority(
 			authorityID(t, "user-authority-query"), taskorchestration.AuthorizationGeneration(1),
@@ -516,12 +530,7 @@ func TestQueryIsReadOnlyAndDoesNotAllocateMutationFacts(t *testing.T) {
 
 	secondHeader := intentHeader(t, "request-query-2", "task-query-1", now.Add(time.Second))
 	secondHeader.ExpectedTaskRevision = 1
-	second := taskorchestration.NewStartTaskIntent(
-		secondHeader,
-		taskorchestration.NewUserAuthority(
-			authorityID(t, "user-authority-query"), taskorchestration.AuthorizationGeneration(1),
-		),
-	)
+	second := minimalWorkIntent(t, secondHeader)
 	secondDecision, err := harness.Mutations.Decide(context.Background(), second)
 	if err != nil {
 		t.Fatalf("decide after committed query: %v", err)
@@ -537,7 +546,7 @@ func TestHarnessRestartsWithDurableStateClockAndIDSequence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create deterministic harness: %v", err)
 	}
-	first := taskorchestration.NewStartTaskIntent(
+	first := minimalPinnedStartIntent(t,
 		intentHeader(t, "request-restart-1", "task-restart-1", now),
 		taskorchestration.NewUserAuthority(
 			authorityID(t, "user-authority-restart"), taskorchestration.AuthorizationGeneration(1),
@@ -564,12 +573,7 @@ func TestHarnessRestartsWithDurableStateClockAndIDSequence(t *testing.T) {
 	}
 	secondHeader := intentHeader(t, "request-restart-2", "task-restart-1", now.Add(time.Minute))
 	secondHeader.ExpectedTaskRevision = 1
-	second := taskorchestration.NewStartTaskIntent(
-		secondHeader,
-		taskorchestration.NewUserAuthority(
-			authorityID(t, "user-authority-restart"), taskorchestration.AuthorizationGeneration(1),
-		),
-	)
+	second := minimalWorkIntent(t, secondHeader)
 	secondDecision, err := restarted.Mutations.Decide(context.Background(), second)
 	if err != nil {
 		t.Fatalf("decide after restart: %v", err)
@@ -597,7 +601,7 @@ func TestHarnessAcceptsDeterministicIdentityStarts(t *testing.T) {
 	authority := taskorchestration.NewUserAuthority(
 		authorityID(t, "user-authority-custom-identities"), taskorchestration.AuthorizationGeneration(1),
 	)
-	first, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	first, err := harness.Mutations.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "request-custom-identities-1", "task-custom-identities", now),
 		authority,
 	))
@@ -613,7 +617,7 @@ func TestHarnessAcceptsDeterministicIdentityStarts(t *testing.T) {
 	header.ExpectedTaskRevision = 1
 	second, err := harness.Restart().Mutations.Decide(
 		context.Background(),
-		taskorchestration.NewStartTaskIntent(header, authority),
+		minimalWorkIntent(t, header),
 	)
 	if err != nil {
 		t.Fatalf("decide after restart with custom deterministic identities: %v", err)
@@ -631,7 +635,7 @@ func TestHarnessCanLoseAResponseAfterCommit(t *testing.T) {
 		t.Fatalf("create deterministic harness: %v", err)
 	}
 	harness.LoseNextResponse()
-	intent := taskorchestration.NewStartTaskIntent(
+	intent := minimalPinnedStartIntent(t,
 		intentHeader(t, "request-response-loss", "task-response-loss", now),
 		taskorchestration.NewUserAuthority(
 			authorityID(t, "user-authority-response"), taskorchestration.AuthorizationGeneration(1),
@@ -660,12 +664,7 @@ func TestHarnessCanLoseAResponseAfterCommit(t *testing.T) {
 	restarted := harness.Restart()
 	secondHeader := intentHeader(t, "request-response-next", "task-response-loss", now.Add(time.Second))
 	secondHeader.ExpectedTaskRevision = 1
-	second, err := restarted.Mutations.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
-		secondHeader,
-		taskorchestration.NewUserAuthority(
-			authorityID(t, "user-authority-response"), taskorchestration.AuthorizationGeneration(1),
-		),
-	))
+	second, err := restarted.Mutations.Decide(context.Background(), minimalWorkIntent(t, secondHeader))
 	if err != nil {
 		t.Fatalf("decide after response-loss restart: %v", err)
 	}
@@ -695,7 +694,7 @@ func TestHarnessCrashBoundariesRespectCommitLinearization(t *testing.T) {
 			if err := harness.CrashNextAt(test.boundary); err != nil {
 				t.Fatalf("configure crash boundary: %v", err)
 			}
-			intent := taskorchestration.NewStartTaskIntent(
+			intent := minimalPinnedStartIntent(t,
 				intentHeader(t, "request-crash", "task-crash", now),
 				taskorchestration.NewUserAuthority(
 					authorityID(t, "user-authority-crash"), taskorchestration.AuthorizationGeneration(1),
@@ -763,7 +762,7 @@ func TestHarnessFaultHooksPreserveTheCommitBoundary(t *testing.T) {
 			if err := harness.FailNextAt(test.point); err != nil {
 				t.Fatalf("configure fault hook: %v", err)
 			}
-			intent := taskorchestration.NewStartTaskIntent(
+			intent := minimalPinnedStartIntent(t,
 				intentHeader(t, "request-fault", "task-fault", now),
 				taskorchestration.NewUserAuthority(
 					authorityID(t, "user-authority-fault"), taskorchestration.AuthorizationGeneration(1),
