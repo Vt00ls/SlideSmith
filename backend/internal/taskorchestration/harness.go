@@ -149,6 +149,7 @@ func (point FaultPoint) String() string {
 type DeterministicHarness struct {
 	Mutations   TaskOrchestration
 	Queries     TaskOrchestrationQuery
+	Diagnostics OperationalDiagnostics
 	persistence *memoryPersistence
 	clock       *controlledClock
 	controls    *harnessControls
@@ -211,6 +212,7 @@ func newHarness(
 	return &DeterministicHarness{
 		Mutations:   engine,
 		Queries:     engine,
+		Diagnostics: &diagnosticEngine{persistence: persistence},
 		persistence: persistence,
 		clock:       clock,
 		controls:    controls,
