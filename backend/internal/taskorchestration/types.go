@@ -494,6 +494,7 @@ const (
 	EvidenceTaskWorkspaceLifecycle
 	EvidencePublication
 	EvidenceScheduling
+	EvidenceUsageAccounting
 )
 
 type EvidenceRef struct {
