@@ -394,14 +394,24 @@ type DeterministicTelemetryConfig struct {
 	DiagnosticAuditFaults *DiagnosticAuditFaultController
 }
 
+type taskScopedMetricSample struct {
+	taskID TaskID
+	sample MetricSample
+}
+
+type taskScopedStructuredLogRecord struct {
+	taskID TaskID
+	record StructuredLogRecord
+}
+
 // DeterministicTelemetry is a vendor-neutral, restart-free contract adapter.
 // It stores typed projections for tests and local diagnostics only.
 type DeterministicTelemetry struct {
 	mu                          sync.Mutex
 	decisions                   map[DecisionID]DecisionTelemetryProjection
 	reconciliations             map[OperationID]ReconciliationTelemetryProjection
-	metrics                     []MetricSample
-	logs                        []StructuredLogRecord
+	metrics                     []taskScopedMetricSample
+	logs                        []taskScopedStructuredLogRecord
 	traces                      []TraceSpanRecord
 	diagnosticAudits            map[AuditFactID]DiagnosticAuditFactRef
 	nextDiagnosticAuditSequence uint64
@@ -432,7 +442,7 @@ func (telemetry *DeterministicTelemetry) ProjectTelemetry(
 		return &ProjectionError{code: ProjectionInvalidFact}
 	}
 	if !validDecisionTelemetryProjection(projection) {
-		telemetry.recordMetricRejection(TelemetryDecision)
+		telemetry.recordMetricRejection(projection.TaskID, TelemetryDecision)
 		return &ProjectionError{code: ProjectionInvalidFact}
 	}
 	projection.Enactments = append([]TelemetryEnactmentProjection(nil), projection.Enactments...)
@@ -445,18 +455,21 @@ func (telemetry *DeterministicTelemetry) ProjectTelemetry(
 		return &ProjectionError{code: ProjectionInvalidFact}
 	}
 	telemetry.decisions[projection.DecisionID] = projection
-	telemetry.appendMetricLocked(MetricSample{
+	telemetry.appendMetricLocked(projection.TaskID, MetricSample{
 		Name: MetricDecisionCount,
 		Labels: MetricLabels{
 			Outcome: TelemetryAccepted, Kind: TelemetryDecision, Category: TelemetryCategoryNone,
 		},
 		Count: 1,
 	})
-	telemetry.logs = append(telemetry.logs, StructuredLogRecord{
-		SchemaVersion: StructuredLogSchemaV1, Severity: StructuredLogInfo,
-		Module: TelemetryModuleTaskOrchestration,
-		Event:  StructuredLogDecisionCommitted, Outcome: TelemetryAccepted,
-		Kind: TelemetryDecision, Category: TelemetryCategoryNone, RecordedAt: projection.RecordedAt,
+	telemetry.logs = append(telemetry.logs, taskScopedStructuredLogRecord{
+		taskID: projection.TaskID,
+		record: StructuredLogRecord{
+			SchemaVersion: StructuredLogSchemaV1, Severity: StructuredLogInfo,
+			Module: TelemetryModuleTaskOrchestration,
+			Event:  StructuredLogDecisionCommitted, Outcome: TelemetryAccepted,
+			Kind: TelemetryDecision, Category: TelemetryCategoryNone, RecordedAt: projection.RecordedAt,
+		},
 	})
 	telemetry.traces = append(telemetry.traces, TraceSpanRecord{
 		Module: TelemetryModuleTaskOrchestration,
@@ -468,18 +481,21 @@ func (telemetry *DeterministicTelemetry) ProjectTelemetry(
 	})
 	for _, enactment := range projection.Enactments {
 		kind := telemetryKindForEnactment(enactment.Kind)
-		telemetry.appendMetricLocked(MetricSample{
+		telemetry.appendMetricLocked(projection.TaskID, MetricSample{
 			Name: MetricOutboxCount,
 			Labels: MetricLabels{
 				Outcome: TelemetryAccepted, Kind: kind, Category: TelemetryCategoryNone,
 			},
 			Count: 1,
 		})
-		telemetry.logs = append(telemetry.logs, StructuredLogRecord{
-			SchemaVersion: StructuredLogSchemaV1, Severity: StructuredLogInfo,
-			Module: TelemetryModuleTaskOrchestration,
-			Event:  StructuredLogOutboxCommitted, Outcome: TelemetryAccepted,
-			Kind: kind, Category: TelemetryCategoryNone, RecordedAt: projection.RecordedAt,
+		telemetry.logs = append(telemetry.logs, taskScopedStructuredLogRecord{
+			taskID: projection.TaskID,
+			record: StructuredLogRecord{
+				SchemaVersion: StructuredLogSchemaV1, Severity: StructuredLogInfo,
+				Module: TelemetryModuleTaskOrchestration,
+				Event:  StructuredLogOutboxCommitted, Outcome: TelemetryAccepted,
+				Kind: kind, Category: TelemetryCategoryNone, RecordedAt: projection.RecordedAt,
+			},
 		})
 		telemetry.traces = append(telemetry.traces, TraceSpanRecord{
 			Module: TelemetryModuleTaskOrchestration,
@@ -501,7 +517,7 @@ func (telemetry *DeterministicTelemetry) ProjectReconciliation(
 		return &ProjectionError{code: ProjectionInvalidFact}
 	}
 	if !validReconciliationTelemetryProjection(projection) {
-		telemetry.recordMetricRejection(TelemetryReconciliation)
+		telemetry.recordMetricRejection(projection.TaskID, TelemetryReconciliation)
 		return &ProjectionError{code: ProjectionInvalidFact}
 	}
 	telemetry.mu.Lock()
@@ -518,15 +534,18 @@ func (telemetry *DeterministicTelemetry) ProjectReconciliation(
 		Kind:     TelemetryReconciliation,
 		Category: projection.Category,
 	}
-	telemetry.appendMetricLocked(MetricSample{
+	telemetry.appendMetricLocked(projection.TaskID, MetricSample{
 		Name: MetricReconciliationCount, Labels: labels, Count: 1,
 	})
-	telemetry.logs = append(telemetry.logs, StructuredLogRecord{
-		SchemaVersion: StructuredLogSchemaV1, Severity: StructuredLogWarning,
-		Module:  TelemetryModuleTaskOrchestration,
-		Event:   StructuredLogReconciliationObserved,
-		Outcome: projection.Outcome, Kind: labels.Kind, Category: projection.Category,
-		RecordedAt: projection.ObservedAt,
+	telemetry.logs = append(telemetry.logs, taskScopedStructuredLogRecord{
+		taskID: projection.TaskID,
+		record: StructuredLogRecord{
+			SchemaVersion: StructuredLogSchemaV1, Severity: StructuredLogWarning,
+			Module:  TelemetryModuleTaskOrchestration,
+			Event:   StructuredLogReconciliationObserved,
+			Outcome: projection.Outcome, Kind: labels.Kind, Category: projection.Category,
+			RecordedAt: projection.ObservedAt,
+		},
 	})
 	telemetry.traces = append(telemetry.traces, TraceSpanRecord{
 		Module:  TelemetryModuleTaskOrchestration,
@@ -539,22 +558,31 @@ func (telemetry *DeterministicTelemetry) ProjectReconciliation(
 	return nil
 }
 
-func (telemetry *DeterministicTelemetry) appendMetricLocked(sample MetricSample) {
+func (telemetry *DeterministicTelemetry) appendMetricLocked(taskID TaskID, sample MetricSample) {
 	if RegisteredMetricSample(sample) {
-		telemetry.metrics = append(telemetry.metrics, sample)
+		telemetry.metrics = append(telemetry.metrics, taskScopedMetricSample{
+			taskID: taskID,
+			sample: sample,
+		})
 		return
 	}
 	kind := sample.Labels.Kind
 	if !containsTelemetryKind(registeredTelemetryKinds(), kind) {
 		kind = TelemetryDecision
 	}
-	telemetry.metrics = append(telemetry.metrics, metricRejectionSample(kind))
+	telemetry.metrics = append(telemetry.metrics, taskScopedMetricSample{
+		taskID: taskID,
+		sample: metricRejectionSample(kind),
+	})
 }
 
-func (telemetry *DeterministicTelemetry) recordMetricRejection(kind TelemetryKind) {
+func (telemetry *DeterministicTelemetry) recordMetricRejection(taskID TaskID, kind TelemetryKind) {
 	telemetry.mu.Lock()
 	defer telemetry.mu.Unlock()
-	telemetry.metrics = append(telemetry.metrics, metricRejectionSample(kind))
+	telemetry.metrics = append(telemetry.metrics, taskScopedMetricSample{
+		taskID: taskID,
+		sample: metricRejectionSample(kind),
+	})
 }
 
 func metricRejectionSample(kind TelemetryKind) MetricSample {
@@ -594,8 +622,26 @@ func (telemetry *DeterministicTelemetry) Snapshot(
 	telemetry.nextDiagnosticAuditSequence++
 	telemetry.diagnosticAudits[auditRef.AuditFactID] = auditRef
 	limit := int(query.limit)
-	metrics := append([]MetricSample(nil), telemetry.metrics[:min(limit, len(telemetry.metrics))]...)
-	logs := append([]StructuredLogRecord(nil), telemetry.logs[:min(limit, len(telemetry.logs))]...)
+	metrics := make([]MetricSample, 0, min(limit, len(telemetry.metrics)))
+	for _, observation := range telemetry.metrics {
+		if observation.taskID != query.taskID {
+			continue
+		}
+		metrics = append(metrics, observation.sample)
+		if len(metrics) == limit {
+			break
+		}
+	}
+	logs := make([]StructuredLogRecord, 0, min(limit, len(telemetry.logs)))
+	for _, observation := range telemetry.logs {
+		if observation.taskID != query.taskID {
+			continue
+		}
+		logs = append(logs, observation.record)
+		if len(logs) == limit {
+			break
+		}
+	}
 	traces := make([]TraceSpanRecord, 0, min(limit, len(telemetry.traces)))
 	for _, trace := range telemetry.traces {
 		if trace.TaskID != query.taskID {

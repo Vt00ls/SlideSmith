@@ -515,6 +515,73 @@ func TestBoundedTelemetryUsesTypedLabelsAndAllowlistedLogsAndTraces(t *testing.T
 	}
 }
 
+func TestTelemetryDiagnosticSnapshotIsolatesEverySignalToTheAuthorizedTask(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 22, 45, 0, 0, time.UTC)
+	telemetry := taskorchestration.NewDeterministicTelemetry(
+		taskorchestration.DeterministicTelemetryConfig{Now: func() time.Time { return now }},
+	)
+	projector, err := taskorchestration.NewDecisionProjectionAdapter(
+		taskorchestration.DecisionProjectionConfig{
+			ExternalAudit: taskorchestration.ExternalAuditProjectionSinkFunc(func(
+				context.Context,
+				taskorchestration.ExternalAuditProjection,
+			) error {
+				return nil
+			}),
+			Telemetry: telemetry,
+		},
+	)
+	if err != nil {
+		t.Fatalf("create Task-scoped telemetry projector: %v", err)
+	}
+	harness, err := taskorchestration.NewDeterministicHarness(
+		taskorchestration.HarnessConfig{Now: now},
+	)
+	if err != nil {
+		t.Fatalf("create Task-scoped telemetry harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "scoped-telemetry-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	for _, value := range []string{"scoped-telemetry-task-a", "scoped-telemetry-task-b"} {
+		decision, decideErr := harness.Mutations.Decide(
+			context.Background(),
+			taskorchestration.NewStartTaskIntent(
+				intentHeader(t, value+"-start", value, now), owner,
+			),
+		)
+		if decideErr != nil {
+			t.Fatalf("commit %s: %v", value, decideErr)
+		}
+		if projectErr := projector.ObserveCommittedDecision(context.Background(), decision); projectErr != nil {
+			t.Fatalf("project %s: %v", value, projectErr)
+		}
+	}
+	administrator := taskorchestration.NewAdministratorMetadataAuthority(
+		authorityID(t, "scoped-telemetry-administrator"),
+		taskorchestration.AuthorizationGeneration(1),
+		taskorchestration.DiagnosticReasonOperations,
+	)
+	snapshot, err := telemetry.Snapshot(
+		context.Background(),
+		taskorchestration.NewTelemetryDiagnosticQuery(
+			administrator, taskID(t, "scoped-telemetry-task-a"), 10,
+		),
+	)
+	if err != nil {
+		t.Fatalf("inspect Task-scoped telemetry: %v", err)
+	}
+	if len(snapshot.Metrics) != 1 || len(snapshot.Logs) != 1 || len(snapshot.Traces) != 1 {
+		t.Fatalf("Task diagnostic included another Task's signals: %+v", snapshot)
+	}
+	if snapshot.Metrics[0].Name != taskorchestration.MetricDecisionCount ||
+		snapshot.Metrics[0].Labels.Kind != taskorchestration.TelemetryDecision ||
+		snapshot.Logs[0].Event != taskorchestration.StructuredLogDecisionCommitted ||
+		snapshot.Traces[0].TaskID != taskID(t, "scoped-telemetry-task-a") {
+		t.Fatalf("Task diagnostic returned the wrong scoped signals: %+v", snapshot)
+	}
+}
+
 type failingDecisionProjectionSink struct {
 	mu         sync.Mutex
 	audits     uint64
