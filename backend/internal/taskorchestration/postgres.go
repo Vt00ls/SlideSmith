@@ -270,6 +270,7 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 	diagnostics := adapter.table("task_orchestration_evidence_diagnostics")
 	audit := adapter.table("task_orchestration_mandatory_audit_facts")
 	outbox := adapter.table("task_orchestration_outbox")
+	delivery := adapter.table("task_orchestration_outbox_delivery")
 	phaseRuns := adapter.table("task_orchestration_phase_runs")
 	runtimeRuns := adapter.table("task_orchestration_runtime_runs")
 	recovery := adapter.table("task_orchestration_recovery_state")
@@ -353,12 +354,33 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 			kind smallint NOT NULL,
 			payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
 			activity_generation bigint NOT NULL,
+			safety_epoch bigint NOT NULL CHECK (safety_epoch > 0),
 			fence_kind smallint NOT NULL,
 			fence bigint NOT NULL,
 			causation_id text NOT NULL,
 			prerequisite_bindings jsonb NOT NULL,
 			committed_at timestamptz NOT NULL
 		)`, outbox, decisions),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS safety_epoch bigint NOT NULL DEFAULT 1 CHECK (safety_epoch > 0)", outbox),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			disposition smallint NOT NULL,
+			lease_authority_kind smallint NOT NULL DEFAULT 0,
+			lease_authority_id text NOT NULL DEFAULT '',
+			lease_authority_generation bigint NOT NULL DEFAULT 0,
+			lease_authority_reason smallint NOT NULL DEFAULT 0,
+			lease_fence bigint NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+			lease_expires_at timestamptz,
+			delivery_count bigint NOT NULL DEFAULT 0 CHECK (delivery_count >= 0),
+			terminal boolean NOT NULL DEFAULT FALSE,
+			result_digest bytea CHECK (result_digest IS NULL OR octet_length(result_digest) = 32),
+			retry_at timestamptz,
+			deferral_reason smallint NOT NULL DEFAULT 0,
+			reconcile_fence bigint NOT NULL DEFAULT 0 CHECK (reconcile_fence >= 0),
+			updated_at timestamptz NOT NULL
+		)`, delivery, outbox),
+		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS task_orchestration_outbox_delivery_claimable
+			ON %s (terminal, disposition, retry_at, lease_expires_at, operation_id)`, delivery),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			task_id text NOT NULL,
 			phase_run_id text NOT NULL,
@@ -466,7 +488,10 @@ func (adapter *PostgresAdapter) Decide(
 	}
 	persistence := &memoryPersistence{
 		tasks: make(map[TaskID]taskRecord), decisions: make(map[decisionRequestScope]committedDecision),
-		acceptedEvidence: make(map[evidenceScope]committedEvidence), ids: ids, recovery: recovery,
+		acceptedEvidence: make(map[evidenceScope]committedEvidence),
+		outbox:           make(map[OperationID]authoritativeOutboxRecord),
+		deliveries:       make(map[OperationID]memoryDeliveryState),
+		ids:              ids, recovery: recovery,
 	}
 	if taskExists {
 		persistence.tasks[header.TaskID] = record
@@ -746,13 +771,13 @@ func (adapter *PostgresAdapter) insertOutbox(
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
 		operation_id, decision_id, task_id, phase_run_id, runtime_run_id, kind,
 		payload_digest, activity_generation, fence_kind, fence, causation_id,
-		prerequisite_bindings, committed_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13)
+		safety_epoch, prerequisite_bindings, committed_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
 	ON CONFLICT (operation_id) DO NOTHING`, adapter.table("task_orchestration_outbox")),
 		enactment.OperationID.value, decision.DecisionID.value, decision.TaskProjection.TaskID.value,
 		phaseRunID.value, runtimeRunID.value, enactment.Kind, enactment.PayloadDigest[:],
 		enactment.ActivityGeneration, fenceKind, fence, enactment.CausationID.value,
-		prerequisites, decision.CommittedAt,
+		decision.TaskProjection.SafetyEpoch, prerequisites, decision.CommittedAt,
 	)
 	if err != nil {
 		return false, SchedulerEnqueueFact{}, newError(ErrorDependencyUnavailable)
@@ -780,20 +805,21 @@ func (adapter *PostgresAdapter) validateExistingOutboxBinding(
 	var kind EnactmentKind
 	var payloadDigest, prerequisites, decisionState []byte
 	var activityGeneration ActivityGeneration
+	var safetyEpoch SafetyEpoch
 	var fenceKind EnactmentFenceKind
 	var fence uint64
 	var committedAt time.Time
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT outbox.decision_id, outbox.task_id,
 		outbox.phase_run_id, outbox.runtime_run_id, outbox.kind, outbox.payload_digest,
 		outbox.activity_generation, outbox.fence_kind, outbox.fence, outbox.causation_id,
-		outbox.prerequisite_bindings, outbox.committed_at, decision.decision_state
+		outbox.safety_epoch, outbox.prerequisite_bindings, outbox.committed_at, decision.decision_state
 		FROM %s AS outbox
 		JOIN %s AS decision ON decision.decision_id=outbox.decision_id
 		WHERE outbox.operation_id=$1`, adapter.table("task_orchestration_outbox"),
 		adapter.table("task_orchestration_decisions")), enactment.OperationID.value,
 	).Scan(&decisionID, &taskID, &phaseRunID, &runtimeRunID, &kind, &payloadDigest,
-		&activityGeneration, &fenceKind, &fence, &causationID, &prerequisites,
-		&committedAt, &decisionState)
+		&activityGeneration, &fenceKind, &fence, &causationID, &safetyEpoch,
+		&prerequisites, &committedAt, &decisionState)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return newPersistenceError(PersistenceStateCorrupt)
@@ -817,6 +843,7 @@ func (adapter *PostgresAdapter) validateExistingOutboxBinding(
 	originalDecision := persistedDecision.decision()
 	if !validPersistedDecision(originalDecision) || originalDecision.DecisionID.value != decisionID ||
 		originalDecision.TaskProjection.TaskID.value != taskID ||
+		safetyEpoch != originalDecision.TaskProjection.SafetyEpoch ||
 		!committedAt.Equal(originalDecision.CommittedAt.Truncate(time.Microsecond)) {
 		return newPersistenceError(PersistenceStateCorrupt)
 	}
