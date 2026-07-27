@@ -52,11 +52,14 @@ type TaskWorkspaceLifecycleAdapterEvidence struct {
 	ActivityGeneration ActivityGeneration
 	Generation         TaskWorkspaceLifecycleGeneration
 	Fence              TaskWorkspaceLifecycleFence
+	ObservedGeneration TaskWorkspaceLifecycleGeneration
+	ObservedFence      TaskWorkspaceLifecycleFence
 	SafetyEpoch        SafetyEpoch
 	Outcome            LifecycleEvidenceOutcome
 	RevisionID         TaskWorkspaceRevisionID
 	CheckpointID       CheckpointID
 	CommitProofDigest  EvidenceDigest
+	FenceProofDigest   EvidenceDigest
 	Prerequisites      []EvidencePrerequisite
 }
 
@@ -65,8 +68,11 @@ func (evidence TaskWorkspaceLifecycleAdapterEvidence) Intent(header IntentHeader
 		evidence.SchemaVersion.Major() != EvidenceSchemaV1.Major() ||
 		!validEvidenceRef(evidence.Evidence) || evidence.Evidence.Kind != EvidenceTaskWorkspaceLifecycle ||
 		!validOpaqueID(evidence.Producer.AuthorityID.String()) || evidence.Producer.Generation == 0 ||
-		(evidence.Outcome == LifecycleEvidenceCommitted && evidence.CommitProofDigest == (EvidenceDigest{})) ||
-		(evidence.Outcome == LifecycleEvidenceFenced && evidence.CommitProofDigest != (EvidenceDigest{})) {
+		evidence.ObservedGeneration == 0 || evidence.ObservedFence <= evidence.Fence ||
+		(evidence.Outcome == LifecycleEvidenceCommitted &&
+			(evidence.CommitProofDigest == (EvidenceDigest{}) || evidence.FenceProofDigest != (EvidenceDigest{}))) ||
+		(evidence.Outcome == LifecycleEvidenceFenced &&
+			(evidence.CommitProofDigest != (EvidenceDigest{}) || evidence.FenceProofDigest == (EvidenceDigest{}))) {
 		return nil, newDownstreamError(DownstreamCorruptEvidence)
 	}
 	authority := NewTaskWorkspaceLifecycleAuthority(
@@ -213,7 +219,7 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) commitEvidence(
 ) (TaskWorkspaceLifecycleAdapterEvidence, error) {
 	request := adapter.binding.Commit
 	if result.Operation.ID != request.Operation.ID || result.Operation.RequestDigest != request.Operation.RequestDigest ||
-		result.Generation != request.Generation || result.PreviousFence != request.Fence || result.Fence != request.Fence ||
+		result.Generation != request.Generation || result.PreviousFence != request.Fence || result.Fence <= request.Fence ||
 		result.TaskWorkspaceID == "" || result.TaskWorkspaceID != request.TaskWorkspaceID ||
 		result.RevisionID == "" || result.CheckpointID == "" ||
 		result.BaseRevisionID != request.BaseRevisionID ||
@@ -231,8 +237,9 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) commitEvidence(
 	}
 	return adapter.evidenceFor(
 		LifecycleEvidenceCommitted, revisionID, checkpointID,
+		TaskWorkspaceLifecycleGeneration(request.Generation), TaskWorkspaceLifecycleFence(request.Fence),
 		TaskWorkspaceLifecycleGeneration(result.Generation), TaskWorkspaceLifecycleFence(result.Fence),
-		TaskWorkspaceCommitProofDigest(result),
+		TaskWorkspaceCommitProofDigest(result), EvidenceDigest{},
 	), nil
 }
 
@@ -252,8 +259,9 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) fenceEvidence(
 	}
 	return adapter.evidenceFor(
 		LifecycleEvidenceFenced, TaskWorkspaceRevisionID{}, CheckpointID{},
+		TaskWorkspaceLifecycleGeneration(request.Generation), TaskWorkspaceLifecycleFence(request.Fence),
 		TaskWorkspaceLifecycleGeneration(result.Generation), TaskWorkspaceLifecycleFence(result.Fence),
-		EvidenceDigest{},
+		EvidenceDigest{}, TaskWorkspaceFenceProofDigest(result),
 	), nil
 }
 
@@ -263,7 +271,10 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) evidenceFor(
 	checkpointID CheckpointID,
 	generation TaskWorkspaceLifecycleGeneration,
 	fence TaskWorkspaceLifecycleFence,
+	observedGeneration TaskWorkspaceLifecycleGeneration,
+	observedFence TaskWorkspaceLifecycleFence,
 	commitProofDigest EvidenceDigest,
+	fenceProofDigest EvidenceDigest,
 ) TaskWorkspaceLifecycleAdapterEvidence {
 	binding := adapter.binding
 	evidence := TaskWorkspaceLifecycleAdapterEvidence{
@@ -271,9 +282,11 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) evidenceFor(
 		Producer:      binding.Producer, TaskID: binding.TaskID, PhaseRunID: binding.PhaseRunID,
 		PhaseRunGeneration: binding.PhaseRunGeneration, PhaseRunFence: binding.PhaseRunFence,
 		OperationID: binding.Enactment.OperationID, ActivityGeneration: binding.Enactment.ActivityGeneration,
-		Generation: generation, Fence: fence, SafetyEpoch: binding.SafetyEpoch,
-		Outcome: outcome, RevisionID: revisionID, CheckpointID: checkpointID,
+		Generation: generation, Fence: fence, ObservedGeneration: observedGeneration, ObservedFence: observedFence,
+		SafetyEpoch: binding.SafetyEpoch,
+		Outcome:     outcome, RevisionID: revisionID, CheckpointID: checkpointID,
 		CommitProofDigest: commitProofDigest,
+		FenceProofDigest:  fenceProofDigest,
 		Prerequisites:     append([]EvidencePrerequisite(nil), binding.Prerequisites...),
 	}
 	evidenceID := lifecycleEvidenceID(binding.Enactment.OperationID)
@@ -294,7 +307,10 @@ func taskWorkspaceLifecycleEvidenceDigest(
 		"commit_proof_digest":   evidence.CommitProofDigest.String(),
 		"evidence_id":           evidenceID.String(),
 		"fence":                 uint64(evidence.Fence),
+		"fence_proof_digest":    evidence.FenceProofDigest.String(),
 		"generation":            uint64(evidence.Generation),
+		"observed_fence":        uint64(evidence.ObservedFence),
+		"observed_generation":   uint64(evidence.ObservedGeneration),
 		"operation_id":          evidence.OperationID.String(),
 		"outcome":               lifecycleEvidenceOutcomeName(evidence.Outcome),
 		"phase_run_fence":       uint64(evidence.PhaseRunFence),
@@ -315,6 +331,15 @@ func taskWorkspaceLifecycleEvidenceDigest(
 // TaskWorkspaceCommitProofDigest binds the complete public C04 commit result
 // without exposing or reinterpreting C04's internal journal or storage model.
 func TaskWorkspaceCommitProofDigest(result taskworkspace.CommitRuntimeViewResult) EvidenceDigest {
+	encoded, _ := json.Marshal(result)
+	sum := sha256.Sum256(encoded)
+	return EvidenceDigest(sum)
+}
+
+// TaskWorkspaceFenceProofDigest binds the complete public C04 fence result
+// while Task Orchestration continues to compare the evidence against the
+// original enactment generation and fence.
+func TaskWorkspaceFenceProofDigest(result taskworkspace.FenceRuntimeViewResult) EvidenceDigest {
 	encoded, _ := json.Marshal(result)
 	sum := sha256.Sum256(encoded)
 	return EvidenceDigest(sum)

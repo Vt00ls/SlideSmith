@@ -622,7 +622,12 @@ func TestTaskWorkspaceLifecycleAdapterUsesOpaqueC04CommitEvidence(t *testing.T) 
 		evidence.OperationID != ref.OperationID ||
 		evidence.RevisionID.String() != string(result.RevisionID) ||
 		evidence.CheckpointID.String() != string(result.CheckpointID) ||
+		evidence.Generation != taskorchestration.TaskWorkspaceLifecycleGeneration(request.Generation) ||
+		evidence.Fence != taskorchestration.TaskWorkspaceLifecycleFence(request.Fence) ||
+		evidence.ObservedGeneration != taskorchestration.TaskWorkspaceLifecycleGeneration(result.Generation) ||
+		evidence.ObservedFence != taskorchestration.TaskWorkspaceLifecycleFence(result.Fence) ||
 		evidence.CommitProofDigest == (taskorchestration.EvidenceDigest{}) ||
+		evidence.FenceProofDigest != (taskorchestration.EvidenceDigest{}) ||
 		evidence.Evidence.Kind != taskorchestration.EvidenceTaskWorkspaceLifecycle ||
 		port.commitCalls != 1 {
 		t.Fatalf("opaque C04 commit evidence = %#v, calls=%d", evidence, port.commitCalls)
@@ -630,6 +635,43 @@ func TestTaskWorkspaceLifecycleAdapterUsesOpaqueC04CommitEvidence(t *testing.T) 
 	replayed, err := adapter.Enact(context.Background(), ref)
 	if err != nil || !reflect.DeepEqual(replayed, evidence) || port.commitCalls != 1 {
 		t.Fatalf("C04 exact replay = %#v, calls=%d, err=%v", replayed, port.commitCalls, err)
+	}
+
+	now := time.Date(2026, time.July, 27, 12, 0, 0, 0, time.UTC)
+	owner := taskorchestration.NewUserAuthority(downstreamAuthorityID(t, "c04-owner"), 1)
+	authority := taskorchestration.NewTaskWorkspaceLifecycleAuthority(
+		downstreamAuthorityID(t, "c04-authority"), 5,
+	)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{
+		Now: now,
+		Tasks: []taskorchestration.HarnessTaskFixture{{
+			TaskID: evidence.TaskID, Owner: owner, TaskRevision: 10,
+			ActivityGeneration: ref.ActivityGeneration, SafetyEpoch: evidence.SafetyEpoch,
+			PhaseRuns: []taskorchestration.HarnessPhaseRunFixture{{
+				PhaseRunID: evidence.PhaseRunID, Generation: evidence.PhaseRunGeneration,
+				Fence: evidence.PhaseRunFence, Active: true,
+			}},
+			LifecycleOperations: []taskorchestration.HarnessLifecycleOperationFixture{{
+				OperationID: evidence.OperationID, PhaseRunID: evidence.PhaseRunID, Authority: authority,
+				Generation: evidence.Generation, Fence: evidence.Fence, SafetyEpoch: evidence.SafetyEpoch,
+				Purpose: taskorchestration.LifecycleOperationCommit,
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := intentHeader(t, "c04-real-fence-decision", evidence.TaskID.String(), now)
+	header.ExpectedTaskRevision = 10
+	header.ActivityGeneration = ref.ActivityGeneration
+	intent, err := evidence.Intent(header)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := harness.Mutations.Decide(context.Background(), intent)
+	if err != nil || len(decision.AcceptedEvidenceRefs) != 1 ||
+		decision.AcceptedEvidenceRefs[0] != evidence.Evidence {
+		t.Fatalf("C04 evidence with advanced result fence was not accepted: %#v err=%v", decision, err)
 	}
 }
 
@@ -827,6 +869,16 @@ func TestTaskWorkspaceLifecycleAdapterCancellationRaceIsSafelyNormalized(t *test
 					if result.evidence.Outcome != want {
 						t.Fatalf("%s winner evidence = %#v", winner, result.evidence)
 					}
+					winnerRef := commitRef
+					if winner == "fence" {
+						winnerRef = fenceRef
+					}
+					if result.evidence.Fence != winnerRef.Fence ||
+						result.evidence.ObservedFence <= result.evidence.Fence ||
+						(winner == "commit" && result.evidence.CommitProofDigest == (taskorchestration.EvidenceDigest{})) ||
+						(winner == "fence" && result.evidence.FenceProofDigest == (taskorchestration.EvidenceDigest{})) {
+						t.Fatalf("%s evidence lost enactment/result fence separation: %#v", winner, result.evidence)
+					}
 					continue
 				}
 				assertDownstreamErrorCode(t, result.err, taskorchestration.DownstreamStale)
@@ -964,7 +1016,7 @@ func c04CommitContractFixture(
 		ValidationEvidenceDigest: validation.Digest,
 		ContentEvidenceRoot:      taskworkspace.EvidenceRoot("content-root-" + ref.OperationID.String()),
 		DurabilityEvidenceRoot:   taskworkspace.EvidenceRoot("durability-root-" + ref.OperationID.String()),
-		Generation:               generation, PreviousFence: fence, Fence: fence, Operation: request.Operation,
+		Generation:               generation, PreviousFence: fence, Fence: fence + 1, Operation: request.Operation,
 	}
 	return request, result
 }
