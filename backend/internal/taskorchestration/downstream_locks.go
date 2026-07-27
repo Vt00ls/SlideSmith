@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"reflect"
 	"sort"
-	"sync"
 )
 
 type TemplateVersionID struct{ value string }
@@ -73,9 +72,8 @@ type ReleaseManagementAdapter interface {
 }
 
 type releaseManagementAdapter struct {
-	mu    sync.Mutex
 	port  ReleaseManagementPort
-	locks map[pinnedLockKey]resolvedExecutionReplay
+	locks *downstreamReplayShell[pinnedLockKey, executionLockRequestFingerprint, ResolvedExecutionContract]
 }
 
 type pinnedLockKey struct {
@@ -83,59 +81,54 @@ type pinnedLockKey struct {
 	lockID string
 }
 
-type resolvedExecutionReplay struct {
-	requestDigest EvidenceDigest
-	resolved      ResolvedExecutionContract
+type executionLockRequestFingerprint struct {
+	executionContractDigest EvidenceDigest
+	requestedContractDigest EvidenceDigest
+	safetyEpoch             SafetyEpoch
 }
 
 func NewReleaseManagementAdapter(port ReleaseManagementPort) ReleaseManagementAdapter {
-	return &releaseManagementAdapter{port: port, locks: make(map[pinnedLockKey]resolvedExecutionReplay)}
+	return &releaseManagementAdapter{
+		port: port,
+		locks: newDownstreamReplayShell[
+			pinnedLockKey, executionLockRequestFingerprint, ResolvedExecutionContract,
+		](),
+	}
 }
 
 func (adapter *releaseManagementAdapter) Resolve(
 	ctx context.Context,
 	request PinnedExecutionLockRequest,
-) (resolved ResolvedExecutionContract, err error) {
+) (ResolvedExecutionContract, error) {
 	if failure := validatePinnedExecutionLockRequest(request); failure != nil {
 		return ResolvedExecutionContract{}, failure
 	}
 	key := pinnedLockKey{request.TaskID, request.ExecutionLock.ID.String()}
-	requestDigest := ExecutionLockContractDigest(request.ExecutionLock)
-	adapter.mu.Lock()
-	defer adapter.mu.Unlock()
-	if replay, exists := adapter.locks[key]; exists {
-		if replay.requestDigest != requestDigest || replay.resolved.ContractDigest != request.ContractDigest ||
-			replay.resolved.SafetyEpoch != request.SafetyEpoch {
-			return ResolvedExecutionContract{}, newDownstreamError(DownstreamIntegrityConflict)
-		}
-		return cloneResolvedExecutionContract(replay.resolved), nil
+	fingerprint := executionLockRequestFingerprint{
+		executionContractDigest: ExecutionLockContractDigest(request.ExecutionLock),
+		requestedContractDigest: request.ContractDigest,
+		safetyEpoch:             request.SafetyEpoch,
 	}
-	if adapter.port == nil {
-		return ResolvedExecutionContract{}, newDownstreamError(DownstreamDependencyUnavailable)
-	}
-	var record PublishedExecutionContract
-	func() {
-		defer func() {
-			if recover() != nil {
-				err = newDownstreamError(DownstreamDependencyUnavailable)
+	return invokeDownstreamWithReplay(
+		adapter.locks,
+		key,
+		fingerprint,
+		adapter.port != nil,
+		nil,
+		func() (PublishedExecutionContract, error) {
+			return adapter.port.ResolveExecutionLock(ctx, request.ExecutionLock.ID)
+		},
+		func(record PublishedExecutionContract) *DownstreamError {
+			return validatePublishedExecutionContract(record, request)
+		},
+		func(record PublishedExecutionContract) ResolvedExecutionContract {
+			return ResolvedExecutionContract{
+				ExecutionLock: cloneExecutionLock(record.ExecutionLock), ContractDigest: record.ContractDigest,
+				Producer: record.Producer, SafetyEpoch: record.SafetyEpoch,
 			}
-		}()
-		record, err = adapter.port.ResolveExecutionLock(ctx, request.ExecutionLock.ID)
-	}()
-	if err != nil {
-		return ResolvedExecutionContract{}, normalizeDownstreamError(err)
-	}
-	if failure := validatePublishedExecutionContract(record, request); failure != nil {
-		return ResolvedExecutionContract{}, failure
-	}
-	resolved = ResolvedExecutionContract{
-		ExecutionLock:  cloneExecutionLock(record.ExecutionLock),
-		ContractDigest: record.ContractDigest,
-		Producer:       record.Producer,
-		SafetyEpoch:    record.SafetyEpoch,
-	}
-	adapter.locks[key] = resolvedExecutionReplay{requestDigest, resolved}
-	return cloneResolvedExecutionContract(resolved), nil
+		},
+		cloneResolvedExecutionContract,
+	)
 }
 
 func ExecutionLockContractDigest(lock ExecutionLock) EvidenceDigest {
@@ -222,14 +215,19 @@ type ResourceBundleContract struct {
 }
 
 type PublishedTemplateLockContract struct {
-	SchemaVersion      EvidenceSchemaVersion
-	Producer           EvidenceProducer
-	TemplateLockID     TemplateLockID
-	TemplateVersionID  TemplateVersionID
-	LockDigest         EvidenceDigest
-	ObservedGeneration ProducerGeneration
-	SafetyEpoch        SafetyEpoch
-	BundleClosure      []ResourceBundleContract
+	SchemaVersion                EvidenceSchemaVersion
+	Producer                     EvidenceProducer
+	TemplateLockID               TemplateLockID
+	TemplateVersionID            TemplateVersionID
+	TemplateManifestDigest       EvidenceDigest
+	TemplatePackageDigest        EvidenceDigest
+	CompatibilityEvidenceID      EvidenceID
+	CompatibilityEvidenceDigest  EvidenceDigest
+	CompatibilityExecutionLockID ExecutionLockID
+	LockDigest                   EvidenceDigest
+	ObservedGeneration           ProducerGeneration
+	SafetyEpoch                  SafetyEpoch
+	BundleClosure                []ResourceBundleContract
 }
 
 type PinnedTemplateLockRequest struct {
@@ -242,13 +240,18 @@ type PinnedTemplateLockRequest struct {
 }
 
 type ResolvedTemplateLockContract struct {
-	TemplateLockID     TemplateLockID
-	TemplateVersionID  TemplateVersionID
-	LockDigest         EvidenceDigest
-	ObservedGeneration ProducerGeneration
-	SafetyEpoch        SafetyEpoch
-	Producer           EvidenceProducer
-	BundleClosure      []ResourceBundleContract
+	TemplateLockID               TemplateLockID
+	TemplateVersionID            TemplateVersionID
+	TemplateManifestDigest       EvidenceDigest
+	TemplatePackageDigest        EvidenceDigest
+	CompatibilityEvidenceID      EvidenceID
+	CompatibilityEvidenceDigest  EvidenceDigest
+	CompatibilityExecutionLockID ExecutionLockID
+	LockDigest                   EvidenceDigest
+	ObservedGeneration           ProducerGeneration
+	SafetyEpoch                  SafetyEpoch
+	Producer                     EvidenceProducer
+	BundleClosure                []ResourceBundleContract
 }
 
 type CatalogPublicationPort interface {
@@ -260,63 +263,53 @@ type CatalogPublicationAdapter interface {
 }
 
 type catalogPublicationAdapter struct {
-	mu    sync.Mutex
 	port  CatalogPublicationPort
-	locks map[pinnedLockKey]resolvedTemplateReplay
-}
-
-type resolvedTemplateReplay struct {
-	requestDigest EvidenceDigest
-	resolved      ResolvedTemplateLockContract
+	locks *downstreamReplayShell[pinnedLockKey, EvidenceDigest, ResolvedTemplateLockContract]
 }
 
 func NewCatalogPublicationAdapter(port CatalogPublicationPort) CatalogPublicationAdapter {
-	return &catalogPublicationAdapter{port: port, locks: make(map[pinnedLockKey]resolvedTemplateReplay)}
+	return &catalogPublicationAdapter{
+		port:  port,
+		locks: newDownstreamReplayShell[pinnedLockKey, EvidenceDigest, ResolvedTemplateLockContract](),
+	}
 }
 
 func (adapter *catalogPublicationAdapter) Resolve(
 	ctx context.Context,
 	request PinnedTemplateLockRequest,
-) (resolved ResolvedTemplateLockContract, err error) {
+) (ResolvedTemplateLockContract, error) {
 	if failure := validatePinnedTemplateLockRequest(request); failure != nil {
 		return ResolvedTemplateLockContract{}, failure
 	}
 	key := pinnedLockKey{request.TaskID, request.TemplateLockID.String()}
 	requestDigest := pinnedTemplateLockRequestDigest(request)
-	adapter.mu.Lock()
-	defer adapter.mu.Unlock()
-	if replay, exists := adapter.locks[key]; exists {
-		if replay.requestDigest != requestDigest {
-			return ResolvedTemplateLockContract{}, newDownstreamError(DownstreamIntegrityConflict)
-		}
-		return cloneResolvedTemplateLockContract(replay.resolved), nil
-	}
-	if adapter.port == nil {
-		return ResolvedTemplateLockContract{}, newDownstreamError(DownstreamDependencyUnavailable)
-	}
-	var record PublishedTemplateLockContract
-	func() {
-		defer func() {
-			if recover() != nil {
-				err = newDownstreamError(DownstreamDependencyUnavailable)
+	return invokeDownstreamWithReplay(
+		adapter.locks,
+		key,
+		requestDigest,
+		adapter.port != nil,
+		nil,
+		func() (PublishedTemplateLockContract, error) {
+			return adapter.port.ResolveTemplateLock(ctx, request.TemplateLockID)
+		},
+		func(record PublishedTemplateLockContract) *DownstreamError {
+			return validatePublishedTemplateLockContract(record, request)
+		},
+		func(record PublishedTemplateLockContract) ResolvedTemplateLockContract {
+			return ResolvedTemplateLockContract{
+				TemplateLockID: record.TemplateLockID, TemplateVersionID: record.TemplateVersionID,
+				TemplateManifestDigest:       record.TemplateManifestDigest,
+				TemplatePackageDigest:        record.TemplatePackageDigest,
+				CompatibilityEvidenceID:      record.CompatibilityEvidenceID,
+				CompatibilityEvidenceDigest:  record.CompatibilityEvidenceDigest,
+				CompatibilityExecutionLockID: record.CompatibilityExecutionLockID,
+				LockDigest:                   record.LockDigest, ObservedGeneration: record.ObservedGeneration,
+				SafetyEpoch: record.SafetyEpoch, Producer: record.Producer,
+				BundleClosure: append([]ResourceBundleContract(nil), record.BundleClosure...),
 			}
-		}()
-		record, err = adapter.port.ResolveTemplateLock(ctx, request.TemplateLockID)
-	}()
-	if err != nil {
-		return ResolvedTemplateLockContract{}, normalizeDownstreamError(err)
-	}
-	if failure := validatePublishedTemplateLockContract(record, request); failure != nil {
-		return ResolvedTemplateLockContract{}, failure
-	}
-	resolved = ResolvedTemplateLockContract{
-		TemplateLockID: record.TemplateLockID, TemplateVersionID: record.TemplateVersionID,
-		LockDigest: record.LockDigest, ObservedGeneration: record.ObservedGeneration,
-		SafetyEpoch: record.SafetyEpoch, Producer: record.Producer,
-		BundleClosure: append([]ResourceBundleContract(nil), record.BundleClosure...),
-	}
-	adapter.locks[key] = resolvedTemplateReplay{requestDigest, resolved}
-	return cloneResolvedTemplateLockContract(resolved), nil
+		},
+		cloneResolvedTemplateLockContract,
+	)
 }
 
 func TemplateLockContractDigest(record PublishedTemplateLockContract) EvidenceDigest {
@@ -336,14 +329,19 @@ func TemplateLockContractDigest(record PublishedTemplateLockContract) EvidenceDi
 		return left < right
 	})
 	encoded, _ := json.Marshal(map[string]any{
-		"bundle_closure":        bundles,
-		"observed_generation":   uint64(record.ObservedGeneration),
-		"producer_authority_id": record.Producer.AuthorityID.String(),
-		"producer_generation":   uint64(record.Producer.Generation),
-		"safety_epoch":          uint64(record.SafetyEpoch),
-		"schema_version":        uint64(record.SchemaVersion),
-		"template_lock_id":      record.TemplateLockID.String(),
-		"template_version_id":   record.TemplateVersionID.String(),
+		"bundle_closure":                  bundles,
+		"observed_generation":             uint64(record.ObservedGeneration),
+		"producer_authority_id":           record.Producer.AuthorityID.String(),
+		"producer_generation":             uint64(record.Producer.Generation),
+		"safety_epoch":                    uint64(record.SafetyEpoch),
+		"schema_version":                  uint64(record.SchemaVersion),
+		"template_lock_id":                record.TemplateLockID.String(),
+		"template_version_id":             record.TemplateVersionID.String(),
+		"template_manifest_digest":        record.TemplateManifestDigest.String(),
+		"template_package_digest":         record.TemplatePackageDigest.String(),
+		"compatibility_evidence_id":       record.CompatibilityEvidenceID.String(),
+		"compatibility_evidence_digest":   record.CompatibilityEvidenceDigest.String(),
+		"compatibility_execution_lock_id": record.CompatibilityExecutionLockID.String(),
 	})
 	sum := sha256.Sum256(encoded)
 	return EvidenceDigest(sum)
@@ -367,6 +365,10 @@ func validatePublishedTemplateLockContract(
 	}
 	if !validOpaqueID(record.Producer.AuthorityID.String()) || record.Producer.Generation == 0 ||
 		!validOpaqueID(record.TemplateLockID.String()) || !validOpaqueID(record.TemplateVersionID.String()) ||
+		record.TemplateManifestDigest == (EvidenceDigest{}) || record.TemplatePackageDigest == (EvidenceDigest{}) ||
+		!validOpaqueID(record.CompatibilityEvidenceID.String()) ||
+		record.CompatibilityEvidenceDigest == (EvidenceDigest{}) ||
+		!validOpaqueID(record.CompatibilityExecutionLockID.String()) ||
 		record.ObservedGeneration == 0 || record.SafetyEpoch == 0 ||
 		record.LockDigest == (EvidenceDigest{}) || record.LockDigest != TemplateLockContractDigest(record) ||
 		!validBundleClosure(record.BundleClosure) {

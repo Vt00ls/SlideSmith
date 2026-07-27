@@ -27,6 +27,18 @@ func TestRuntimeAdapterConsumesExactEnactmentAndReturnsTypedEvidence(t *testing.
 		PhaseRunGeneration: 5,
 		PhaseRunFence:      6,
 		RuntimeRunID:       downstreamRuntimeRunID(t, "runtime-run-adapter"),
+		RuntimeBindingID:   downstreamRuntimeBindingID(t, "runtime-binding-adapter"),
+		RuntimeBindingDigest: downstreamEvidenceRef(
+			t, "runtime-binding-digest-adapter", taskorchestration.EvidenceRuntime,
+		).Digest,
+		ImmutableInputManifestDigest: downstreamEvidenceRef(
+			t, "runtime-input-manifest-adapter", taskorchestration.EvidenceRuntime,
+		).Digest,
+		ExecutionNodeID: downstreamExecutionNodeID(t, "runtime-node-adapter"),
+		SandboxLeaseID:  downstreamSandboxLeaseID(t, "runtime-lease-adapter"),
+		OutputManifestDigest: downstreamEvidenceRef(
+			t, "runtime-output-manifest-adapter", taskorchestration.EvidenceRuntime,
+		).Digest,
 		OperationID:        ref.OperationID,
 		ActivityGeneration: ref.ActivityGeneration,
 		Generation:         3,
@@ -41,10 +53,9 @@ func TestRuntimeAdapterConsumesExactEnactmentAndReturnsTypedEvidence(t *testing.
 			},
 		},
 	}
-	record.RequiredPrerequisites = []taskorchestration.EvidenceRef{record.Prerequisites[0].Evidence}
 	record.EvidenceDigest = taskorchestration.RuntimeEvidenceDigest(record)
 	port := &runtimeEvidencePortDouble{record: record}
-	adapter := taskorchestration.NewRuntimeEvidenceAdapter(port)
+	adapter := taskorchestration.NewRuntimeEvidenceAdapter(port, prerequisiteAuthority(record.Prerequisites))
 
 	evidence, err := adapter.Enact(context.Background(), ref)
 	if err != nil {
@@ -52,6 +63,11 @@ func TestRuntimeAdapterConsumesExactEnactmentAndReturnsTypedEvidence(t *testing.
 	}
 	if evidence.TaskID != record.TaskID || evidence.PhaseRunID != record.PhaseRunID ||
 		evidence.RuntimeRunID != record.RuntimeRunID || evidence.OperationID != ref.OperationID ||
+		evidence.RuntimeBindingID != record.RuntimeBindingID ||
+		evidence.RuntimeBindingDigest != record.RuntimeBindingDigest ||
+		evidence.ImmutableInputManifestDigest != record.ImmutableInputManifestDigest ||
+		evidence.ExecutionNodeID != record.ExecutionNodeID || evidence.SandboxLeaseID != record.SandboxLeaseID ||
+		evidence.OutputManifestDigest != record.OutputManifestDigest ||
 		evidence.Outcome != taskorchestration.RuntimeRunSucceeded ||
 		evidence.Evidence.Kind != taskorchestration.EvidenceRuntime ||
 		evidence.Evidence.Digest != record.EvidenceDigest || len(evidence.Prerequisites) != 1 {
@@ -101,8 +117,11 @@ func TestRuntimeAdapterEvidenceCannotCompletePhaseWithoutValidation(t *testing.T
 		Generation: 1, Fence: taskorchestration.RuntimeFence(run.Fence), SafetyEpoch: view.SafetyEpoch,
 		Outcome: taskorchestration.RuntimeRunSucceeded,
 	}
+	bindRuntimeEvidenceContract(t, &record, "runtime-success")
 	record.EvidenceDigest = taskorchestration.RuntimeEvidenceDigest(record)
-	adapter := taskorchestration.NewRuntimeEvidenceAdapter(&runtimeEvidencePortDouble{record: record})
+	adapter := taskorchestration.NewRuntimeEvidenceAdapter(
+		&runtimeEvidencePortDouble{record: record}, prerequisiteAuthority(record.Prerequisites),
+	)
 	evidence, err := adapter.Enact(context.Background(), work.EnactmentRefs[0])
 	if err != nil {
 		t.Fatal(err)
@@ -161,8 +180,11 @@ func TestRuntimeAdapterEvidenceFailsClosedAcrossScopeAndProducerAuthority(t *tes
 		ActivityGeneration: ref.ActivityGeneration, Generation: 3, Fence: 7,
 		SafetyEpoch: 2, Outcome: taskorchestration.RuntimeRunSucceeded,
 	}
+	bindRuntimeEvidenceContract(t, &record, "runtime-scope")
 	record.EvidenceDigest = taskorchestration.RuntimeEvidenceDigest(record)
-	adapter := taskorchestration.NewRuntimeEvidenceAdapter(&runtimeEvidencePortDouble{record: record})
+	adapter := taskorchestration.NewRuntimeEvidenceAdapter(
+		&runtimeEvidencePortDouble{record: record}, prerequisiteAuthority(record.Prerequisites),
+	)
 	evidence, err := adapter.Enact(context.Background(), ref)
 	if err != nil {
 		t.Fatal(err)
@@ -192,6 +214,7 @@ func TestRuntimeAdapterEvidenceFailsClosedAcrossScopeAndProducerAuthority(t *tes
 	crossPhaseRecord.EvidenceDigest = taskorchestration.RuntimeEvidenceDigest(crossPhaseRecord)
 	crossPhaseAdapter := taskorchestration.NewRuntimeEvidenceAdapter(
 		&runtimeEvidencePortDouble{record: crossPhaseRecord},
+		prerequisiteAuthority(crossPhaseRecord.Prerequisites),
 	)
 	crossPhaseEvidence, err := crossPhaseAdapter.Enact(context.Background(), ref)
 	if err != nil {
@@ -215,6 +238,57 @@ func TestRuntimeAdapterEvidenceFailsClosedAcrossScopeAndProducerAuthority(t *tes
 	if err != nil || view.TaskRevision != 4 || view.DecisionCount != 0 || view.EvidenceDiagnosticCount != 2 {
 		t.Fatalf("rejected producer/scope evidence changed Task: %#v err=%v", view, err)
 	}
+}
+
+func TestRuntimeAdapterDoesNotTrustProducerDeclaredPrerequisiteOmission(t *testing.T) {
+	ref := downstreamEnactmentRef(t, "runtime-prerequisite-authority-operation",
+		taskorchestration.EnactmentRuntimeExecution, taskorchestration.RuntimeFence(7))
+	record := taskorchestration.RuntimeEvidenceRecord{
+		SchemaVersion: taskorchestration.EvidenceSchemaV1,
+		EvidenceID:    downstreamEvidenceID(t, "runtime-prerequisite-authority-evidence"),
+		Producer: taskorchestration.EvidenceProducer{
+			AuthorityID: downstreamAuthorityID(t, "runtime-prerequisite-authority"), Generation: 3,
+		},
+		TaskID:             downstreamTaskID(t, "runtime-prerequisite-task"),
+		PhaseRunID:         downstreamPhaseRunID(t, "runtime-prerequisite-phase"),
+		PhaseRunGeneration: 5, PhaseRunFence: 6,
+		RuntimeRunID: downstreamRuntimeRunID(t, "runtime-prerequisite-run"),
+		OperationID:  ref.OperationID, ActivityGeneration: ref.ActivityGeneration,
+		Generation: 3, Fence: 7, SafetyEpoch: 2, Outcome: taskorchestration.RuntimeRunSucceeded,
+	}
+	bindRuntimeEvidenceContract(t, &record, "runtime-prerequisite-authority")
+	record.EvidenceDigest = taskorchestration.RuntimeEvidenceDigest(record)
+	expected := taskorchestration.EvidencePrerequisite{
+		Evidence:   downstreamEvidenceRef(t, "runtime-required-admission", taskorchestration.EvidenceScheduling),
+		Generation: 2, Fence: 4,
+	}
+	adapter := taskorchestration.NewRuntimeEvidenceAdapter(
+		&runtimeEvidencePortDouble{record: record},
+		&prerequisiteAuthorityDouble{expected: []taskorchestration.EvidencePrerequisite{expected}},
+	)
+
+	_, err := adapter.Enact(context.Background(), ref)
+	assertDownstreamErrorCode(t, err, taskorchestration.DownstreamPrerequisitePending)
+}
+
+type prerequisiteAuthorityDouble struct {
+	expected []taskorchestration.EvidencePrerequisite
+	err      error
+}
+
+func prerequisiteAuthority(
+	expected []taskorchestration.EvidencePrerequisite,
+) *prerequisiteAuthorityDouble {
+	return &prerequisiteAuthorityDouble{
+		expected: append([]taskorchestration.EvidencePrerequisite(nil), expected...),
+	}
+}
+
+func (authority *prerequisiteAuthorityDouble) ExpectedPrerequisites(
+	_ context.Context,
+	_ taskorchestration.EnactmentRef,
+) ([]taskorchestration.EvidencePrerequisite, error) {
+	return append([]taskorchestration.EvidencePrerequisite(nil), authority.expected...), authority.err
 }
 
 func TestSchedulerAdapterReturnsEvidenceWithoutChangingTaskOrPhase(t *testing.T) {
@@ -267,7 +341,9 @@ func TestSchedulerAdapterReturnsEvidenceWithoutChangingTaskOrPhase(t *testing.T)
 			record.AdmissionGrantID = downstreamAdmissionGrantID(t, "scheduler-grant-"+string(rune('a'+index)))
 		}
 		record.EvidenceDigest = taskorchestration.SchedulerEvidenceDigest(record)
-		adapter := taskorchestration.NewSchedulerEvidenceAdapter(&schedulerEvidencePortDouble{record: record})
+		adapter := taskorchestration.NewSchedulerEvidenceAdapter(
+			&schedulerEvidencePortDouble{record: record}, prerequisiteAuthority(record.Prerequisites),
+		)
 		evidence, err := adapter.Enact(context.Background(), ref)
 		if err != nil || evidence.Kind != kind || evidence.OperationID != ref.OperationID ||
 			evidence.WorkItemID != record.WorkItemID || evidence.DeliveryClaimID != record.DeliveryClaimID ||
@@ -312,7 +388,9 @@ func TestSchedulerAdapterBindsExactWorkItemClaimAndAdmissionGrant(t *testing.T) 
 		AdmissionGrantID: downstreamAdmissionGrantID(t, "scheduler-admission-grant"),
 	}
 	record.EvidenceDigest = taskorchestration.SchedulerEvidenceDigest(record)
-	adapter := taskorchestration.NewSchedulerEvidenceAdapter(&schedulerEvidencePortDouble{record: record})
+	adapter := taskorchestration.NewSchedulerEvidenceAdapter(
+		&schedulerEvidencePortDouble{record: record}, prerequisiteAuthority(record.Prerequisites),
+	)
 
 	evidence, err := adapter.Enact(context.Background(), ref)
 	if err != nil {
@@ -371,7 +449,9 @@ func TestPublicationAdapterRequiresExactActivationEvidence(t *testing.T) {
 		ArtifactVersionID: downstreamArtifactVersionID(t, "artifact-version-activated"),
 	}
 	record.EvidenceDigest = taskorchestration.PublicationEvidenceDigest(record)
-	invalidAdapter := taskorchestration.NewPublicationEvidenceAdapter(&publicationEvidencePortDouble{record: record})
+	invalidAdapter := taskorchestration.NewPublicationEvidenceAdapter(
+		&publicationEvidencePortDouble{record: record}, prerequisiteAuthority(record.Prerequisites),
+	)
 	_, err = invalidAdapter.Enact(context.Background(), work.EnactmentRefs[0])
 	assertDownstreamErrorCode(t, err, taskorchestration.DownstreamCorruptEvidence)
 
@@ -379,7 +459,9 @@ func TestPublicationAdapterRequiresExactActivationEvidence(t *testing.T) {
 		t, "artifact-manifest-activated", taskorchestration.EvidencePublication,
 	).Digest
 	record.EvidenceDigest = taskorchestration.PublicationEvidenceDigest(record)
-	adapter := taskorchestration.NewPublicationEvidenceAdapter(&publicationEvidencePortDouble{record: record})
+	adapter := taskorchestration.NewPublicationEvidenceAdapter(
+		&publicationEvidencePortDouble{record: record}, prerequisiteAuthority(record.Prerequisites),
+	)
 	evidence, err := adapter.Enact(context.Background(), work.EnactmentRefs[0])
 	if err != nil {
 		t.Fatal(err)
@@ -445,7 +527,9 @@ func TestLatePublicationAdapterEvidenceCannotResurrectCancelledTask(t *testing.T
 		).Digest,
 	}
 	record.EvidenceDigest = taskorchestration.PublicationEvidenceDigest(record)
-	adapter := taskorchestration.NewPublicationEvidenceAdapter(&publicationEvidencePortDouble{record: record})
+	adapter := taskorchestration.NewPublicationEvidenceAdapter(
+		&publicationEvidencePortDouble{record: record}, prerequisiteAuthority(record.Prerequisites),
+	)
 	lateEvidence, err := adapter.Enact(context.Background(), work.EnactmentRefs[0])
 	if err != nil {
 		t.Fatal(err)
@@ -511,17 +595,9 @@ func TestTaskWorkspaceLifecycleAdapterUsesOpaqueC04CommitEvidence(t *testing.T) 
 	ref := downstreamEnactmentRef(t, "c04-commit-operation",
 		taskorchestration.EnactmentTaskWorkspaceLifecycle,
 		taskorchestration.TaskWorkspaceLifecycleFence(7))
-	operation := taskworkspace.Operation{
-		ID:            taskworkspace.OperationID(ref.OperationID.String()),
-		RequestDigest: taskworkspace.Digest("sha256:c04-request-digest"),
-	}
-	request := taskworkspace.CommitRuntimeViewRequest{
-		TaskID: taskworkspace.TaskID("c04-task"), Generation: 5, Fence: 7, Operation: operation,
-	}
-	port := &taskWorkspaceLifecyclePortDouble{commit: taskworkspace.CommitRuntimeViewResult{
-		TaskWorkspaceID: "c04-workspace", RevisionID: "c04-revision", CheckpointID: "c04-checkpoint",
-		Generation: 5, Fence: 7, Operation: operation,
-	}}
+	request, result := c04CommitContractFixture(t, ref, "c04-task", "c04-phase-run", "c04-workspace", 5, 7)
+	bindC04EnactmentPayload(t, &ref, request.Operation.RequestDigest)
+	port := &taskWorkspaceLifecyclePortDouble{commit: result}
 	adapter := taskorchestration.NewTaskWorkspaceLifecycleEvidenceAdapter(
 		port,
 		taskorchestration.TaskWorkspaceLifecycleAdapterBinding{
@@ -544,8 +620,9 @@ func TestTaskWorkspaceLifecycleAdapterUsesOpaqueC04CommitEvidence(t *testing.T) 
 	}
 	if evidence.Outcome != taskorchestration.LifecycleEvidenceCommitted ||
 		evidence.OperationID != ref.OperationID ||
-		evidence.RevisionID.String() != "c04-revision" ||
-		evidence.CheckpointID.String() != "c04-checkpoint" ||
+		evidence.RevisionID.String() != string(result.RevisionID) ||
+		evidence.CheckpointID.String() != string(result.CheckpointID) ||
+		evidence.CommitProofDigest == (taskorchestration.EvidenceDigest{}) ||
 		evidence.Evidence.Kind != taskorchestration.EvidenceTaskWorkspaceLifecycle ||
 		port.commitCalls != 1 {
 		t.Fatalf("opaque C04 commit evidence = %#v, calls=%d", evidence, port.commitCalls)
@@ -575,18 +652,12 @@ func TestTaskWorkspaceLifecycleAdapterRecoversCommitEvidenceAfterResponseLoss(t 
 			ref := downstreamEnactmentRef(t, "c04-response-loss-"+strings.ReplaceAll(scenario.name, " ", "-"),
 				taskorchestration.EnactmentTaskWorkspaceLifecycle,
 				taskorchestration.TaskWorkspaceLifecycleFence(7))
-			operation := taskworkspace.Operation{
-				ID: taskworkspace.OperationID(ref.OperationID.String()), RequestDigest: "sha256:c04-response-loss",
-			}
-			request := taskworkspace.CommitRuntimeViewRequest{
-				TaskID: "c04-response-loss-task", Generation: 5, Fence: 7, Operation: operation,
-			}
-			result := taskworkspace.CommitRuntimeViewResult{
-				TaskWorkspaceID: "c04-response-loss-workspace", RevisionID: "c04-response-loss-revision",
-				CheckpointID: "c04-response-loss-checkpoint", Generation: 5, Fence: 7, Operation: operation,
-			}
+			request, result := c04CommitContractFixture(
+				t, ref, "c04-response-loss-task", "c04-response-loss-phase", "c04-response-loss-workspace", 5, 7,
+			)
+			bindC04EnactmentPayload(t, &ref, request.Operation.RequestDigest)
 			terminal := taskworkspace.OperationInspection{
-				Operation: operation, Disposition: taskworkspace.OperationTerminal, CommitRuntimeView: &result,
+				Operation: request.Operation, Disposition: taskworkspace.OperationTerminal, CommitRuntimeView: &result,
 			}
 			if scenario.name == "inspect terminal" {
 				scenario.inspection = terminal
@@ -614,8 +685,8 @@ func TestTaskWorkspaceLifecycleAdapterRecoversCommitEvidenceAfterResponseLoss(t 
 			if err != nil {
 				t.Fatal(err)
 			}
-			if evidence.RevisionID.String() != "c04-response-loss-revision" ||
-				evidence.CheckpointID.String() != "c04-response-loss-checkpoint" ||
+			if evidence.RevisionID.String() != string(result.RevisionID) ||
+				evidence.CheckpointID.String() != string(result.CheckpointID) ||
 				port.commitCalls != 1 || port.inspectCalls != 1 || port.reconcileCalls != scenario.wantCalls {
 				t.Fatalf("response-loss reconciliation = %#v calls=(%d,%d,%d)",
 					evidence, port.commitCalls, port.inspectCalls, port.reconcileCalls)
@@ -633,6 +704,62 @@ func TestTaskWorkspaceLifecycleAdapterSafelyRejectsMalformedEnactment(t *testing
 	assertDownstreamErrorCode(t, err, taskorchestration.DownstreamInvalidEnactment)
 }
 
+func TestTaskWorkspaceLifecycleAdapterRejectsCrossWorkspaceCommitResult(t *testing.T) {
+	ref := downstreamEnactmentRef(t, "c04-cross-workspace-operation",
+		taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(7))
+	request, result := c04CommitContractFixture(
+		t, ref, "c04-cross-workspace-task", "c04-cross-workspace-phase", "c04-workspace-a", 5, 7,
+	)
+	bindC04EnactmentPayload(t, &ref, request.Operation.RequestDigest)
+	result.TaskWorkspaceID = "c04-workspace-b"
+	port := &taskWorkspaceLifecyclePortDouble{commit: result}
+	adapter := taskorchestration.NewTaskWorkspaceLifecycleEvidenceAdapter(
+		port,
+		taskorchestration.TaskWorkspaceLifecycleAdapterBinding{
+			Enactment: ref,
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: downstreamAuthorityID(t, "c04-cross-workspace-authority"), Generation: 5,
+			},
+			TaskID:             downstreamTaskID(t, "c04-cross-workspace-task"),
+			PhaseRunID:         downstreamPhaseRunID(t, "c04-cross-workspace-phase"),
+			PhaseRunGeneration: 6, PhaseRunFence: 7, SafetyEpoch: 2, Commit: &request,
+		},
+	)
+
+	_, err := adapter.Enact(context.Background(), ref)
+	assertDownstreamErrorCode(t, err, taskorchestration.DownstreamCorruptEvidence)
+}
+
+func TestTaskWorkspaceLifecycleAdapterRejectsCrossPhaseCommitBinding(t *testing.T) {
+	ref := downstreamEnactmentRef(t, "c04-cross-phase-operation",
+		taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(7))
+	request, result := c04CommitContractFixture(
+		t, ref, "c04-cross-phase-task", "c04-other-phase", "c04-cross-phase-workspace", 5, 7,
+	)
+	bindC04EnactmentPayload(t, &ref, request.Operation.RequestDigest)
+	port := &taskWorkspaceLifecyclePortDouble{commit: result}
+	adapter := taskorchestration.NewTaskWorkspaceLifecycleEvidenceAdapter(
+		port,
+		taskorchestration.TaskWorkspaceLifecycleAdapterBinding{
+			Enactment: ref,
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: downstreamAuthorityID(t, "c04-cross-phase-authority"), Generation: 5,
+			},
+			TaskID:             downstreamTaskID(t, "c04-cross-phase-task"),
+			PhaseRunID:         downstreamPhaseRunID(t, "c04-expected-phase"),
+			PhaseRunGeneration: 6, PhaseRunFence: 7, SafetyEpoch: 2, Commit: &request,
+		},
+	)
+
+	_, err := adapter.Enact(context.Background(), ref)
+	assertDownstreamErrorCode(t, err, taskorchestration.DownstreamInvalidEnactment)
+	if port.commitCalls != 0 {
+		t.Fatal("cross-Phase C04 binding reached Lifecycle port")
+	}
+}
+
 func TestTaskWorkspaceLifecycleAdapterCancellationRaceIsSafelyNormalized(t *testing.T) {
 	for _, winner := range []string{"commit", "fence"} {
 		winner := winner
@@ -643,19 +770,15 @@ func TestTaskWorkspaceLifecycleAdapterCancellationRaceIsSafelyNormalized(t *test
 			fenceRef := downstreamEnactmentRef(t, "c04-race-fence-"+winner,
 				taskorchestration.EnactmentTaskWorkspaceLifecycle,
 				taskorchestration.TaskWorkspaceLifecycleFence(8))
-			commitOperation := taskworkspace.Operation{
-				ID: taskworkspace.OperationID(commitRef.OperationID.String()), RequestDigest: "sha256:c04-race-commit",
-			}
-			fenceOperation := taskworkspace.Operation{
-				ID: taskworkspace.OperationID(fenceRef.OperationID.String()), RequestDigest: "sha256:c04-race-fence",
-			}
-			commitRequest := taskworkspace.CommitRuntimeViewRequest{
-				TaskID: "c04-race-task", Generation: 7, Fence: 7, Operation: commitOperation,
-			}
-			fenceRequest := taskworkspace.FenceRuntimeViewRequest{
-				TaskID: "c04-race-task", Generation: 8, Fence: 8, Operation: fenceOperation,
-			}
-			port := newC04RacePort(winner, commitOperation, fenceOperation)
+			commitRequest, commitResult := c04CommitContractFixture(
+				t, commitRef, "c04-race-task", "c04-race-phase", "c04-race-workspace", 7, 7,
+			)
+			bindC04EnactmentPayload(t, &commitRef, commitRequest.Operation.RequestDigest)
+			fenceRequest, fenceResult := c04FenceContractFixture(
+				t, fenceRef, "c04-race-task", "c04-race-phase", "c04-race-workspace", 8, 8,
+			)
+			bindC04EnactmentPayload(t, &fenceRef, fenceRequest.Operation.RequestDigest)
+			port := newC04RacePort(winner, commitResult, fenceResult)
 			producer := taskorchestration.EvidenceProducer{
 				AuthorityID: downstreamAuthorityID(t, "c04-race-authority"), Generation: 7,
 			}
@@ -713,20 +836,20 @@ func TestTaskWorkspaceLifecycleAdapterCancellationRaceIsSafelyNormalized(t *test
 }
 
 type c04RacePort struct {
-	winner          string
-	commitOperation taskworkspace.Operation
-	fenceOperation  taskworkspace.Operation
-	commitWon       chan struct{}
-	fenceWon        chan struct{}
+	winner       string
+	commitResult taskworkspace.CommitRuntimeViewResult
+	fenceResult  taskworkspace.FenceRuntimeViewResult
+	commitWon    chan struct{}
+	fenceWon     chan struct{}
 }
 
 func newC04RacePort(
 	winner string,
-	commitOperation taskworkspace.Operation,
-	fenceOperation taskworkspace.Operation,
+	commitResult taskworkspace.CommitRuntimeViewResult,
+	fenceResult taskworkspace.FenceRuntimeViewResult,
 ) *c04RacePort {
 	return &c04RacePort{
-		winner: winner, commitOperation: commitOperation, fenceOperation: fenceOperation,
+		winner: winner, commitResult: commitResult, fenceResult: fenceResult,
 		commitWon: make(chan struct{}), fenceWon: make(chan struct{}),
 	}
 }
@@ -740,10 +863,7 @@ func (port *c04RacePort) CommitRuntimeView(
 		return taskworkspace.CommitRuntimeViewResult{}, &taskworkspace.Error{Code: taskworkspace.ErrorViewTerminalConflict}
 	}
 	close(port.commitWon)
-	return taskworkspace.CommitRuntimeViewResult{
-		TaskWorkspaceID: "c04-race-workspace", RevisionID: "c04-race-revision", CheckpointID: "c04-race-checkpoint",
-		Generation: 7, Fence: 7, Operation: port.commitOperation,
-	}, nil
+	return port.commitResult, nil
 }
 
 func (port *c04RacePort) FenceRuntimeView(
@@ -755,10 +875,7 @@ func (port *c04RacePort) FenceRuntimeView(
 		return taskworkspace.FenceRuntimeViewResult{}, &taskworkspace.Error{Code: taskworkspace.ErrorViewTerminalConflict}
 	}
 	close(port.fenceWon)
-	return taskworkspace.FenceRuntimeViewResult{
-		TaskWorkspaceID: "c04-race-workspace", RuntimeViewID: "c04-race-view",
-		Generation: 8, Fence: 8, Operation: port.fenceOperation,
-	}, nil
+	return port.fenceResult, nil
 }
 
 func (port *c04RacePort) InspectOperation(
@@ -788,6 +905,110 @@ type taskWorkspaceLifecyclePortDouble struct {
 	fenceCalls     int
 	inspectCalls   int
 	reconcileCalls int
+}
+
+func c04CommitContractFixture(
+	t *testing.T,
+	ref taskorchestration.EnactmentRef,
+	taskID string,
+	phaseRunID string,
+	workspaceID string,
+	generation taskworkspace.Generation,
+	fence taskworkspace.Fence,
+) (taskworkspace.CommitRuntimeViewRequest, taskworkspace.CommitRuntimeViewResult) {
+	t.Helper()
+	policyDomainID := taskworkspace.PolicyDomainID("policy-" + taskID)
+	runtimeOperationID := taskworkspace.OperationID("runtime-" + ref.OperationID.String())
+	runtimeViewID := taskworkspace.RuntimeViewID("view-" + ref.OperationID.String())
+	baseRevisionID := taskworkspace.RevisionID("base-" + ref.OperationID.String())
+	lease := taskworkspace.SandboxLeaseAuthority{
+		ID:             taskworkspace.SandboxLeaseID("lease-" + ref.OperationID.String()),
+		EvidenceID:     taskworkspace.EvidenceID("lease-evidence-" + ref.OperationID.String()),
+		AuthorityID:    taskworkspace.SandboxLeaseAuthorityID("lease-authority-" + ref.OperationID.String()),
+		PolicyDomainID: policyDomainID, TaskID: taskworkspace.TaskID(taskID),
+		PhaseRunID:         taskworkspace.PhaseRunID(phaseRunID),
+		RuntimeRunID:       taskworkspace.RuntimeRunID("runtime-run-" + ref.OperationID.String()),
+		RuntimeOperationID: runtimeOperationID, EffectClass: taskworkspace.RuntimeViewMutating,
+		LeaseGeneration: 1, LeaseFence: 1, ExpiresAt: 100,
+	}
+	lease.Digest = lease.CanonicalDigest()
+	manifest := taskworkspace.DeclaredStateManifest{}
+	manifest.Digest = manifest.CanonicalDigest()
+	validation := taskworkspace.ValidationEvidence{
+		ID:                    taskworkspace.EvidenceID("validation-" + ref.OperationID.String()),
+		ValidationAuthorityID: taskworkspace.ValidationAuthorityID("validator-" + ref.OperationID.String()),
+		PolicyDomainID:        policyDomainID, TaskID: taskworkspace.TaskID(taskID),
+		TaskWorkspaceID: taskworkspace.TaskWorkspaceID(workspaceID), RuntimeViewID: runtimeViewID,
+		BaseRevisionID: baseRevisionID, PhaseRunID: taskworkspace.PhaseRunID(phaseRunID),
+		RuntimeRunID: lease.RuntimeRunID, RuntimeOperationID: runtimeOperationID,
+		SandboxLeaseAuthorityDigest: lease.Digest, ManifestDigest: manifest.Digest,
+		Generation: generation, Fence: fence, Decision: taskworkspace.ValidationAccepted,
+	}
+	validation.Digest = validation.CanonicalDigest()
+	request := taskworkspace.CommitRuntimeViewRequest{
+		PolicyDomainID: policyDomainID, TaskID: taskworkspace.TaskID(taskID),
+		TaskWorkspaceID: taskworkspace.TaskWorkspaceID(workspaceID), RuntimeViewID: runtimeViewID,
+		RuntimeOperationID: runtimeOperationID, SandboxLeaseAuthority: lease,
+		BaseRevisionID: baseRevisionID, ExpectedCurrentRevision: baseRevisionID,
+		Generation: generation, Fence: fence, ValidationEvidence: validation,
+		DeclaredStateManifest: manifest,
+		Operation:             taskworkspace.Operation{ID: taskworkspace.OperationID(ref.OperationID.String())},
+	}
+	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	result := taskworkspace.CommitRuntimeViewResult{
+		TaskWorkspaceID: request.TaskWorkspaceID,
+		RevisionID:      taskworkspace.RevisionID("revision-" + ref.OperationID.String()),
+		CheckpointID:    taskworkspace.CheckpointID("checkpoint-" + ref.OperationID.String()),
+		BaseRevisionID:  baseRevisionID, PredecessorRevisionID: baseRevisionID,
+		ManifestDigest: manifest.Digest, ValidationEvidenceID: validation.ID,
+		ValidationEvidenceDigest: validation.Digest,
+		ContentEvidenceRoot:      taskworkspace.EvidenceRoot("content-root-" + ref.OperationID.String()),
+		DurabilityEvidenceRoot:   taskworkspace.EvidenceRoot("durability-root-" + ref.OperationID.String()),
+		Generation:               generation, PreviousFence: fence, Fence: fence, Operation: request.Operation,
+	}
+	return request, result
+}
+
+func c04FenceContractFixture(
+	t *testing.T,
+	ref taskorchestration.EnactmentRef,
+	taskID string,
+	phaseRunID string,
+	workspaceID string,
+	generation taskworkspace.Generation,
+	fence taskworkspace.Fence,
+) (taskworkspace.FenceRuntimeViewRequest, taskworkspace.FenceRuntimeViewResult) {
+	t.Helper()
+	commit, _ := c04CommitContractFixture(t, ref, taskID, phaseRunID, workspaceID, generation, fence)
+	request := taskworkspace.FenceRuntimeViewRequest{
+		PolicyDomainID: commit.PolicyDomainID, TaskID: commit.TaskID,
+		TaskWorkspaceID: commit.TaskWorkspaceID, RuntimeViewID: commit.RuntimeViewID,
+		RuntimeOperationID: commit.RuntimeOperationID, SandboxLeaseAuthority: commit.SandboxLeaseAuthority,
+		BaseRevisionID: commit.BaseRevisionID, ExpectedCurrentRevision: commit.ExpectedCurrentRevision,
+		Generation: generation, Fence: fence, Reason: taskworkspace.RuntimeViewCancelled,
+		Operation: taskworkspace.Operation{ID: taskworkspace.OperationID(ref.OperationID.String())},
+	}
+	request.Operation.RequestDigest = request.CanonicalRequestDigest()
+	return request, taskworkspace.FenceRuntimeViewResult{
+		TaskWorkspaceID: request.TaskWorkspaceID, RuntimeViewID: request.RuntimeViewID,
+		BaseRevisionID: request.BaseRevisionID, CurrentRevisionID: request.ExpectedCurrentRevision,
+		Reason: request.Reason, Generation: generation, PreviousFence: fence, Fence: fence + 1,
+		Operation: request.Operation,
+	}
+}
+
+func bindC04EnactmentPayload(
+	t *testing.T,
+	ref *taskorchestration.EnactmentRef,
+	digest taskworkspace.Digest,
+) {
+	t.Helper()
+	value := strings.TrimPrefix(string(digest), "sha256:")
+	parsed, err := taskorchestration.ParseEnactmentPayloadDigest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref.PayloadDigest = parsed
 }
 
 func (port *taskWorkspaceLifecyclePortDouble) CommitRuntimeView(
@@ -876,11 +1097,22 @@ func TestReleaseAndCatalogAdaptersNeverRepinExistingTaskLocks(t *testing.T) {
 		Producer: taskorchestration.EvidenceProducer{
 			AuthorityID: downstreamAuthorityID(t, "catalog-authority"), Generation: 8,
 		},
-		TemplateLockID:     pinned.TemplateLockID,
-		TemplateVersionID:  templateVersion,
-		ObservedGeneration: 12,
-		SafetyEpoch:        3,
-		BundleClosure:      []taskorchestration.ResourceBundleContract{bundle},
+		TemplateLockID:    pinned.TemplateLockID,
+		TemplateVersionID: templateVersion,
+		TemplateManifestDigest: downstreamEvidenceRef(
+			t, "template-manifest-pinned", taskorchestration.EvidencePublication,
+		).Digest,
+		TemplatePackageDigest: downstreamEvidenceRef(
+			t, "template-package-pinned", taskorchestration.EvidencePublication,
+		).Digest,
+		CompatibilityEvidenceID: downstreamEvidenceID(t, "template-compatibility-pinned"),
+		CompatibilityEvidenceDigest: downstreamEvidenceRef(
+			t, "template-compatibility-digest-pinned", taskorchestration.EvidencePublication,
+		).Digest,
+		CompatibilityExecutionLockID: pinned.ExecutionLock.ID,
+		ObservedGeneration:           12,
+		SafetyEpoch:                  3,
+		BundleClosure:                []taskorchestration.ResourceBundleContract{bundle},
 	}
 	catalogRecord.LockDigest = taskorchestration.TemplateLockContractDigest(catalogRecord)
 	catalogPort := &catalogPublicationPortDouble{record: catalogRecord}
@@ -904,6 +1136,13 @@ func TestReleaseAndCatalogAdaptersNeverRepinExistingTaskLocks(t *testing.T) {
 			firstCatalog = resolved
 		} else if !reflect.DeepEqual(resolved, firstCatalog) {
 			t.Fatalf("Catalog adapter repinned purpose %d: %#v != %#v", purpose, resolved, firstCatalog)
+		}
+		if resolved.TemplateManifestDigest != catalogRecord.TemplateManifestDigest ||
+			resolved.TemplatePackageDigest != catalogRecord.TemplatePackageDigest ||
+			resolved.CompatibilityEvidenceID != catalogRecord.CompatibilityEvidenceID ||
+			resolved.CompatibilityEvidenceDigest != catalogRecord.CompatibilityEvidenceDigest ||
+			resolved.CompatibilityExecutionLockID != catalogRecord.CompatibilityExecutionLockID {
+			t.Fatalf("Catalog adapter dropped pinned Template contract material: %#v", resolved)
 		}
 	}
 	if catalogPort.calls != 1 {
@@ -954,6 +1193,7 @@ func TestCatalogPublicationAdapterRejectsStaleGenerationAndSafetyEpoch(t *testin
 			PackageDigest:    downstreamEvidenceRef(t, "catalog-stale-package", taskorchestration.EvidencePublication).Digest,
 		}},
 	}
+	bindTemplatePublishedContract(t, &record, pinned.ExecutionLock.ID, "catalog-stale")
 	record.LockDigest = taskorchestration.TemplateLockContractDigest(record)
 
 	for _, scenario := range []struct {
@@ -1002,6 +1242,7 @@ func TestCatalogPublicationAdapterCanonicalizesBundleClosureOrder(t *testing.T) 
 		TemplateLockID: pinned.TemplateLockID, TemplateVersionID: downstreamTemplateVersionID(t, "catalog-closure-version"),
 		ObservedGeneration: 12, SafetyEpoch: 3, BundleClosure: bundles,
 	}
+	bindTemplatePublishedContract(t, &record, pinned.ExecutionLock.ID, "catalog-closure")
 	record.LockDigest = taskorchestration.TemplateLockContractDigest(record)
 	record.BundleClosure = []taskorchestration.ResourceBundleContract{bundles[1], bundles[0]}
 	adapter := taskorchestration.NewCatalogPublicationAdapter(&catalogPublicationPortDouble{record: record})
@@ -1020,6 +1261,11 @@ func TestCatalogPublicationAdapterCanonicalizesBundleClosureOrder(t *testing.T) 
 }
 
 func TestDownstreamAdapterPublicSurfacesDoNotExposeProgressionOrPhysicalMechanics(t *testing.T) {
+	assertDownstreamAdapterPublicSurfaces(t)
+}
+
+func assertDownstreamAdapterPublicSurfaces(t *testing.T) {
+	t.Helper()
 	interfaces := []reflect.Type{
 		reflect.TypeOf((*taskorchestration.RuntimeEvidenceAdapter)(nil)).Elem(),
 		reflect.TypeOf((*taskorchestration.SchedulerEvidenceAdapter)(nil)).Elem(),
@@ -1154,7 +1400,9 @@ func TestUsageAccountingEvidenceCannotReopenTerminalPhase(t *testing.T) {
 		QuotaReservationID: downstreamQuotaReservationID(t, "quota-reservation-terminal"),
 	}
 	record.EvidenceDigest = taskorchestration.UsageAccountingEvidenceDigest(record)
-	adapter := taskorchestration.NewUsageAccountingEvidenceAdapter(&usageAccountingPortDouble{record: record})
+	adapter := taskorchestration.NewUsageAccountingEvidenceAdapter(
+		&usageAccountingPortDouble{record: record}, prerequisiteAuthority(record.Prerequisites),
+	)
 	evidence, err := adapter.Enact(context.Background(), ref)
 	if err != nil || evidence.Kind != taskorchestration.UsageReservationSettled {
 		t.Fatalf("late Usage evidence = %#v, err=%v", evidence, err)
@@ -1358,4 +1606,59 @@ func downstreamAdmissionGrantID(t *testing.T, value string) taskorchestration.Ad
 		t.Fatal(err)
 	}
 	return id
+}
+
+func downstreamRuntimeBindingID(t *testing.T, value string) taskorchestration.RuntimeBindingID {
+	t.Helper()
+	id, err := taskorchestration.NewRuntimeBindingID(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func downstreamExecutionNodeID(t *testing.T, value string) taskorchestration.ExecutionNodeID {
+	t.Helper()
+	id, err := taskorchestration.NewExecutionNodeID(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func downstreamSandboxLeaseID(t *testing.T, value string) taskorchestration.SandboxLeaseID {
+	t.Helper()
+	id, err := taskorchestration.NewSandboxLeaseID(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func bindRuntimeEvidenceContract(
+	t *testing.T,
+	record *taskorchestration.RuntimeEvidenceRecord,
+	prefix string,
+) {
+	t.Helper()
+	record.RuntimeBindingID = downstreamRuntimeBindingID(t, prefix+"-binding")
+	record.RuntimeBindingDigest = downstreamEvidenceRef(t, prefix+"-binding-digest", taskorchestration.EvidenceRuntime).Digest
+	record.ImmutableInputManifestDigest = downstreamEvidenceRef(t, prefix+"-input-manifest", taskorchestration.EvidenceRuntime).Digest
+	record.ExecutionNodeID = downstreamExecutionNodeID(t, prefix+"-node")
+	record.SandboxLeaseID = downstreamSandboxLeaseID(t, prefix+"-lease")
+	record.OutputManifestDigest = downstreamEvidenceRef(t, prefix+"-output-manifest", taskorchestration.EvidenceRuntime).Digest
+}
+
+func bindTemplatePublishedContract(
+	t *testing.T,
+	record *taskorchestration.PublishedTemplateLockContract,
+	executionLockID taskorchestration.ExecutionLockID,
+	prefix string,
+) {
+	t.Helper()
+	record.TemplateManifestDigest = downstreamEvidenceRef(t, prefix+"-template-manifest", taskorchestration.EvidencePublication).Digest
+	record.TemplatePackageDigest = downstreamEvidenceRef(t, prefix+"-template-package", taskorchestration.EvidencePublication).Digest
+	record.CompatibilityEvidenceID = downstreamEvidenceID(t, prefix+"-compatibility")
+	record.CompatibilityEvidenceDigest = downstreamEvidenceRef(t, prefix+"-compatibility-digest", taskorchestration.EvidencePublication).Digest
+	record.CompatibilityExecutionLockID = executionLockID
 }

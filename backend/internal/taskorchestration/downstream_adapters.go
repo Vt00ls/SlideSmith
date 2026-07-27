@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
-	"sync"
 )
 
 // EvidenceSchemaVersion identifies a downstream evidence envelope encoding.
@@ -33,6 +32,13 @@ type EvidencePrerequisite struct {
 	Evidence   EvidenceRef
 	Generation ProducerGeneration
 	Fence      uint64
+}
+
+// EvidencePrerequisiteAuthority supplies the Task Orchestration-owned
+// prerequisite bindings for one committed enactment. Downstream producers do
+// not declare what evidence they were required to observe.
+type EvidencePrerequisiteAuthority interface {
+	ExpectedPrerequisites(context.Context, EnactmentRef) ([]EvidencePrerequisite, error)
 }
 
 type DownstreamErrorCode uint8
@@ -104,6 +110,16 @@ func (failure *DownstreamError) ReconciliationDisposition() ReconciliationDispos
 	return failure.reconciliation
 }
 
+// NewDownstreamError lets a downstream port return one closed, content-free
+// category without retaining a raw cause. Unknown codes fail closed as an
+// invalid enactment.
+func NewDownstreamError(code DownstreamErrorCode) *DownstreamError {
+	if code < DownstreamInvalidEnactment || code > DownstreamReconciliationRequired {
+		code = DownstreamInvalidEnactment
+	}
+	return newDownstreamError(code)
+}
+
 func newDownstreamError(code DownstreamErrorCode) *DownstreamError {
 	failure := &DownstreamError{code: code}
 	switch code {
@@ -125,51 +141,89 @@ func normalizeDownstreamError(err error) *DownstreamError {
 	return newDownstreamError(DownstreamDependencyUnavailable)
 }
 
+type RuntimeBindingID struct{ value string }
+type ExecutionNodeID struct{ value string }
+type SandboxLeaseID struct{ value string }
+
+func NewRuntimeBindingID(value string) (RuntimeBindingID, error) {
+	if !validOpaqueID(value) {
+		return RuntimeBindingID{}, invalidIntentError()
+	}
+	return RuntimeBindingID{value: value}, nil
+}
+
+func NewExecutionNodeID(value string) (ExecutionNodeID, error) {
+	if !validOpaqueID(value) {
+		return ExecutionNodeID{}, invalidIntentError()
+	}
+	return ExecutionNodeID{value: value}, nil
+}
+
+func NewSandboxLeaseID(value string) (SandboxLeaseID, error) {
+	if !validOpaqueID(value) {
+		return SandboxLeaseID{}, invalidIntentError()
+	}
+	return SandboxLeaseID{value: value}, nil
+}
+
+func (id RuntimeBindingID) String() string { return id.value }
+func (id ExecutionNodeID) String() string  { return id.value }
+func (id SandboxLeaseID) String() string   { return id.value }
+
 // RuntimeEvidenceRecord is the content-free record returned by the Runtime
 // Execution authority before adapter verification.
 type RuntimeEvidenceRecord struct {
-	SchemaVersion         EvidenceSchemaVersion
-	EvidenceID            EvidenceID
-	EvidenceDigest        EvidenceDigest
-	Producer              EvidenceProducer
-	TaskID                TaskID
-	PhaseRunID            PhaseRunID
-	PhaseRunGeneration    PhaseRunGeneration
-	PhaseRunFence         PhaseRunFence
-	RuntimeRunID          RuntimeRunID
-	OperationID           OperationID
-	ActivityGeneration    ActivityGeneration
-	Generation            RuntimeGeneration
-	Fence                 RuntimeFence
-	SafetyEpoch           SafetyEpoch
-	Outcome               RuntimeRunOutcome
-	RequiredPrerequisites []EvidenceRef
-	Prerequisites         []EvidencePrerequisite
+	SchemaVersion                EvidenceSchemaVersion
+	EvidenceID                   EvidenceID
+	EvidenceDigest               EvidenceDigest
+	Producer                     EvidenceProducer
+	TaskID                       TaskID
+	PhaseRunID                   PhaseRunID
+	PhaseRunGeneration           PhaseRunGeneration
+	PhaseRunFence                PhaseRunFence
+	RuntimeRunID                 RuntimeRunID
+	RuntimeBindingID             RuntimeBindingID
+	RuntimeBindingDigest         EvidenceDigest
+	ImmutableInputManifestDigest EvidenceDigest
+	ExecutionNodeID              ExecutionNodeID
+	SandboxLeaseID               SandboxLeaseID
+	OutputManifestDigest         EvidenceDigest
+	OperationID                  OperationID
+	ActivityGeneration           ActivityGeneration
+	Generation                   RuntimeGeneration
+	Fence                        RuntimeFence
+	SafetyEpoch                  SafetyEpoch
+	Outcome                      RuntimeRunOutcome
+	Prerequisites                []EvidencePrerequisite
 }
 
 // RuntimeEvidenceDigest independently canonicalizes the typed record. The
 // claimed EvidenceDigest is deliberately excluded.
 func RuntimeEvidenceDigest(record RuntimeEvidenceRecord) EvidenceDigest {
 	prerequisites := canonicalEvidencePrerequisites(record.Prerequisites)
-	requiredPrerequisites := canonicalRequiredPrerequisites(record.RequiredPrerequisites)
 	encoded, _ := json.Marshal(map[string]any{
-		"activity_generation":    uint64(record.ActivityGeneration),
-		"evidence_id":            record.EvidenceID.String(),
-		"fence":                  uint64(record.Fence),
-		"generation":             uint64(record.Generation),
-		"operation_id":           record.OperationID.String(),
-		"outcome":                runtimeRunOutcomeName(record.Outcome),
-		"phase_run_fence":        uint64(record.PhaseRunFence),
-		"phase_run_generation":   uint64(record.PhaseRunGeneration),
-		"phase_run_id":           record.PhaseRunID.String(),
-		"prerequisites":          prerequisites,
-		"required_prerequisites": requiredPrerequisites,
-		"producer_authority_id":  record.Producer.AuthorityID.String(),
-		"producer_generation":    uint64(record.Producer.Generation),
-		"runtime_run_id":         record.RuntimeRunID.String(),
-		"safety_epoch":           uint64(record.SafetyEpoch),
-		"schema_version":         uint64(record.SchemaVersion),
-		"task_id":                record.TaskID.String(),
+		"activity_generation":             uint64(record.ActivityGeneration),
+		"evidence_id":                     record.EvidenceID.String(),
+		"fence":                           uint64(record.Fence),
+		"generation":                      uint64(record.Generation),
+		"operation_id":                    record.OperationID.String(),
+		"outcome":                         runtimeRunOutcomeName(record.Outcome),
+		"phase_run_fence":                 uint64(record.PhaseRunFence),
+		"phase_run_generation":            uint64(record.PhaseRunGeneration),
+		"phase_run_id":                    record.PhaseRunID.String(),
+		"prerequisites":                   prerequisites,
+		"producer_authority_id":           record.Producer.AuthorityID.String(),
+		"producer_generation":             uint64(record.Producer.Generation),
+		"runtime_run_id":                  record.RuntimeRunID.String(),
+		"runtime_binding_id":              record.RuntimeBindingID.String(),
+		"runtime_binding_digest":          record.RuntimeBindingDigest.String(),
+		"immutable_input_manifest_digest": record.ImmutableInputManifestDigest.String(),
+		"execution_node_id":               record.ExecutionNodeID.String(),
+		"sandbox_lease_id":                record.SandboxLeaseID.String(),
+		"output_manifest_digest":          record.OutputManifestDigest.String(),
+		"safety_epoch":                    uint64(record.SafetyEpoch),
+		"schema_version":                  uint64(record.SchemaVersion),
+		"task_id":                         record.TaskID.String(),
 	})
 	sum := sha256.Sum256(encoded)
 	return EvidenceDigest(sum)
@@ -196,21 +250,27 @@ type RuntimeEvidenceAdapter interface {
 }
 
 type RuntimeAdapterEvidence struct {
-	SchemaVersion      EvidenceSchemaVersion
-	Evidence           EvidenceRef
-	Producer           EvidenceProducer
-	TaskID             TaskID
-	PhaseRunID         PhaseRunID
-	PhaseRunGeneration PhaseRunGeneration
-	PhaseRunFence      PhaseRunFence
-	RuntimeRunID       RuntimeRunID
-	OperationID        OperationID
-	ActivityGeneration ActivityGeneration
-	Generation         RuntimeGeneration
-	Fence              RuntimeFence
-	SafetyEpoch        SafetyEpoch
-	Outcome            RuntimeRunOutcome
-	Prerequisites      []EvidencePrerequisite
+	SchemaVersion                EvidenceSchemaVersion
+	Evidence                     EvidenceRef
+	Producer                     EvidenceProducer
+	TaskID                       TaskID
+	PhaseRunID                   PhaseRunID
+	PhaseRunGeneration           PhaseRunGeneration
+	PhaseRunFence                PhaseRunFence
+	RuntimeRunID                 RuntimeRunID
+	RuntimeBindingID             RuntimeBindingID
+	RuntimeBindingDigest         EvidenceDigest
+	ImmutableInputManifestDigest EvidenceDigest
+	ExecutionNodeID              ExecutionNodeID
+	SandboxLeaseID               SandboxLeaseID
+	OutputManifestDigest         EvidenceDigest
+	OperationID                  OperationID
+	ActivityGeneration           ActivityGeneration
+	Generation                   RuntimeGeneration
+	Fence                        RuntimeFence
+	SafetyEpoch                  SafetyEpoch
+	Outcome                      RuntimeRunOutcome
+	Prerequisites                []EvidencePrerequisite
 }
 
 // Intent translates verified Runtime evidence into the one authoritative
@@ -235,69 +295,67 @@ func (evidence RuntimeAdapterEvidence) Intent(header IntentHeader) (TransitionIn
 }
 
 type runtimeEvidenceAdapter struct {
-	mu      sync.Mutex
-	port    RuntimeEvidencePort
-	replays map[OperationID]runtimeEvidenceReplay
+	port          RuntimeEvidencePort
+	prerequisites EvidencePrerequisiteAuthority
+	replays       *downstreamReplayShell[OperationID, [32]byte, RuntimeAdapterEvidence]
 }
 
-type runtimeEvidenceReplay struct {
-	fingerprint [32]byte
-	evidence    RuntimeAdapterEvidence
-}
-
-func NewRuntimeEvidenceAdapter(port RuntimeEvidencePort) RuntimeEvidenceAdapter {
-	return &runtimeEvidenceAdapter{port: port, replays: make(map[OperationID]runtimeEvidenceReplay)}
+func NewRuntimeEvidenceAdapter(
+	port RuntimeEvidencePort,
+	prerequisites EvidencePrerequisiteAuthority,
+) RuntimeEvidenceAdapter {
+	return &runtimeEvidenceAdapter{
+		port: port, prerequisites: prerequisites,
+		replays: newDownstreamReplayShell[OperationID, [32]byte, RuntimeAdapterEvidence](),
+	}
 }
 
 func (adapter *runtimeEvidenceAdapter) Enact(
 	ctx context.Context,
 	ref EnactmentRef,
-) (evidence RuntimeAdapterEvidence, err error) {
+) (RuntimeAdapterEvidence, error) {
 	if failure := validateEnactmentRef(ref, EnactmentRuntimeExecution, EnactmentFenceRuntimeExecution); failure != nil {
 		return RuntimeAdapterEvidence{}, failure
 	}
-	fingerprint := enactmentFingerprint(ref)
-	adapter.mu.Lock()
-	defer adapter.mu.Unlock()
-	if replay, exists := adapter.replays[ref.OperationID]; exists {
-		if replay.fingerprint != fingerprint {
-			return RuntimeAdapterEvidence{}, newDownstreamError(DownstreamIntegrityConflict)
-		}
-		return cloneRuntimeAdapterEvidence(replay.evidence), nil
-	}
-	if adapter.port == nil {
-		return RuntimeAdapterEvidence{}, newDownstreamError(DownstreamDependencyUnavailable)
-	}
-	var record RuntimeEvidenceRecord
-	func() {
-		defer func() {
-			if recover() != nil {
-				err = newDownstreamError(DownstreamDependencyUnavailable)
+	var expectedPrerequisites []EvidencePrerequisite
+	return invokeDownstreamWithReplay(
+		adapter.replays,
+		ref.OperationID,
+		enactmentFingerprint(ref),
+		adapter.port != nil,
+		func() (failure *DownstreamError) {
+			expectedPrerequisites, failure = loadExpectedPrerequisites(ctx, adapter.prerequisites, ref)
+			return failure
+		},
+		func() (RuntimeEvidenceRecord, error) { return adapter.port.EnactRuntime(ctx, ref) },
+		func(record RuntimeEvidenceRecord) *DownstreamError {
+			return validateRuntimeEvidenceRecord(record, ref, expectedPrerequisites)
+		},
+		func(record RuntimeEvidenceRecord) RuntimeAdapterEvidence {
+			return RuntimeAdapterEvidence{
+				SchemaVersion: record.SchemaVersion,
+				Evidence:      NewEvidenceRef(record.EvidenceID, EvidenceRuntime, record.EvidenceDigest),
+				Producer:      record.Producer, TaskID: record.TaskID, PhaseRunID: record.PhaseRunID,
+				PhaseRunGeneration: record.PhaseRunGeneration, PhaseRunFence: record.PhaseRunFence,
+				RuntimeRunID: record.RuntimeRunID, RuntimeBindingID: record.RuntimeBindingID,
+				RuntimeBindingDigest:         record.RuntimeBindingDigest,
+				ImmutableInputManifestDigest: record.ImmutableInputManifestDigest,
+				ExecutionNodeID:              record.ExecutionNodeID, SandboxLeaseID: record.SandboxLeaseID,
+				OutputManifestDigest: record.OutputManifestDigest, OperationID: record.OperationID,
+				ActivityGeneration: record.ActivityGeneration, Generation: record.Generation,
+				Fence: record.Fence, SafetyEpoch: record.SafetyEpoch, Outcome: record.Outcome,
+				Prerequisites: append([]EvidencePrerequisite(nil), record.Prerequisites...),
 			}
-		}()
-		record, err = adapter.port.EnactRuntime(ctx, ref)
-	}()
-	if err != nil {
-		return RuntimeAdapterEvidence{}, normalizeDownstreamError(err)
-	}
-	if failure := validateRuntimeEvidenceRecord(record, ref); failure != nil {
-		return RuntimeAdapterEvidence{}, failure
-	}
-	evidence = RuntimeAdapterEvidence{
-		SchemaVersion: record.SchemaVersion,
-		Evidence:      NewEvidenceRef(record.EvidenceID, EvidenceRuntime, record.EvidenceDigest),
-		Producer:      record.Producer, TaskID: record.TaskID, PhaseRunID: record.PhaseRunID,
-		PhaseRunGeneration: record.PhaseRunGeneration, PhaseRunFence: record.PhaseRunFence,
-		RuntimeRunID: record.RuntimeRunID, OperationID: record.OperationID,
-		ActivityGeneration: record.ActivityGeneration, Generation: record.Generation,
-		Fence: record.Fence, SafetyEpoch: record.SafetyEpoch, Outcome: record.Outcome,
-		Prerequisites: append([]EvidencePrerequisite(nil), record.Prerequisites...),
-	}
-	adapter.replays[ref.OperationID] = runtimeEvidenceReplay{fingerprint: fingerprint, evidence: evidence}
-	return cloneRuntimeAdapterEvidence(evidence), nil
+		},
+		cloneRuntimeAdapterEvidence,
+	)
 }
 
-func validateRuntimeEvidenceRecord(record RuntimeEvidenceRecord, ref EnactmentRef) *DownstreamError {
+func validateRuntimeEvidenceRecord(
+	record RuntimeEvidenceRecord,
+	ref EnactmentRef,
+	expectedPrerequisites []EvidencePrerequisite,
+) *DownstreamError {
 	if record.SchemaVersion.Major() != EvidenceSchemaV1.Major() {
 		return newDownstreamError(DownstreamUnsupportedSchema)
 	}
@@ -305,6 +363,10 @@ func validateRuntimeEvidenceRecord(record RuntimeEvidenceRecord, ref EnactmentRe
 		record.Producer.Generation == 0 || !validOpaqueID(record.TaskID.String()) ||
 		!validOpaqueID(record.PhaseRunID.String()) || record.PhaseRunGeneration == 0 ||
 		record.PhaseRunFence == 0 || !validOpaqueID(record.RuntimeRunID.String()) ||
+		!validOpaqueID(record.RuntimeBindingID.String()) || record.RuntimeBindingDigest == (EvidenceDigest{}) ||
+		record.ImmutableInputManifestDigest == (EvidenceDigest{}) ||
+		!validOpaqueID(record.ExecutionNodeID.String()) || !validOpaqueID(record.SandboxLeaseID.String()) ||
+		record.OutputManifestDigest == (EvidenceDigest{}) ||
 		record.OperationID != ref.OperationID || record.ActivityGeneration != ref.ActivityGeneration ||
 		record.Generation == 0 || record.Fence == 0 || record.SafetyEpoch == 0 ||
 		runtimeRunOutcomeName(record.Outcome) == "" {
@@ -314,7 +376,7 @@ func validateRuntimeEvidenceRecord(record RuntimeEvidenceRecord, ref EnactmentRe
 	if !ok || record.Fence != runtimeFence {
 		return newDownstreamError(DownstreamStale)
 	}
-	if failure := validateEvidencePrerequisites(record.RequiredPrerequisites, record.Prerequisites); failure != nil {
+	if failure := validateEvidencePrerequisites(expectedPrerequisites, record.Prerequisites); failure != nil {
 		return failure
 	}
 	if record.EvidenceDigest == (EvidenceDigest{}) || record.EvidenceDigest != RuntimeEvidenceDigest(record) {
@@ -428,50 +490,47 @@ func schedulerEvidenceKindName(kind SchedulerEvidenceKind) string {
 }
 
 type SchedulerEvidenceRecord struct {
-	SchemaVersion         EvidenceSchemaVersion
-	EvidenceID            EvidenceID
-	EvidenceDigest        EvidenceDigest
-	Producer              EvidenceProducer
-	TaskID                TaskID
-	PhaseRunID            PhaseRunID
-	PhaseRunGeneration    PhaseRunGeneration
-	PhaseRunFence         PhaseRunFence
-	OperationID           OperationID
-	ActivityGeneration    ActivityGeneration
-	Generation            ProducerGeneration
-	Fence                 SchedulerFence
-	SafetyEpoch           SafetyEpoch
-	Kind                  SchedulerEvidenceKind
-	WorkItemID            SchedulerWorkItemID
-	DeliveryClaimID       DeliveryClaimID
-	AdmissionGrantID      AdmissionGrantID
-	RequiredPrerequisites []EvidenceRef
-	Prerequisites         []EvidencePrerequisite
+	SchemaVersion      EvidenceSchemaVersion
+	EvidenceID         EvidenceID
+	EvidenceDigest     EvidenceDigest
+	Producer           EvidenceProducer
+	TaskID             TaskID
+	PhaseRunID         PhaseRunID
+	PhaseRunGeneration PhaseRunGeneration
+	PhaseRunFence      PhaseRunFence
+	OperationID        OperationID
+	ActivityGeneration ActivityGeneration
+	Generation         ProducerGeneration
+	Fence              SchedulerFence
+	SafetyEpoch        SafetyEpoch
+	Kind               SchedulerEvidenceKind
+	WorkItemID         SchedulerWorkItemID
+	DeliveryClaimID    DeliveryClaimID
+	AdmissionGrantID   AdmissionGrantID
+	Prerequisites      []EvidencePrerequisite
 }
 
 func SchedulerEvidenceDigest(record SchedulerEvidenceRecord) EvidenceDigest {
 	prerequisites := canonicalEvidencePrerequisites(record.Prerequisites)
-	requiredPrerequisites := canonicalRequiredPrerequisites(record.RequiredPrerequisites)
 	encoded, _ := json.Marshal(map[string]any{
-		"activity_generation":    uint64(record.ActivityGeneration),
-		"evidence_id":            record.EvidenceID.String(),
-		"fence":                  uint64(record.Fence),
-		"generation":             uint64(record.Generation),
-		"kind":                   schedulerEvidenceKindName(record.Kind),
-		"operation_id":           record.OperationID.String(),
-		"admission_grant_id":     record.AdmissionGrantID.String(),
-		"delivery_claim_id":      record.DeliveryClaimID.String(),
-		"phase_run_fence":        uint64(record.PhaseRunFence),
-		"phase_run_generation":   uint64(record.PhaseRunGeneration),
-		"phase_run_id":           record.PhaseRunID.String(),
-		"prerequisites":          prerequisites,
-		"required_prerequisites": requiredPrerequisites,
-		"producer_authority_id":  record.Producer.AuthorityID.String(),
-		"producer_generation":    uint64(record.Producer.Generation),
-		"safety_epoch":           uint64(record.SafetyEpoch),
-		"schema_version":         uint64(record.SchemaVersion),
-		"task_id":                record.TaskID.String(),
-		"work_item_id":           record.WorkItemID.String(),
+		"activity_generation":   uint64(record.ActivityGeneration),
+		"evidence_id":           record.EvidenceID.String(),
+		"fence":                 uint64(record.Fence),
+		"generation":            uint64(record.Generation),
+		"kind":                  schedulerEvidenceKindName(record.Kind),
+		"operation_id":          record.OperationID.String(),
+		"admission_grant_id":    record.AdmissionGrantID.String(),
+		"delivery_claim_id":     record.DeliveryClaimID.String(),
+		"phase_run_fence":       uint64(record.PhaseRunFence),
+		"phase_run_generation":  uint64(record.PhaseRunGeneration),
+		"phase_run_id":          record.PhaseRunID.String(),
+		"prerequisites":         prerequisites,
+		"producer_authority_id": record.Producer.AuthorityID.String(),
+		"producer_generation":   uint64(record.Producer.Generation),
+		"safety_epoch":          uint64(record.SafetyEpoch),
+		"schema_version":        uint64(record.SchemaVersion),
+		"task_id":               record.TaskID.String(),
+		"work_item_id":          record.WorkItemID.String(),
 	})
 	sum := sha256.Sum256(encoded)
 	return EvidenceDigest(sum)
@@ -522,70 +581,64 @@ func (evidence SchedulerAdapterEvidence) Intent(header IntentHeader) (Transition
 }
 
 type schedulerEvidenceAdapter struct {
-	mu      sync.Mutex
-	port    SchedulerEvidencePort
-	replays map[OperationID]schedulerEvidenceReplay
+	port          SchedulerEvidencePort
+	prerequisites EvidencePrerequisiteAuthority
+	replays       *downstreamReplayShell[OperationID, [32]byte, SchedulerAdapterEvidence]
 }
 
-type schedulerEvidenceReplay struct {
-	fingerprint [32]byte
-	evidence    SchedulerAdapterEvidence
-}
-
-func NewSchedulerEvidenceAdapter(port SchedulerEvidencePort) SchedulerEvidenceAdapter {
-	return &schedulerEvidenceAdapter{port: port, replays: make(map[OperationID]schedulerEvidenceReplay)}
+func NewSchedulerEvidenceAdapter(
+	port SchedulerEvidencePort,
+	prerequisites EvidencePrerequisiteAuthority,
+) SchedulerEvidenceAdapter {
+	return &schedulerEvidenceAdapter{
+		port: port, prerequisites: prerequisites,
+		replays: newDownstreamReplayShell[OperationID, [32]byte, SchedulerAdapterEvidence](),
+	}
 }
 
 func (adapter *schedulerEvidenceAdapter) Enact(
 	ctx context.Context,
 	ref EnactmentRef,
-) (evidence SchedulerAdapterEvidence, err error) {
+) (SchedulerAdapterEvidence, error) {
 	if failure := validateEnactmentRef(ref, EnactmentScheduling, EnactmentFenceScheduling); failure != nil {
 		return SchedulerAdapterEvidence{}, failure
 	}
-	fingerprint := enactmentFingerprint(ref)
-	adapter.mu.Lock()
-	defer adapter.mu.Unlock()
-	if replay, exists := adapter.replays[ref.OperationID]; exists {
-		if replay.fingerprint != fingerprint {
-			return SchedulerAdapterEvidence{}, newDownstreamError(DownstreamIntegrityConflict)
-		}
-		return cloneSchedulerAdapterEvidence(replay.evidence), nil
-	}
-	if adapter.port == nil {
-		return SchedulerAdapterEvidence{}, newDownstreamError(DownstreamDependencyUnavailable)
-	}
-	var record SchedulerEvidenceRecord
-	func() {
-		defer func() {
-			if recover() != nil {
-				err = newDownstreamError(DownstreamDependencyUnavailable)
+	var expectedPrerequisites []EvidencePrerequisite
+	return invokeDownstreamWithReplay(
+		adapter.replays,
+		ref.OperationID,
+		enactmentFingerprint(ref),
+		adapter.port != nil,
+		func() (failure *DownstreamError) {
+			expectedPrerequisites, failure = loadExpectedPrerequisites(ctx, adapter.prerequisites, ref)
+			return failure
+		},
+		func() (SchedulerEvidenceRecord, error) { return adapter.port.EnactScheduling(ctx, ref) },
+		func(record SchedulerEvidenceRecord) *DownstreamError {
+			return validateSchedulerEvidenceRecord(record, ref, expectedPrerequisites)
+		},
+		func(record SchedulerEvidenceRecord) SchedulerAdapterEvidence {
+			return SchedulerAdapterEvidence{
+				SchemaVersion: record.SchemaVersion,
+				Evidence:      NewEvidenceRef(record.EvidenceID, EvidenceScheduling, record.EvidenceDigest),
+				Producer:      record.Producer, TaskID: record.TaskID, PhaseRunID: record.PhaseRunID,
+				PhaseRunGeneration: record.PhaseRunGeneration, PhaseRunFence: record.PhaseRunFence,
+				OperationID: record.OperationID, ActivityGeneration: record.ActivityGeneration,
+				Generation: record.Generation, Fence: record.Fence, SafetyEpoch: record.SafetyEpoch,
+				Kind: record.Kind, WorkItemID: record.WorkItemID, DeliveryClaimID: record.DeliveryClaimID,
+				AdmissionGrantID: record.AdmissionGrantID,
+				Prerequisites:    append([]EvidencePrerequisite(nil), record.Prerequisites...),
 			}
-		}()
-		record, err = adapter.port.EnactScheduling(ctx, ref)
-	}()
-	if err != nil {
-		return SchedulerAdapterEvidence{}, normalizeDownstreamError(err)
-	}
-	if failure := validateSchedulerEvidenceRecord(record, ref); failure != nil {
-		return SchedulerAdapterEvidence{}, failure
-	}
-	evidence = SchedulerAdapterEvidence{
-		SchemaVersion: record.SchemaVersion,
-		Evidence:      NewEvidenceRef(record.EvidenceID, EvidenceScheduling, record.EvidenceDigest),
-		Producer:      record.Producer, TaskID: record.TaskID, PhaseRunID: record.PhaseRunID,
-		PhaseRunGeneration: record.PhaseRunGeneration, PhaseRunFence: record.PhaseRunFence,
-		OperationID: record.OperationID, ActivityGeneration: record.ActivityGeneration,
-		Generation: record.Generation, Fence: record.Fence, SafetyEpoch: record.SafetyEpoch,
-		Kind: record.Kind, WorkItemID: record.WorkItemID, DeliveryClaimID: record.DeliveryClaimID,
-		AdmissionGrantID: record.AdmissionGrantID,
-		Prerequisites:    append([]EvidencePrerequisite(nil), record.Prerequisites...),
-	}
-	adapter.replays[ref.OperationID] = schedulerEvidenceReplay{fingerprint, evidence}
-	return cloneSchedulerAdapterEvidence(evidence), nil
+		},
+		cloneSchedulerAdapterEvidence,
+	)
 }
 
-func validateSchedulerEvidenceRecord(record SchedulerEvidenceRecord, ref EnactmentRef) *DownstreamError {
+func validateSchedulerEvidenceRecord(
+	record SchedulerEvidenceRecord,
+	ref EnactmentRef,
+	expectedPrerequisites []EvidencePrerequisite,
+) *DownstreamError {
 	if record.SchemaVersion.Major() != EvidenceSchemaV1.Major() {
 		return newDownstreamError(DownstreamUnsupportedSchema)
 	}
@@ -604,7 +657,7 @@ func validateSchedulerEvidenceRecord(record SchedulerEvidenceRecord, ref Enactme
 	if !ok || record.Fence != fence {
 		return newDownstreamError(DownstreamStale)
 	}
-	if failure := validateEvidencePrerequisites(record.RequiredPrerequisites, record.Prerequisites); failure != nil {
+	if failure := validateEvidencePrerequisites(expectedPrerequisites, record.Prerequisites); failure != nil {
 		return failure
 	}
 	if record.EvidenceDigest == (EvidenceDigest{}) || record.EvidenceDigest != SchedulerEvidenceDigest(record) {
@@ -653,13 +706,11 @@ type PublicationEvidenceRecord struct {
 	Outcome                PublicationOutcome
 	ArtifactVersionID      ArtifactVersionID
 	ArtifactManifestDigest EvidenceDigest
-	RequiredPrerequisites  []EvidenceRef
 	Prerequisites          []EvidencePrerequisite
 }
 
 func PublicationEvidenceDigest(record PublicationEvidenceRecord) EvidenceDigest {
 	prerequisites := canonicalEvidencePrerequisites(record.Prerequisites)
-	requiredPrerequisites := canonicalRequiredPrerequisites(record.RequiredPrerequisites)
 	encoded, _ := json.Marshal(map[string]any{
 		"activity_generation":      uint64(record.ActivityGeneration),
 		"artifact_manifest_digest": record.ArtifactManifestDigest.String(),
@@ -673,7 +724,6 @@ func PublicationEvidenceDigest(record PublicationEvidenceRecord) EvidenceDigest 
 		"phase_run_generation":     uint64(record.PhaseRunGeneration),
 		"phase_run_id":             record.PhaseRunID.String(),
 		"prerequisites":            prerequisites,
-		"required_prerequisites":   requiredPrerequisites,
 		"producer_authority_id":    record.Producer.AuthorityID.String(),
 		"producer_generation":      uint64(record.Producer.Generation),
 		"safety_epoch":             uint64(record.SafetyEpoch),
@@ -729,70 +779,64 @@ func (evidence PublicationAdapterEvidence) Intent(header IntentHeader) (Transiti
 }
 
 type publicationEvidenceAdapter struct {
-	mu      sync.Mutex
-	port    PublicationEvidencePort
-	replays map[OperationID]publicationEvidenceReplay
+	port          PublicationEvidencePort
+	prerequisites EvidencePrerequisiteAuthority
+	replays       *downstreamReplayShell[OperationID, [32]byte, PublicationAdapterEvidence]
 }
 
-type publicationEvidenceReplay struct {
-	fingerprint [32]byte
-	evidence    PublicationAdapterEvidence
-}
-
-func NewPublicationEvidenceAdapter(port PublicationEvidencePort) PublicationEvidenceAdapter {
-	return &publicationEvidenceAdapter{port: port, replays: make(map[OperationID]publicationEvidenceReplay)}
+func NewPublicationEvidenceAdapter(
+	port PublicationEvidencePort,
+	prerequisites EvidencePrerequisiteAuthority,
+) PublicationEvidenceAdapter {
+	return &publicationEvidenceAdapter{
+		port: port, prerequisites: prerequisites,
+		replays: newDownstreamReplayShell[OperationID, [32]byte, PublicationAdapterEvidence](),
+	}
 }
 
 func (adapter *publicationEvidenceAdapter) Enact(
 	ctx context.Context,
 	ref EnactmentRef,
-) (evidence PublicationAdapterEvidence, err error) {
+) (PublicationAdapterEvidence, error) {
 	if failure := validateEnactmentRef(ref, EnactmentArtifactPublication, EnactmentFenceArtifactPublication); failure != nil {
 		return PublicationAdapterEvidence{}, failure
 	}
-	fingerprint := enactmentFingerprint(ref)
-	adapter.mu.Lock()
-	defer adapter.mu.Unlock()
-	if replay, exists := adapter.replays[ref.OperationID]; exists {
-		if replay.fingerprint != fingerprint {
-			return PublicationAdapterEvidence{}, newDownstreamError(DownstreamIntegrityConflict)
-		}
-		return clonePublicationAdapterEvidence(replay.evidence), nil
-	}
-	if adapter.port == nil {
-		return PublicationAdapterEvidence{}, newDownstreamError(DownstreamDependencyUnavailable)
-	}
-	var record PublicationEvidenceRecord
-	func() {
-		defer func() {
-			if recover() != nil {
-				err = newDownstreamError(DownstreamDependencyUnavailable)
+	var expectedPrerequisites []EvidencePrerequisite
+	return invokeDownstreamWithReplay(
+		adapter.replays,
+		ref.OperationID,
+		enactmentFingerprint(ref),
+		adapter.port != nil,
+		func() (failure *DownstreamError) {
+			expectedPrerequisites, failure = loadExpectedPrerequisites(ctx, adapter.prerequisites, ref)
+			return failure
+		},
+		func() (PublicationEvidenceRecord, error) { return adapter.port.EnactPublication(ctx, ref) },
+		func(record PublicationEvidenceRecord) *DownstreamError {
+			return validatePublicationEvidenceRecord(record, ref, expectedPrerequisites)
+		},
+		func(record PublicationEvidenceRecord) PublicationAdapterEvidence {
+			return PublicationAdapterEvidence{
+				SchemaVersion: record.SchemaVersion,
+				Evidence:      NewEvidenceRef(record.EvidenceID, EvidencePublication, record.EvidenceDigest),
+				Producer:      record.Producer, TaskID: record.TaskID, PhaseRunID: record.PhaseRunID,
+				PhaseRunGeneration: record.PhaseRunGeneration, PhaseRunFence: record.PhaseRunFence,
+				OperationID: record.OperationID, ActivityGeneration: record.ActivityGeneration,
+				Generation: record.Generation, Fence: record.Fence, SafetyEpoch: record.SafetyEpoch,
+				Outcome: record.Outcome, ArtifactVersionID: record.ArtifactVersionID,
+				ArtifactManifestDigest: record.ArtifactManifestDigest,
+				Prerequisites:          append([]EvidencePrerequisite(nil), record.Prerequisites...),
 			}
-		}()
-		record, err = adapter.port.EnactPublication(ctx, ref)
-	}()
-	if err != nil {
-		return PublicationAdapterEvidence{}, normalizeDownstreamError(err)
-	}
-	if failure := validatePublicationEvidenceRecord(record, ref); failure != nil {
-		return PublicationAdapterEvidence{}, failure
-	}
-	evidence = PublicationAdapterEvidence{
-		SchemaVersion: record.SchemaVersion,
-		Evidence:      NewEvidenceRef(record.EvidenceID, EvidencePublication, record.EvidenceDigest),
-		Producer:      record.Producer, TaskID: record.TaskID, PhaseRunID: record.PhaseRunID,
-		PhaseRunGeneration: record.PhaseRunGeneration, PhaseRunFence: record.PhaseRunFence,
-		OperationID: record.OperationID, ActivityGeneration: record.ActivityGeneration,
-		Generation: record.Generation, Fence: record.Fence, SafetyEpoch: record.SafetyEpoch,
-		Outcome: record.Outcome, ArtifactVersionID: record.ArtifactVersionID,
-		ArtifactManifestDigest: record.ArtifactManifestDigest,
-		Prerequisites:          append([]EvidencePrerequisite(nil), record.Prerequisites...),
-	}
-	adapter.replays[ref.OperationID] = publicationEvidenceReplay{fingerprint, evidence}
-	return clonePublicationAdapterEvidence(evidence), nil
+		},
+		clonePublicationAdapterEvidence,
+	)
 }
 
-func validatePublicationEvidenceRecord(record PublicationEvidenceRecord, ref EnactmentRef) *DownstreamError {
+func validatePublicationEvidenceRecord(
+	record PublicationEvidenceRecord,
+	ref EnactmentRef,
+	expectedPrerequisites []EvidencePrerequisite,
+) *DownstreamError {
 	if record.SchemaVersion.Major() != EvidenceSchemaV1.Major() {
 		return newDownstreamError(DownstreamUnsupportedSchema)
 	}
@@ -812,7 +856,7 @@ func validatePublicationEvidenceRecord(record PublicationEvidenceRecord, ref Ena
 	if !ok || record.Fence != fence {
 		return newDownstreamError(DownstreamStale)
 	}
-	if failure := validateEvidencePrerequisites(record.RequiredPrerequisites, record.Prerequisites); failure != nil {
+	if failure := validateEvidencePrerequisites(expectedPrerequisites, record.Prerequisites); failure != nil {
 		return failure
 	}
 	if record.EvidenceDigest == (EvidenceDigest{}) || record.EvidenceDigest != PublicationEvidenceDigest(record) {
@@ -859,46 +903,43 @@ func usageAccountingEvidenceKindName(kind UsageAccountingEvidenceKind) string {
 }
 
 type UsageAccountingEvidenceRecord struct {
-	SchemaVersion         EvidenceSchemaVersion
-	EvidenceID            EvidenceID
-	EvidenceDigest        EvidenceDigest
-	Producer              EvidenceProducer
-	TaskID                TaskID
-	PhaseRunID            PhaseRunID
-	PhaseRunGeneration    PhaseRunGeneration
-	PhaseRunFence         PhaseRunFence
-	OperationID           OperationID
-	ActivityGeneration    ActivityGeneration
-	Generation            ProducerGeneration
-	Fence                 UsageFence
-	SafetyEpoch           SafetyEpoch
-	Kind                  UsageAccountingEvidenceKind
-	QuotaReservationID    QuotaReservationID
-	RequiredPrerequisites []EvidenceRef
-	Prerequisites         []EvidencePrerequisite
+	SchemaVersion      EvidenceSchemaVersion
+	EvidenceID         EvidenceID
+	EvidenceDigest     EvidenceDigest
+	Producer           EvidenceProducer
+	TaskID             TaskID
+	PhaseRunID         PhaseRunID
+	PhaseRunGeneration PhaseRunGeneration
+	PhaseRunFence      PhaseRunFence
+	OperationID        OperationID
+	ActivityGeneration ActivityGeneration
+	Generation         ProducerGeneration
+	Fence              UsageFence
+	SafetyEpoch        SafetyEpoch
+	Kind               UsageAccountingEvidenceKind
+	QuotaReservationID QuotaReservationID
+	Prerequisites      []EvidencePrerequisite
 }
 
 func UsageAccountingEvidenceDigest(record UsageAccountingEvidenceRecord) EvidenceDigest {
 	prerequisites := canonicalEvidencePrerequisites(record.Prerequisites)
-	requiredPrerequisites := canonicalRequiredPrerequisites(record.RequiredPrerequisites)
 	encoded, _ := json.Marshal(map[string]any{
-		"activity_generation":    uint64(record.ActivityGeneration),
-		"evidence_id":            record.EvidenceID.String(),
-		"fence":                  uint64(record.Fence),
-		"generation":             uint64(record.Generation),
-		"kind":                   usageAccountingEvidenceKindName(record.Kind),
-		"operation_id":           record.OperationID.String(),
-		"phase_run_fence":        uint64(record.PhaseRunFence),
-		"phase_run_generation":   uint64(record.PhaseRunGeneration),
-		"phase_run_id":           record.PhaseRunID.String(),
-		"prerequisites":          prerequisites,
-		"required_prerequisites": requiredPrerequisites,
-		"producer_authority_id":  record.Producer.AuthorityID.String(),
-		"producer_generation":    uint64(record.Producer.Generation),
-		"quota_reservation_id":   record.QuotaReservationID.String(),
-		"safety_epoch":           uint64(record.SafetyEpoch),
-		"schema_version":         uint64(record.SchemaVersion),
-		"task_id":                record.TaskID.String(),
+		"activity_generation":   uint64(record.ActivityGeneration),
+		"evidence_id":           record.EvidenceID.String(),
+		"fence":                 uint64(record.Fence),
+		"generation":            uint64(record.Generation),
+		"kind":                  usageAccountingEvidenceKindName(record.Kind),
+		"operation_id":          record.OperationID.String(),
+		"phase_run_fence":       uint64(record.PhaseRunFence),
+		"phase_run_generation":  uint64(record.PhaseRunGeneration),
+		"phase_run_id":          record.PhaseRunID.String(),
+		"prerequisites":         prerequisites,
+		"producer_authority_id": record.Producer.AuthorityID.String(),
+		"producer_generation":   uint64(record.Producer.Generation),
+		"quota_reservation_id":  record.QuotaReservationID.String(),
+		"safety_epoch":          uint64(record.SafetyEpoch),
+		"schema_version":        uint64(record.SchemaVersion),
+		"task_id":               record.TaskID.String(),
 	})
 	sum := sha256.Sum256(encoded)
 	return EvidenceDigest(sum)
@@ -934,73 +975,62 @@ type UsageAccountingAdapterEvidence struct {
 }
 
 type usageAccountingEvidenceAdapter struct {
-	mu      sync.Mutex
-	port    UsageAccountingEvidencePort
-	replays map[OperationID]usageAccountingEvidenceReplay
+	port          UsageAccountingEvidencePort
+	prerequisites EvidencePrerequisiteAuthority
+	replays       *downstreamReplayShell[OperationID, [32]byte, UsageAccountingAdapterEvidence]
 }
 
-type usageAccountingEvidenceReplay struct {
-	fingerprint [32]byte
-	evidence    UsageAccountingAdapterEvidence
-}
-
-func NewUsageAccountingEvidenceAdapter(port UsageAccountingEvidencePort) UsageAccountingEvidenceAdapter {
+func NewUsageAccountingEvidenceAdapter(
+	port UsageAccountingEvidencePort,
+	prerequisites EvidencePrerequisiteAuthority,
+) UsageAccountingEvidenceAdapter {
 	return &usageAccountingEvidenceAdapter{
-		port: port, replays: make(map[OperationID]usageAccountingEvidenceReplay),
+		port: port, prerequisites: prerequisites,
+		replays: newDownstreamReplayShell[OperationID, [32]byte, UsageAccountingAdapterEvidence](),
 	}
 }
 
 func (adapter *usageAccountingEvidenceAdapter) Enact(
 	ctx context.Context,
 	ref EnactmentRef,
-) (evidence UsageAccountingAdapterEvidence, err error) {
+) (UsageAccountingAdapterEvidence, error) {
 	if failure := validateEnactmentRef(ref, EnactmentUsageAccounting, EnactmentFenceUsageAccounting); failure != nil {
 		return UsageAccountingAdapterEvidence{}, failure
 	}
-	fingerprint := enactmentFingerprint(ref)
-	adapter.mu.Lock()
-	defer adapter.mu.Unlock()
-	if replay, exists := adapter.replays[ref.OperationID]; exists {
-		if replay.fingerprint != fingerprint {
-			return UsageAccountingAdapterEvidence{}, newDownstreamError(DownstreamIntegrityConflict)
-		}
-		return cloneUsageAccountingAdapterEvidence(replay.evidence), nil
-	}
-	if adapter.port == nil {
-		return UsageAccountingAdapterEvidence{}, newDownstreamError(DownstreamDependencyUnavailable)
-	}
-	var record UsageAccountingEvidenceRecord
-	func() {
-		defer func() {
-			if recover() != nil {
-				err = newDownstreamError(DownstreamDependencyUnavailable)
+	var expectedPrerequisites []EvidencePrerequisite
+	return invokeDownstreamWithReplay(
+		adapter.replays,
+		ref.OperationID,
+		enactmentFingerprint(ref),
+		adapter.port != nil,
+		func() (failure *DownstreamError) {
+			expectedPrerequisites, failure = loadExpectedPrerequisites(ctx, adapter.prerequisites, ref)
+			return failure
+		},
+		func() (UsageAccountingEvidenceRecord, error) { return adapter.port.EnactUsageAccounting(ctx, ref) },
+		func(record UsageAccountingEvidenceRecord) *DownstreamError {
+			return validateUsageAccountingEvidenceRecord(record, ref, expectedPrerequisites)
+		},
+		func(record UsageAccountingEvidenceRecord) UsageAccountingAdapterEvidence {
+			return UsageAccountingAdapterEvidence{
+				SchemaVersion: record.SchemaVersion,
+				Evidence:      NewEvidenceRef(record.EvidenceID, EvidenceUsageAccounting, record.EvidenceDigest),
+				Producer:      record.Producer, TaskID: record.TaskID, PhaseRunID: record.PhaseRunID,
+				PhaseRunGeneration: record.PhaseRunGeneration, PhaseRunFence: record.PhaseRunFence,
+				OperationID: record.OperationID, ActivityGeneration: record.ActivityGeneration,
+				Generation: record.Generation, Fence: record.Fence, SafetyEpoch: record.SafetyEpoch,
+				Kind: record.Kind, QuotaReservationID: record.QuotaReservationID,
+				Prerequisites: append([]EvidencePrerequisite(nil), record.Prerequisites...),
 			}
-		}()
-		record, err = adapter.port.EnactUsageAccounting(ctx, ref)
-	}()
-	if err != nil {
-		return UsageAccountingAdapterEvidence{}, normalizeDownstreamError(err)
-	}
-	if failure := validateUsageAccountingEvidenceRecord(record, ref); failure != nil {
-		return UsageAccountingAdapterEvidence{}, failure
-	}
-	evidence = UsageAccountingAdapterEvidence{
-		SchemaVersion: record.SchemaVersion,
-		Evidence:      NewEvidenceRef(record.EvidenceID, EvidenceUsageAccounting, record.EvidenceDigest),
-		Producer:      record.Producer, TaskID: record.TaskID, PhaseRunID: record.PhaseRunID,
-		PhaseRunGeneration: record.PhaseRunGeneration, PhaseRunFence: record.PhaseRunFence,
-		OperationID: record.OperationID, ActivityGeneration: record.ActivityGeneration,
-		Generation: record.Generation, Fence: record.Fence, SafetyEpoch: record.SafetyEpoch,
-		Kind: record.Kind, QuotaReservationID: record.QuotaReservationID,
-		Prerequisites: append([]EvidencePrerequisite(nil), record.Prerequisites...),
-	}
-	adapter.replays[ref.OperationID] = usageAccountingEvidenceReplay{fingerprint, evidence}
-	return cloneUsageAccountingAdapterEvidence(evidence), nil
+		},
+		cloneUsageAccountingAdapterEvidence,
+	)
 }
 
 func validateUsageAccountingEvidenceRecord(
 	record UsageAccountingEvidenceRecord,
 	ref EnactmentRef,
+	expectedPrerequisites []EvidencePrerequisite,
 ) *DownstreamError {
 	if record.SchemaVersion.Major() != EvidenceSchemaV1.Major() {
 		return newDownstreamError(DownstreamUnsupportedSchema)
@@ -1018,7 +1048,7 @@ func validateUsageAccountingEvidenceRecord(
 	if !ok || record.Fence != fence {
 		return newDownstreamError(DownstreamStale)
 	}
-	if failure := validateEvidencePrerequisites(record.RequiredPrerequisites, record.Prerequisites); failure != nil {
+	if failure := validateEvidencePrerequisites(expectedPrerequisites, record.Prerequisites); failure != nil {
 		return failure
 	}
 	if record.EvidenceDigest == (EvidenceDigest{}) ||
@@ -1033,21 +1063,6 @@ func cloneUsageAccountingAdapterEvidence(
 ) UsageAccountingAdapterEvidence {
 	evidence.Prerequisites = append([]EvidencePrerequisite(nil), evidence.Prerequisites...)
 	return evidence
-}
-
-func canonicalRequiredPrerequisites(required []EvidenceRef) []map[string]any {
-	encoded := make([]map[string]any, len(required))
-	for index, evidence := range required {
-		encoded[index] = map[string]any{
-			"digest":      evidence.Digest.String(),
-			"evidence_id": evidence.ID.String(),
-			"kind":        evidenceKindName(evidence.Kind),
-		}
-	}
-	sort.Slice(encoded, func(i, j int) bool {
-		return canonicalPrerequisiteSortKey(encoded[i]) < canonicalPrerequisiteSortKey(encoded[j])
-	})
-	return encoded
 }
 
 func canonicalEvidencePrerequisites(prerequisites []EvidencePrerequisite) []map[string]any {
@@ -1065,8 +1080,34 @@ func canonicalPrerequisiteSortKey(encoded map[string]any) string {
 	return encoded["evidence_id"].(string) + "\x00" + encoded["kind"].(string) + "\x00" + encoded["digest"].(string)
 }
 
+func loadExpectedPrerequisites(
+	ctx context.Context,
+	authority EvidencePrerequisiteAuthority,
+	ref EnactmentRef,
+) (expected []EvidencePrerequisite, failure *DownstreamError) {
+	if authority == nil {
+		return nil, newDownstreamError(DownstreamDependencyUnavailable)
+	}
+	defer func() {
+		if recover() != nil {
+			expected = nil
+			failure = newDownstreamError(DownstreamDependencyUnavailable)
+		}
+	}()
+	expected, err := authority.ExpectedPrerequisites(ctx, ref)
+	if err != nil {
+		return nil, normalizeDownstreamError(err)
+	}
+	for _, prerequisite := range expected {
+		if !validEvidenceRef(prerequisite.Evidence) || prerequisite.Generation == 0 || prerequisite.Fence == 0 {
+			return nil, newDownstreamError(DownstreamCorruptEvidence)
+		}
+	}
+	return append([]EvidencePrerequisite(nil), expected...), nil
+}
+
 func validateEvidencePrerequisites(
-	required []EvidenceRef,
+	required []EvidencePrerequisite,
 	observed []EvidencePrerequisite,
 ) *DownstreamError {
 	if len(observed) < len(required) {
@@ -1075,15 +1116,15 @@ func validateEvidencePrerequisites(
 	if len(observed) != len(required) {
 		return newDownstreamError(DownstreamCorruptEvidence)
 	}
-	requiredByID := make(map[EvidenceID]EvidenceRef, len(required))
-	for _, evidence := range required {
-		if !validEvidenceRef(evidence) {
+	requiredByID := make(map[EvidenceID]EvidencePrerequisite, len(required))
+	for _, prerequisite := range required {
+		if !validEvidenceRef(prerequisite.Evidence) || prerequisite.Generation == 0 || prerequisite.Fence == 0 {
 			return newDownstreamError(DownstreamCorruptEvidence)
 		}
-		if _, duplicate := requiredByID[evidence.ID]; duplicate {
+		if _, duplicate := requiredByID[prerequisite.Evidence.ID]; duplicate {
 			return newDownstreamError(DownstreamCorruptEvidence)
 		}
-		requiredByID[evidence.ID] = evidence
+		requiredByID[prerequisite.Evidence.ID] = prerequisite
 	}
 	seen := make(map[EvidenceID]struct{}, len(observed))
 	for _, prerequisite := range observed {
@@ -1091,7 +1132,7 @@ func validateEvidencePrerequisites(
 			return newDownstreamError(DownstreamPrerequisitePending)
 		}
 		expected, exists := requiredByID[prerequisite.Evidence.ID]
-		if !exists || prerequisite.Evidence != expected {
+		if !exists || prerequisite != expected {
 			return newDownstreamError(DownstreamCorruptEvidence)
 		}
 		if _, duplicate := seen[prerequisite.Evidence.ID]; duplicate {

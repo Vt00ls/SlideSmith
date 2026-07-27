@@ -56,6 +56,7 @@ type TaskWorkspaceLifecycleAdapterEvidence struct {
 	Outcome            LifecycleEvidenceOutcome
 	RevisionID         TaskWorkspaceRevisionID
 	CheckpointID       CheckpointID
+	CommitProofDigest  EvidenceDigest
 	Prerequisites      []EvidencePrerequisite
 }
 
@@ -63,7 +64,9 @@ func (evidence TaskWorkspaceLifecycleAdapterEvidence) Intent(header IntentHeader
 	if header.TaskID != evidence.TaskID || header.ActivityGeneration != evidence.ActivityGeneration ||
 		evidence.SchemaVersion.Major() != EvidenceSchemaV1.Major() ||
 		!validEvidenceRef(evidence.Evidence) || evidence.Evidence.Kind != EvidenceTaskWorkspaceLifecycle ||
-		!validOpaqueID(evidence.Producer.AuthorityID.String()) || evidence.Producer.Generation == 0 {
+		!validOpaqueID(evidence.Producer.AuthorityID.String()) || evidence.Producer.Generation == 0 ||
+		(evidence.Outcome == LifecycleEvidenceCommitted && evidence.CommitProofDigest == (EvidenceDigest{})) ||
+		(evidence.Outcome == LifecycleEvidenceFenced && evidence.CommitProofDigest != (EvidenceDigest{})) {
 		return nil, newDownstreamError(DownstreamCorruptEvidence)
 	}
 	authority := NewTaskWorkspaceLifecycleAuthority(
@@ -210,8 +213,15 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) commitEvidence(
 ) (TaskWorkspaceLifecycleAdapterEvidence, error) {
 	request := adapter.binding.Commit
 	if result.Operation.ID != request.Operation.ID || result.Operation.RequestDigest != request.Operation.RequestDigest ||
-		result.Generation != request.Generation || result.Fence != request.Fence ||
-		result.TaskWorkspaceID == "" || result.RevisionID == "" || result.CheckpointID == "" {
+		result.Generation != request.Generation || result.PreviousFence != request.Fence || result.Fence != request.Fence ||
+		result.TaskWorkspaceID == "" || result.TaskWorkspaceID != request.TaskWorkspaceID ||
+		result.RevisionID == "" || result.CheckpointID == "" ||
+		result.BaseRevisionID != request.BaseRevisionID ||
+		result.PredecessorRevisionID != request.ExpectedCurrentRevision ||
+		result.ManifestDigest == "" || result.ManifestDigest != request.DeclaredStateManifest.Digest ||
+		result.ValidationEvidenceID == "" || result.ValidationEvidenceID != request.ValidationEvidence.ID ||
+		result.ValidationEvidenceDigest == "" || result.ValidationEvidenceDigest != request.ValidationEvidence.Digest ||
+		result.ContentEvidenceRoot == "" || result.DurabilityEvidenceRoot == "" {
 		return TaskWorkspaceLifecycleAdapterEvidence{}, newDownstreamError(DownstreamCorruptEvidence)
 	}
 	revisionID, revisionErr := NewTaskWorkspaceRevisionID(string(result.RevisionID))
@@ -222,6 +232,7 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) commitEvidence(
 	return adapter.evidenceFor(
 		LifecycleEvidenceCommitted, revisionID, checkpointID,
 		TaskWorkspaceLifecycleGeneration(result.Generation), TaskWorkspaceLifecycleFence(result.Fence),
+		TaskWorkspaceCommitProofDigest(result),
 	), nil
 }
 
@@ -230,13 +241,19 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) fenceEvidence(
 ) (TaskWorkspaceLifecycleAdapterEvidence, error) {
 	request := adapter.binding.Fence
 	if result.Operation.ID != request.Operation.ID || result.Operation.RequestDigest != request.Operation.RequestDigest ||
-		result.Generation != request.Generation || result.Fence != request.Fence ||
-		result.TaskWorkspaceID == "" || result.RuntimeViewID == "" {
+		result.PreviousFence != request.Fence || result.Fence <= request.Fence ||
+		result.TaskWorkspaceID == "" || result.TaskWorkspaceID != request.TaskWorkspaceID ||
+		result.RuntimeViewID == "" || result.RuntimeViewID != request.RuntimeViewID ||
+		result.BaseRevisionID != request.BaseRevisionID ||
+		result.CurrentRevisionID != request.ExpectedCurrentRevision || result.Reason != request.Reason ||
+		(request.Reason != taskworkspace.RuntimeViewRecoveryGenerationAdvanced && result.Generation != request.Generation) ||
+		(request.Reason == taskworkspace.RuntimeViewRecoveryGenerationAdvanced && result.Generation != request.Generation+1) {
 		return TaskWorkspaceLifecycleAdapterEvidence{}, newDownstreamError(DownstreamCorruptEvidence)
 	}
 	return adapter.evidenceFor(
 		LifecycleEvidenceFenced, TaskWorkspaceRevisionID{}, CheckpointID{},
 		TaskWorkspaceLifecycleGeneration(result.Generation), TaskWorkspaceLifecycleFence(result.Fence),
+		EvidenceDigest{},
 	), nil
 }
 
@@ -246,6 +263,7 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) evidenceFor(
 	checkpointID CheckpointID,
 	generation TaskWorkspaceLifecycleGeneration,
 	fence TaskWorkspaceLifecycleFence,
+	commitProofDigest EvidenceDigest,
 ) TaskWorkspaceLifecycleAdapterEvidence {
 	binding := adapter.binding
 	evidence := TaskWorkspaceLifecycleAdapterEvidence{
@@ -255,7 +273,8 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) evidenceFor(
 		OperationID: binding.Enactment.OperationID, ActivityGeneration: binding.Enactment.ActivityGeneration,
 		Generation: generation, Fence: fence, SafetyEpoch: binding.SafetyEpoch,
 		Outcome: outcome, RevisionID: revisionID, CheckpointID: checkpointID,
-		Prerequisites: append([]EvidencePrerequisite(nil), binding.Prerequisites...),
+		CommitProofDigest: commitProofDigest,
+		Prerequisites:     append([]EvidencePrerequisite(nil), binding.Prerequisites...),
 	}
 	evidenceID := lifecycleEvidenceID(binding.Enactment.OperationID)
 	evidence.Evidence = NewEvidenceRef(
@@ -272,6 +291,7 @@ func taskWorkspaceLifecycleEvidenceDigest(
 	encoded, _ := json.Marshal(map[string]any{
 		"activity_generation":   uint64(evidence.ActivityGeneration),
 		"checkpoint_id":         evidence.CheckpointID.String(),
+		"commit_proof_digest":   evidence.CommitProofDigest.String(),
 		"evidence_id":           evidenceID.String(),
 		"fence":                 uint64(evidence.Fence),
 		"generation":            uint64(evidence.Generation),
@@ -288,6 +308,14 @@ func taskWorkspaceLifecycleEvidenceDigest(
 		"schema_version":        uint64(evidence.SchemaVersion),
 		"task_id":               evidence.TaskID.String(),
 	})
+	sum := sha256.Sum256(encoded)
+	return EvidenceDigest(sum)
+}
+
+// TaskWorkspaceCommitProofDigest binds the complete public C04 commit result
+// without exposing or reinterpreting C04's internal journal or storage model.
+func TaskWorkspaceCommitProofDigest(result taskworkspace.CommitRuntimeViewResult) EvidenceDigest {
+	encoded, _ := json.Marshal(result)
 	sum := sha256.Sum256(encoded)
 	return EvidenceDigest(sum)
 }
@@ -319,7 +347,8 @@ func validateTaskWorkspaceLifecycleBinding(binding TaskWorkspaceLifecycleAdapter
 		request := binding.Commit
 		if string(request.TaskID) != binding.TaskID.String() ||
 			string(request.Operation.ID) != binding.Enactment.OperationID.String() ||
-			request.Operation.RequestDigest == "" || request.Generation == 0 || request.Fence != expectedFence {
+			request.Operation.RequestDigest == "" || request.Generation == 0 || request.Fence != expectedFence ||
+			!validTaskWorkspaceCommitScope(binding, *request) {
 			return newDownstreamError(DownstreamInvalidEnactment)
 		}
 		return nil
@@ -327,10 +356,65 @@ func validateTaskWorkspaceLifecycleBinding(binding TaskWorkspaceLifecycleAdapter
 	request := binding.Fence
 	if string(request.TaskID) != binding.TaskID.String() ||
 		string(request.Operation.ID) != binding.Enactment.OperationID.String() ||
-		request.Operation.RequestDigest == "" || request.Generation == 0 || request.Fence != expectedFence {
+		request.Operation.RequestDigest == "" || request.Generation == 0 || request.Fence != expectedFence ||
+		!validTaskWorkspaceFenceScope(binding, *request) {
 		return newDownstreamError(DownstreamInvalidEnactment)
 	}
 	return nil
+}
+
+func validTaskWorkspaceCommitScope(
+	binding TaskWorkspaceLifecycleAdapterBinding,
+	request taskworkspace.CommitRuntimeViewRequest,
+) bool {
+	lease := request.SandboxLeaseAuthority
+	validation := request.ValidationEvidence
+	return request.PolicyDomainID != "" && request.TaskWorkspaceID != "" && request.RuntimeViewID != "" &&
+		request.RuntimeOperationID != "" && request.BaseRevisionID != "" && request.ExpectedCurrentRevision != "" &&
+		request.Operation.RequestDigest == request.CanonicalRequestDigest() &&
+		"sha256:"+binding.Enactment.PayloadDigest.String() == string(request.Operation.RequestDigest) &&
+		validTaskWorkspaceLeaseScope(binding, request.PolicyDomainID, request.TaskID, request.TaskWorkspaceID,
+			request.RuntimeViewID, request.RuntimeOperationID, lease) &&
+		validation.ID != "" && validation.Digest == validation.CanonicalDigest() &&
+		validation.ValidationAuthorityID != "" && validation.PolicyDomainID == request.PolicyDomainID &&
+		validation.TaskID == request.TaskID && validation.TaskWorkspaceID == request.TaskWorkspaceID &&
+		validation.RuntimeViewID == request.RuntimeViewID && validation.BaseRevisionID == request.BaseRevisionID &&
+		string(validation.PhaseRunID) == binding.PhaseRunID.String() &&
+		validation.RuntimeRunID == lease.RuntimeRunID && validation.RuntimeOperationID == request.RuntimeOperationID &&
+		validation.SandboxLeaseAuthorityDigest == lease.Digest &&
+		validation.ManifestDigest == request.DeclaredStateManifest.Digest &&
+		validation.Generation == request.Generation && validation.Fence == request.Fence &&
+		validation.Decision == taskworkspace.ValidationAccepted && request.DeclaredStateManifest.Digest != "" &&
+		request.DeclaredStateManifest.Digest == request.DeclaredStateManifest.CanonicalDigest()
+}
+
+func validTaskWorkspaceFenceScope(
+	binding TaskWorkspaceLifecycleAdapterBinding,
+	request taskworkspace.FenceRuntimeViewRequest,
+) bool {
+	return request.PolicyDomainID != "" && request.TaskWorkspaceID != "" && request.RuntimeViewID != "" &&
+		request.RuntimeOperationID != "" && request.BaseRevisionID != "" && request.ExpectedCurrentRevision != "" &&
+		request.Reason != "" && request.Operation.RequestDigest == request.CanonicalRequestDigest() &&
+		"sha256:"+binding.Enactment.PayloadDigest.String() == string(request.Operation.RequestDigest) &&
+		validTaskWorkspaceLeaseScope(binding, request.PolicyDomainID, request.TaskID, request.TaskWorkspaceID,
+			request.RuntimeViewID, request.RuntimeOperationID, request.SandboxLeaseAuthority)
+}
+
+func validTaskWorkspaceLeaseScope(
+	binding TaskWorkspaceLifecycleAdapterBinding,
+	policyDomainID taskworkspace.PolicyDomainID,
+	taskID taskworkspace.TaskID,
+	taskWorkspaceID taskworkspace.TaskWorkspaceID,
+	runtimeViewID taskworkspace.RuntimeViewID,
+	runtimeOperationID taskworkspace.OperationID,
+	lease taskworkspace.SandboxLeaseAuthority,
+) bool {
+	return lease.ID != "" && lease.EvidenceID != "" && lease.AuthorityID != "" &&
+		lease.Digest == lease.CanonicalDigest() && lease.PolicyDomainID == policyDomainID && lease.TaskID == taskID &&
+		string(lease.PhaseRunID) == binding.PhaseRunID.String() && lease.RuntimeRunID != "" &&
+		lease.RuntimeOperationID == runtimeOperationID && lease.EffectClass == taskworkspace.RuntimeViewMutating &&
+		lease.LeaseGeneration != 0 && lease.LeaseFence != 0 && lease.ExpiresAt != 0 &&
+		taskWorkspaceID != "" && runtimeViewID != ""
 }
 
 func normalizeTaskWorkspaceLifecycleError(err error) *DownstreamError {
