@@ -18,9 +18,10 @@ func TestSharedTaskOrchestrationCoordinationContract(t *testing.T) {
 }
 
 type sharedTaskOrchestrationAdapter struct {
-	mutations     taskorchestration.TaskOrchestration
-	queries       taskorchestration.TaskOrchestrationQuery
-	afterDecision func(*testing.T, taskorchestration.TransitionDecision)
+	mutations                taskorchestration.TaskOrchestration
+	queries                  taskorchestration.TaskOrchestrationQuery
+	afterDecision            func(*testing.T, taskorchestration.TransitionDecision)
+	roundTripRuntimeEvidence func(*testing.T, taskorchestration.TransitionDecision) taskorchestration.TransitionDecision
 }
 
 type sharedTaskOrchestrationAdapterFactory struct {
@@ -104,6 +105,7 @@ func runSharedMinimalContract(t *testing.T, factory sharedTaskOrchestrationAdapt
 		t.Fatalf("work decision omitted committed public facts: %+v", work)
 	}
 	adapter.afterDecision(t, work)
+	evidenceDecision := adapter.roundTripRuntimeEvidence(t, work)
 
 	view, err := adapter.queries.Query(context.Background(), taskorchestration.TaskQuery{
 		TaskID:    taskID(t, "shared-contract-task"),
@@ -112,8 +114,9 @@ func runSharedMinimalContract(t *testing.T, factory sharedTaskOrchestrationAdapt
 	if err != nil {
 		t.Fatalf("query through shared read-only seam: %v", err)
 	}
-	if view.TaskRevision != 2 || view.LatestDecisionID != work.DecisionID ||
-		len(view.PhaseRuns) != 1 || len(view.PhaseRuns[0].RuntimeRuns) != 1 {
+	if view.TaskRevision != 3 || view.LatestDecisionID != evidenceDecision.DecisionID ||
+		len(view.PhaseRuns) != 1 || len(view.PhaseRuns[0].RuntimeRuns) != 1 ||
+		view.PhaseRuns[0].RuntimeRuns[0].Outcome != taskorchestration.RuntimeRunSucceeded {
 		t.Fatalf("shared Query did not return committed aggregate: %+v", view)
 	}
 }
@@ -318,7 +321,7 @@ func requireSharedDecisionError(t *testing.T, err error, code taskorchestration.
 func newSharedInMemoryAdapter(
 	t *testing.T,
 	now time.Time,
-	_ taskorchestration.UserAuthority,
+	owner taskorchestration.UserAuthority,
 	_ taskorchestration.WorkerAuthority,
 ) sharedTaskOrchestrationAdapter {
 	t.Helper()
@@ -333,13 +336,16 @@ func newSharedInMemoryAdapter(
 		queries:   harness.Queries,
 		afterDecision: func(*testing.T, taskorchestration.TransitionDecision) {
 		},
+		roundTripRuntimeEvidence: directSharedRuntimeEvidenceRoundTrip(
+			now, owner, harness.Mutations, harness.Queries,
+		),
 	}
 }
 
 func newSharedPostgresAdapter(
 	t *testing.T,
 	now time.Time,
-	_ taskorchestration.UserAuthority,
+	owner taskorchestration.UserAuthority,
 	_ taskorchestration.WorkerAuthority,
 ) sharedTaskOrchestrationAdapter {
 	t.Helper()
@@ -352,6 +358,9 @@ func newSharedPostgresAdapter(
 		queries:   adapter,
 		afterDecision: func(*testing.T, taskorchestration.TransitionDecision) {
 		},
+		roundTripRuntimeEvidence: directSharedRuntimeEvidenceRoundTrip(
+			now, owner, adapter, adapter,
+		),
 	}
 }
 
@@ -399,6 +408,7 @@ func newSharedOwnedTransportAdapter(
 	evidenceAdapter := taskorchestration.NewRuntimeEvidenceAdapter(
 		evidencePort, sharedPrerequisiteAuthority{},
 	)
+	var observedEvidence taskorchestration.RuntimeAdapterEvidence
 	return sharedTaskOrchestrationAdapter{
 		mutations: adapter,
 		queries:   adapter,
@@ -464,7 +474,87 @@ func newSharedOwnedTransportAdapter(
 				evidence.Evidence.Digest != record.EvidenceDigest {
 				t.Fatalf("enact through owned Runtime evidence adapter: evidence=%+v err=%v", evidence, err)
 			}
+			observedEvidence = evidence
 		},
+		roundTripRuntimeEvidence: func(
+			t *testing.T,
+			decision taskorchestration.TransitionDecision,
+		) taskorchestration.TransitionDecision {
+			t.Helper()
+			header := intentHeader(
+				t, "shared-owned-runtime-evidence-decision",
+				decision.TaskProjection.TaskID.String(), now.Add(3*time.Second),
+			)
+			header.ExpectedTaskRevision = decision.AcceptedTaskRevision
+			header.ActivityGeneration = observedEvidence.ActivityGeneration
+			intent, err := observedEvidence.Intent(header)
+			if err != nil {
+				t.Fatalf("translate owned Runtime evidence through public Intent seam: %v", err)
+			}
+			accepted, err := adapter.Decide(context.Background(), intent)
+			if err != nil {
+				t.Fatalf("accept owned Runtime evidence through Decide seam: %v", err)
+			}
+			return accepted
+		},
+	}
+}
+
+func directSharedRuntimeEvidenceRoundTrip(
+	now time.Time,
+	owner taskorchestration.UserAuthority,
+	mutations taskorchestration.TaskOrchestration,
+	queries taskorchestration.TaskOrchestrationQuery,
+) func(*testing.T, taskorchestration.TransitionDecision) taskorchestration.TransitionDecision {
+	return func(t *testing.T, decision taskorchestration.TransitionDecision) taskorchestration.TransitionDecision {
+		t.Helper()
+		view, err := queries.Query(context.Background(), taskorchestration.TaskQuery{
+			TaskID:    decision.TaskProjection.TaskID,
+			Authority: taskorchestration.NewUserQueryAuthority(owner),
+		})
+		if err != nil || len(view.PhaseRuns) != 1 || len(view.PhaseRuns[0].RuntimeRuns) != 1 {
+			t.Fatalf("query direct Runtime evidence scope: view=%+v err=%v", view, err)
+		}
+		phase := view.PhaseRuns[0]
+		ref := decision.EnactmentRefs[0]
+		runtimeFence, ok := ref.Fence.(taskorchestration.RuntimeFence)
+		if !ok {
+			t.Fatalf("direct Runtime enactment has non-Runtime fence: %+v", ref)
+		}
+		evidence := taskorchestration.RuntimeAdapterEvidence{
+			SchemaVersion: taskorchestration.EvidenceSchemaV1,
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, "shared-direct-runtime-evidence"),
+				taskorchestration.EvidenceRuntime,
+				evidenceDigest(t, "6666666666666666666666666666666666666666666666666666666666666666"),
+			),
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: authorityID(t, "shared-direct-runtime-producer"),
+				Generation:  taskorchestration.AuthorizationGeneration(1),
+			},
+			TaskID:     decision.TaskProjection.TaskID,
+			PhaseRunID: phase.PhaseRunID, PhaseRunGeneration: phase.Generation,
+			PhaseRunFence: phase.Fence, RuntimeRunID: phase.RuntimeRuns[0].RuntimeRunID,
+			OperationID: ref.OperationID, ActivityGeneration: ref.ActivityGeneration,
+			Generation: taskorchestration.RuntimeGeneration(phase.Generation),
+			Fence:      runtimeFence, SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.RuntimeRunSucceeded,
+		}
+		header := intentHeader(
+			t, "shared-direct-runtime-evidence-decision",
+			decision.TaskProjection.TaskID.String(), now.Add(3*time.Second),
+		)
+		header.ExpectedTaskRevision = decision.AcceptedTaskRevision
+		header.ActivityGeneration = evidence.ActivityGeneration
+		intent, err := evidence.Intent(header)
+		if err != nil {
+			t.Fatalf("translate direct Runtime evidence through public Intent seam: %v", err)
+		}
+		accepted, err := mutations.Decide(context.Background(), intent)
+		if err != nil {
+			t.Fatalf("accept direct Runtime evidence through Decide seam: %v", err)
+		}
+		return accepted
 	}
 }
 

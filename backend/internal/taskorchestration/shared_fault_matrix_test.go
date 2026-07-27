@@ -15,14 +15,21 @@ func TestSharedTaskOrchestrationFaultMatrix(t *testing.T) {
 }
 
 type sharedDecisionFaultAdapter struct {
-	decide           func(context.Context, taskorchestration.TransitionIntent) (taskorchestration.TransitionDecision, error)
-	query            func(context.Context, taskorchestration.TaskQuery) (taskorchestration.TaskOrchestrationView, error)
-	failBeforeCommit func(*testing.T)
-	crashAfterCommit func(*testing.T)
-	loseResponse     func(*testing.T)
-	restart          func(*testing.T)
-	afterDecision    func(*testing.T, taskorchestration.TransitionDecision)
-	newDispatcher    func(
+	decide                func(context.Context, taskorchestration.TransitionIntent) (taskorchestration.TransitionDecision, error)
+	query                 func(context.Context, taskorchestration.TaskQuery) (taskorchestration.TaskOrchestrationView, error)
+	failBeforeCommit      func(*testing.T)
+	crashAfterCommit      func(*testing.T)
+	loseResponse          func(*testing.T)
+	restart               func(*testing.T)
+	afterDecision         func(*testing.T, taskorchestration.TransitionDecision)
+	runtimeEvidenceIntent func(
+		*testing.T,
+		taskorchestration.IntentHeader,
+		taskorchestration.EnactmentRef,
+		taskorchestration.TaskOrchestrationView,
+		string,
+	) taskorchestration.TransitionIntent
+	newDispatcher func(
 		*testing.T,
 		func() time.Time,
 		[]taskorchestration.WorkerAuthority,
@@ -296,27 +303,10 @@ func newSharedPendingLifecycle(
 	runtimeHeader := intentHeader(t, prefix+"-runtime", taskName, now.Add(2*time.Second))
 	runtimeHeader.ExpectedTaskRevision = view.TaskRevision
 	runtimeHeader.ActivityGeneration = view.ActivityGeneration
-	_, err = adapter.decide(
-		context.Background(),
-		taskorchestration.NewAcceptRuntimeEvidenceIntent(
-			runtimeHeader,
-			taskorchestration.NewRuntimeAuthority(
-				authorityID(t, prefix+"-runtime"), taskorchestration.AuthorizationGeneration(1),
-			),
-			taskorchestration.RuntimeEvidenceBinding{
-				Evidence: taskorchestration.NewEvidenceRef(
-					evidenceID(t, prefix+"-runtime-evidence"), taskorchestration.EvidenceRuntime,
-					evidenceDigest(t, "9999999999999999999999999999999999999999999999999999999999999999"),
-				),
-				PhaseRunID: phase.PhaseRunID, PhaseRunGeneration: phase.Generation,
-				PhaseRunFence: phase.Fence, RuntimeRunID: phase.RuntimeRuns[0].RuntimeRunID,
-				OperationID: work.EnactmentRefs[0].OperationID,
-				Generation:  taskorchestration.RuntimeGeneration(phase.Generation),
-				Fence:       taskorchestration.RuntimeFence(phase.Fence), SafetyEpoch: view.SafetyEpoch,
-				Outcome: taskorchestration.RuntimeRunSucceeded,
-			},
-		),
+	runtimeIntent := adapter.runtimeEvidenceIntent(
+		t, runtimeHeader, work.EnactmentRefs[0], view, prefix,
 	)
+	_, err = adapter.decide(context.Background(), runtimeIntent)
 	if err != nil {
 		t.Fatalf("accept pending lifecycle Runtime evidence: %v", err)
 	}
@@ -716,6 +706,7 @@ func newInMemoryDecisionFaultAdapter(
 		restart:      func(*testing.T) { current = current.Restart() },
 		afterDecision: func(*testing.T, taskorchestration.TransitionDecision) {
 		},
+		runtimeEvidenceIntent: directSharedFaultRuntimeEvidenceIntent,
 	}
 }
 
@@ -747,6 +738,10 @@ func newOwnedDecisionFaultAdapter(
 		Now: func() time.Time { return now }, Faults: faults,
 	})
 	result := sharedPostgresDecisionFaultAdapter(t, now, db, schema, faults, &current)
+	evidencePort := &sharedRuntimeEvidencePort{}
+	evidenceAdapter := taskorchestration.NewRuntimeEvidenceAdapter(
+		evidencePort, sharedPrerequisiteAuthority{},
+	)
 	deliveryNow := now.Add(5 * time.Second)
 	transport, err := taskorchestration.NewDeterministicOwnedTransport(
 		taskorchestration.OwnedTransportConfig{
@@ -788,6 +783,52 @@ func newOwnedDecisionFaultAdapter(
 			t.Fatalf("deliver original operation after decision restart: result=%+v err=%v", delivered, err)
 		}
 	}
+	result.runtimeEvidenceIntent = func(
+		t *testing.T,
+		header taskorchestration.IntentHeader,
+		ref taskorchestration.EnactmentRef,
+		view taskorchestration.TaskOrchestrationView,
+		prefix string,
+	) taskorchestration.TransitionIntent {
+		t.Helper()
+		phase := view.PhaseRuns[0]
+		runtimeFence, ok := ref.Fence.(taskorchestration.RuntimeFence)
+		if !ok {
+			t.Fatalf("fault-matrix Runtime enactment has non-Runtime fence: %+v", ref)
+		}
+		record := taskorchestration.RuntimeEvidenceRecord{
+			SchemaVersion: taskorchestration.EvidenceSchemaV1,
+			EvidenceID:    evidenceID(t, prefix+"-owned-runtime-evidence"),
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: authorityID(t, prefix+"-owned-runtime-producer"),
+				Generation:  taskorchestration.AuthorizationGeneration(1),
+			},
+			TaskID: view.TaskID, PhaseRunID: phase.PhaseRunID,
+			PhaseRunGeneration: phase.Generation, PhaseRunFence: phase.Fence,
+			RuntimeRunID:                 phase.RuntimeRuns[0].RuntimeRunID,
+			RuntimeBindingID:             downstreamRuntimeBindingID(t, prefix+"-owned-runtime-binding"),
+			RuntimeBindingDigest:         evidenceDigest(t, "7777777777777777777777777777777777777777777777777777777777777777"),
+			ImmutableInputManifestDigest: evidenceDigest(t, "8888888888888888888888888888888888888888888888888888888888888888"),
+			ExecutionNodeID:              downstreamExecutionNodeID(t, prefix+"-owned-runtime-node"),
+			SandboxLeaseID:               downstreamSandboxLeaseID(t, prefix+"-owned-runtime-lease"),
+			OutputManifestDigest:         evidenceDigest(t, "9999999999999999999999999999999999999999999999999999999999999999"),
+			OperationID:                  ref.OperationID, ActivityGeneration: ref.ActivityGeneration,
+			Generation: taskorchestration.RuntimeGeneration(phase.Generation),
+			Fence:      runtimeFence, SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.RuntimeRunSucceeded,
+		}
+		record.EvidenceDigest = taskorchestration.RuntimeEvidenceDigest(record)
+		evidencePort.record = record
+		evidence, err := evidenceAdapter.Enact(context.Background(), ref)
+		if err != nil {
+			t.Fatalf("fault-matrix owned Runtime evidence adapter: %v", err)
+		}
+		intent, err := evidence.Intent(header)
+		if err != nil {
+			t.Fatalf("fault-matrix owned Runtime evidence Intent: %v", err)
+		}
+		return intent
+	}
 	return result
 }
 
@@ -813,6 +854,7 @@ func sharedPostgresDecisionFaultAdapter(
 		) {
 			return (*current).Query(ctx, query)
 		},
+		runtimeEvidenceIntent: directSharedFaultRuntimeEvidenceIntent,
 		newDispatcher: func(
 			t *testing.T,
 			now func() time.Time,
@@ -856,4 +898,33 @@ func sharedPostgresDecisionFaultAdapter(
 		afterDecision: func(*testing.T, taskorchestration.TransitionDecision) {
 		},
 	}
+}
+
+func directSharedFaultRuntimeEvidenceIntent(
+	t *testing.T,
+	header taskorchestration.IntentHeader,
+	ref taskorchestration.EnactmentRef,
+	view taskorchestration.TaskOrchestrationView,
+	prefix string,
+) taskorchestration.TransitionIntent {
+	t.Helper()
+	phase := view.PhaseRuns[0]
+	return taskorchestration.NewAcceptRuntimeEvidenceIntent(
+		header,
+		taskorchestration.NewRuntimeAuthority(
+			authorityID(t, prefix+"-runtime"), taskorchestration.AuthorizationGeneration(1),
+		),
+		taskorchestration.RuntimeEvidenceBinding{
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, prefix+"-runtime-evidence"), taskorchestration.EvidenceRuntime,
+				evidenceDigest(t, "9999999999999999999999999999999999999999999999999999999999999999"),
+			),
+			PhaseRunID: phase.PhaseRunID, PhaseRunGeneration: phase.Generation,
+			PhaseRunFence: phase.Fence, RuntimeRunID: phase.RuntimeRuns[0].RuntimeRunID,
+			OperationID: ref.OperationID,
+			Generation:  taskorchestration.RuntimeGeneration(phase.Generation),
+			Fence:       taskorchestration.RuntimeFence(phase.Fence), SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.RuntimeRunSucceeded,
+		},
+	)
 }

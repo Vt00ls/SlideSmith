@@ -29,7 +29,9 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 	}
 	rawFailure := errors.New(strings.Join(canaries, " | "))
 	now := time.Date(2026, time.July, 27, 23, 30, 0, 0, time.UTC)
-	telemetry := taskorchestration.NewDeterministicTelemetry()
+	telemetry := taskorchestration.NewDeterministicTelemetry(
+		taskorchestration.DeterministicTelemetryConfig{Now: func() time.Time { return now }},
+	)
 	sink := &canaryProjectionSink{rawFailure: rawFailure, telemetry: telemetry}
 	projector, err := taskorchestration.NewDecisionProjectionAdapter(
 		taskorchestration.DecisionProjectionConfig{ExternalAudit: sink, Telemetry: sink},
@@ -98,7 +100,7 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 			taskID(t, "canary-postgres-task"), 1,
 		),
 	)
-	if err != nil || projectionBacklog.Pending != 1 {
+	if err != nil || projectionBacklog.Pending != 2 || projectionBacklog.SourceFactCount != 2 {
 		t.Fatalf("retain canary projection backlog: backlog=%+v err=%v", projectionBacklog, err)
 	}
 
@@ -115,10 +117,19 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 		),
 	)
 	requireSharedDecisionError(t, diagnosticErr, taskorchestration.ErrorAuthorizationDenied)
+	telemetrySnapshot, snapshotErr := telemetry.Snapshot(
+		context.Background(),
+		taskorchestration.NewTelemetryDiagnosticQuery(
+			authority, taskID(t, "canary-task"), 10,
+		),
+	)
+	if snapshotErr != nil {
+		t.Fatalf("read canary telemetry through protected diagnostics: %v", snapshotErr)
+	}
 
 	surfaces := []any{
 		sink.audit,
-		telemetry.Snapshot(),
+		telemetrySnapshot,
 		projectionErr,
 		projectionBacklog,
 		diagnosticErr,

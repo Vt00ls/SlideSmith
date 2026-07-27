@@ -114,6 +114,7 @@ type TelemetryEnactmentProjection struct {
 // committed decision. It deliberately exposes no arbitrary attribute map.
 type DecisionTelemetryProjection struct {
 	SchemaVersion    ProjectionSchemaVersion
+	TaskID           TaskID
 	DecisionID       DecisionID
 	AcceptedRevision TaskRevision
 	Outcome          ProjectionOutcome
@@ -163,6 +164,7 @@ const (
 	MetricDecisionCount MetricName = iota + 1
 	MetricOutboxCount
 	MetricReconciliationCount
+	MetricCardinalityRejectionCount
 )
 
 type MetricLabels struct {
@@ -213,6 +215,21 @@ var registeredMetricPolicies = []metricRegistryEntry{
 		kinds:      []TelemetryKind{TelemetryReconciliation},
 		categories: registeredTelemetryCategories(),
 	},
+	{
+		name:       MetricCardinalityRejectionCount,
+		outcomes:   []TelemetryOutcome{TelemetryRejected},
+		kinds:      registeredTelemetryKinds(),
+		categories: []TelemetryCategory{TelemetryCategoryInvalid},
+	},
+}
+
+func registeredTelemetryKinds() []TelemetryKind {
+	return []TelemetryKind{
+		TelemetryDecision, TelemetryRuntimeEnactment,
+		TelemetryTaskWorkspaceLifecycleEnactment, TelemetryPublicationEnactment,
+		TelemetrySchedulingEnactment, TelemetryUsageEnactment,
+		TelemetryConfirmationEnactment, TelemetryReconciliation,
+	}
 }
 
 func registeredTelemetryCategories() []TelemetryCategory {
@@ -329,6 +346,7 @@ type TraceSpanRecord struct {
 	Outcome      TelemetryOutcome
 	Kind         TelemetryKind
 	Category     TelemetryCategory
+	TaskID       TaskID
 	DecisionID   DecisionID
 	OperationID  OperationID
 	TaskRevision TaskRevision
@@ -337,6 +355,7 @@ type TraceSpanRecord struct {
 
 type ReconciliationTelemetryProjection struct {
 	SchemaVersion ProjectionSchemaVersion
+	TaskID        TaskID
 	DecisionID    DecisionID
 	OperationID   OperationID
 	TaskRevision  TaskRevision
@@ -350,26 +369,58 @@ type ReconciliationTelemetrySink interface {
 }
 
 type TelemetrySnapshot struct {
-	Metrics []MetricSample
-	Logs    []StructuredLogRecord
-	Traces  []TraceSpanRecord
+	Metrics            []MetricSample
+	Logs               []StructuredLogRecord
+	Traces             []TraceSpanRecord
+	AccessAuditFactRef DiagnosticAuditFactRef
+}
+
+type TelemetryDiagnosticQuery struct {
+	authority AdministratorMetadataAuthority
+	taskID    TaskID
+	limit     uint32
+}
+
+func NewTelemetryDiagnosticQuery(
+	authority AdministratorMetadataAuthority,
+	taskID TaskID,
+	limit uint32,
+) TelemetryDiagnosticQuery {
+	return TelemetryDiagnosticQuery{authority: authority, taskID: taskID, limit: limit}
+}
+
+type DeterministicTelemetryConfig struct {
+	Now                   func() time.Time
+	DiagnosticAuditFaults *DiagnosticAuditFaultController
 }
 
 // DeterministicTelemetry is a vendor-neutral, restart-free contract adapter.
 // It stores typed projections for tests and local diagnostics only.
 type DeterministicTelemetry struct {
-	mu              sync.Mutex
-	decisions       map[DecisionID]DecisionTelemetryProjection
-	reconciliations map[OperationID]ReconciliationTelemetryProjection
-	metrics         []MetricSample
-	logs            []StructuredLogRecord
-	traces          []TraceSpanRecord
+	mu                          sync.Mutex
+	decisions                   map[DecisionID]DecisionTelemetryProjection
+	reconciliations             map[OperationID]ReconciliationTelemetryProjection
+	metrics                     []MetricSample
+	logs                        []StructuredLogRecord
+	traces                      []TraceSpanRecord
+	diagnosticAudits            map[AuditFactID]DiagnosticAuditFactRef
+	nextDiagnosticAuditSequence uint64
+	now                         func() time.Time
+	diagnosticAuditFaults       *DiagnosticAuditFaultController
 }
 
-func NewDeterministicTelemetry() *DeterministicTelemetry {
+func NewDeterministicTelemetry(config DeterministicTelemetryConfig) *DeterministicTelemetry {
+	now := config.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &DeterministicTelemetry{
-		decisions:       make(map[DecisionID]DecisionTelemetryProjection),
-		reconciliations: make(map[OperationID]ReconciliationTelemetryProjection),
+		decisions:                   make(map[DecisionID]DecisionTelemetryProjection),
+		reconciliations:             make(map[OperationID]ReconciliationTelemetryProjection),
+		diagnosticAudits:            make(map[AuditFactID]DiagnosticAuditFactRef),
+		nextDiagnosticAuditSequence: 1,
+		now:                         now,
+		diagnosticAuditFaults:       config.DiagnosticAuditFaults,
 	}
 }
 
@@ -377,8 +428,11 @@ func (telemetry *DeterministicTelemetry) ProjectTelemetry(
 	ctx context.Context,
 	projection DecisionTelemetryProjection,
 ) error {
-	if telemetry == nil || ctx == nil || ctx.Err() != nil ||
-		!validDecisionTelemetryProjection(projection) {
+	if telemetry == nil || ctx == nil || ctx.Err() != nil {
+		return &ProjectionError{code: ProjectionInvalidFact}
+	}
+	if !validDecisionTelemetryProjection(projection) {
+		telemetry.recordMetricRejection(TelemetryDecision)
 		return &ProjectionError{code: ProjectionInvalidFact}
 	}
 	projection.Enactments = append([]TelemetryEnactmentProjection(nil), projection.Enactments...)
@@ -391,7 +445,7 @@ func (telemetry *DeterministicTelemetry) ProjectTelemetry(
 		return &ProjectionError{code: ProjectionInvalidFact}
 	}
 	telemetry.decisions[projection.DecisionID] = projection
-	telemetry.metrics = append(telemetry.metrics, MetricSample{
+	telemetry.appendMetricLocked(MetricSample{
 		Name: MetricDecisionCount,
 		Labels: MetricLabels{
 			Outcome: TelemetryAccepted, Kind: TelemetryDecision, Category: TelemetryCategoryNone,
@@ -408,12 +462,13 @@ func (telemetry *DeterministicTelemetry) ProjectTelemetry(
 		Module: TelemetryModuleTaskOrchestration,
 		Name:   TraceDecisionCommit, Outcome: TelemetryAccepted,
 		Kind: TelemetryDecision, Category: TelemetryCategoryNone,
-		DecisionID: projection.DecisionID, TaskRevision: projection.AcceptedRevision,
-		RecordedAt: projection.RecordedAt,
+		TaskID: projection.TaskID, DecisionID: projection.DecisionID,
+		TaskRevision: projection.AcceptedRevision,
+		RecordedAt:   projection.RecordedAt,
 	})
 	for _, enactment := range projection.Enactments {
 		kind := telemetryKindForEnactment(enactment.Kind)
-		telemetry.metrics = append(telemetry.metrics, MetricSample{
+		telemetry.appendMetricLocked(MetricSample{
 			Name: MetricOutboxCount,
 			Labels: MetricLabels{
 				Outcome: TelemetryAccepted, Kind: kind, Category: TelemetryCategoryNone,
@@ -430,7 +485,8 @@ func (telemetry *DeterministicTelemetry) ProjectTelemetry(
 			Module: TelemetryModuleTaskOrchestration,
 			Name:   TraceOutboxCommit, Outcome: TelemetryAccepted,
 			Kind: kind, Category: TelemetryCategoryNone,
-			DecisionID: projection.DecisionID, OperationID: enactment.OperationID,
+			TaskID: projection.TaskID, DecisionID: projection.DecisionID,
+			OperationID:  enactment.OperationID,
 			TaskRevision: projection.AcceptedRevision, RecordedAt: projection.RecordedAt,
 		})
 	}
@@ -441,8 +497,11 @@ func (telemetry *DeterministicTelemetry) ProjectReconciliation(
 	ctx context.Context,
 	projection ReconciliationTelemetryProjection,
 ) error {
-	if telemetry == nil || ctx == nil || ctx.Err() != nil ||
-		!validReconciliationTelemetryProjection(projection) {
+	if telemetry == nil || ctx == nil || ctx.Err() != nil {
+		return &ProjectionError{code: ProjectionInvalidFact}
+	}
+	if !validReconciliationTelemetryProjection(projection) {
+		telemetry.recordMetricRejection(TelemetryReconciliation)
 		return &ProjectionError{code: ProjectionInvalidFact}
 	}
 	telemetry.mu.Lock()
@@ -459,7 +518,7 @@ func (telemetry *DeterministicTelemetry) ProjectReconciliation(
 		Kind:     TelemetryReconciliation,
 		Category: projection.Category,
 	}
-	telemetry.metrics = append(telemetry.metrics, MetricSample{
+	telemetry.appendMetricLocked(MetricSample{
 		Name: MetricReconciliationCount, Labels: labels, Count: 1,
 	})
 	telemetry.logs = append(telemetry.logs, StructuredLogRecord{
@@ -473,28 +532,89 @@ func (telemetry *DeterministicTelemetry) ProjectReconciliation(
 		Module:  TelemetryModuleTaskOrchestration,
 		Name:    TraceReconciliation,
 		Outcome: projection.Outcome, Kind: labels.Kind, Category: projection.Category,
-		DecisionID: projection.DecisionID, OperationID: projection.OperationID,
+		TaskID: projection.TaskID, DecisionID: projection.DecisionID,
+		OperationID:  projection.OperationID,
 		TaskRevision: projection.TaskRevision, RecordedAt: projection.ObservedAt,
 	})
 	return nil
 }
 
-func (telemetry *DeterministicTelemetry) Snapshot() TelemetrySnapshot {
-	if telemetry == nil {
-		return TelemetrySnapshot{}
+func (telemetry *DeterministicTelemetry) appendMetricLocked(sample MetricSample) {
+	if RegisteredMetricSample(sample) {
+		telemetry.metrics = append(telemetry.metrics, sample)
+		return
+	}
+	kind := sample.Labels.Kind
+	if !containsTelemetryKind(registeredTelemetryKinds(), kind) {
+		kind = TelemetryDecision
+	}
+	telemetry.metrics = append(telemetry.metrics, metricRejectionSample(kind))
+}
+
+func (telemetry *DeterministicTelemetry) recordMetricRejection(kind TelemetryKind) {
+	telemetry.mu.Lock()
+	defer telemetry.mu.Unlock()
+	telemetry.metrics = append(telemetry.metrics, metricRejectionSample(kind))
+}
+
+func metricRejectionSample(kind TelemetryKind) MetricSample {
+	return MetricSample{
+		Name: MetricCardinalityRejectionCount,
+		Labels: MetricLabels{
+			Outcome: TelemetryRejected, Kind: kind, Category: TelemetryCategoryInvalid,
+		},
+		Count: 1,
+	}
+}
+
+func (telemetry *DeterministicTelemetry) Snapshot(
+	ctx context.Context,
+	query TelemetryDiagnosticQuery,
+) (TelemetrySnapshot, error) {
+	if telemetry == nil || ctx == nil || ctx.Err() != nil {
+		return TelemetrySnapshot{}, newError(ErrorDependencyUnavailable)
+	}
+	if !query.authority.valid() || !validOpaqueID(query.taskID.value) ||
+		query.limit == 0 || query.limit > 100 {
+		return TelemetrySnapshot{}, newError(ErrorAuthorizationDenied)
 	}
 	telemetry.mu.Lock()
 	defer telemetry.mu.Unlock()
-	return TelemetrySnapshot{
-		Metrics: append([]MetricSample(nil), telemetry.metrics...),
-		Logs:    append([]StructuredLogRecord(nil), telemetry.logs...),
-		Traces:  append([]TraceSpanRecord(nil), telemetry.traces...),
+	if telemetry.diagnosticAuditFaults.consume() {
+		return TelemetrySnapshot{}, newError(ErrorDependencyUnavailable)
 	}
+	operationalQuery := OperationalDiagnosticQuery{
+		authority: query.authority, taskID: query.taskID,
+		lookupKind: DiagnosticLookupTelemetrySnapshot, resultLimit: query.limit,
+	}
+	auditRef := diagnosticAuditFactRef(
+		telemetry.nextDiagnosticAuditSequence, operationalQuery,
+		DiagnosticAuditAccepted, telemetry.now().UTC(),
+	)
+	telemetry.nextDiagnosticAuditSequence++
+	telemetry.diagnosticAudits[auditRef.AuditFactID] = auditRef
+	limit := int(query.limit)
+	metrics := append([]MetricSample(nil), telemetry.metrics[:min(limit, len(telemetry.metrics))]...)
+	logs := append([]StructuredLogRecord(nil), telemetry.logs[:min(limit, len(telemetry.logs))]...)
+	traces := make([]TraceSpanRecord, 0, min(limit, len(telemetry.traces)))
+	for _, trace := range telemetry.traces {
+		if trace.TaskID != query.taskID {
+			continue
+		}
+		traces = append(traces, trace)
+		if len(traces) == limit {
+			break
+		}
+	}
+	return TelemetrySnapshot{
+		Metrics: metrics, Logs: logs, Traces: traces, AccessAuditFactRef: auditRef,
+	}, nil
 }
 
 func validDecisionTelemetryProjection(projection DecisionTelemetryProjection) bool {
 	if projection.SchemaVersion != ProjectionSchemaV1 ||
-		!validOpaqueID(projection.DecisionID.value) || projection.AcceptedRevision == 0 ||
+		!validOpaqueID(projection.TaskID.value) || !validOpaqueID(projection.DecisionID.value) ||
+		projection.AcceptedRevision == 0 ||
 		projection.Outcome != ProjectionAccepted || projection.RecordedAt.IsZero() {
 		return false
 	}
@@ -509,7 +629,8 @@ func validDecisionTelemetryProjection(projection DecisionTelemetryProjection) bo
 
 func validReconciliationTelemetryProjection(projection ReconciliationTelemetryProjection) bool {
 	return projection.SchemaVersion == ProjectionSchemaV1 &&
-		validOpaqueID(projection.DecisionID.value) && validOpaqueID(projection.OperationID.value) &&
+		validOpaqueID(projection.TaskID.value) && validOpaqueID(projection.DecisionID.value) &&
+		validOpaqueID(projection.OperationID.value) &&
 		projection.TaskRevision > 0 && projection.Outcome == TelemetryReconciliationRequired &&
 		projection.Category >= TelemetryCategoryNone &&
 		projection.Category <= TelemetryCategoryUnknown && !projection.ObservedAt.IsZero()
@@ -656,6 +777,7 @@ func decisionProjections(
 	}
 	telemetry := DecisionTelemetryProjection{
 		SchemaVersion:    ProjectionSchemaV1,
+		TaskID:           decision.TaskProjection.TaskID,
 		DecisionID:       decision.DecisionID,
 		AcceptedRevision: decision.AcceptedTaskRevision,
 		Outcome:          ProjectionAccepted,
@@ -663,27 +785,6 @@ func decisionProjections(
 		Enactments:       enactments,
 	}
 	return audit, telemetry
-}
-
-func (adapter *DecisionProjectionAdapter) projectCommittedDecision(
-	ctx context.Context,
-	decision TransitionDecision,
-	externalAuditPending bool,
-	telemetryPending bool,
-) (externalAuditDelivered bool, telemetryDelivered bool) {
-	if adapter == nil || ctx == nil || ctx.Err() != nil || !validProjectionDecision(decision) {
-		return false, false
-	}
-	audit, telemetry := decisionProjections(decision)
-	externalAuditDelivered = !externalAuditPending
-	telemetryDelivered = !telemetryPending
-	if externalAuditPending {
-		externalAuditDelivered = adapter.externalAudit.ProjectExternalAudit(ctx, audit) == nil
-	}
-	if telemetryPending {
-		telemetryDelivered = adapter.telemetry.ProjectTelemetry(ctx, telemetry) == nil
-	}
-	return externalAuditDelivered, telemetryDelivered
 }
 
 func validProjectionDecision(decision TransitionDecision) bool {

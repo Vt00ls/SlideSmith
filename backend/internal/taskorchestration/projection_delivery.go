@@ -121,6 +121,13 @@ func (adapter *PostgresAdapter) RebuildDecisionProjectionDelivery(
 	if !request.authority.valid() || !validOpaqueID(request.taskID.value) {
 		return DecisionProjectionBacklog{}, newError(ErrorAuthorizationDenied)
 	}
+	auditRef, err := adapter.recordProjectionDeliveryAccessAudit(
+		ctx, request.authority, request.taskID, request.limit,
+		DiagnosticLookupProjectionBacklogRebuild,
+	)
+	if err != nil {
+		return DecisionProjectionBacklog{}, err
+	}
 	sources, err := adapter.loadDecisionProjectionSources(
 		ctx, request.taskID, request.limit, true,
 	)
@@ -138,21 +145,21 @@ func (adapter *PostgresAdapter) RebuildDecisionProjectionDelivery(
 		if err := adapter.beginProjectionDeliveryAttempt(ctx, source); err != nil {
 			return DecisionProjectionBacklog{}, err
 		}
-		auditDelivered := source.evidence.ExternalAuditDelivered
-		telemetryDelivered := source.evidence.TelemetryDelivered || !source.hasTelemetry
-		if !auditDelivered {
-			auditDelivered = adapter.projectionDelivery.externalAudit.ProjectExternalAudit(
+		auditDeliveredThisAttempt := false
+		telemetryDeliveredThisAttempt := false
+		if !source.evidence.ExternalAuditDelivered {
+			auditDeliveredThisAttempt = adapter.projectionDelivery.externalAudit.ProjectExternalAudit(
 				ctx, source.externalAudit,
 			) == nil
 		}
-		if source.hasTelemetry && !telemetryDelivered {
-			telemetryDelivered = adapter.projectionDelivery.telemetry.ProjectTelemetry(
+		if source.hasTelemetry && !source.evidence.TelemetryDelivered {
+			telemetryDeliveredThisAttempt = adapter.projectionDelivery.telemetry.ProjectTelemetry(
 				ctx, source.telemetry,
 			) == nil
 		}
 		if err := adapter.finishProjectionDeliveryAttempt(
 			ctx, source.evidence.AuditFactID, source.evidence.CanonicalDigest,
-			auditDelivered, telemetryDelivered,
+			auditDeliveredThisAttempt, telemetryDeliveredThisAttempt,
 		); err != nil {
 			return DecisionProjectionBacklog{}, err
 		}
@@ -160,13 +167,6 @@ func (adapter *PostgresAdapter) RebuildDecisionProjectionDelivery(
 	}
 	backlog, err := adapter.inspectDecisionProjectionBacklog(
 		ctx, request.taskID, request.limit,
-	)
-	if err != nil {
-		return DecisionProjectionBacklog{}, err
-	}
-	auditRef, err := adapter.recordProjectionDeliveryAccessAudit(
-		ctx, request.authority, request.taskID, request.limit,
-		DiagnosticLookupProjectionBacklogRebuild,
 	)
 	if err != nil {
 		return DecisionProjectionBacklog{}, err

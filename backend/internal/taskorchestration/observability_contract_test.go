@@ -66,14 +66,24 @@ func TestExternalAuditAndTelemetryProjectionDeliveryIsAsynchronousAndRebuildable
 		beforeDelivery.AccessAuditFactRef.Outcome != taskorchestration.DiagnosticAuditAccepted {
 		t.Fatalf("inspect initial projection backlog: backlog=%+v err=%v", beforeDelivery, err)
 	}
+	auditFaults.FailNext()
+	_, err = adapter.RebuildDecisionProjectionDelivery(
+		context.Background(), taskorchestration.NewProjectionDeliveryRebuildRequest(
+			administrator, taskID(t, "projection-task"), 100,
+		),
+	)
+	requireSharedDecisionError(t, err, taskorchestration.ErrorDependencyUnavailable)
+	if sink.auditCount() != 0 || sink.telemetryCount() != 0 {
+		t.Fatal("privileged redrive reached projection sinks before mandatory access audit")
+	}
 	failed, err := adapter.RebuildDecisionProjectionDelivery(
 		context.Background(), taskorchestration.NewProjectionDeliveryRebuildRequest(
 			administrator, taskID(t, "projection-task"), 100,
 		),
 	)
-	if err != nil || failed.Pending != 2 || failed.Delivered != 0 ||
-		failed.SourceFactCount != 2 || len(failed.Evidence) != 2 ||
-		failed.Evidence[0].AttemptCount != 1 || sink.auditCount() != 2 || sink.telemetryCount() != 1 {
+	if err != nil || failed.Pending != 3 || failed.Delivered != 0 ||
+		failed.SourceFactCount != 3 || len(failed.Evidence) != 3 ||
+		failed.Evidence[0].AttemptCount != 1 || sink.auditCount() != 3 || sink.telemetryCount() != 1 {
 		t.Fatalf("failed projection delivery was not retained: backlog=%+v err=%v", failed, err)
 	}
 	if sink.lastAudit().CanonicalDigest == (taskorchestration.ProjectionDigest{}) ||
@@ -97,9 +107,9 @@ func TestExternalAuditAndTelemetryProjectionDeliveryIsAsynchronousAndRebuildable
 			administrator, taskID(t, "projection-task"), 100,
 		),
 	)
-	if err != nil || rebuilt.Pending != 0 || rebuilt.Delivered != 3 ||
-		rebuilt.SourceFactCount != 3 || len(rebuilt.Evidence) != 3 ||
-		rebuilt.Evidence[0].AttemptCount != 2 || sink.auditCount() != 5 || sink.telemetryCount() != 2 {
+	if err != nil || rebuilt.Pending != 0 || rebuilt.Delivered != 4 ||
+		rebuilt.SourceFactCount != 4 || len(rebuilt.Evidence) != 4 ||
+		rebuilt.Evidence[0].AttemptCount != 2 || sink.auditCount() != 7 || sink.telemetryCount() != 2 {
 		t.Fatalf("rebuild projection delivery after restart: backlog=%+v err=%v", rebuilt, err)
 	}
 	again, err := restarted.RebuildDecisionProjectionDelivery(
@@ -107,11 +117,83 @@ func TestExternalAuditAndTelemetryProjectionDeliveryIsAsynchronousAndRebuildable
 			administrator, taskID(t, "projection-task"), 100,
 		),
 	)
-	if err != nil || again.Pending != 0 || again.Delivered != 4 ||
-		again.SourceFactCount != 4 || sink.auditCount() != 6 || sink.telemetryCount() != 2 ||
+	if err != nil || again.Pending != 0 || again.Delivered != 5 ||
+		again.SourceFactCount != 5 || sink.auditCount() != 8 || sink.telemetryCount() != 2 ||
 		sink.auditFactCount(decision.MandatoryAuditFactRef.AuditFactID) != 2 {
 		t.Fatalf("delivered projection was not idempotent: backlog=%+v err=%v", again, err)
 	}
+}
+
+func TestTelemetryOnlyProjectionRetryPreservesExternalAuditDeliveryTimes(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 22, 18, 0, 0, time.UTC)
+	db, schema := isolatedPostgresSchema(t)
+	sink := &splitProjectionSink{}
+	projector, err := taskorchestration.NewDecisionProjectionAdapter(
+		taskorchestration.DecisionProjectionConfig{ExternalAudit: sink, Telemetry: sink},
+	)
+	if err != nil {
+		t.Fatalf("create split projection sink: %v", err)
+	}
+	adapter := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
+		Now: func() time.Time { return now }, ProjectionDelivery: projector,
+	})
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "split-projection-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	decision, err := adapter.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+		intentHeader(t, "split-projection-start", "split-projection-task", now), owner,
+	))
+	if err != nil {
+		t.Fatalf("commit split projection Task: %v", err)
+	}
+	administrator := taskorchestration.NewAdministratorMetadataAuthority(
+		authorityID(t, "split-projection-administrator"),
+		taskorchestration.AuthorizationGeneration(1),
+		taskorchestration.DiagnosticReasonOperations,
+	)
+	request := taskorchestration.NewProjectionDeliveryRebuildRequest(
+		administrator, taskID(t, "split-projection-task"), 1,
+	)
+	first, err := adapter.RebuildDecisionProjectionDelivery(context.Background(), request)
+	if err != nil {
+		t.Fatalf("first split projection attempt: %v", err)
+	}
+	firstEvidence := projectionEvidenceForAudit(t, first, decision.MandatoryAuditFactRef.AuditFactID)
+	if !firstEvidence.ExternalAuditDelivered || firstEvidence.TelemetryDelivered ||
+		!firstEvidence.FirstExternalAuditDeliveredAt.Equal(now) ||
+		!firstEvidence.LastExternalAuditDeliveredAt.Equal(now) {
+		t.Fatalf("first split projection evidence is invalid: %+v", firstEvidence)
+	}
+	sink.telemetryHealthy = true
+	restarted := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
+		Now: func() time.Time { return now.Add(time.Second) }, ProjectionDelivery: projector,
+	})
+	second, err := restarted.RebuildDecisionProjectionDelivery(context.Background(), request)
+	if err != nil {
+		t.Fatalf("telemetry-only projection retry: %v", err)
+	}
+	secondEvidence := projectionEvidenceForAudit(t, second, decision.MandatoryAuditFactRef.AuditFactID)
+	if !secondEvidence.ExternalAuditDelivered || !secondEvidence.TelemetryDelivered ||
+		!secondEvidence.FirstExternalAuditDeliveredAt.Equal(now) ||
+		!secondEvidence.LastExternalAuditDeliveredAt.Equal(now) ||
+		sink.auditCalls != 1 || sink.telemetryCalls != 2 {
+		t.Fatalf("telemetry-only retry changed audit delivery evidence: evidence=%+v sink=%+v", secondEvidence, sink)
+	}
+}
+
+func projectionEvidenceForAudit(
+	t *testing.T,
+	backlog taskorchestration.DecisionProjectionBacklog,
+	auditFactID taskorchestration.AuditFactID,
+) taskorchestration.ProjectionDeliveryEvidence {
+	t.Helper()
+	for _, evidence := range backlog.Evidence {
+		if evidence.AuditFactID == auditFactID {
+			return evidence
+		}
+	}
+	t.Fatalf("projection evidence for audit %s is missing: %+v", auditFactID, backlog)
+	return taskorchestration.ProjectionDeliveryEvidence{}
 }
 
 func TestProtectedDiagnosticAccessAuditDeliveryIsRebuildable(t *testing.T) {
@@ -270,7 +352,12 @@ func TestProjectionDeliverySuccessIsMonotonicAcrossConcurrentRebuilds(t *testing
 
 func TestBoundedTelemetryUsesTypedLabelsAndAllowlistedLogsAndTraces(t *testing.T) {
 	now := time.Date(2026, time.July, 27, 22, 30, 0, 0, time.UTC)
-	telemetry := taskorchestration.NewDeterministicTelemetry()
+	auditFaults := &taskorchestration.DiagnosticAuditFaultController{}
+	telemetry := taskorchestration.NewDeterministicTelemetry(
+		taskorchestration.DeterministicTelemetryConfig{
+			Now: func() time.Time { return now }, DiagnosticAuditFaults: auditFaults,
+		},
+	)
 	projector, err := taskorchestration.NewDecisionProjectionAdapter(
 		taskorchestration.DecisionProjectionConfig{
 			ExternalAudit: taskorchestration.ExternalAuditProjectionSinkFunc(func(
@@ -325,6 +412,7 @@ func TestBoundedTelemetryUsesTypedLabelsAndAllowlistedLogsAndTraces(t *testing.T
 		context.Background(),
 		taskorchestration.ReconciliationTelemetryProjection{
 			SchemaVersion: taskorchestration.ProjectionSchemaV1,
+			TaskID:        taskID(t, "telemetry-task"),
 			DecisionID:    work.DecisionID, OperationID: work.EnactmentRefs[0].OperationID,
 			TaskRevision: work.AcceptedTaskRevision,
 			Outcome:      taskorchestration.TelemetryReconciliationRequired,
@@ -334,8 +422,40 @@ func TestBoundedTelemetryUsesTypedLabelsAndAllowlistedLogsAndTraces(t *testing.T
 	); err != nil {
 		t.Fatalf("project reconciliation health: %v", err)
 	}
-	snapshot := telemetry.Snapshot()
-	if len(snapshot.Metrics) != 3 || len(snapshot.Logs) != 3 || len(snapshot.Traces) != 3 {
+	invalidProjectionErr := telemetry.ProjectReconciliation(
+		context.Background(),
+		taskorchestration.ReconciliationTelemetryProjection{
+			SchemaVersion: taskorchestration.ProjectionSchemaV1,
+			TaskID:        taskID(t, "telemetry-task"),
+			DecisionID:    work.DecisionID, OperationID: work.EnactmentRefs[0].OperationID,
+			TaskRevision: work.AcceptedTaskRevision,
+			Outcome:      taskorchestration.TelemetryReconciliationRequired,
+			Category:     taskorchestration.TelemetryCategory(255),
+			ObservedAt:   now.Add(3 * time.Second),
+		},
+	)
+	var invalidProjection *taskorchestration.ProjectionError
+	if !errors.As(invalidProjectionErr, &invalidProjection) ||
+		invalidProjection.Code() != taskorchestration.ProjectionInvalidFact {
+		t.Fatalf("unknown metric category was not rejected: %T %v", invalidProjectionErr, invalidProjectionErr)
+	}
+	administrator := taskorchestration.NewAdministratorMetadataAuthority(
+		authorityID(t, "telemetry-administrator"),
+		taskorchestration.AuthorizationGeneration(1),
+		taskorchestration.DiagnosticReasonOperations,
+	)
+	diagnosticQuery := taskorchestration.NewTelemetryDiagnosticQuery(
+		administrator, taskID(t, "telemetry-task"), 10,
+	)
+	auditFaults.FailNext()
+	_, err = telemetry.Snapshot(context.Background(), diagnosticQuery)
+	requireSharedDecisionError(t, err, taskorchestration.ErrorDependencyUnavailable)
+	snapshot, err := telemetry.Snapshot(context.Background(), diagnosticQuery)
+	if err != nil || snapshot.AccessAuditFactRef.AuditFactID.String() == "" ||
+		snapshot.AccessAuditFactRef.Outcome != taskorchestration.DiagnosticAuditAccepted {
+		t.Fatalf("authorized telemetry snapshot audit: snapshot=%+v err=%v", snapshot, err)
+	}
+	if len(snapshot.Metrics) != 4 || len(snapshot.Logs) != 3 || len(snapshot.Traces) != 3 {
 		t.Fatalf("bounded telemetry snapshot omitted signals: %+v", snapshot)
 	}
 	if taskorchestration.MetricSeriesUpperBound() == 0 ||
@@ -357,6 +477,12 @@ func TestBoundedTelemetryUsesTypedLabelsAndAllowlistedLogsAndTraces(t *testing.T
 			}
 		}
 	}
+	if snapshot.Metrics[3].Name != taskorchestration.MetricCardinalityRejectionCount ||
+		snapshot.Metrics[3].Labels.Outcome != taskorchestration.TelemetryRejected ||
+		snapshot.Metrics[3].Labels.Kind != taskorchestration.TelemetryReconciliation ||
+		snapshot.Metrics[3].Labels.Category != taskorchestration.TelemetryCategoryInvalid {
+		t.Fatalf("metric policy rejection did not use bounded labels: %+v", snapshot.Metrics[3])
+	}
 	for _, log := range snapshot.Logs {
 		if log.SchemaVersion != taskorchestration.StructuredLogSchemaV1 ||
 			(log.Severity != taskorchestration.StructuredLogInfo &&
@@ -372,6 +498,20 @@ func TestBoundedTelemetryUsesTypedLabelsAndAllowlistedLogsAndTraces(t *testing.T
 	if snapshot.Traces[0].DecisionID != work.DecisionID ||
 		snapshot.Traces[1].OperationID != work.EnactmentRefs[0].OperationID {
 		t.Fatalf("allowlisted protected trace correlation is missing: %+v", snapshot.Traces)
+	}
+	for _, trace := range snapshot.Traces {
+		if trace.TaskID != taskID(t, "telemetry-task") {
+			t.Fatalf("telemetry diagnostic escaped exact Task scope: %+v", trace)
+		}
+	}
+	bounded, err := telemetry.Snapshot(
+		context.Background(),
+		taskorchestration.NewTelemetryDiagnosticQuery(
+			administrator, taskID(t, "telemetry-task"), 1,
+		),
+	)
+	if err != nil || len(bounded.Metrics) > 1 || len(bounded.Logs) > 1 || len(bounded.Traces) > 1 {
+		t.Fatalf("telemetry diagnostic result is not bounded: snapshot=%+v err=%v", bounded, err)
 	}
 }
 
@@ -389,6 +529,31 @@ type interleavingProjectionSink struct {
 	auditCalls        uint64
 	firstAuditStarted chan struct{}
 	releaseFirstAudit chan struct{}
+}
+
+type splitProjectionSink struct {
+	auditCalls       uint64
+	telemetryCalls   uint64
+	telemetryHealthy bool
+}
+
+func (sink *splitProjectionSink) ProjectExternalAudit(
+	context.Context,
+	taskorchestration.ExternalAuditProjection,
+) error {
+	sink.auditCalls++
+	return nil
+}
+
+func (sink *splitProjectionSink) ProjectTelemetry(
+	context.Context,
+	taskorchestration.DecisionTelemetryProjection,
+) error {
+	sink.telemetryCalls++
+	if sink.telemetryHealthy {
+		return nil
+	}
+	return errors.New("controlled telemetry failure")
 }
 
 func newInterleavingProjectionSink() *interleavingProjectionSink {

@@ -62,6 +62,7 @@ const (
 	DiagnosticLookupOperation
 	DiagnosticLookupProjectionBacklogInspection
 	DiagnosticLookupProjectionBacklogRebuild
+	DiagnosticLookupTelemetrySnapshot
 )
 
 type OperationalDiagnosticQuery struct {
@@ -317,7 +318,8 @@ func validOperationalDiagnosticQuery(query OperationalDiagnosticQuery) bool {
 		return validOpaqueID(query.operationID.value) && query.decisionID == (DecisionID{}) &&
 			query.resultLimit == 0
 	case DiagnosticLookupProjectionBacklogInspection,
-		DiagnosticLookupProjectionBacklogRebuild:
+		DiagnosticLookupProjectionBacklogRebuild,
+		DiagnosticLookupTelemetrySnapshot:
 		return query.decisionID == (DecisionID{}) && query.operationID == (OperationID{}) &&
 			query.resultLimit > 0 && query.resultLimit <= 100
 	default:
