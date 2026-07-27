@@ -264,6 +264,47 @@ func runSharedCoordinationContract(t *testing.T, factory sharedTaskOrchestration
 		after.EvidenceDiagnosticCount != 2 {
 		t.Fatalf("replay/conflict/stale inputs changed Task authority: %+v", after)
 	}
+	validHeader := intentHeader(
+		t, "shared-coordination-valid-evidence", "shared-coordination-task", now.Add(4*time.Second),
+	)
+	validHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
+	validHeader.ActivityGeneration = view.ActivityGeneration
+	validEvidence := taskorchestration.NewEvidenceRef(
+		evidenceID(t, "shared-coordination-valid-runtime-evidence"),
+		taskorchestration.EvidenceRuntime,
+		evidenceDigest(t, "5555555555555555555555555555555555555555555555555555555555555555"),
+	)
+	validBinding := taskorchestration.RuntimeEvidenceBinding{
+		Evidence:   validEvidence,
+		PhaseRunID: phase.PhaseRunID, PhaseRunGeneration: phase.Generation,
+		PhaseRunFence: phase.Fence, RuntimeRunID: runtimeRun.RuntimeRunID,
+		OperationID: work.EnactmentRefs[0].OperationID,
+		Generation:  taskorchestration.RuntimeGeneration(phase.Generation),
+		Fence:       taskorchestration.RuntimeFence(phase.Fence), SafetyEpoch: view.SafetyEpoch,
+		Outcome: taskorchestration.RuntimeRunSucceeded,
+	}
+	acceptedEvidence, err := adapter.mutations.Decide(
+		context.Background(),
+		taskorchestration.NewAcceptRuntimeEvidenceIntent(validHeader, runtimeAuthority, validBinding),
+	)
+	if err != nil {
+		t.Fatalf("accept shared Runtime evidence: %v", err)
+	}
+	duplicateHeader := validHeader
+	duplicateHeader.DecisionRequestID = decisionRequestID(t, "shared-coordination-duplicate-evidence")
+	duplicate, err := adapter.mutations.Decide(
+		context.Background(),
+		taskorchestration.NewAcceptRuntimeEvidenceIntent(duplicateHeader, runtimeAuthority, validBinding),
+	)
+	if err != nil || duplicate.DecisionID != acceptedEvidence.DecisionID ||
+		duplicate.AcceptedTaskRevision != acceptedEvidence.AcceptedTaskRevision {
+		t.Fatalf("duplicate exact evidence changed Decision: duplicate=%+v err=%v", duplicate, err)
+	}
+	afterDuplicate, err := adapter.queries.Query(context.Background(), query)
+	if err != nil || afterDuplicate.TaskRevision != acceptedEvidence.AcceptedTaskRevision ||
+		afterDuplicate.DecisionCount != 3 {
+		t.Fatalf("duplicate evidence advanced Task twice: view=%+v err=%v", afterDuplicate, err)
+	}
 }
 
 func requireSharedDecisionError(t *testing.T, err error, code taskorchestration.ErrorCode) {
@@ -317,7 +358,7 @@ func newSharedPostgresAdapter(
 func newSharedOwnedTransportAdapter(
 	t *testing.T,
 	now time.Time,
-	_ taskorchestration.UserAuthority,
+	owner taskorchestration.UserAuthority,
 	worker taskorchestration.WorkerAuthority,
 ) sharedTaskOrchestrationAdapter {
 	t.Helper()
@@ -354,6 +395,10 @@ func newSharedOwnedTransportAdapter(
 	if err != nil {
 		t.Fatalf("create shared PostgreSQL dispatcher: %v", err)
 	}
+	evidencePort := &sharedRuntimeEvidencePort{}
+	evidenceAdapter := taskorchestration.NewRuntimeEvidenceAdapter(
+		evidencePort, sharedPrerequisiteAuthority{},
+	)
 	return sharedTaskOrchestrationAdapter{
 		mutations: adapter,
 		queries:   adapter,
@@ -373,6 +418,72 @@ func newSharedOwnedTransportAdapter(
 			if err != nil || delivered.Disposition != taskorchestration.DeliveryAccepted {
 				t.Fatalf("deliver shared committed enactment: result=%+v err=%v", delivered, err)
 			}
+			view, err := adapter.Query(context.Background(), taskorchestration.TaskQuery{
+				TaskID:    decision.TaskProjection.TaskID,
+				Authority: taskorchestration.NewUserQueryAuthority(owner),
+			})
+			if err != nil || len(view.PhaseRuns) != 1 || len(view.PhaseRuns[0].RuntimeRuns) != 1 {
+				t.Fatalf("query Runtime evidence scope: view=%+v err=%v", view, err)
+			}
+			ref := decision.EnactmentRefs[0]
+			phase := view.PhaseRuns[0]
+			runtimeFence, ok := ref.Fence.(taskorchestration.RuntimeFence)
+			if !ok {
+				t.Fatalf("Runtime enactment has non-Runtime fence: %+v", ref)
+			}
+			record := taskorchestration.RuntimeEvidenceRecord{
+				SchemaVersion: taskorchestration.EvidenceSchemaV1,
+				EvidenceID:    evidenceID(t, "shared-owned-runtime-evidence"),
+				Producer: taskorchestration.EvidenceProducer{
+					AuthorityID: authorityID(t, "shared-owned-runtime-producer"),
+					Generation:  taskorchestration.AuthorizationGeneration(1),
+				},
+				TaskID:                       decision.TaskProjection.TaskID,
+				PhaseRunID:                   phase.PhaseRunID,
+				PhaseRunGeneration:           phase.Generation,
+				PhaseRunFence:                phase.Fence,
+				RuntimeRunID:                 phase.RuntimeRuns[0].RuntimeRunID,
+				RuntimeBindingID:             downstreamRuntimeBindingID(t, "shared-owned-runtime-binding"),
+				RuntimeBindingDigest:         evidenceDigest(t, "2222222222222222222222222222222222222222222222222222222222222222"),
+				ImmutableInputManifestDigest: evidenceDigest(t, "3333333333333333333333333333333333333333333333333333333333333333"),
+				ExecutionNodeID:              downstreamExecutionNodeID(t, "shared-owned-runtime-node"),
+				SandboxLeaseID:               downstreamSandboxLeaseID(t, "shared-owned-runtime-lease"),
+				OutputManifestDigest:         evidenceDigest(t, "4444444444444444444444444444444444444444444444444444444444444444"),
+				OperationID:                  ref.OperationID,
+				ActivityGeneration:           ref.ActivityGeneration,
+				Generation:                   taskorchestration.RuntimeGeneration(phase.Generation),
+				Fence:                        runtimeFence,
+				SafetyEpoch:                  view.SafetyEpoch,
+				Outcome:                      taskorchestration.RuntimeRunSucceeded,
+			}
+			record.EvidenceDigest = taskorchestration.RuntimeEvidenceDigest(record)
+			evidencePort.record = record
+			evidence, err := evidenceAdapter.Enact(context.Background(), ref)
+			if err != nil || evidence.OperationID != ref.OperationID ||
+				evidence.Evidence.ID != record.EvidenceID ||
+				evidence.Evidence.Digest != record.EvidenceDigest {
+				t.Fatalf("enact through owned Runtime evidence adapter: evidence=%+v err=%v", evidence, err)
+			}
 		},
 	}
+}
+
+type sharedRuntimeEvidencePort struct {
+	record taskorchestration.RuntimeEvidenceRecord
+}
+
+func (port *sharedRuntimeEvidencePort) EnactRuntime(
+	context.Context,
+	taskorchestration.EnactmentRef,
+) (taskorchestration.RuntimeEvidenceRecord, error) {
+	return port.record, nil
+}
+
+type sharedPrerequisiteAuthority struct{}
+
+func (sharedPrerequisiteAuthority) ExpectedPrerequisites(
+	context.Context,
+	taskorchestration.EnactmentRef,
+) ([]taskorchestration.EvidencePrerequisite, error) {
+	return nil, nil
 }

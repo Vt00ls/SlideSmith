@@ -14,33 +14,37 @@ func TestAuthorizedDeterministicDiagnosticsContract(t *testing.T) {
 		new  func(
 			*testing.T,
 			time.Time,
-		) (taskorchestration.TaskOrchestration, taskorchestration.TaskOrchestrationQuery, taskorchestration.OperationalDiagnostics)
+		) (taskorchestration.TaskOrchestration, taskorchestration.TaskOrchestrationQuery, taskorchestration.OperationalDiagnostics, func())
 	}{
 		{name: "in_memory", new: func(t *testing.T, now time.Time) (
 			taskorchestration.TaskOrchestration,
 			taskorchestration.TaskOrchestrationQuery,
 			taskorchestration.OperationalDiagnostics,
+			func(),
 		) {
 			t.Helper()
+			faults := &taskorchestration.DiagnosticAuditFaultController{}
 			harness, err := taskorchestration.NewDeterministicHarness(
-				taskorchestration.HarnessConfig{Now: now},
+				taskorchestration.HarnessConfig{Now: now, DiagnosticAuditFaults: faults},
 			)
 			if err != nil {
 				t.Fatalf("create diagnostic harness: %v", err)
 			}
-			return harness.Mutations, harness.Queries, harness.Diagnostics
+			return harness.Mutations, harness.Queries, harness.Diagnostics, faults.FailNext
 		}},
 		{name: "postgres_owned_persistence", new: func(t *testing.T, now time.Time) (
 			taskorchestration.TaskOrchestration,
 			taskorchestration.TaskOrchestrationQuery,
 			taskorchestration.OperationalDiagnostics,
+			func(),
 		) {
 			t.Helper()
 			db, schema := isolatedPostgresSchema(t)
+			faults := &taskorchestration.DiagnosticAuditFaultController{}
 			adapter := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
-				Now: func() time.Time { return now },
+				Now: func() time.Time { return now }, DiagnosticAuditFaults: faults,
 			})
-			return adapter, adapter, adapter
+			return adapter, adapter, adapter, faults.FailNext
 		}},
 	}
 	for _, testCase := range testCases {
@@ -57,11 +61,11 @@ func runAuthorizedDiagnosticContract(
 	newAdapter func(
 		*testing.T,
 		time.Time,
-	) (taskorchestration.TaskOrchestration, taskorchestration.TaskOrchestrationQuery, taskorchestration.OperationalDiagnostics),
+	) (taskorchestration.TaskOrchestration, taskorchestration.TaskOrchestrationQuery, taskorchestration.OperationalDiagnostics, func()),
 ) {
 	t.Helper()
 	now := time.Date(2026, time.July, 27, 23, 0, 0, 0, time.UTC)
-	mutations, queries, diagnostics := newAdapter(t, now)
+	mutations, queries, diagnostics, failNextAudit := newAdapter(t, now)
 	owner := taskorchestration.NewUserAuthority(
 		authorityID(t, "diagnostic-owner"), taskorchestration.AuthorizationGeneration(1),
 	)
@@ -100,30 +104,52 @@ func runAuthorizedDiagnosticContract(
 		taskorchestration.AuthorizationGeneration(1),
 		taskorchestration.DiagnosticReasonOperations,
 	)
+	failNextAudit()
+	_, err = diagnostics.Diagnose(
+		context.Background(),
+		taskorchestration.NewDecisionDiagnosticQuery(
+			authority, taskID(t, "diagnostic-task"), work.DecisionID,
+		),
+	)
+	requireSharedDecisionError(t, err, taskorchestration.ErrorDependencyUnavailable)
 	decisionView, err := diagnostics.Diagnose(
 		context.Background(),
-		taskorchestration.NewDecisionDiagnosticQuery(authority, work.DecisionID),
+		taskorchestration.NewDecisionDiagnosticQuery(
+			authority, taskID(t, "diagnostic-task"), work.DecisionID,
+		),
 	)
 	if err != nil || decisionView.DecisionID != work.DecisionID ||
 		decisionView.AcceptedTaskRevision != work.AcceptedTaskRevision ||
-		decisionView.AuditFactID != work.MandatoryAuditFactRef.AuditFactID {
+		decisionView.AuditFactID != work.MandatoryAuditFactRef.AuditFactID ||
+		decisionView.AccessAuditFactRef.AuditFactID.String() == "" ||
+		decisionView.AccessAuditFactRef.CanonicalDigest == (taskorchestration.ProjectionDigest{}) ||
+		decisionView.AccessAuditFactRef.Outcome != taskorchestration.DiagnosticAuditAccepted {
 		t.Fatalf("query Decision diagnostic: view=%+v err=%v", decisionView, err)
 	}
 	operationView, err := diagnostics.Diagnose(
 		context.Background(),
 		taskorchestration.NewOperationDiagnosticQuery(
-			authority, work.EnactmentRefs[0].OperationID,
+			authority, taskID(t, "diagnostic-task"), work.EnactmentRefs[0].OperationID,
 		),
 	)
 	if err != nil || operationView.DecisionID != work.DecisionID ||
 		operationView.OperationID != work.EnactmentRefs[0].OperationID ||
-		operationView.EnactmentKind != work.EnactmentRefs[0].Kind {
+		operationView.EnactmentKind != work.EnactmentRefs[0].Kind ||
+		operationView.AccessAuditFactRef.AuditFactID == decisionView.AccessAuditFactRef.AuditFactID {
 		t.Fatalf("query Operation diagnostic: view=%+v err=%v", operationView, err)
 	}
 	_, err = diagnostics.Diagnose(
 		context.Background(),
 		taskorchestration.NewDecisionDiagnosticQuery(
-			taskorchestration.AdministratorMetadataAuthority{}, work.DecisionID,
+			authority, taskID(t, "diagnostic-other-task"), work.DecisionID,
+		),
+	)
+	requireSharedDecisionError(t, err, taskorchestration.ErrorAuthorizationDenied)
+	_, err = diagnostics.Diagnose(
+		context.Background(),
+		taskorchestration.NewDecisionDiagnosticQuery(
+			taskorchestration.AdministratorMetadataAuthority{},
+			taskID(t, "diagnostic-task"), work.DecisionID,
 		),
 	)
 	requireSharedDecisionError(t, err, taskorchestration.ErrorAuthorizationDenied)

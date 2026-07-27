@@ -544,15 +544,29 @@ func TestPostgresProjectionObserverFailureDoesNotRollBackCommittedDecision(t *te
 	now := time.Date(2026, time.July, 27, 10, 30, 0, 0, time.UTC)
 	db, schema := isolatedPostgresSchema(t)
 	var observations atomic.Uint64
+	projector, err := taskorchestration.NewDecisionProjectionAdapter(
+		taskorchestration.DecisionProjectionConfig{
+			ExternalAudit: taskorchestration.ExternalAuditProjectionSinkFunc(func(
+				context.Context,
+				taskorchestration.ExternalAuditProjection,
+			) error {
+				observations.Add(1)
+				return errors.New("external-audit-credential-canary")
+			}),
+			Telemetry: taskorchestration.DecisionTelemetryProjectionSinkFunc(func(
+				context.Context,
+				taskorchestration.DecisionTelemetryProjection,
+			) error {
+				return nil
+			}),
+		},
+	)
+	if err != nil {
+		t.Fatalf("create projection adapter: %v", err)
+	}
 	adapter := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
-		Now: func() time.Time { return now },
-		CommitObserver: taskorchestration.DecisionCommitObserverFunc(func(
-			context.Context,
-			taskorchestration.TransitionDecision,
-		) error {
-			observations.Add(1)
-			return errors.New("external-audit-credential-canary")
-		}),
+		Now:                func() time.Time { return now },
+		ProjectionDelivery: projector,
 	})
 	owner := taskorchestration.NewUserAuthority(
 		authorityID(t, "postgres-observer-owner"), taskorchestration.AuthorizationGeneration(1),
@@ -563,8 +577,13 @@ func TestPostgresProjectionObserverFailureDoesNotRollBackCommittedDecision(t *te
 	if err != nil {
 		t.Fatalf("commit with failing projection observer: %v", err)
 	}
-	if decision.AcceptedTaskRevision != 1 || observations.Load() != 1 {
-		t.Fatal("post-commit projection observer did not observe the committed decision")
+	if decision.AcceptedTaskRevision != 1 || observations.Load() != 0 {
+		t.Fatal("projection delivery ran in the protected Decision path")
+	}
+	if _, err := adapter.RebuildDecisionProjectionDelivery(
+		context.Background(), taskorchestration.ProjectionDeliveryRebuildRequest{Limit: 1},
+	); err != nil || observations.Load() != 1 {
+		t.Fatalf("asynchronous projection delivery attempt: observations=%d err=%v", observations.Load(), err)
 	}
 	persistence, err := adapter.InspectPersistence(context.Background(), taskorchestration.TaskQuery{
 		TaskID:    taskID(t, "postgres-observer-task"),

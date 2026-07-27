@@ -10,10 +10,11 @@ import (
 )
 
 type HarnessConfig struct {
-	Now      time.Time
-	IDs      DeterministicIDConfig
-	Tasks    []HarnessTaskFixture
-	Recovery HarnessRecoveryFixture
+	Now                   time.Time
+	IDs                   DeterministicIDConfig
+	Tasks                 []HarnessTaskFixture
+	Recovery              HarnessRecoveryFixture
+	DiagnosticAuditFaults *DiagnosticAuditFaultController
 }
 
 type HarnessRecoveryFixture struct {
@@ -160,12 +161,15 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		return nil, invalidIntentError()
 	}
 	persistence := &memoryPersistence{
-		tasks:            make(map[TaskID]taskRecord),
-		decisions:        make(map[decisionRequestScope]committedDecision),
-		acceptedEvidence: make(map[evidenceScope]committedEvidence),
-		outbox:           make(map[OperationID]authoritativeOutboxRecord),
-		deliveries:       make(map[OperationID]memoryDeliveryState),
-		ids:              newDeterministicIDAllocator(config.IDs),
+		tasks:                       make(map[TaskID]taskRecord),
+		decisions:                   make(map[decisionRequestScope]committedDecision),
+		acceptedEvidence:            make(map[evidenceScope]committedEvidence),
+		outbox:                      make(map[OperationID]authoritativeOutboxRecord),
+		deliveries:                  make(map[OperationID]memoryDeliveryState),
+		diagnosticAudits:            make(map[AuditFactID]DiagnosticAuditFactRef),
+		nextDiagnosticAuditSequence: 1,
+		diagnosticAuditFaults:       config.DiagnosticAuditFaults,
+		ids:                         newDeterministicIDAllocator(config.IDs),
 	}
 	if config.Recovery != (HarnessRecoveryFixture{}) {
 		if !config.Recovery.Authority.value.valid() ||
@@ -210,9 +214,12 @@ func newHarness(
 	controls := &harnessControls{}
 	engine := &decisionEngine{clock: clock, persistence: persistence, controls: controls}
 	return &DeterministicHarness{
-		Mutations:   engine,
-		Queries:     engine,
-		Diagnostics: &diagnosticEngine{persistence: persistence},
+		Mutations: engine,
+		Queries:   engine,
+		Diagnostics: &diagnosticEngine{
+			persistence: persistence, now: clock.current,
+			auditFaults: persistence.diagnosticAuditFaults,
+		},
 		persistence: persistence,
 		clock:       clock,
 		controls:    controls,
@@ -319,14 +326,17 @@ func (clock *controlledClock) current() time.Time {
 }
 
 type memoryPersistence struct {
-	mu               sync.Mutex
-	tasks            map[TaskID]taskRecord
-	decisions        map[decisionRequestScope]committedDecision
-	acceptedEvidence map[evidenceScope]committedEvidence
-	outbox           map[OperationID]authoritativeOutboxRecord
-	deliveries       map[OperationID]memoryDeliveryState
-	ids              deterministicIDAllocator
-	recovery         recoveryBinding
+	mu                          sync.Mutex
+	tasks                       map[TaskID]taskRecord
+	decisions                   map[decisionRequestScope]committedDecision
+	acceptedEvidence            map[evidenceScope]committedEvidence
+	outbox                      map[OperationID]authoritativeOutboxRecord
+	deliveries                  map[OperationID]memoryDeliveryState
+	ids                         deterministicIDAllocator
+	recovery                    recoveryBinding
+	diagnosticAudits            map[AuditFactID]DiagnosticAuditFactRef
+	nextDiagnosticAuditSequence uint64
+	diagnosticAuditFaults       *DiagnosticAuditFaultController
 }
 
 type recoveryBinding struct {

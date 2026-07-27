@@ -2,6 +2,8 @@ package taskorchestration
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"reflect"
 	"sync"
 	"time"
@@ -21,6 +23,10 @@ func (version ProjectionSchemaVersion) Minor() uint16 { return uint16(version) }
 
 type ProjectionOutcome uint8
 
+// ProjectionDigest binds a content-free projection or protected diagnostic
+// audit fact to one canonical representation.
+type ProjectionDigest [32]byte
+
 const (
 	ProjectionAccepted ProjectionOutcome = iota + 1
 )
@@ -30,12 +36,36 @@ const (
 // credential field and never replaces the authoritative audit fact.
 type ExternalAuditProjection struct {
 	SchemaVersion     ProjectionSchemaVersion
+	CanonicalDigest   ProjectionDigest
 	AuditFactID       AuditFactID
 	DecisionID        DecisionID
 	DecisionRequestID DecisionRequestID
 	AcceptedRevision  TaskRevision
 	Outcome           ProjectionOutcome
 	RecordedAt        time.Time
+}
+
+// ExternalAuditProjectionDigest returns the canonical delivery identity for a
+// content-free copy of one retained authoritative audit fact.
+func ExternalAuditProjectionDigest(projection ExternalAuditProjection) ProjectionDigest {
+	encoded, _ := json.Marshal(struct {
+		SchemaVersion     ProjectionSchemaVersion
+		AuditFactID       string
+		DecisionID        string
+		DecisionRequestID string
+		AcceptedRevision  TaskRevision
+		Outcome           ProjectionOutcome
+		RecordedAt        int64
+	}{
+		SchemaVersion:     projection.SchemaVersion,
+		AuditFactID:       projection.AuditFactID.value,
+		DecisionID:        projection.DecisionID.value,
+		DecisionRequestID: projection.DecisionRequestID.value,
+		AcceptedRevision:  projection.AcceptedRevision,
+		Outcome:           projection.Outcome,
+		RecordedAt:        projection.RecordedAt.UnixNano(),
+	})
+	return sha256.Sum256(encoded)
 }
 
 // TelemetryEnactmentProjection is protected correlation metadata for one
@@ -113,14 +143,102 @@ type MetricSample struct {
 	Count  uint64
 }
 
-// MetricSeriesUpperBound is the complete finite product of the registered
-// metric name and label enums. No runtime identity can enlarge it.
+type metricRegistryEntry struct {
+	name       MetricName
+	outcomes   []TelemetryOutcome
+	kinds      []TelemetryKind
+	categories []TelemetryCategory
+}
+
+var registeredMetricPolicies = []metricRegistryEntry{
+	{
+		name:       MetricDecisionCount,
+		outcomes:   []TelemetryOutcome{TelemetryAccepted, TelemetryRejected},
+		kinds:      []TelemetryKind{TelemetryDecision},
+		categories: registeredTelemetryCategories(),
+	},
+	{
+		name: MetricOutboxCount,
+		outcomes: []TelemetryOutcome{
+			TelemetryAccepted, TelemetryDelivered, TelemetryDeferred,
+			TelemetryReconciliationRequired, TelemetryFailed,
+		},
+		kinds: []TelemetryKind{
+			TelemetryRuntimeEnactment, TelemetryTaskWorkspaceLifecycleEnactment,
+			TelemetryPublicationEnactment, TelemetrySchedulingEnactment,
+			TelemetryUsageEnactment, TelemetryConfirmationEnactment,
+		},
+		categories: registeredTelemetryCategories(),
+	},
+	{
+		name: MetricReconciliationCount,
+		outcomes: []TelemetryOutcome{
+			TelemetryDelivered, TelemetryDeferred,
+			TelemetryReconciliationRequired, TelemetryFailed,
+		},
+		kinds:      []TelemetryKind{TelemetryReconciliation},
+		categories: registeredTelemetryCategories(),
+	},
+}
+
+func registeredTelemetryCategories() []TelemetryCategory {
+	return []TelemetryCategory{
+		TelemetryCategoryNone, TelemetryCategoryAuthorization,
+		TelemetryCategoryIntegrity, TelemetryCategoryStale,
+		TelemetryCategoryDependency, TelemetryCategoryInvalid,
+		TelemetryCategoryUnknown,
+	}
+}
+
+// MetricSeriesUpperBound is derived from the same closed registry used to
+// reject unregistered samples. No runtime identity can enlarge it.
 func MetricSeriesUpperBound() uint64 {
-	const categories = uint64(7)
-	const decisionSeries = uint64(2*1) * categories
-	const outboxSeries = uint64(5*6) * categories
-	const reconciliationSeries = uint64(4*1) * categories
-	return decisionSeries + outboxSeries + reconciliationSeries
+	var bound uint64
+	for _, policy := range registeredMetricPolicies {
+		bound += uint64(len(policy.outcomes) * len(policy.kinds) * len(policy.categories))
+	}
+	return bound
+}
+
+func RegisteredMetricSample(sample MetricSample) bool {
+	if sample.Count == 0 {
+		return false
+	}
+	for _, policy := range registeredMetricPolicies {
+		if sample.Name == policy.name && containsTelemetryOutcome(policy.outcomes, sample.Labels.Outcome) &&
+			containsTelemetryKind(policy.kinds, sample.Labels.Kind) &&
+			containsTelemetryCategory(policy.categories, sample.Labels.Category) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTelemetryOutcome(values []TelemetryOutcome, value TelemetryOutcome) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTelemetryKind(values []TelemetryKind, value TelemetryKind) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTelemetryCategory(values []TelemetryCategory, value TelemetryCategory) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }
 
 type StructuredLogEvent uint8
@@ -129,6 +247,17 @@ const (
 	StructuredLogDecisionCommitted StructuredLogEvent = iota + 1
 	StructuredLogOutboxCommitted
 	StructuredLogReconciliationObserved
+)
+
+type StructuredLogSchemaVersion uint16
+
+const StructuredLogSchemaV1 StructuredLogSchemaVersion = 1
+
+type StructuredLogSeverity uint8
+
+const (
+	StructuredLogInfo StructuredLogSeverity = iota + 1
+	StructuredLogWarning
 )
 
 type TelemetryModule uint8
@@ -140,12 +269,14 @@ const (
 // StructuredLogRecord has a closed allowlist and deliberately carries no
 // business identity or arbitrary message/attribute field.
 type StructuredLogRecord struct {
-	Module     TelemetryModule
-	Event      StructuredLogEvent
-	Outcome    TelemetryOutcome
-	Kind       TelemetryKind
-	Category   TelemetryCategory
-	RecordedAt time.Time
+	SchemaVersion StructuredLogSchemaVersion
+	Severity      StructuredLogSeverity
+	Module        TelemetryModule
+	Event         StructuredLogEvent
+	Outcome       TelemetryOutcome
+	Kind          TelemetryKind
+	Category      TelemetryCategory
+	RecordedAt    time.Time
 }
 
 type TraceSpanName uint8
@@ -234,6 +365,7 @@ func (telemetry *DeterministicTelemetry) ProjectTelemetry(
 		Count: 1,
 	})
 	telemetry.logs = append(telemetry.logs, StructuredLogRecord{
+		SchemaVersion: StructuredLogSchemaV1, Severity: StructuredLogInfo,
 		Module: TelemetryModuleTaskOrchestration,
 		Event:  StructuredLogDecisionCommitted, Outcome: TelemetryAccepted,
 		Kind: TelemetryDecision, Category: TelemetryCategoryNone, RecordedAt: projection.RecordedAt,
@@ -255,6 +387,7 @@ func (telemetry *DeterministicTelemetry) ProjectTelemetry(
 			Count: 1,
 		})
 		telemetry.logs = append(telemetry.logs, StructuredLogRecord{
+			SchemaVersion: StructuredLogSchemaV1, Severity: StructuredLogInfo,
 			Module: TelemetryModuleTaskOrchestration,
 			Event:  StructuredLogOutboxCommitted, Outcome: TelemetryAccepted,
 			Kind: kind, Category: TelemetryCategoryNone, RecordedAt: projection.RecordedAt,
@@ -296,6 +429,7 @@ func (telemetry *DeterministicTelemetry) ProjectReconciliation(
 		Name: MetricReconciliationCount, Labels: labels, Count: 1,
 	})
 	telemetry.logs = append(telemetry.logs, StructuredLogRecord{
+		SchemaVersion: StructuredLogSchemaV1, Severity: StructuredLogWarning,
 		Module:  TelemetryModuleTaskOrchestration,
 		Event:   StructuredLogReconciliationObserved,
 		Outcome: projection.Outcome, Kind: labels.Kind, Category: projection.Category,
@@ -455,6 +589,18 @@ func (adapter *DecisionProjectionAdapter) ObserveCommittedDecision(
 		ctx == nil || !validProjectionDecision(decision) {
 		return &ProjectionError{code: ProjectionInvalidFact}
 	}
+	audit, telemetry := decisionProjections(decision)
+	auditErr := adapter.externalAudit.ProjectExternalAudit(ctx, audit)
+	telemetryErr := adapter.telemetry.ProjectTelemetry(ctx, telemetry)
+	if auditErr != nil || telemetryErr != nil {
+		return &ProjectionError{code: ProjectionUnavailable}
+	}
+	return nil
+}
+
+func decisionProjections(
+	decision TransitionDecision,
+) (ExternalAuditProjection, DecisionTelemetryProjection) {
 	audit := ExternalAuditProjection{
 		SchemaVersion:     ProjectionSchemaV1,
 		AuditFactID:       decision.MandatoryAuditFactRef.AuditFactID,
@@ -464,6 +610,7 @@ func (adapter *DecisionProjectionAdapter) ObserveCommittedDecision(
 		Outcome:           ProjectionAccepted,
 		RecordedAt:        decision.CommittedAt,
 	}
+	audit.CanonicalDigest = ExternalAuditProjectionDigest(audit)
 	enactments := make([]TelemetryEnactmentProjection, len(decision.EnactmentRefs))
 	for index, enactment := range decision.EnactmentRefs {
 		enactments[index] = TelemetryEnactmentProjection{
@@ -479,12 +626,28 @@ func (adapter *DecisionProjectionAdapter) ObserveCommittedDecision(
 		RecordedAt:       decision.CommittedAt,
 		Enactments:       enactments,
 	}
-	auditErr := adapter.externalAudit.ProjectExternalAudit(ctx, audit)
-	telemetryErr := adapter.telemetry.ProjectTelemetry(ctx, telemetry)
-	if auditErr != nil || telemetryErr != nil {
-		return &ProjectionError{code: ProjectionUnavailable}
+	return audit, telemetry
+}
+
+func (adapter *DecisionProjectionAdapter) projectCommittedDecision(
+	ctx context.Context,
+	decision TransitionDecision,
+	externalAuditPending bool,
+	telemetryPending bool,
+) (externalAuditDelivered bool, telemetryDelivered bool) {
+	if adapter == nil || ctx == nil || ctx.Err() != nil || !validProjectionDecision(decision) {
+		return false, false
 	}
-	return nil
+	audit, telemetry := decisionProjections(decision)
+	externalAuditDelivered = !externalAuditPending
+	telemetryDelivered = !telemetryPending
+	if externalAuditPending {
+		externalAuditDelivered = adapter.externalAudit.ProjectExternalAudit(ctx, audit) == nil
+	}
+	if telemetryPending {
+		telemetryDelivered = adapter.telemetry.ProjectTelemetry(ctx, telemetry) == nil
+	}
+	return externalAuditDelivered, telemetryDelivered
 }
 
 func validProjectionDecision(decision TransitionDecision) bool {

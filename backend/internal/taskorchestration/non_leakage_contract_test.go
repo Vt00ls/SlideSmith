@@ -76,6 +76,24 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 		safeProjectionErr.Code() != taskorchestration.ProjectionUnavailable {
 		t.Fatalf("raw projection failure was not normalized: %T %v", projectionErr, projectionErr)
 	}
+	db, schema := isolatedPostgresSchema(t)
+	postgres := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
+		Now: func() time.Time { return now }, ProjectionDelivery: projector,
+	})
+	if _, err := postgres.Decide(
+		context.Background(),
+		taskorchestration.NewStartTaskIntent(
+			intentHeader(t, "canary-postgres-start", "canary-postgres-task", now), owner,
+		),
+	); err != nil {
+		t.Fatalf("commit canary PostgreSQL Decision: %v", err)
+	}
+	projectionBacklog, err := postgres.RebuildDecisionProjectionDelivery(
+		context.Background(), taskorchestration.ProjectionDeliveryRebuildRequest{Limit: 1},
+	)
+	if err != nil || projectionBacklog.Pending != 1 {
+		t.Fatalf("retain canary projection backlog: backlog=%+v err=%v", projectionBacklog, err)
+	}
 
 	authority := taskorchestration.NewAdministratorMetadataAuthority(
 		authorityID(t, "canary-diagnostic-administrator"),
@@ -85,7 +103,9 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 	missingOperation := operationID(t, "foreign-workspace-exists-canary")
 	_, diagnosticErr := harness.Diagnostics.Diagnose(
 		context.Background(),
-		taskorchestration.NewOperationDiagnosticQuery(authority, missingOperation),
+		taskorchestration.NewOperationDiagnosticQuery(
+			authority, taskID(t, "canary-task"), missingOperation,
+		),
 	)
 	requireSharedDecisionError(t, diagnosticErr, taskorchestration.ErrorAuthorizationDenied)
 
@@ -93,6 +113,7 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 		sink.audit,
 		telemetry.Snapshot(),
 		projectionErr,
+		projectionBacklog,
 		diagnosticErr,
 		taskorchestration.NewDownstreamError(taskorchestration.DownstreamDependencyUnavailable),
 	}
@@ -114,6 +135,9 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 		taskorchestration.TraceSpanRecord{},
 		taskorchestration.ReconciliationTelemetryProjection{},
 		taskorchestration.OperationalDiagnosticView{},
+		taskorchestration.DiagnosticAuditFactRef{},
+		taskorchestration.DecisionProjectionBacklog{},
+		taskorchestration.ProjectionDeliveryEvidence{},
 	} {
 		assertAllowlistedNonLeakageSurface(t, reflect.TypeOf(value))
 	}

@@ -2,11 +2,30 @@ package taskorchestration
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
+	"time"
 )
+
+// DiagnosticAuditFaultController is a deterministic fail-closed seam for
+// proving that protected diagnostics are never returned without access audit.
+type DiagnosticAuditFaultController struct {
+	next atomic.Bool
+}
+
+func (controller *DiagnosticAuditFaultController) FailNext() {
+	if controller != nil {
+		controller.next.Store(true)
+	}
+}
+
+func (controller *DiagnosticAuditFaultController) consume() bool {
+	return controller != nil && controller.next.CompareAndSwap(true, false)
+}
 
 type DiagnosticReason uint8
 
@@ -46,6 +65,7 @@ const (
 
 type OperationalDiagnosticQuery struct {
 	authority   AdministratorMetadataAuthority
+	taskID      TaskID
 	lookupKind  DiagnosticLookupKind
 	decisionID  DecisionID
 	operationID OperationID
@@ -53,19 +73,23 @@ type OperationalDiagnosticQuery struct {
 
 func NewDecisionDiagnosticQuery(
 	authority AdministratorMetadataAuthority,
+	taskID TaskID,
 	decisionID DecisionID,
 ) OperationalDiagnosticQuery {
 	return OperationalDiagnosticQuery{
-		authority: authority, lookupKind: DiagnosticLookupDecision, decisionID: decisionID,
+		authority: authority, taskID: taskID,
+		lookupKind: DiagnosticLookupDecision, decisionID: decisionID,
 	}
 }
 
 func NewOperationDiagnosticQuery(
 	authority AdministratorMetadataAuthority,
+	taskID TaskID,
 	operationID OperationID,
 ) OperationalDiagnosticQuery {
 	return OperationalDiagnosticQuery{
-		authority: authority, lookupKind: DiagnosticLookupOperation, operationID: operationID,
+		authority: authority, taskID: taskID,
+		lookupKind: DiagnosticLookupOperation, operationID: operationID,
 	}
 }
 
@@ -95,7 +119,23 @@ type OperationalDiagnosticView struct {
 	EnactmentKind        EnactmentKind
 	DeliveryDisposition  DeliveryDisposition
 	NextAction           DiagnosticNextAction
+	AccessAuditFactRef   DiagnosticAuditFactRef
 }
+
+// DiagnosticAuditFactRef proves the reason-bound protected query was recorded
+// before its exact result was returned.
+type DiagnosticAuditFactRef struct {
+	AuditFactID     AuditFactID
+	CanonicalDigest ProjectionDigest
+	Outcome         DiagnosticAuditOutcome
+}
+
+type DiagnosticAuditOutcome uint8
+
+const (
+	DiagnosticAuditAccepted DiagnosticAuditOutcome = iota + 1
+	DiagnosticAuditDenied
+)
 
 type OperationalDiagnostics interface {
 	Diagnose(context.Context, OperationalDiagnosticQuery) (OperationalDiagnosticView, error)
@@ -103,6 +143,8 @@ type OperationalDiagnostics interface {
 
 type diagnosticEngine struct {
 	persistence *memoryPersistence
+	now         func() time.Time
+	auditFaults *DiagnosticAuditFaultController
 }
 
 func (engine *diagnosticEngine) Diagnose(
@@ -117,20 +159,26 @@ func (engine *diagnosticEngine) Diagnose(
 	}
 	engine.persistence.mu.Lock()
 	defer engine.persistence.mu.Unlock()
+	var view OperationalDiagnosticView
 	switch query.lookupKind {
 	case DiagnosticLookupDecision:
 		for _, committed := range engine.persistence.decisions {
-			if committed.decision.DecisionID == query.decisionID {
-				return diagnosticViewFromDecision(committed.decision), nil
+			if committed.decision.DecisionID == query.decisionID &&
+				committed.decision.TaskProjection.TaskID == query.taskID {
+				view = diagnosticViewFromDecision(committed.decision)
+				break
 			}
 		}
 	case DiagnosticLookupOperation:
 		if record, ok := engine.persistence.outbox[query.operationID]; ok {
+			if record.TaskID != query.taskID {
+				break
+			}
 			for _, committed := range engine.persistence.decisions {
 				if committed.decision.DecisionID != record.DecisionID {
 					continue
 				}
-				view := diagnosticViewFromDecision(committed.decision)
+				view = diagnosticViewFromDecision(committed.decision)
 				view.OperationID = record.OperationID
 				view.EnactmentKind = record.Kind
 				view.DeliveryDisposition = DeliveryPending
@@ -139,11 +187,26 @@ func (engine *diagnosticEngine) Diagnose(
 					view.DeliveryDisposition = state.Disposition
 				}
 				view.NextAction = diagnosticNextAction(view.DeliveryDisposition)
-				return view, nil
+				break
 			}
 		}
 	}
-	return OperationalDiagnosticView{}, newError(ErrorAuthorizationDenied)
+	if engine.auditFaults.consume() {
+		return OperationalDiagnosticView{}, newError(ErrorDependencyUnavailable)
+	}
+	sequence := engine.persistence.nextDiagnosticAuditSequence
+	engine.persistence.nextDiagnosticAuditSequence++
+	outcome := DiagnosticAuditAccepted
+	if view.DecisionID == (DecisionID{}) {
+		outcome = DiagnosticAuditDenied
+	}
+	auditRef := diagnosticAuditFactRef(sequence, query, outcome, engine.now().UTC())
+	engine.persistence.diagnosticAudits[auditRef.AuditFactID] = auditRef
+	if outcome == DiagnosticAuditDenied {
+		return OperationalDiagnosticView{}, newError(ErrorAuthorizationDenied)
+	}
+	view.AccessAuditFactRef = auditRef
+	return view, nil
 }
 
 func (adapter *PostgresAdapter) Diagnose(
@@ -156,37 +219,53 @@ func (adapter *PostgresAdapter) Diagnose(
 	if !validOperationalDiagnosticQuery(query) {
 		return OperationalDiagnosticView{}, newError(ErrorAuthorizationDenied)
 	}
+	tx, err := adapter.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return OperationalDiagnosticView{}, newError(ErrorDependencyUnavailable)
+	}
+	defer func() { _ = tx.Rollback() }()
 	var encoded []byte
 	var operationID string
 	var kind EnactmentKind
 	var disposition DeliveryDisposition
-	var err error
+	var queryErr error
 	switch query.lookupKind {
 	case DiagnosticLookupDecision:
-		err = adapter.db.QueryRowContext(ctx, fmt.Sprintf(
-			"SELECT decision_state FROM %s WHERE decision_id=$1",
+		queryErr = tx.QueryRowContext(ctx, fmt.Sprintf(
+			"SELECT decision_state FROM %s WHERE decision_id=$1 AND task_id=$2",
 			adapter.table("task_orchestration_decisions"),
-		), query.decisionID.value).Scan(&encoded)
+		), query.decisionID.value, query.taskID.value).Scan(&encoded)
 	case DiagnosticLookupOperation:
-		err = adapter.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT decision.decision_state,
+		queryErr = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT decision.decision_state,
 			outbox.operation_id, outbox.kind, COALESCE(delivery.disposition, $2)
 			FROM %s AS outbox
 			JOIN %s AS decision ON decision.decision_id=outbox.decision_id
 			LEFT JOIN %s AS delivery ON delivery.operation_id=outbox.operation_id
-			WHERE outbox.operation_id=$1`,
+			WHERE outbox.operation_id=$1 AND outbox.task_id=$3`,
 			adapter.table("task_orchestration_outbox"),
 			adapter.table("task_orchestration_decisions"),
 			adapter.table("task_orchestration_outbox_delivery"),
-		), query.operationID.value, DeliveryPending).Scan(
+		), query.operationID.value, DeliveryPending, query.taskID.value).Scan(
 			&encoded, &operationID, &kind, &disposition,
 		)
 	default:
 		return OperationalDiagnosticView{}, newError(ErrorAuthorizationDenied)
 	}
-	if errors.Is(err, sql.ErrNoRows) {
+	if errors.Is(queryErr, sql.ErrNoRows) {
+		if adapter.diagnosticAuditFaults.consume() {
+			return OperationalDiagnosticView{}, newError(ErrorDependencyUnavailable)
+		}
+		if _, err := adapter.recordDiagnosticAudit(
+			ctx, tx, query, DiagnosticAuditDenied,
+		); err != nil {
+			return OperationalDiagnosticView{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return OperationalDiagnosticView{}, newError(ErrorDependencyUnavailable)
+		}
 		return OperationalDiagnosticView{}, newError(ErrorAuthorizationDenied)
 	}
-	if err != nil {
+	if queryErr != nil {
 		return OperationalDiagnosticView{}, newError(ErrorDependencyUnavailable)
 	}
 	var state postgresDecisionState
@@ -208,11 +287,24 @@ func (adapter *PostgresAdapter) Diagnose(
 		view.DeliveryDisposition = disposition
 		view.NextAction = diagnosticNextAction(disposition)
 	}
+	if adapter.diagnosticAuditFaults.consume() {
+		return OperationalDiagnosticView{}, newError(ErrorDependencyUnavailable)
+	}
+	auditRef, err := adapter.recordDiagnosticAudit(
+		ctx, tx, query, DiagnosticAuditAccepted,
+	)
+	if err != nil {
+		return OperationalDiagnosticView{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return OperationalDiagnosticView{}, newError(ErrorDependencyUnavailable)
+	}
+	view.AccessAuditFactRef = auditRef
 	return view, nil
 }
 
 func validOperationalDiagnosticQuery(query OperationalDiagnosticQuery) bool {
-	if !query.authority.valid() {
+	if !query.authority.valid() || !validOpaqueID(query.taskID.value) {
 		return false
 	}
 	switch query.lookupKind {
@@ -223,6 +315,64 @@ func validOperationalDiagnosticQuery(query OperationalDiagnosticQuery) bool {
 	default:
 		return false
 	}
+}
+
+func diagnosticAuditFactRef(
+	sequence uint64,
+	query OperationalDiagnosticQuery,
+	outcome DiagnosticAuditOutcome,
+	recordedAt time.Time,
+) DiagnosticAuditFactRef {
+	id := AuditFactID{value: fmt.Sprintf("diagnostic-audit-fact-%06d", sequence)}
+	encoded, _ := json.Marshal(struct {
+		AuditFactID             string
+		TaskID                  string
+		LookupKind              DiagnosticLookupKind
+		DecisionID              string
+		OperationID             string
+		AuthorityID             string
+		AuthorizationGeneration AuthorizationGeneration
+		Reason                  DiagnosticReason
+		Outcome                 DiagnosticAuditOutcome
+		RecordedAt              int64
+	}{
+		AuditFactID: id.value, TaskID: query.taskID.value, LookupKind: query.lookupKind,
+		DecisionID: query.decisionID.value, OperationID: query.operationID.value,
+		AuthorityID:             query.authority.id.value,
+		AuthorizationGeneration: query.authority.generation,
+		Reason:                  query.authority.reason, Outcome: outcome, RecordedAt: recordedAt.UnixNano(),
+	})
+	return DiagnosticAuditFactRef{
+		AuditFactID: id, CanonicalDigest: sha256.Sum256(encoded), Outcome: outcome,
+	}
+}
+
+func (adapter *PostgresAdapter) recordDiagnosticAudit(
+	ctx context.Context,
+	tx *sql.Tx,
+	query OperationalDiagnosticQuery,
+	outcome DiagnosticAuditOutcome,
+) (DiagnosticAuditFactRef, error) {
+	var sequence uint64
+	if err := tx.QueryRowContext(ctx, "SELECT nextval('"+
+		adapter.table("task_orchestration_diagnostic_audit_sequence")+"')").Scan(&sequence); err != nil {
+		return DiagnosticAuditFactRef{}, newError(ErrorDependencyUnavailable)
+	}
+	recordedAt := adapter.now().UTC()
+	auditRef := diagnosticAuditFactRef(sequence, query, outcome, recordedAt)
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
+		audit_fact_id, canonical_digest, task_id, lookup_kind, decision_id,
+		operation_id, authority_id, authority_generation, reason, outcome, recorded_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		adapter.table("task_orchestration_diagnostic_audit_facts")),
+		auditRef.AuditFactID.value, auditRef.CanonicalDigest[:], query.taskID.value,
+		query.lookupKind, query.decisionID.value, query.operationID.value,
+		query.authority.id.value, query.authority.generation, query.authority.reason,
+		outcome, recordedAt,
+	); err != nil {
+		return DiagnosticAuditFactRef{}, newError(ErrorDependencyUnavailable)
+	}
+	return auditRef, nil
 }
 
 func diagnosticViewFromDecision(decision TransitionDecision) OperationalDiagnosticView {
