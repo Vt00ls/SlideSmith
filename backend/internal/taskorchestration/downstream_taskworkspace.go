@@ -223,7 +223,7 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) commitEvidence(
 		result.TaskWorkspaceID == "" || result.TaskWorkspaceID != request.TaskWorkspaceID ||
 		result.RevisionID == "" || result.CheckpointID == "" ||
 		result.BaseRevisionID != request.BaseRevisionID ||
-		result.PredecessorRevisionID != request.ExpectedCurrentRevision ||
+		!validTaskWorkspaceCommitLineage(result, *request) ||
 		result.ManifestDigest == "" || result.ManifestDigest != request.DeclaredStateManifest.Digest ||
 		result.ValidationEvidenceID == "" || result.ValidationEvidenceID != request.ValidationEvidence.ID ||
 		result.ValidationEvidenceDigest == "" || result.ValidationEvidenceDigest != request.ValidationEvidence.Digest ||
@@ -241,6 +241,16 @@ func (adapter *taskWorkspaceLifecycleEvidenceAdapter) commitEvidence(
 		TaskWorkspaceLifecycleGeneration(result.Generation), TaskWorkspaceLifecycleFence(result.Fence),
 		TaskWorkspaceCommitProofDigest(result), EvidenceDigest{},
 	), nil
+}
+
+func validTaskWorkspaceCommitLineage(
+	result taskworkspace.CommitRuntimeViewResult,
+	request taskworkspace.CommitRuntimeViewRequest,
+) bool {
+	if result.RevisionID == request.ExpectedCurrentRevision {
+		return result.PredecessorRevisionID != result.RevisionID
+	}
+	return result.PredecessorRevisionID == request.ExpectedCurrentRevision
 }
 
 func (adapter *taskWorkspaceLifecycleEvidenceAdapter) fenceEvidence(
@@ -396,6 +406,7 @@ func validTaskWorkspaceCommitScope(
 	validation := request.ValidationEvidence
 	return request.PolicyDomainID != "" && request.TaskWorkspaceID != "" && request.RuntimeViewID != "" &&
 		request.RuntimeOperationID != "" && request.BaseRevisionID != "" && request.ExpectedCurrentRevision != "" &&
+		request.BaseRevisionID == request.ExpectedCurrentRevision &&
 		request.Operation.RequestDigest == request.CanonicalRequestDigest() &&
 		"sha256:"+binding.Enactment.PayloadDigest.String() == string(request.Operation.RequestDigest) &&
 		validTaskWorkspaceLeaseScope(binding, request.PolicyDomainID, request.TaskID, request.TaskWorkspaceID,

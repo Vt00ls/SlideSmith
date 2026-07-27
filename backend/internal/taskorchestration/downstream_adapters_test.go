@@ -737,6 +737,40 @@ func TestTaskWorkspaceLifecycleAdapterRecoversCommitEvidenceAfterResponseLoss(t 
 	}
 }
 
+func TestTaskWorkspaceLifecycleAdapterAcceptsUnchangedContentCommitLineage(t *testing.T) {
+	ref := downstreamEnactmentRef(t, "c04-unchanged-operation",
+		taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(7))
+	request, result := c04CommitContractFixture(
+		t, ref, "c04-unchanged-task", "c04-unchanged-phase", "c04-unchanged-workspace", 5, 7,
+	)
+	bindC04EnactmentPayload(t, &ref, request.Operation.RequestDigest)
+	result.RevisionID = request.ExpectedCurrentRevision
+	result.PredecessorRevisionID = taskworkspace.RevisionID("c04-unchanged-predecessor")
+	adapter := taskorchestration.NewTaskWorkspaceLifecycleEvidenceAdapter(
+		&taskWorkspaceLifecyclePortDouble{commit: result},
+		taskorchestration.TaskWorkspaceLifecycleAdapterBinding{
+			Enactment: ref,
+			Producer: taskorchestration.EvidenceProducer{
+				AuthorityID: downstreamAuthorityID(t, "c04-unchanged-authority"), Generation: 5,
+			},
+			TaskID:             downstreamTaskID(t, "c04-unchanged-task"),
+			PhaseRunID:         downstreamPhaseRunID(t, "c04-unchanged-phase"),
+			PhaseRunGeneration: 6, PhaseRunFence: 7, SafetyEpoch: 2, Commit: &request,
+		},
+	)
+
+	evidence, err := adapter.Enact(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("valid unchanged-content C04 commit was rejected: %v", err)
+	}
+	if evidence.RevisionID.String() != string(request.ExpectedCurrentRevision) ||
+		evidence.CheckpointID.String() != string(result.CheckpointID) ||
+		evidence.CommitProofDigest == (taskorchestration.EvidenceDigest{}) {
+		t.Fatalf("unchanged-content C04 evidence = %#v", evidence)
+	}
+}
+
 func TestTaskWorkspaceLifecycleAdapterSafelyRejectsMalformedEnactment(t *testing.T) {
 	adapter := taskorchestration.NewTaskWorkspaceLifecycleEvidenceAdapter(
 		&taskWorkspaceLifecyclePortDouble{},
