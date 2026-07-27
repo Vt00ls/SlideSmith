@@ -745,6 +745,8 @@ func evidenceKindName(kind EvidenceKind) string {
 		return "publication"
 	case EvidenceScheduling:
 		return "scheduling"
+	case EvidenceUsageAccounting:
+		return "usage_accounting"
 	default:
 		return ""
 	}
