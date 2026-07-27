@@ -23,6 +23,13 @@ func (version ProjectionSchemaVersion) Minor() uint16 { return uint16(version) }
 
 type ProjectionOutcome uint8
 
+type ExternalAuditFactKind uint8
+
+const (
+	ExternalAuditDecisionFact ExternalAuditFactKind = iota + 1
+	ExternalAuditDiagnosticAccessFact
+)
+
 // ProjectionDigest binds a content-free projection or protected diagnostic
 // audit fact to one canonical representation.
 type ProjectionDigest [32]byte
@@ -35,35 +42,62 @@ const (
 // mandatory audit fact. It contains no content, path, locator, session, or
 // credential field and never replaces the authoritative audit fact.
 type ExternalAuditProjection struct {
-	SchemaVersion     ProjectionSchemaVersion
-	CanonicalDigest   ProjectionDigest
-	AuditFactID       AuditFactID
-	DecisionID        DecisionID
-	DecisionRequestID DecisionRequestID
-	AcceptedRevision  TaskRevision
-	Outcome           ProjectionOutcome
-	RecordedAt        time.Time
+	SchemaVersion           ProjectionSchemaVersion
+	FactKind                ExternalAuditFactKind
+	CanonicalDigest         ProjectionDigest
+	AuditFactID             AuditFactID
+	TaskID                  TaskID
+	DecisionID              DecisionID
+	DecisionRequestID       DecisionRequestID
+	OperationID             OperationID
+	AcceptedRevision        TaskRevision
+	AuthorityID             AuthorityID
+	AuthorizationGeneration AuthorizationGeneration
+	DiagnosticLookup        DiagnosticLookupKind
+	DiagnosticReason        DiagnosticReason
+	DiagnosticOutcome       DiagnosticAuditOutcome
+	ResultLimit             uint32
+	Outcome                 ProjectionOutcome
+	RecordedAt              time.Time
 }
 
 // ExternalAuditProjectionDigest returns the canonical delivery identity for a
 // content-free copy of one retained authoritative audit fact.
 func ExternalAuditProjectionDigest(projection ExternalAuditProjection) ProjectionDigest {
 	encoded, _ := json.Marshal(struct {
-		SchemaVersion     ProjectionSchemaVersion
-		AuditFactID       string
-		DecisionID        string
-		DecisionRequestID string
-		AcceptedRevision  TaskRevision
-		Outcome           ProjectionOutcome
-		RecordedAt        int64
+		SchemaVersion           ProjectionSchemaVersion
+		FactKind                ExternalAuditFactKind
+		AuditFactID             string
+		TaskID                  string
+		DecisionID              string
+		DecisionRequestID       string
+		OperationID             string
+		AcceptedRevision        TaskRevision
+		AuthorityID             string
+		AuthorizationGeneration AuthorizationGeneration
+		DiagnosticLookup        DiagnosticLookupKind
+		DiagnosticReason        DiagnosticReason
+		DiagnosticOutcome       DiagnosticAuditOutcome
+		ResultLimit             uint32
+		Outcome                 ProjectionOutcome
+		RecordedAt              int64
 	}{
-		SchemaVersion:     projection.SchemaVersion,
-		AuditFactID:       projection.AuditFactID.value,
-		DecisionID:        projection.DecisionID.value,
-		DecisionRequestID: projection.DecisionRequestID.value,
-		AcceptedRevision:  projection.AcceptedRevision,
-		Outcome:           projection.Outcome,
-		RecordedAt:        projection.RecordedAt.UnixNano(),
+		SchemaVersion:           projection.SchemaVersion,
+		FactKind:                projection.FactKind,
+		AuditFactID:             projection.AuditFactID.value,
+		TaskID:                  projection.TaskID.value,
+		DecisionID:              projection.DecisionID.value,
+		DecisionRequestID:       projection.DecisionRequestID.value,
+		OperationID:             projection.OperationID.value,
+		AcceptedRevision:        projection.AcceptedRevision,
+		AuthorityID:             projection.AuthorityID.value,
+		AuthorizationGeneration: projection.AuthorizationGeneration,
+		DiagnosticLookup:        projection.DiagnosticLookup,
+		DiagnosticReason:        projection.DiagnosticReason,
+		DiagnosticOutcome:       projection.DiagnosticOutcome,
+		ResultLimit:             projection.ResultLimit,
+		Outcome:                 projection.Outcome,
+		RecordedAt:              projection.RecordedAt.UnixNano(),
 	})
 	return sha256.Sum256(encoded)
 }
@@ -603,7 +637,9 @@ func decisionProjections(
 ) (ExternalAuditProjection, DecisionTelemetryProjection) {
 	audit := ExternalAuditProjection{
 		SchemaVersion:     ProjectionSchemaV1,
+		FactKind:          ExternalAuditDecisionFact,
 		AuditFactID:       decision.MandatoryAuditFactRef.AuditFactID,
+		TaskID:            decision.TaskProjection.TaskID,
 		DecisionID:        decision.DecisionID,
 		DecisionRequestID: decision.DecisionRequestID,
 		AcceptedRevision:  decision.AcceptedTaskRevision,

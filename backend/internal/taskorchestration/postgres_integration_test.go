@@ -581,7 +581,14 @@ func TestPostgresProjectionObserverFailureDoesNotRollBackCommittedDecision(t *te
 		t.Fatal("projection delivery ran in the protected Decision path")
 	}
 	if _, err := adapter.RebuildDecisionProjectionDelivery(
-		context.Background(), taskorchestration.ProjectionDeliveryRebuildRequest{Limit: 1},
+		context.Background(), taskorchestration.NewProjectionDeliveryRebuildRequest(
+			taskorchestration.NewAdministratorMetadataAuthority(
+				authorityID(t, "postgres-observer-projection-administrator"),
+				taskorchestration.AuthorizationGeneration(1),
+				taskorchestration.DiagnosticReasonOperations,
+			),
+			taskID(t, "postgres-observer-task"), 1,
+		),
 	); err != nil || observations.Load() != 1 {
 		t.Fatalf("asynchronous projection delivery attempt: observations=%d err=%v", observations.Load(), err)
 	}

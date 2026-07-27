@@ -2,7 +2,6 @@ package taskorchestration
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -61,6 +60,8 @@ type DiagnosticLookupKind uint8
 const (
 	DiagnosticLookupDecision DiagnosticLookupKind = iota + 1
 	DiagnosticLookupOperation
+	DiagnosticLookupProjectionBacklogInspection
+	DiagnosticLookupProjectionBacklogRebuild
 )
 
 type OperationalDiagnosticQuery struct {
@@ -69,6 +70,7 @@ type OperationalDiagnosticQuery struct {
 	lookupKind  DiagnosticLookupKind
 	decisionID  DecisionID
 	operationID OperationID
+	resultLimit uint32
 }
 
 func NewDecisionDiagnosticQuery(
@@ -309,9 +311,15 @@ func validOperationalDiagnosticQuery(query OperationalDiagnosticQuery) bool {
 	}
 	switch query.lookupKind {
 	case DiagnosticLookupDecision:
-		return validOpaqueID(query.decisionID.value) && query.operationID == (OperationID{})
+		return validOpaqueID(query.decisionID.value) && query.operationID == (OperationID{}) &&
+			query.resultLimit == 0
 	case DiagnosticLookupOperation:
-		return validOpaqueID(query.operationID.value) && query.decisionID == (DecisionID{})
+		return validOpaqueID(query.operationID.value) && query.decisionID == (DecisionID{}) &&
+			query.resultLimit == 0
+	case DiagnosticLookupProjectionBacklogInspection,
+		DiagnosticLookupProjectionBacklogRebuild:
+		return query.decisionID == (DecisionID{}) && query.operationID == (OperationID{}) &&
+			query.resultLimit > 0 && query.resultLimit <= 100
 	default:
 		return false
 	}
@@ -324,27 +332,35 @@ func diagnosticAuditFactRef(
 	recordedAt time.Time,
 ) DiagnosticAuditFactRef {
 	id := AuditFactID{value: fmt.Sprintf("diagnostic-audit-fact-%06d", sequence)}
-	encoded, _ := json.Marshal(struct {
-		AuditFactID             string
-		TaskID                  string
-		LookupKind              DiagnosticLookupKind
-		DecisionID              string
-		OperationID             string
-		AuthorityID             string
-		AuthorizationGeneration AuthorizationGeneration
-		Reason                  DiagnosticReason
-		Outcome                 DiagnosticAuditOutcome
-		RecordedAt              int64
-	}{
-		AuditFactID: id.value, TaskID: query.taskID.value, LookupKind: query.lookupKind,
-		DecisionID: query.decisionID.value, OperationID: query.operationID.value,
-		AuthorityID:             query.authority.id.value,
-		AuthorizationGeneration: query.authority.generation,
-		Reason:                  query.authority.reason, Outcome: outcome, RecordedAt: recordedAt.UnixNano(),
-	})
+	projection := diagnosticAuditProjection(id, query, outcome, recordedAt)
 	return DiagnosticAuditFactRef{
-		AuditFactID: id, CanonicalDigest: sha256.Sum256(encoded), Outcome: outcome,
+		AuditFactID: id, CanonicalDigest: projection.CanonicalDigest, Outcome: outcome,
 	}
+}
+
+func diagnosticAuditProjection(
+	auditFactID AuditFactID,
+	query OperationalDiagnosticQuery,
+	outcome DiagnosticAuditOutcome,
+	recordedAt time.Time,
+) ExternalAuditProjection {
+	projection := ExternalAuditProjection{
+		SchemaVersion:           ProjectionSchemaV1,
+		FactKind:                ExternalAuditDiagnosticAccessFact,
+		AuditFactID:             auditFactID,
+		TaskID:                  query.taskID,
+		DecisionID:              query.decisionID,
+		OperationID:             query.operationID,
+		AuthorityID:             query.authority.id,
+		AuthorizationGeneration: query.authority.generation,
+		DiagnosticLookup:        query.lookupKind,
+		DiagnosticReason:        query.authority.reason,
+		DiagnosticOutcome:       outcome,
+		ResultLimit:             query.resultLimit,
+		RecordedAt:              recordedAt,
+	}
+	projection.CanonicalDigest = ExternalAuditProjectionDigest(projection)
+	return projection
 }
 
 func (adapter *PostgresAdapter) recordDiagnosticAudit(
@@ -362,13 +378,13 @@ func (adapter *PostgresAdapter) recordDiagnosticAudit(
 	auditRef := diagnosticAuditFactRef(sequence, query, outcome, recordedAt)
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
 		audit_fact_id, canonical_digest, task_id, lookup_kind, decision_id,
-		operation_id, authority_id, authority_generation, reason, outcome, recorded_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		operation_id, result_limit, authority_id, authority_generation, reason, outcome, recorded_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		adapter.table("task_orchestration_diagnostic_audit_facts")),
 		auditRef.AuditFactID.value, auditRef.CanonicalDigest[:], query.taskID.value,
 		query.lookupKind, query.decisionID.value, query.operationID.value,
-		query.authority.id.value, query.authority.generation, query.authority.reason,
-		outcome, recordedAt,
+		query.resultLimit, query.authority.id.value, query.authority.generation,
+		query.authority.reason, outcome, recordedAt,
 	); err != nil {
 		return DiagnosticAuditFactRef{}, newError(ErrorDependencyUnavailable)
 	}

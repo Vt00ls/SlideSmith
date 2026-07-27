@@ -70,7 +70,12 @@ func runCleanupDebtOwnershipAndEvidenceReferenceContract(t *testing.T) {
 		t.Fatalf("query before Cleanup Debt evidence reference: %v", err)
 	}
 
-	index := taskorchestration.NewDeterministicCleanupEvidenceIndex()
+	auditFaults := &taskorchestration.DiagnosticAuditFaultController{}
+	index := taskorchestration.NewDeterministicCleanupEvidenceIndex(
+		taskorchestration.CleanupEvidenceIndexConfig{
+			Now: func() time.Time { return now }, DiagnosticAuditFaults: auditFaults,
+		},
+	)
 	producer := taskorchestration.NewCleanupEvidenceAuthority(
 		authorityID(t, "cleanup-c04-producer"),
 		taskorchestration.AuthorizationGeneration(1),
@@ -98,13 +103,34 @@ func runCleanupDebtOwnershipAndEvidenceReferenceContract(t *testing.T) {
 		taskorchestration.AuthorizationGeneration(1),
 		taskorchestration.DiagnosticReasonOperations,
 	)
+	auditFaults.FailNext()
+	_, err = index.Query(
+		context.Background(),
+		taskorchestration.NewCleanupEvidenceQuery(administrator, reference.DebtID),
+	)
+	requireSharedDecisionError(t, err, taskorchestration.ErrorDependencyUnavailable)
 	observed, err := index.Query(
 		context.Background(),
 		taskorchestration.NewCleanupEvidenceQuery(administrator, reference.DebtID),
 	)
-	if err != nil || observed != reference {
+	if err != nil || observed.Reference != reference ||
+		observed.AccessAuditFactRef.AuditFactID.String() == "" ||
+		observed.AccessAuditFactRef.CanonicalDigest == (taskorchestration.ProjectionDigest{}) ||
+		observed.AccessAuditFactRef.Outcome != taskorchestration.DiagnosticAuditAccepted {
 		t.Fatalf("query cleanup evidence reference: observed=%+v err=%v", observed, err)
 	}
+	missingDebtID := cleanupDebtID(t, "cleanup-debt-missing")
+	auditFaults.FailNext()
+	_, err = index.Query(
+		context.Background(),
+		taskorchestration.NewCleanupEvidenceQuery(administrator, missingDebtID),
+	)
+	requireSharedDecisionError(t, err, taskorchestration.ErrorDependencyUnavailable)
+	_, err = index.Query(
+		context.Background(),
+		taskorchestration.NewCleanupEvidenceQuery(administrator, missingDebtID),
+	)
+	requireSharedDecisionError(t, err, taskorchestration.ErrorAuthorizationDenied)
 
 	_, err = taskorchestration.NewCleanupEvidenceReference(
 		cleanupDebtID(t, "cleanup-debt-wrong-owner"),
@@ -123,6 +149,9 @@ func runCleanupDebtOwnershipAndEvidenceReferenceContract(t *testing.T) {
 	}
 	assertAllowlistedNonLeakageSurface(
 		t, reflect.TypeOf(taskorchestration.CleanupEvidenceReference{}),
+	)
+	assertAllowlistedNonLeakageSurface(
+		t, reflect.TypeOf(taskorchestration.CleanupEvidenceQueryResult{}),
 	)
 }
 

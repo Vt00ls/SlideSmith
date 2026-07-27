@@ -89,7 +89,14 @@ func runTaskOrchestrationCanaryRedactionAndNonLeakageContract(t *testing.T) {
 		t.Fatalf("commit canary PostgreSQL Decision: %v", err)
 	}
 	projectionBacklog, err := postgres.RebuildDecisionProjectionDelivery(
-		context.Background(), taskorchestration.ProjectionDeliveryRebuildRequest{Limit: 1},
+		context.Background(), taskorchestration.NewProjectionDeliveryRebuildRequest(
+			taskorchestration.NewAdministratorMetadataAuthority(
+				authorityID(t, "canary-projection-administrator"),
+				taskorchestration.AuthorizationGeneration(1),
+				taskorchestration.DiagnosticReasonOperations,
+			),
+			taskID(t, "canary-postgres-task"), 1,
+		),
 	)
 	if err != nil || projectionBacklog.Pending != 1 {
 		t.Fatalf("retain canary projection backlog: backlog=%+v err=%v", projectionBacklog, err)

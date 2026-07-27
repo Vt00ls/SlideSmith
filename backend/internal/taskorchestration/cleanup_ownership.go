@@ -2,7 +2,11 @@ package taskorchestration
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"sync"
+	"time"
 )
 
 type CleanupOwnerModule uint8
@@ -183,17 +187,41 @@ func NewCleanupEvidenceQuery(
 
 type CleanupEvidenceIndex interface {
 	Record(context.Context, CleanupEvidenceAuthority, CleanupEvidenceReference) error
-	Query(context.Context, CleanupEvidenceQuery) (CleanupEvidenceReference, error)
+	Query(context.Context, CleanupEvidenceQuery) (CleanupEvidenceQueryResult, error)
+}
+
+type CleanupEvidenceQueryResult struct {
+	Reference          CleanupEvidenceReference
+	AccessAuditFactRef DiagnosticAuditFactRef
+}
+
+type CleanupEvidenceIndexConfig struct {
+	Now                   func() time.Time
+	DiagnosticAuditFaults *DiagnosticAuditFaultController
 }
 
 type DeterministicCleanupEvidenceIndex struct {
-	mu         sync.Mutex
-	references map[CleanupDebtID]CleanupEvidenceReference
+	mu                    sync.Mutex
+	references            map[CleanupDebtID]CleanupEvidenceReference
+	diagnosticAudits      map[AuditFactID]DiagnosticAuditFactRef
+	nextAuditSequence     uint64
+	now                   func() time.Time
+	diagnosticAuditFaults *DiagnosticAuditFaultController
 }
 
-func NewDeterministicCleanupEvidenceIndex() *DeterministicCleanupEvidenceIndex {
+func NewDeterministicCleanupEvidenceIndex(
+	config CleanupEvidenceIndexConfig,
+) *DeterministicCleanupEvidenceIndex {
+	now := config.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &DeterministicCleanupEvidenceIndex{
-		references: make(map[CleanupDebtID]CleanupEvidenceReference),
+		references:            make(map[CleanupDebtID]CleanupEvidenceReference),
+		diagnosticAudits:      make(map[AuditFactID]DiagnosticAuditFactRef),
+		nextAuditSequence:     1,
+		now:                   now,
+		diagnosticAuditFaults: config.DiagnosticAuditFaults,
 	}
 }
 
@@ -226,18 +254,60 @@ func (index *DeterministicCleanupEvidenceIndex) Record(
 func (index *DeterministicCleanupEvidenceIndex) Query(
 	ctx context.Context,
 	query CleanupEvidenceQuery,
-) (CleanupEvidenceReference, error) {
+) (CleanupEvidenceQueryResult, error) {
 	if index == nil || ctx == nil || ctx.Err() != nil {
-		return CleanupEvidenceReference{}, newError(ErrorDependencyUnavailable)
+		return CleanupEvidenceQueryResult{}, newError(ErrorDependencyUnavailable)
 	}
 	if !query.authority.valid() || !validOpaqueID(query.debtID.value) {
-		return CleanupEvidenceReference{}, newError(ErrorAuthorizationDenied)
+		return CleanupEvidenceQueryResult{}, newError(ErrorAuthorizationDenied)
 	}
 	index.mu.Lock()
 	defer index.mu.Unlock()
 	reference, exists := index.references[query.debtID]
-	if !exists {
-		return CleanupEvidenceReference{}, newError(ErrorAuthorizationDenied)
+	if index.diagnosticAuditFaults.consume() {
+		return CleanupEvidenceQueryResult{}, newError(ErrorDependencyUnavailable)
 	}
-	return reference, nil
+	outcome := DiagnosticAuditAccepted
+	if !exists {
+		outcome = DiagnosticAuditDenied
+	}
+	auditRef := cleanupEvidenceAuditFactRef(
+		index.nextAuditSequence, query, outcome, index.now().UTC(),
+	)
+	index.nextAuditSequence++
+	index.diagnosticAudits[auditRef.AuditFactID] = auditRef
+	if outcome == DiagnosticAuditDenied {
+		return CleanupEvidenceQueryResult{}, newError(ErrorAuthorizationDenied)
+	}
+	return CleanupEvidenceQueryResult{
+		Reference: reference, AccessAuditFactRef: auditRef,
+	}, nil
+}
+
+func cleanupEvidenceAuditFactRef(
+	sequence uint64,
+	query CleanupEvidenceQuery,
+	outcome DiagnosticAuditOutcome,
+	recordedAt time.Time,
+) DiagnosticAuditFactRef {
+	id := AuditFactID{value: fmt.Sprintf("cleanup-diagnostic-audit-fact-%06d", sequence)}
+	encoded, _ := json.Marshal(struct {
+		AuditFactID             string
+		CleanupDebtID           string
+		AuthorityID             string
+		AuthorizationGeneration AuthorizationGeneration
+		Reason                  DiagnosticReason
+		Outcome                 DiagnosticAuditOutcome
+		RecordedAt              int64
+	}{
+		AuditFactID: id.value, CleanupDebtID: query.debtID.value,
+		AuthorityID:             query.authority.id.value,
+		AuthorizationGeneration: query.authority.generation,
+		Reason:                  query.authority.reason,
+		Outcome:                 outcome,
+		RecordedAt:              recordedAt.UnixNano(),
+	})
+	return DiagnosticAuditFactRef{
+		AuditFactID: id, CanonicalDigest: sha256.Sum256(encoded), Outcome: outcome,
+	}
 }

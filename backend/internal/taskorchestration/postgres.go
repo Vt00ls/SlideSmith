@@ -345,6 +345,7 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 			lookup_kind smallint NOT NULL,
 			decision_id text NOT NULL,
 			operation_id text NOT NULL,
+			result_limit bigint NOT NULL CHECK (result_limit >= 0 AND result_limit <= 100),
 			authority_id text NOT NULL,
 			authority_generation bigint NOT NULL CHECK (authority_generation > 0),
 			reason smallint NOT NULL,
@@ -352,14 +353,16 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 			recorded_at timestamptz NOT NULL
 		)`, diagnosticAudits),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-			audit_fact_id text PRIMARY KEY REFERENCES %s(audit_fact_id),
+			audit_fact_id text PRIMARY KEY,
 			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
 			external_audit_delivered boolean NOT NULL DEFAULT FALSE,
 			telemetry_delivered boolean NOT NULL DEFAULT FALSE,
 			attempt_count bigint NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
 			last_outcome smallint NOT NULL,
-			last_attempt_at timestamptz
-		)`, projectionDelivery, audit),
+			last_attempt_at timestamptz,
+			first_external_audit_delivered_at timestamptz,
+			last_external_audit_delivered_at timestamptz
+		)`, projectionDelivery),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY,
 			decision_id text NOT NULL REFERENCES %s(decision_id),
