@@ -162,6 +162,8 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		tasks:            make(map[TaskID]taskRecord),
 		decisions:        make(map[decisionRequestScope]committedDecision),
 		acceptedEvidence: make(map[evidenceScope]committedEvidence),
+		outbox:           make(map[OperationID]authoritativeOutboxRecord),
+		deliveries:       make(map[OperationID]memoryDeliveryState),
 		ids:              newDeterministicIDAllocator(config.IDs),
 	}
 	if config.Recovery != (HarnessRecoveryFixture{}) {
@@ -319,6 +321,8 @@ type memoryPersistence struct {
 	tasks            map[TaskID]taskRecord
 	decisions        map[decisionRequestScope]committedDecision
 	acceptedEvidence map[evidenceScope]committedEvidence
+	outbox           map[OperationID]authoritativeOutboxRecord
+	deliveries       map[OperationID]memoryDeliveryState
 	ids              deterministicIDAllocator
 	recovery         recoveryBinding
 }
@@ -1026,6 +1030,25 @@ func (engine *decisionEngine) Decide(
 		}
 	}
 	engine.persistence.tasks[header.TaskID] = updatedRecord
+	for _, enactment := range decision.EnactmentRefs {
+		if _, exists := engine.persistence.outbox[enactment.OperationID]; exists {
+			continue
+		}
+		phaseRunID, runtimeRunID := enactmentScope(updatedRecord, enactment.OperationID)
+		engine.persistence.outbox[enactment.OperationID] = authoritativeOutboxRecord{
+			EnactmentRef: enactment,
+			DecisionID:   decision.DecisionID,
+			TaskID:       decision.TaskProjection.TaskID,
+			PhaseRunID:   phaseRunID,
+			RuntimeRunID: runtimeRunID,
+			SafetyEpoch:  decision.TaskProjection.SafetyEpoch,
+			Prerequisites: DeliveryPrerequisites{
+				TaskRevision:        decision.AcceptedTaskRevision,
+				AcceptedEvidenceIDs: evidenceIDValues(decision.AcceptedEvidenceRefs),
+			},
+			CommittedAt: decision.CommittedAt,
+		}
+	}
 	engine.persistence.decisions[requestScope] = committedDecision{
 		digest: digest, decision: cloneTransitionDecision(decision),
 	}
