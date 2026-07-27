@@ -31,7 +31,7 @@ func TestDispatcherClaimsOnlyCommittedOutboxRecordsWithinItsBatchBound(t *testin
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "delivery-start", "delivery-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -45,7 +45,7 @@ func TestDispatcherClaimsOnlyCommittedOutboxRecordsWithinItsBatchBound(t *testin
 	if err != nil {
 		t.Fatalf("commit authoritative outbox record: %v", err)
 	}
-	secondStart, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	secondStart, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "delivery-second-start", "delivery-second-task", now.Add(2*time.Second)), owner, pinned,
 	))
 	if err != nil {
@@ -117,7 +117,7 @@ func TestDispatcherHeartbeatExtendsLeaseAndExpiryRecoversTheOriginalOperation(t 
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "lease-start", "lease-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -214,7 +214,7 @@ func TestInMemoryClaimResponseLossRecoversOriginalOperationAfterLeaseExpiry(t *t
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "memory-claim-loss-start", "memory-claim-loss-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -324,7 +324,7 @@ func TestDispatcherDeliversTheCommittedEnvelopeWithoutMutatingTaskAuthority(t *t
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "deliver-start", "deliver-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -417,7 +417,7 @@ func TestOwnedTransportReplaysExactDuplicateAndRejectsOperationRebinding(t *test
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "transport-start", "transport-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -517,7 +517,7 @@ func TestOwnedTransportDefersRevisionGapUntilItsPrerequisiteArrives(t *testing.T
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "prerequisite-start", "prerequisite-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -611,7 +611,7 @@ func TestDispatcherReconcilesAcceptanceAfterAcknowledgementLoss(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "reconcile-delivery-start", "reconcile-delivery-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -718,7 +718,7 @@ func TestDispatcherHonorsTransportBackpressureWithoutCreatingAnotherOperation(t 
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "backpressure-start", "backpressure-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -799,7 +799,7 @@ func TestOutOfOrderCancellationFenceSupersedesStalePendingEnactment(t *testing.T
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "supersede-start", "supersede-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -942,7 +942,7 @@ func TestRecoveryFenceCommittedAfterClaimSupersedesBeforeRemoteIO(t *testing.T) 
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "claimed-before-recovery-start", "claimed-before-recovery-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -1016,7 +1016,7 @@ func TestRecoveryFenceSupersedesPreRecoveryPendingEnactmentBeforeRemoteIO(t *tes
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "delivery-recovery-start", "delivery-recovery-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -1097,7 +1097,7 @@ func TestDispatcherTerminatesPoisonDeliveryWithoutRedrivingIt(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "poison-start", "poison-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -1177,7 +1177,7 @@ func TestDispatcherDefersOutOfOrderPrerequisiteAndReplaysTheSameOperation(t *tes
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "deferred-start", "deferred-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -1264,7 +1264,7 @@ func TestOwnedTransportWireIsVersionedStrictAndSafe(t *testing.T) {
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "wire-start", "wire-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -1372,7 +1372,7 @@ func TestDispatcherAndOwnedTransportRestartReconcileTheOriginalAcceptance(t *tes
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "restart-start", "restart-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -1457,7 +1457,7 @@ func TestInMemoryCrashAfterSendThenCancellationStillRequiresInspection(t *testin
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "memory-send-crash-start", "memory-send-crash-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -1747,7 +1747,7 @@ func newInMemoryDeliveryFixture(
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := harness.Mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, prefix+"-start", prefix+"-task", now), owner, pinned,
 	))
 	if err != nil {

@@ -96,10 +96,17 @@ func runCancellationOrderingContract(
 	)
 	cancelHeader.ExpectedTaskRevision = commitFirst.view.TaskRevision
 	cancelHeader.ActivityGeneration = commitFirst.view.ActivityGeneration
+	commitFirstFenceBinding := exactC04FenceRequestBinding(
+		t, commitFirst.taskName, commitFirst.phase.PhaseRunID, commitFirst.view.TaskWorkspaceID,
+		"shared-cancel-commit-first-fence-operation",
+		commitFirst.view.TaskWorkspaceLifecycleGeneration,
+		commitFirst.view.TaskWorkspaceLifecycleFence, commitFirst.view.LatestRevisionID,
+	)
 	cancelled, err := commitFirst.adapter.decide(
 		context.Background(),
-		taskorchestration.NewCancelTaskByUserIntent(
+		taskorchestration.NewCancelTaskByUserWithLifecycleFenceIntent(
 			cancelHeader, commitFirst.owner, taskorchestration.CancelReasonUserRequested,
+			commitFirstFenceBinding,
 		),
 	)
 	if err != nil || cancelled.TaskProjection.CancellationState != taskorchestration.CancellationCancelling {
@@ -132,7 +139,8 @@ func runCancellationOrderingContract(
 				PhaseRunFence:      commitFirst.phase.Fence,
 				OperationID:        commitFirst.commitOperation.OperationID,
 				Generation:         taskorchestration.TaskWorkspaceLifecycleGeneration(commitFirst.phase.Generation),
-				Fence:              commitFence, SafetyEpoch: commitFirst.view.SafetyEpoch,
+				Fence:              commitFence, ObservedGeneration: commitFirst.view.TaskWorkspaceLifecycleGeneration,
+				ObservedFence: commitFence + 1, SafetyEpoch: commitFirst.view.SafetyEpoch,
 				Outcome:    taskorchestration.LifecycleEvidenceCommitted,
 				RevisionID: revisionID, CheckpointID: checkpoint,
 			},
@@ -153,10 +161,17 @@ func runCancellationOrderingContract(
 	)
 	fenceCancelHeader.ExpectedTaskRevision = fenceFirst.view.TaskRevision
 	fenceCancelHeader.ActivityGeneration = fenceFirst.view.ActivityGeneration
+	fenceFirstBinding := exactC04FenceRequestBinding(
+		t, fenceFirst.taskName, fenceFirst.phase.PhaseRunID, fenceFirst.view.TaskWorkspaceID,
+		"shared-cancel-fence-first-fence-operation",
+		fenceFirst.view.TaskWorkspaceLifecycleGeneration,
+		fenceFirst.view.TaskWorkspaceLifecycleFence, fenceFirst.view.LatestRevisionID,
+	)
 	fenceCancellation, err := fenceFirst.adapter.decide(
 		context.Background(),
-		taskorchestration.NewCancelTaskByUserIntent(
+		taskorchestration.NewCancelTaskByUserWithLifecycleFenceIntent(
 			fenceCancelHeader, fenceFirst.owner, taskorchestration.CancelReasonUserRequested,
+			fenceFirstBinding,
 		),
 	)
 	if err != nil {
@@ -194,7 +209,8 @@ func runCancellationOrderingContract(
 				PhaseRunFence:      fenceFirst.phase.Fence,
 				OperationID:        fenceOperation.OperationID,
 				Generation:         taskorchestration.TaskWorkspaceLifecycleGeneration(fenceFirst.phase.Generation),
-				Fence:              lifecycleFence, SafetyEpoch: fenceFirst.view.SafetyEpoch,
+				Fence:              lifecycleFence, ObservedGeneration: fenceFirst.view.TaskWorkspaceLifecycleGeneration,
+				ObservedFence: lifecycleFence + 1, SafetyEpoch: fenceFirst.view.SafetyEpoch,
 				Outcome: taskorchestration.LifecycleEvidenceFenced,
 			},
 		),
@@ -228,7 +244,8 @@ func runCancellationOrderingContract(
 				PhaseRunFence:      fenceFirst.phase.Fence,
 				OperationID:        fenceFirst.commitOperation.OperationID,
 				Generation:         taskorchestration.TaskWorkspaceLifecycleGeneration(fenceFirst.phase.Generation),
-				Fence:              oldCommitFence, SafetyEpoch: fenceFirst.view.SafetyEpoch,
+				Fence:              oldCommitFence, ObservedGeneration: fenceFirst.view.TaskWorkspaceLifecycleGeneration,
+				ObservedFence: oldCommitFence + 1, SafetyEpoch: fenceFirst.view.SafetyEpoch,
 				Outcome:      taskorchestration.LifecycleEvidenceCommitted,
 				RevisionID:   taskWorkspaceRevisionID(t, "shared-cancel-fence-first-late-revision"),
 				CheckpointID: checkpointID(t, "shared-cancel-fence-first-late-checkpoint"),
@@ -261,9 +278,6 @@ func newSharedPendingLifecycle(
 	worker := taskorchestration.NewWorkerAuthority(
 		authorityID(t, prefix+"-worker"), taskorchestration.AuthorizationGeneration(1),
 	)
-	lifecycleAuthority := taskorchestration.NewTaskWorkspaceLifecycleAuthority(
-		authorityID(t, prefix+"-lifecycle"), taskorchestration.AuthorizationGeneration(1),
-	)
 	adapter := factory.new(t, now, owner, worker)
 	taskName := prefix + "-task"
 	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
@@ -273,7 +287,7 @@ func newSharedPendingLifecycle(
 	}})
 	started, err := adapter.decide(
 		context.Background(),
-		taskorchestration.NewStartPinnedTaskIntent(
+		verifiedPinnedStartIntent(t,
 			intentHeader(t, prefix+"-start", taskName, now), owner, pinned,
 		),
 	)
@@ -317,13 +331,16 @@ func newSharedPendingLifecycle(
 	validationHeader := intentHeader(t, prefix+"-validation", taskName, now.Add(3*time.Second))
 	validationHeader.ExpectedTaskRevision = view.TaskRevision
 	validationHeader.ActivityGeneration = view.ActivityGeneration
+	commitBinding := exactC04CommitRequestBinding(
+		t, taskName, phase.PhaseRunID, view.TaskWorkspaceID,
+		prefix+"-commit-operation", taskorchestration.TaskWorkspaceLifecycleGeneration(phase.Generation),
+		taskorchestration.TaskWorkspaceLifecycleFence(phase.Fence), view.LatestRevisionID,
+	)
 	validation, err := adapter.decide(
 		context.Background(),
 		taskorchestration.NewAcceptPhaseValidationEvidenceIntent(
 			validationHeader,
-			taskorchestration.NewValidatorAuthority(
-				authorityID(t, prefix+"-validator"), taskorchestration.AuthorizationGeneration(1),
-			),
+			pinned.Authorities.Validator,
 			taskorchestration.ValidationEvidenceBinding{
 				Evidence: taskorchestration.NewEvidenceRef(
 					evidenceID(t, prefix+"-validation-evidence"),
@@ -334,7 +351,7 @@ func newSharedPendingLifecycle(
 				PhaseRunFence: phase.Fence,
 				Generation:    taskorchestration.ProducerGeneration(phase.Generation),
 				Fence:         taskorchestration.ValidationFence(phase.Fence), SafetyEpoch: view.SafetyEpoch,
-				Outcome: taskorchestration.PhaseValidationAccepted,
+				Outcome: taskorchestration.PhaseValidationAccepted, LifecycleCommit: commitBinding,
 			},
 		),
 	)
@@ -347,7 +364,7 @@ func newSharedPendingLifecycle(
 		t.Fatalf("query pending lifecycle Task: %v", err)
 	}
 	return sharedPendingLifecycle{
-		adapter: adapter, owner: owner, lifecycleAuthority: lifecycleAuthority,
+		adapter: adapter, owner: owner, lifecycleAuthority: pinned.Authorities.TaskWorkspaceLifecycle,
 		taskName: taskName, view: view, phase: phase,
 		commitOperation: validation.EnactmentRefs[0],
 	}
@@ -371,7 +388,7 @@ func runDecisionCrashAndResponseLossContract(
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
 		RequiredRuntimeRuns: 1,
 	}})
-	start, err := adapter.decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+	start, err := adapter.decide(context.Background(), verifiedPinnedStartIntent(t,
 		intentHeader(t, "shared-fault-start", "shared-fault-task", now), owner, pinned,
 	))
 	if err != nil {
@@ -407,7 +424,7 @@ func runDecisionCrashAndResponseLossContract(
 		t.Fatalf("post-restart decision did not commit once: %+v", committed)
 	}
 	adapter.afterDecision(t, committed)
-	postCommitCrashIntent := taskorchestration.NewStartTaskIntent(
+	postCommitCrashIntent := minimalPinnedStartIntent(t,
 		intentHeader(t, "shared-post-commit-crash", "shared-post-commit-crash-task", now.Add(2*time.Second)),
 		owner,
 	)
@@ -428,7 +445,7 @@ func runDecisionCrashAndResponseLossContract(
 		t.Fatalf("post-commit crash created another Decision: view=%+v err=%v", postCommitView, err)
 	}
 
-	lostIntent := taskorchestration.NewStartTaskIntent(
+	lostIntent := minimalPinnedStartIntent(t,
 		intentHeader(t, "shared-response-loss", "shared-response-loss-task", now.Add(3*time.Second)),
 		owner,
 	)
@@ -506,7 +523,7 @@ func runDeliveryFaultContract(
 	commitWork := func(taskName, requestPrefix string) taskorchestration.TransitionDecision {
 		started, err := adapter.decide(
 			context.Background(),
-			taskorchestration.NewStartPinnedTaskIntent(
+			verifiedPinnedStartIntent(t,
 				intentHeader(t, requestPrefix+"-start", taskName, now), owner, pinned,
 			),
 		)
@@ -800,7 +817,7 @@ func newOwnedDecisionFaultAdapter(
 			SchemaVersion: taskorchestration.EvidenceSchemaV1,
 			EvidenceID:    evidenceID(t, prefix+"-owned-runtime-evidence"),
 			Producer: taskorchestration.EvidenceProducer{
-				AuthorityID: authorityID(t, prefix+"-owned-runtime-producer"),
+				AuthorityID: authorityID(t, "generation-runtime-authority"),
 				Generation:  taskorchestration.AuthorizationGeneration(1),
 			},
 			TaskID: view.TaskID, PhaseRunID: phase.PhaseRunID,
@@ -912,7 +929,7 @@ func directSharedFaultRuntimeEvidenceIntent(
 	return taskorchestration.NewAcceptRuntimeEvidenceIntent(
 		header,
 		taskorchestration.NewRuntimeAuthority(
-			authorityID(t, prefix+"-runtime"), taskorchestration.AuthorizationGeneration(1),
+			authorityID(t, "generation-runtime-authority"), taskorchestration.AuthorizationGeneration(1),
 		),
 		taskorchestration.RuntimeEvidenceBinding{
 			Evidence: taskorchestration.NewEvidenceRef(

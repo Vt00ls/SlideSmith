@@ -336,7 +336,23 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 			decision_id text NOT NULL UNIQUE REFERENCES %s(decision_id),
 			task_id text NOT NULL,
 			decision_request_id text NOT NULL,
-			committed_at timestamptz NOT NULL
+			schema_version bigint NOT NULL,
+			integrity_version smallint NOT NULL,
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			authority_kind smallint NOT NULL,
+			authority_id text NOT NULL,
+			authority_generation bigint NOT NULL,
+			authority_reason smallint NOT NULL,
+			action smallint NOT NULL,
+			reason_code smallint NOT NULL,
+			before_revision bigint NOT NULL,
+			after_revision bigint NOT NULL,
+			recovery_generation bigint NOT NULL,
+			before_safety_epoch bigint NOT NULL,
+			after_safety_epoch bigint NOT NULL,
+			occurred_at timestamptz NOT NULL,
+			committed_at timestamptz NOT NULL,
+			audit_state jsonb NOT NULL
 		)`, audit, decisions),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			audit_fact_id text PRIMARY KEY,
@@ -663,11 +679,27 @@ func (adapter *PostgresAdapter) persistFreshDecision(
 	if adapter.failAt(PersistenceFaultBeforeMandatoryAudit) {
 		return newError(ErrorDependencyUnavailable)
 	}
+	auditFact := decision.MandatoryAuditFactRef
+	auditState, err := json.Marshal(postgresAuditFactStateFromFact(auditFact))
+	if err != nil {
+		return newError(ErrorDependencyUnavailable)
+	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
-		audit_fact_id, decision_id, task_id, decision_request_id, committed_at
-	) VALUES ($1,$2,$3,$4,$5)`, adapter.table("task_orchestration_mandatory_audit_facts")),
-		decision.MandatoryAuditFactRef.AuditFactID.value, decision.DecisionID.value,
-		header.TaskID.value, header.DecisionRequestID.value, decision.CommittedAt,
+		audit_fact_id, decision_id, task_id, decision_request_id,
+		schema_version, integrity_version, canonical_digest,
+		authority_kind, authority_id, authority_generation, authority_reason,
+		action, reason_code, before_revision, after_revision, recovery_generation,
+		before_safety_epoch, after_safety_epoch, occurred_at, committed_at, audit_state
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb)`,
+		adapter.table("task_orchestration_mandatory_audit_facts")),
+		auditFact.AuditFactID.value, decision.DecisionID.value,
+		header.TaskID.value, header.DecisionRequestID.value,
+		auditFact.SchemaVersion, auditFact.IntegrityVersion, auditFact.CanonicalDigest[:],
+		auditFact.AuthorityKind, auditFact.AuthorityID.value, auditFact.AuthorizationGeneration,
+		auditFact.AuthorityReason, auditFact.Action, auditFact.ReasonCode,
+		auditFact.BeforeTaskRevision, auditFact.AfterTaskRevision, auditFact.RecoveryGeneration,
+		auditFact.BeforeSafetyEpoch, auditFact.AfterSafetyEpoch,
+		auditFact.OccurredAt, auditFact.RecordedAt, auditState,
 	); err != nil {
 		return newError(ErrorDependencyUnavailable)
 	}
@@ -1260,7 +1292,7 @@ func (adapter *PostgresAdapter) validateTaskJournal(
 	record taskRecord,
 ) error {
 	var decisionTaskID, requestID, auditFactID string
-	var digestBytes, decisionBytes, projectionBytes []byte
+	var digestBytes, decisionBytes, projectionBytes, auditDigestBytes, auditStateBytes []byte
 	var previousRevision, acceptedRevision TaskRevision
 	var committedAt time.Time
 	var decisionCount, revisionCount, auditCount, outboxCount uint64
@@ -1268,6 +1300,7 @@ func (adapter *PostgresAdapter) validateTaskJournal(
 		decision.decision_request_id, decision.canonical_request_digest,
 		decision.previous_revision, decision.accepted_revision, decision.committed_at,
 		decision.decision_state, revision.projection, audit.audit_fact_id,
+		audit.canonical_digest, audit.audit_state,
 		(SELECT count(*) FROM %s WHERE task_id=$1),
 		(SELECT count(*) FROM %s WHERE task_id=$1),
 		(SELECT count(*) FROM %s WHERE task_id=$1),
@@ -1288,6 +1321,7 @@ func (adapter *PostgresAdapter) validateTaskJournal(
 		taskID.value, record.latestDecision.DecisionID.value,
 	).Scan(&decisionTaskID, &requestID, &digestBytes, &previousRevision,
 		&acceptedRevision, &committedAt, &decisionBytes, &projectionBytes, &auditFactID,
+		&auditDigestBytes, &auditStateBytes,
 		&decisionCount, &revisionCount, &auditCount, &outboxCount)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1303,15 +1337,20 @@ func (adapter *PostgresAdapter) validateTaskJournal(
 		acceptedRevision != decision.AcceptedTaskRevision ||
 		!committedAt.Equal(decision.CommittedAt.Truncate(time.Microsecond)) ||
 		auditFactID != decision.MandatoryAuditFactRef.AuditFactID.value ||
+		len(auditDigestBytes) != len(decision.MandatoryAuditFactRef.CanonicalDigest) ||
+		!bytes.Equal(auditDigestBytes, decision.MandatoryAuditFactRef.CanonicalDigest[:]) ||
 		decisionCount != record.decisionCount || revisionCount != uint64(record.revision) ||
 		auditCount != record.decisionCount || outboxCount != record.enactmentCount {
 		return newPersistenceError(PersistenceStateCorrupt)
 	}
 	var persistedDecision postgresDecisionState
 	var persistedProjection postgresTaskProjectionState
+	var persistedAudit postgresAuditFactState
 	if json.Unmarshal(decisionBytes, &persistedDecision) != nil ||
 		json.Unmarshal(projectionBytes, &persistedProjection) != nil ||
+		json.Unmarshal(auditStateBytes, &persistedAudit) != nil ||
 		!reflect.DeepEqual(persistedDecision, postgresDecisionStateFromDecision(decision)) ||
+		!reflect.DeepEqual(persistedAudit, postgresAuditFactStateFromFact(decision.MandatoryAuditFactRef)) ||
 		persistedProjection != postgresTaskProjectionStateFromProjection(decision.TaskProjection) {
 		return newPersistenceError(PersistenceStateCorrupt)
 	}

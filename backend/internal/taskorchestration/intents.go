@@ -153,10 +153,23 @@ func NewStartTaskIntent(header IntentHeader, authority UserAuthority) Transition
 	return newIntent(header, IntentStartTask, authority.value, emptyIntentPayload{})
 }
 
-type pinnedTaskStartPayload struct{ pinned PinnedTaskStart }
+type pinnedTaskStartPayload struct {
+	pinned                      PinnedTaskStart
+	verifiedTask                TaskID
+	safetyEpoch                 SafetyEpoch
+	executionVerificationDigest EvidenceDigest
+	templateVerificationDigest  EvidenceDigest
+}
 
 func (payload pinnedTaskStartPayload) canonical() map[string]any {
 	return map[string]any{
+		"admission": map[string]any{
+			"execution_verification_digest": payload.executionVerificationDigest.String(),
+			"safety_epoch":                  uint64(payload.safetyEpoch),
+			"task_id":                       payload.verifiedTask.value,
+			"template_verification_digest":  payload.templateVerificationDigest.String(),
+		},
+		"authorities": payload.pinned.Authorities.canonical(),
 		"execution_lock": map[string]any{
 			"compatibility_approval_id": payload.pinned.ExecutionLock.CompatibilityApprovalID.value,
 			"id":                        payload.pinned.ExecutionLock.ID.value,
@@ -170,14 +183,34 @@ func (payload pinnedTaskStartPayload) canonical() map[string]any {
 	}
 }
 
-func (payload pinnedTaskStartPayload) valid() bool { return payload.pinned.valid() }
+func (payload pinnedTaskStartPayload) valid() bool {
+	if !payload.pinned.valid() || !validOpaqueID(payload.verifiedTask.value) ||
+		payload.safetyEpoch == 0 || payload.executionVerificationDigest == (EvidenceDigest{}) {
+		return false
+	}
+	if payload.pinned.Route == RouteGeneration {
+		return payload.templateVerificationDigest != (EvidenceDigest{})
+	}
+	return payload.templateVerificationDigest == (EvidenceDigest{})
+}
 
 func NewStartPinnedTaskIntent(
 	header IntentHeader,
 	authority UserAuthority,
-	pinned PinnedTaskStart,
+	admission TaskStartAdmission,
 ) TransitionIntent {
-	return newIntent(header, IntentStartTask, authority.value, pinnedTaskStartPayload{pinned})
+	if !admission.validFor(header.TaskID) {
+		return newIntent(header, IntentStartTask, authority.value, pinnedTaskStartPayload{})
+	}
+	return newIntent(
+		header, IntentStartTask, authority.value,
+		pinnedTaskStartPayload{
+			pinned: clonePinnedTaskStart(admission.pinned), verifiedTask: admission.taskID,
+			safetyEpoch:                 admission.safetyEpoch,
+			executionVerificationDigest: admission.executionVerificationDigest,
+			templateVerificationDigest:  admission.templateVerificationDigest,
+		},
+	)
 }
 
 type operationPayload struct{ operationID OperationID }
@@ -236,19 +269,74 @@ func NewRetryPhaseIntent(
 	return newIntent(header, IntentRetryPhase, authority.value, phaseRunPayload{phaseRunID})
 }
 
-type cancelPayload struct{ reason CancelReason }
+type runtimeRunRetryPayload struct {
+	phaseRunID   PhaseRunID
+	runtimeRunID RuntimeRunID
+}
+
+func (payload runtimeRunRetryPayload) canonical() map[string]any {
+	return map[string]any{
+		"phase_run_id": payload.phaseRunID.value, "runtime_run_id": payload.runtimeRunID.value,
+	}
+}
+
+func (payload runtimeRunRetryPayload) valid() bool {
+	return validOpaqueID(payload.phaseRunID.value) && validOpaqueID(payload.runtimeRunID.value)
+}
+
+// NewRetryRuntimeRunIntent requests a new execution attempt inside the same
+// Phase Run. It is distinct from business Phase retry and delivery replay.
+func NewRetryRuntimeRunIntent(
+	header IntentHeader,
+	authority WorkerAuthority,
+	phaseRunID PhaseRunID,
+	runtimeRunID RuntimeRunID,
+) TransitionIntent {
+	return newIntent(
+		header, IntentRetryRuntimeRun, authority.value,
+		runtimeRunRetryPayload{phaseRunID: phaseRunID, runtimeRunID: runtimeRunID},
+	)
+}
+
+type cancelPayload struct {
+	reason         CancelReason
+	lifecycleFence TaskWorkspaceLifecycleFenceRequestBinding
+}
 
 func (payload cancelPayload) canonical() map[string]any {
-	return map[string]any{"reason": cancelReasonName(payload.reason)}
+	canonical := map[string]any{"reason": cancelReasonName(payload.reason)}
+	if payload.lifecycleFence.valid() {
+		canonical["task_workspace_lifecycle_fence"] = payload.lifecycleFence.canonical()
+	}
+	return canonical
 }
-func (payload cancelPayload) valid() bool { return cancelReasonName(payload.reason) != "" }
+func (payload cancelPayload) valid() bool {
+	return cancelReasonName(payload.reason) != "" &&
+		(payload.lifecycleFence == (TaskWorkspaceLifecycleFenceRequestBinding{}) ||
+			payload.lifecycleFence.valid())
+}
 
 func NewCancelTaskByUserIntent(
 	header IntentHeader,
 	authority UserAuthority,
 	reason CancelReason,
 ) TransitionIntent {
-	return newIntent(header, IntentCancelTask, authority.value, cancelPayload{reason})
+	return newIntent(
+		header, IntentCancelTask, authority.value,
+		cancelPayload{reason: reason},
+	)
+}
+
+func NewCancelTaskByUserWithLifecycleFenceIntent(
+	header IntentHeader,
+	authority UserAuthority,
+	reason CancelReason,
+	binding TaskWorkspaceLifecycleFenceRequestBinding,
+) TransitionIntent {
+	return newIntent(
+		header, IntentCancelTask, authority.value,
+		cancelPayload{reason: reason, lifecycleFence: binding},
+	)
 }
 
 func NewCancelTaskByAdministratorIntent(
@@ -256,16 +344,48 @@ func NewCancelTaskByAdministratorIntent(
 	authority AdministratorAuthority,
 	reason CancelReason,
 ) TransitionIntent {
-	return newIntent(header, IntentCancelTask, authority.value, cancelPayload{reason})
+	return newIntent(
+		header, IntentCancelTask, authority.value,
+		cancelPayload{reason: reason},
+	)
 }
 
-type manualEditPayload struct{ artifactVersionID ArtifactVersionID }
+func NewCancelTaskByAdministratorWithLifecycleFenceIntent(
+	header IntentHeader,
+	authority AdministratorAuthority,
+	reason CancelReason,
+	binding TaskWorkspaceLifecycleFenceRequestBinding,
+) TransitionIntent {
+	return newIntent(
+		header, IntentCancelTask, authority.value,
+		cancelPayload{reason: reason, lifecycleFence: binding},
+	)
+}
+
+type manualEditPayload struct {
+	artifactVersionID      ArtifactVersionID
+	reconstructionRequired bool
+	reconstructionRequest  TaskWorkspaceReconstructionRequestBinding
+}
 
 func (payload manualEditPayload) canonical() map[string]any {
-	return map[string]any{"artifact_version_id": payload.artifactVersionID.value}
+	canonical := map[string]any{
+		"artifact_version_id":     payload.artifactVersionID.value,
+		"reconstruction_required": payload.reconstructionRequired,
+	}
+	if payload.reconstructionRequest.valid() {
+		canonical["reconstruction_request"] = payload.reconstructionRequest.canonical()
+	}
+	return canonical
 }
 func (payload manualEditPayload) valid() bool {
-	return validOpaqueID(payload.artifactVersionID.value)
+	if !validOpaqueID(payload.artifactVersionID.value) {
+		return false
+	}
+	if payload.reconstructionRequired {
+		return payload.reconstructionRequest.valid()
+	}
+	return payload.reconstructionRequest == (TaskWorkspaceReconstructionRequestBinding{})
 }
 
 func NewBeginManualEditIntent(
@@ -273,7 +393,26 @@ func NewBeginManualEditIntent(
 	authority UserAuthority,
 	artifactVersionID ArtifactVersionID,
 ) TransitionIntent {
-	return newIntent(header, IntentBeginManualEdit, authority.value, manualEditPayload{artifactVersionID})
+	return newIntent(
+		header, IntentBeginManualEdit, authority.value,
+		manualEditPayload{artifactVersionID: artifactVersionID},
+	)
+}
+
+// NewBeginManualEditAfterExpiryIntent begins a manual-edit activity whose
+// workspace materialization must first be reconstructed from the exact latest
+// Artifact Version. Reconstruction remains a C04 enactment; only accepted C04
+// evidence may make the manual-edit Phase available.
+func NewBeginManualEditAfterExpiryIntent(
+	header IntentHeader,
+	authority UserAuthority,
+	artifactVersionID ArtifactVersionID,
+	reconstructionRequest TaskWorkspaceReconstructionRequestBinding,
+) TransitionIntent {
+	return newIntent(header, IntentBeginManualEdit, authority.value, manualEditPayload{
+		artifactVersionID: artifactVersionID, reconstructionRequired: true,
+		reconstructionRequest: reconstructionRequest,
+	})
 }
 
 type RuntimeEvidenceBinding struct {
@@ -337,6 +476,7 @@ type ValidationEvidenceBinding struct {
 	Fence              ValidationFence
 	SafetyEpoch        SafetyEpoch
 	Outcome            PhaseValidationOutcome
+	LifecycleCommit    TaskWorkspaceLifecycleCommitRequestBinding
 }
 
 type validationEvidencePayload struct{ binding ValidationEvidenceBinding }
@@ -352,6 +492,9 @@ func (payload validationEvidencePayload) canonical() map[string]any {
 	extra["phase_run_fence"] = uint64(payload.binding.PhaseRunFence)
 	extra["phase_run_generation"] = uint64(payload.binding.PhaseRunGeneration)
 	extra["safety_epoch"] = uint64(payload.binding.SafetyEpoch)
+	if payload.binding.LifecycleCommit.valid() {
+		extra["task_workspace_lifecycle_commit"] = payload.binding.LifecycleCommit.canonical()
+	}
 	return evidenceCanonical(
 		payload.binding.Evidence,
 		payload.binding.PhaseRunID,
@@ -366,6 +509,8 @@ func (payload validationEvidencePayload) valid() bool {
 		payload.binding.PhaseRunGeneration > 0 && payload.binding.PhaseRunFence > 0 &&
 		payload.binding.Generation > 0 && payload.binding.Fence > 0 &&
 		payload.binding.SafetyEpoch > 0 &&
+		(payload.binding.LifecycleCommit == (TaskWorkspaceLifecycleCommitRequestBinding{}) ||
+			payload.binding.LifecycleCommit.valid()) &&
 		(payload.binding.Outcome == 0 || phaseValidationOutcomeName(payload.binding.Outcome) != "")
 }
 
@@ -390,10 +535,29 @@ type TaskWorkspaceLifecycleEvidenceBinding struct {
 	OperationID        OperationID
 	Generation         TaskWorkspaceLifecycleGeneration
 	Fence              TaskWorkspaceLifecycleFence
+	ObservedGeneration TaskWorkspaceLifecycleGeneration
+	ObservedFence      TaskWorkspaceLifecycleFence
 	SafetyEpoch        SafetyEpoch
 	Outcome            LifecycleEvidenceOutcome
 	RevisionID         TaskWorkspaceRevisionID
 	CheckpointID       CheckpointID
+}
+
+// TaskWorkspaceReconstructionEvidenceBinding is the content-free result of a
+// C04 reconstruction enactment. It deliberately has no Phase Run identity:
+// reconstruction establishes the workspace before the manual-edit Phase Run
+// exists.
+type TaskWorkspaceReconstructionEvidenceBinding struct {
+	Evidence           EvidenceRef
+	OperationID        OperationID
+	ArtifactVersionID  ArtifactVersionID
+	RevisionID         TaskWorkspaceRevisionID
+	CheckpointID       CheckpointID
+	Generation         TaskWorkspaceLifecycleGeneration
+	Fence              TaskWorkspaceLifecycleFence
+	ObservedGeneration TaskWorkspaceLifecycleGeneration
+	ObservedFence      TaskWorkspaceLifecycleFence
+	SafetyEpoch        SafetyEpoch
 }
 
 type LifecycleEvidenceOutcome = TaskWorkspaceLifecycleOutcome
@@ -430,6 +594,9 @@ type SchedulingEvidenceBinding struct {
 type taskWorkspaceLifecycleEvidencePayload struct {
 	binding TaskWorkspaceLifecycleEvidenceBinding
 }
+type taskWorkspaceReconstructionEvidencePayload struct {
+	binding TaskWorkspaceReconstructionEvidenceBinding
+}
 type publicationEvidencePayload struct{ binding PublicationEvidenceBinding }
 type schedulingEvidencePayload struct{ binding SchedulingEvidenceBinding }
 
@@ -447,6 +614,8 @@ func (payload taskWorkspaceLifecycleEvidencePayload) canonical() map[string]any 
 	}
 	extra["phase_run_fence"] = uint64(payload.binding.PhaseRunFence)
 	extra["phase_run_generation"] = uint64(payload.binding.PhaseRunGeneration)
+	extra["observed_fence"] = uint64(payload.binding.ObservedFence)
+	extra["observed_generation"] = uint64(payload.binding.ObservedGeneration)
 	extra["safety_epoch"] = uint64(payload.binding.SafetyEpoch)
 	return evidenceCanonical(
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
@@ -458,6 +627,8 @@ func (payload taskWorkspaceLifecycleEvidencePayload) valid() bool {
 		payload.binding.Evidence, payload.binding.PhaseRunID, payload.binding.OperationID,
 		ProducerGeneration(payload.binding.Generation), uint64(payload.binding.Fence),
 	) || payload.binding.PhaseRunGeneration == 0 || payload.binding.PhaseRunFence == 0 ||
+		payload.binding.ObservedGeneration < payload.binding.Generation ||
+		payload.binding.ObservedFence <= payload.binding.Fence ||
 		payload.binding.SafetyEpoch == 0 {
 		return false
 	}
@@ -477,6 +648,32 @@ func (payload taskWorkspaceLifecycleEvidencePayload) valid() bool {
 			payload.binding.RevisionID == (TaskWorkspaceRevisionID{}) &&
 			payload.binding.CheckpointID == (CheckpointID{})
 	}
+}
+
+func (payload taskWorkspaceReconstructionEvidencePayload) canonical() map[string]any {
+	return evidenceCanonical(
+		payload.binding.Evidence, PhaseRunID{}, payload.binding.OperationID,
+		ProducerGeneration(payload.binding.Generation), uint64(payload.binding.Fence), map[string]any{
+			"artifact_version_id": payload.binding.ArtifactVersionID.value,
+			"checkpoint_id":       payload.binding.CheckpointID.value,
+			"observed_fence":      uint64(payload.binding.ObservedFence),
+			"observed_generation": uint64(payload.binding.ObservedGeneration),
+			"revision_id":         payload.binding.RevisionID.value,
+			"safety_epoch":        uint64(payload.binding.SafetyEpoch),
+		},
+	)
+}
+
+func (payload taskWorkspaceReconstructionEvidencePayload) valid() bool {
+	return validEvidenceRef(payload.binding.Evidence) &&
+		validOpaqueID(payload.binding.OperationID.value) &&
+		validOpaqueID(payload.binding.ArtifactVersionID.value) &&
+		validOpaqueID(payload.binding.RevisionID.value) &&
+		validOpaqueID(payload.binding.CheckpointID.value) &&
+		payload.binding.Generation > 0 && payload.binding.Fence > 0 &&
+		payload.binding.ObservedGeneration > payload.binding.Generation &&
+		payload.binding.ObservedFence > payload.binding.Fence &&
+		payload.binding.SafetyEpoch > 0
 }
 func (payload publicationEvidencePayload) canonical() map[string]any {
 	extra := map[string]any(nil)
@@ -547,6 +744,19 @@ func NewAcceptTaskWorkspaceLifecycleEvidenceIntent(
 	)
 }
 
+func NewAcceptTaskWorkspaceReconstructionEvidenceIntent(
+	header IntentHeader,
+	authority TaskWorkspaceLifecycleAuthority,
+	binding TaskWorkspaceReconstructionEvidenceBinding,
+) TransitionIntent {
+	return newIntent(
+		header,
+		IntentAcceptTaskWorkspaceReconstructionEvidence,
+		authority.value,
+		taskWorkspaceReconstructionEvidencePayload{binding},
+	)
+}
+
 func NewAcceptPublicationEvidenceIntent(
 	header IntentHeader,
 	authority PublicationAuthority,
@@ -588,25 +798,32 @@ func NewReconcileEnactmentIntent(
 }
 
 type OperationalFenceBinding struct {
-	Generation  RecoveryGeneration
-	Fence       RecoveryFence
-	SafetyEpoch SafetyEpoch
-	Mode        OperationalMode
+	Generation     RecoveryGeneration
+	Fence          RecoveryFence
+	SafetyEpoch    SafetyEpoch
+	Mode           OperationalMode
+	LifecycleFence TaskWorkspaceLifecycleFenceRequestBinding
 }
 
 type operationalFencePayload struct{ binding OperationalFenceBinding }
 
 func (payload operationalFencePayload) canonical() map[string]any {
-	return map[string]any{
+	canonical := map[string]any{
 		"fence":        uint64(payload.binding.Fence),
 		"generation":   uint64(payload.binding.Generation),
 		"mode":         operationalModeName(payload.binding.Mode),
 		"safety_epoch": uint64(payload.binding.SafetyEpoch),
 	}
+	if payload.binding.LifecycleFence.valid() {
+		canonical["task_workspace_lifecycle_fence"] = payload.binding.LifecycleFence.canonical()
+	}
+	return canonical
 }
 func (payload operationalFencePayload) valid() bool {
 	return payload.binding.Generation > 0 && payload.binding.Fence > 0 &&
 		payload.binding.SafetyEpoch > 0 &&
+		(payload.binding.LifecycleFence == (TaskWorkspaceLifecycleFenceRequestBinding{}) ||
+			payload.binding.LifecycleFence.valid()) &&
 		operationalModeName(payload.binding.Mode) != ""
 }
 

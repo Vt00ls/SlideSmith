@@ -184,10 +184,42 @@ type PinnedTaskStart struct {
 	TaskWorkspaceID TaskWorkspaceID
 	ExecutionLock   ExecutionLock
 	TemplateLockID  TemplateLockID
+	Authorities     DownstreamAuthorityBindings
+}
+
+// DownstreamAuthorityBindings pins the only producer identity allowed to
+// return evidence for each enactment family created by this Task. The binding
+// is immutable with the Route and locks; retry and manual edit reuse it.
+type DownstreamAuthorityBindings struct {
+	Runtime                RuntimeAuthority
+	Validator              ValidatorAuthority
+	TaskWorkspaceLifecycle TaskWorkspaceLifecycleAuthority
+	Publication            PublicationAuthority
+	Scheduler              SchedulerAuthority
+}
+
+func (bindings DownstreamAuthorityBindings) valid() bool {
+	return bindings.Runtime.value.valid() && bindings.Runtime.value.kind == AuthorityRuntime &&
+		bindings.Validator.value.valid() && bindings.Validator.value.kind == AuthorityValidator &&
+		bindings.TaskWorkspaceLifecycle.value.valid() &&
+		bindings.TaskWorkspaceLifecycle.value.kind == AuthorityTaskWorkspaceLifecycle &&
+		bindings.Publication.value.valid() && bindings.Publication.value.kind == AuthorityPublication &&
+		bindings.Scheduler.value.valid() && bindings.Scheduler.value.kind == AuthorityScheduler
+}
+
+func (bindings DownstreamAuthorityBindings) canonical() map[string]any {
+	return map[string]any{
+		"publication":              bindings.Publication.value.canonical(),
+		"runtime":                  bindings.Runtime.value.canonical(),
+		"scheduler":                bindings.Scheduler.value.canonical(),
+		"task_workspace_lifecycle": bindings.TaskWorkspaceLifecycle.value.canonical(),
+		"validator":                bindings.Validator.value.canonical(),
+	}
 }
 
 func (pinned PinnedTaskStart) valid() bool {
 	if pinned.Route.String() == "" || !validOpaqueID(pinned.TaskWorkspaceID.value) ||
+		!pinned.Authorities.valid() ||
 		!validOpaqueID(pinned.ExecutionLock.ID.value) ||
 		!validOpaqueID(pinned.ExecutionLock.PipelineVersionID.value) ||
 		!validOpaqueID(pinned.ExecutionLock.RuntimeReleaseID.value) ||

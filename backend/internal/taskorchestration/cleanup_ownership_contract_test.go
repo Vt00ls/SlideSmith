@@ -55,7 +55,7 @@ func runCleanupDebtOwnershipAndEvidenceReferenceContract(t *testing.T) {
 	owner := taskorchestration.NewUserAuthority(
 		authorityID(t, "cleanup-task-owner"), taskorchestration.AuthorizationGeneration(1),
 	)
-	_, err = harness.Mutations.Decide(context.Background(), taskorchestration.NewStartTaskIntent(
+	_, err = harness.Mutations.Decide(context.Background(), minimalPinnedStartIntent(t,
 		intentHeader(t, "cleanup-task-start", "cleanup-task", now), owner,
 	))
 	if err != nil {

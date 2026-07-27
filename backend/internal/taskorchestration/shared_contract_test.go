@@ -42,7 +42,227 @@ func runSharedTaskOrchestrationAdapterContract(t *testing.T) {
 		t.Run(factory.name, func(t *testing.T) {
 			t.Parallel()
 			runSharedMinimalContract(t, factory)
+			runSharedRuntimeRetryContract(t, factory)
+			runSharedManualEditReconstructionContract(t, factory)
 		})
+	}
+}
+
+func runSharedManualEditReconstructionContract(
+	t *testing.T,
+	factory sharedTaskOrchestrationAdapterFactory,
+) {
+	t.Helper()
+	now := time.Date(2026, time.July, 27, 20, 25, 0, 0, time.UTC)
+	owner := taskorchestration.NewUserAuthority(authorityID(t, "shared-reconstruction-owner"), 1)
+	worker := taskorchestration.NewWorkerAuthority(authorityID(t, "shared-reconstruction-worker"), 1)
+	adapter := factory.new(t, now, owner, worker)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "shared-reconstruction-publication"), Kind: taskorchestration.PhasePublication,
+	}})
+	pinned.ExecutionLock.PipelineContract.ManualEditEntryPhase = phaseKey(t, "shared-reconstruction-edit")
+	pinned.ExecutionLock.PipelineContract.ManualEditPhases = []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "shared-reconstruction-edit"), Kind: taskorchestration.PhaseMutating,
+		ValidationContract: taskorchestration.PhaseValidationAllRuntimeRunsSucceeded, RequiredRuntimeRuns: 1,
+	}}
+	started, err := adapter.mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
+		intentHeader(t, "shared-reconstruction-start", "shared-reconstruction-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start shared reconstruction Task: %v", err)
+	}
+	workHeader := intentHeader(t, "shared-reconstruction-publication-work", "shared-reconstruction-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = started.AcceptedTaskRevision
+	publicationWork, err := adapter.mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "shared-reconstruction-publication-available"),
+	))
+	if err != nil {
+		t.Fatalf("make shared publication available: %v", err)
+	}
+	adapter.afterDecision(t, publicationWork)
+	query := taskorchestration.TaskQuery{
+		TaskID: taskID(t, "shared-reconstruction-task"), Authority: taskorchestration.NewUserQueryAuthority(owner),
+	}
+	view, err := adapter.queries.Query(context.Background(), query)
+	if err != nil || len(view.PhaseRuns) != 1 {
+		t.Fatalf("query shared publication Phase: view=%+v err=%v", view, err)
+	}
+	run := view.PhaseRuns[0]
+	reconstructionRef := downstreamEnactmentRef(
+		t, "shared-reconstruction-operation",
+		taskorchestration.EnactmentTaskWorkspaceLifecycle,
+		taskorchestration.TaskWorkspaceLifecycleFence(2),
+	)
+	reconstructionRequest, _ := c04ReconstructionContractFixture(
+		t, reconstructionRef, "shared-reconstruction-task", pinned.TaskWorkspaceID.String(), 2, 2,
+	)
+	reconstructionBinding, err := taskorchestration.NewTaskWorkspaceReconstructionRequestBinding(
+		reconstructionRequest,
+	)
+	if err != nil {
+		t.Fatalf("bind exact shared C04 reconstruction request: %v", err)
+	}
+	artifact := artifactVersionID(
+		t, string(reconstructionRequest.Intent.ArtifactVersionInput.ArtifactVersionID),
+	)
+	publicationHeader := intentHeader(t, "shared-reconstruction-published", "shared-reconstruction-task", now.Add(2*time.Second))
+	publicationHeader.ExpectedTaskRevision = publicationWork.AcceptedTaskRevision
+	published, err := adapter.mutations.Decide(context.Background(), taskorchestration.NewAcceptPublicationEvidenceIntent(
+		publicationHeader, pinned.Authorities.Publication, taskorchestration.PublicationEvidenceBinding{
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, "shared-reconstruction-publication-evidence"), taskorchestration.EvidencePublication,
+				evidenceDigest(t, "7474747474747474747474747474747474747474747474747474747474747474"),
+			),
+			PhaseRunID: run.PhaseRunID, PhaseRunGeneration: run.Generation, PhaseRunFence: run.Fence,
+			OperationID: publicationWork.EnactmentRefs[0].OperationID,
+			Generation:  taskorchestration.ProducerGeneration(run.Generation),
+			Fence:       taskorchestration.PublicationFence(run.Fence), SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.PublicationActivated, ArtifactVersionID: artifact,
+		},
+	))
+	if err != nil {
+		t.Fatalf("accept shared publication evidence: %v", err)
+	}
+	beginHeader := intentHeader(t, "shared-reconstruction-begin", "shared-reconstruction-task", now.Add(3*time.Second))
+	beginHeader.ExpectedTaskRevision = published.AcceptedTaskRevision
+	beginHeader.ActivityGeneration = 2
+	beginIntent := taskorchestration.NewBeginManualEditAfterExpiryIntent(
+		beginHeader, owner, artifact, reconstructionBinding,
+	)
+	reconstruction, err := adapter.mutations.Decide(context.Background(), beginIntent)
+	if err != nil || len(reconstruction.EnactmentRefs) != 1 || len(reconstruction.AffectedPhaseRuns) != 0 {
+		t.Fatalf("begin shared reconstruction: decision=%+v err=%v", reconstruction, err)
+	}
+	adapter.afterDecision(t, reconstruction)
+	replayed, err := adapter.mutations.Decide(context.Background(), beginIntent)
+	if err != nil || replayed.DecisionID != reconstruction.DecisionID ||
+		replayed.EnactmentRefs[0].OperationID != reconstruction.EnactmentRefs[0].OperationID {
+		t.Fatalf("shared reconstruction replay diverged: decision=%+v err=%v", replayed, err)
+	}
+	view, err = adapter.queries.Query(context.Background(), query)
+	if err != nil {
+		t.Fatalf("query pending shared reconstruction: %v", err)
+	}
+	evidenceHeader := intentHeader(t, "shared-reconstruction-evidence", "shared-reconstruction-task", now.Add(4*time.Second))
+	evidenceHeader.ExpectedTaskRevision = reconstruction.AcceptedTaskRevision
+	evidenceHeader.ActivityGeneration = 2
+	evidence := taskorchestration.TaskWorkspaceReconstructionEvidenceBinding{
+		Evidence: taskorchestration.NewEvidenceRef(
+			evidenceID(t, "shared-reconstruction-evidence-ref"), taskorchestration.EvidenceTaskWorkspaceLifecycle,
+			evidenceDigest(t, "7575757575757575757575757575757575757575757575757575757575757575"),
+		),
+		OperationID: reconstruction.EnactmentRefs[0].OperationID, ArtifactVersionID: artifact,
+		RevisionID:   taskWorkspaceRevisionID(t, "shared-reconstructed-revision"),
+		CheckpointID: checkpointID(t, "shared-reconstructed-checkpoint"),
+		Generation:   2, Fence: 2, ObservedGeneration: 3, ObservedFence: 3,
+		SafetyEpoch: view.SafetyEpoch,
+	}
+	accepted, err := adapter.mutations.Decide(context.Background(),
+		taskorchestration.NewAcceptTaskWorkspaceReconstructionEvidenceIntent(
+			evidenceHeader, pinned.Authorities.TaskWorkspaceLifecycle, evidence,
+		))
+	if err != nil || len(accepted.AcceptedEvidenceRefs) != 1 || len(accepted.AffectedPhaseRuns) != 0 ||
+		accepted.TaskProjection.LatestRevisionID != evidence.RevisionID ||
+		accepted.TaskProjection.LatestCheckpointID != evidence.CheckpointID ||
+		accepted.TaskProjection.TaskWorkspaceLifecycleGeneration != evidence.ObservedGeneration ||
+		accepted.TaskProjection.TaskWorkspaceLifecycleFence != evidence.ObservedFence {
+		t.Fatalf("accept shared reconstruction evidence: decision=%+v err=%v", accepted, err)
+	}
+	view, err = adapter.queries.Query(context.Background(), query)
+	if err != nil || view.TaskWorkspaceLifecycleGeneration != evidence.ObservedGeneration ||
+		view.TaskWorkspaceLifecycleFence != evidence.ObservedFence {
+		t.Fatalf("persist shared reconstruction lineage: view=%+v err=%v", view, err)
+	}
+	manualHeader := intentHeader(t, "shared-reconstruction-manual-work", "shared-reconstruction-task", now.Add(5*time.Second))
+	manualHeader.ExpectedTaskRevision = accepted.AcceptedTaskRevision
+	manualHeader.ActivityGeneration = 2
+	manual, err := adapter.mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		manualHeader, worker, operationID(t, "shared-reconstruction-manual-available"),
+	))
+	if err != nil || len(manual.EnactmentRefs) != 1 ||
+		manual.EnactmentRefs[0].Kind != taskorchestration.EnactmentRuntimeExecution {
+		t.Fatalf("shared manual work did not wait for reconstruction: decision=%+v err=%v", manual, err)
+	}
+}
+
+func runSharedRuntimeRetryContract(t *testing.T, factory sharedTaskOrchestrationAdapterFactory) {
+	t.Helper()
+	now := time.Date(2026, time.July, 27, 20, 15, 0, 0, time.UTC)
+	owner := taskorchestration.NewUserAuthority(authorityID(t, "shared-runtime-retry-owner"), 1)
+	worker := taskorchestration.NewWorkerAuthority(authorityID(t, "shared-runtime-retry-worker"), 1)
+	adapter := factory.new(t, now, owner, worker)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "shared-runtime-retry-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1, RetryEligible: true,
+	}})
+	started, err := adapter.mutations.Decide(context.Background(), verifiedPinnedStartIntent(t,
+		intentHeader(t, "shared-runtime-retry-start", "shared-runtime-retry-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start shared Runtime retry Task: %v", err)
+	}
+	workHeader := intentHeader(t, "shared-runtime-retry-work", "shared-runtime-retry-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = started.AcceptedTaskRevision
+	work, err := adapter.mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "shared-runtime-retry-work-available"),
+	))
+	if err != nil {
+		t.Fatalf("make shared Runtime retry work available: %v", err)
+	}
+	adapter.afterDecision(t, work)
+	query := taskorchestration.TaskQuery{
+		TaskID:    taskID(t, "shared-runtime-retry-task"),
+		Authority: taskorchestration.NewUserQueryAuthority(owner),
+	}
+	view, err := adapter.queries.Query(context.Background(), query)
+	if err != nil {
+		t.Fatalf("query shared Runtime retry scope: %v", err)
+	}
+	phase := view.PhaseRuns[0]
+	failedRuntime := phase.RuntimeRuns[0]
+	failedHeader := intentHeader(t, "shared-runtime-retry-failed", "shared-runtime-retry-task", now.Add(2*time.Second))
+	failedHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
+	failed, err := adapter.mutations.Decide(context.Background(), taskorchestration.NewAcceptRuntimeEvidenceIntent(
+		failedHeader, pinned.Authorities.Runtime, taskorchestration.RuntimeEvidenceBinding{
+			Evidence: taskorchestration.NewEvidenceRef(
+				evidenceID(t, "shared-runtime-retry-failed-evidence"), taskorchestration.EvidenceRuntime,
+				evidenceDigest(t, "7171717171717171717171717171717171717171717171717171717171717171"),
+			),
+			PhaseRunID: phase.PhaseRunID, PhaseRunGeneration: phase.Generation, PhaseRunFence: phase.Fence,
+			RuntimeRunID: failedRuntime.RuntimeRunID, OperationID: work.EnactmentRefs[0].OperationID,
+			Generation: taskorchestration.RuntimeGeneration(phase.Generation),
+			Fence:      taskorchestration.RuntimeFence(phase.Fence), SafetyEpoch: view.SafetyEpoch,
+			Outcome: taskorchestration.RuntimeRunFailed,
+		},
+	))
+	if err != nil {
+		t.Fatalf("accept shared failed Runtime evidence: %v", err)
+	}
+	retryHeader := intentHeader(t, "shared-runtime-retry-command", "shared-runtime-retry-task", now.Add(3*time.Second))
+	retryHeader.ExpectedTaskRevision = failed.AcceptedTaskRevision
+	retryIntent := taskorchestration.NewRetryRuntimeRunIntent(
+		retryHeader, worker, phase.PhaseRunID, failedRuntime.RuntimeRunID,
+	)
+	retried, err := adapter.mutations.Decide(context.Background(), retryIntent)
+	if err != nil {
+		t.Fatalf("commit shared Runtime retry: %v", err)
+	}
+	adapter.afterDecision(t, retried)
+	view, err = adapter.queries.Query(context.Background(), query)
+	if err != nil || len(view.PhaseRuns) != 1 || len(view.PhaseRuns[0].RuntimeRuns) != 2 ||
+		view.PhaseRuns[0].PhaseRunID != phase.PhaseRunID ||
+		view.PhaseRuns[0].RuntimeRuns[0].RuntimeRunID != failedRuntime.RuntimeRunID ||
+		view.PhaseRuns[0].RuntimeRuns[0].Outcome != taskorchestration.RuntimeRunFailed ||
+		view.PhaseRuns[0].RuntimeRuns[1].Outcome != taskorchestration.RuntimeRunPending ||
+		len(retried.EnactmentRefs) != 1 ||
+		retried.EnactmentRefs[0].OperationID == work.EnactmentRefs[0].OperationID {
+		t.Fatalf("shared Runtime retry contract diverged: decision=%+v view=%+v err=%v", retried, view, err)
+	}
+	replayed, err := adapter.mutations.Decide(context.Background(), retryIntent)
+	if err != nil || replayed.DecisionID != retried.DecisionID ||
+		replayed.EnactmentRefs[0].OperationID != retried.EnactmentRefs[0].OperationID {
+		t.Fatalf("shared Runtime retry replay diverged: decision=%+v err=%v", replayed, err)
 	}
 }
 
@@ -74,7 +294,7 @@ func runSharedMinimalContract(t *testing.T, factory sharedTaskOrchestrationAdapt
 
 	started, err := adapter.mutations.Decide(
 		context.Background(),
-		taskorchestration.NewStartPinnedTaskIntent(
+		verifiedPinnedStartIntent(t,
 			intentHeader(t, "shared-contract-start", "shared-contract-task", now),
 			owner,
 			pinned,
@@ -151,7 +371,7 @@ func runSharedCoordinationContract(t *testing.T, factory sharedTaskOrchestration
 		RequiredRuntimeRuns: 1,
 	}})
 	started, err := adapter.mutations.Decide(context.Background(),
-		taskorchestration.NewStartPinnedTaskIntent(
+		verifiedPinnedStartIntent(t,
 			intentHeader(t, "shared-coordination-start", "shared-coordination-task", now),
 			owner, pinned,
 		))
@@ -413,7 +633,7 @@ func newSharedOwnedTransportAdapter(
 			SchemaVersion: taskorchestration.EvidenceSchemaV1,
 			EvidenceID:    evidenceID(t, "shared-owned-runtime-evidence"),
 			Producer: taskorchestration.EvidenceProducer{
-				AuthorityID: authorityID(t, "shared-owned-runtime-producer"),
+				AuthorityID: authorityID(t, "generation-runtime-authority"),
 				Generation:  taskorchestration.AuthorizationGeneration(1),
 			},
 			TaskID:                       decision.TaskProjection.TaskID,
@@ -498,7 +718,7 @@ func directSharedRuntimeEvidence(
 				evidenceDigest(t, "6666666666666666666666666666666666666666666666666666666666666666"),
 			),
 			Producer: taskorchestration.EvidenceProducer{
-				AuthorityID: authorityID(t, "shared-direct-runtime-producer"),
+				AuthorityID: authorityID(t, "generation-runtime-authority"),
 				Generation:  taskorchestration.AuthorizationGeneration(1),
 			},
 			TaskID:     decision.TaskProjection.TaskID,
