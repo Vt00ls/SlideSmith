@@ -138,26 +138,14 @@ func (function SchedulerTransactionalParticipantFunc) Participate(
 	return function(ctx, transaction, fact)
 }
 
-type DecisionCommitObserver interface {
-	ObserveCommittedDecision(context.Context, TransitionDecision) error
-}
-
-type DecisionCommitObserverFunc func(context.Context, TransitionDecision) error
-
-func (function DecisionCommitObserverFunc) ObserveCommittedDecision(
-	ctx context.Context,
-	decision TransitionDecision,
-) error {
-	return function(ctx, decision)
-}
-
 type PostgresConfig struct {
 	Schema                   string
 	Now                      func() time.Time
 	Faults                   PersistenceFaultInjector
 	SchedulerParticipant     SchedulerTransactionalParticipant
 	SchedulerEnqueueFunction string
-	CommitObserver           DecisionCommitObserver
+	ProjectionDelivery       *DecisionProjectionAdapter
+	DiagnosticAuditFaults    *DiagnosticAuditFaultController
 }
 
 type PersistenceView struct {
@@ -179,7 +167,8 @@ type PostgresAdapter struct {
 	faults                   PersistenceFaultInjector
 	schedulerParticipant     SchedulerTransactionalParticipant
 	schedulerEnqueueFunction string
-	commitObserver           DecisionCommitObserver
+	projectionDelivery       *DecisionProjectionAdapter
+	diagnosticAuditFaults    *DiagnosticAuditFaultController
 }
 
 func NewPostgresAdapter(db *sql.DB, config PostgresConfig) (*PostgresAdapter, error) {
@@ -207,7 +196,8 @@ func NewPostgresAdapter(db *sql.DB, config PostgresConfig) (*PostgresAdapter, er
 		db: db, schema: schema, now: now, faults: config.Faults,
 		schedulerParticipant:     config.SchedulerParticipant,
 		schedulerEnqueueFunction: config.SchedulerEnqueueFunction,
-		commitObserver:           config.CommitObserver,
+		projectionDelivery:       config.ProjectionDelivery,
+		diagnosticAuditFaults:    config.DiagnosticAuditFaults,
 	}, nil
 }
 
@@ -269,6 +259,8 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 	evidence := adapter.table("task_orchestration_evidence_refs")
 	diagnostics := adapter.table("task_orchestration_evidence_diagnostics")
 	audit := adapter.table("task_orchestration_mandatory_audit_facts")
+	diagnosticAudits := adapter.table("task_orchestration_diagnostic_audit_facts")
+	projectionDelivery := adapter.table("task_orchestration_projection_delivery")
 	outbox := adapter.table("task_orchestration_outbox")
 	delivery := adapter.table("task_orchestration_outbox_delivery")
 	phaseRuns := adapter.table("task_orchestration_phase_runs")
@@ -282,6 +274,7 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", adapter.table("task_orchestration_runtime_run_blocks")),
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", adapter.table("task_orchestration_operation_blocks")),
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", adapter.table("task_orchestration_causation_blocks")),
+		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", adapter.table("task_orchestration_diagnostic_audit_sequence")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			task_id text PRIMARY KEY,
 			revision bigint NOT NULL CHECK (revision > 0),
@@ -345,6 +338,31 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 			decision_request_id text NOT NULL,
 			committed_at timestamptz NOT NULL
 		)`, audit, decisions),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			audit_fact_id text PRIMARY KEY,
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			task_id text NOT NULL,
+			lookup_kind smallint NOT NULL,
+			decision_id text NOT NULL,
+			operation_id text NOT NULL,
+			result_limit bigint NOT NULL CHECK (result_limit >= 0 AND result_limit <= 100),
+			authority_id text NOT NULL,
+			authority_generation bigint NOT NULL CHECK (authority_generation > 0),
+			reason smallint NOT NULL,
+			outcome smallint NOT NULL,
+			recorded_at timestamptz NOT NULL
+		)`, diagnosticAudits),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			audit_fact_id text PRIMARY KEY,
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			external_audit_delivered boolean NOT NULL DEFAULT FALSE,
+			telemetry_delivered boolean NOT NULL DEFAULT FALSE,
+			attempt_count bigint NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+			last_outcome smallint NOT NULL,
+			last_attempt_at timestamptz,
+			first_external_audit_delivered_at timestamptz,
+			last_external_audit_delivered_at timestamptz
+		)`, projectionDelivery),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY,
 			decision_id text NOT NULL REFERENCES %s(decision_id),
@@ -432,6 +450,8 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", diagnostics, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_mutation ON %s", audit),
 		fmt.Sprintf("CREATE TRIGGER reject_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", audit, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_mutation ON %s", diagnosticAudits),
+		fmt.Sprintf("CREATE TRIGGER reject_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", diagnosticAudits, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_mutation ON %s", outbox),
 		fmt.Sprintf("CREATE TRIGGER reject_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", outbox, immutableFunction),
 	}
@@ -554,11 +574,6 @@ func (adapter *PostgresAdapter) Decide(
 	}
 	if adapter.failAt(PersistenceFaultAfterCommit) {
 		return TransitionDecision{}, newError(ErrorReconciliationRequired)
-	}
-	if adapter.commitObserver != nil {
-		_ = adapter.commitObserver.ObserveCommittedDecision(
-			context.WithoutCancel(ctx), cloneTransitionDecision(decision),
-		)
 	}
 	if adapter.failAt(PersistenceFaultBeforeResponse) {
 		return TransitionDecision{}, newError(ErrorReconciliationRequired)
