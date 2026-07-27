@@ -53,6 +53,7 @@ type ownedTransportPrerequisitesWire struct {
 type ownedTransportRequestWire struct {
 	SchemaVersion      string                          `json:"schema_version"`
 	Authorization      ownedTransportAuthorityWire     `json:"authorization"`
+	Deadline           string                          `json:"deadline"`
 	OperationID        string                          `json:"operation_id"`
 	DecisionID         string                          `json:"decision_id"`
 	TaskID             string                          `json:"task_id"`
@@ -92,6 +93,7 @@ func EncodeOwnedTransportRequest(request OwnedTransportRequest) ([]byte, error) 
 			Kind: "worker", ID: request.Authority.value.id.value,
 			Generation: request.Authority.value.generation,
 		},
+		Deadline:    request.Deadline.Format(time.RFC3339Nano),
 		OperationID: request.OperationID.value, DecisionID: request.DecisionID.value,
 		TaskID: request.TaskID.value, PhaseRunID: request.PhaseRunID.value,
 		RuntimeRunID: request.RuntimeRunID.value, Kind: enactmentKindName(request.Kind),
@@ -132,9 +134,14 @@ func DecodeOwnedTransportRequest(encoded []byte) (OwnedTransportRequest, error) 
 	if err != nil {
 		return OwnedTransportRequest{}, &OwnedTransportWireError{code: OwnedTransportWireInvalidEnvelope}
 	}
+	deadline, err := time.Parse(time.RFC3339Nano, wire.Deadline)
+	if err != nil {
+		return OwnedTransportRequest{}, &OwnedTransportWireError{code: OwnedTransportWireInvalidEnvelope}
+	}
 	request := OwnedTransportRequest{
 		Version:     version,
 		Authority:   NewWorkerAuthority(authorityID, wire.Authorization.Generation),
+		Deadline:    deadline.UTC(),
 		OperationID: OperationID{value: wire.OperationID}, DecisionID: DecisionID{value: wire.DecisionID},
 		TaskID: TaskID{value: wire.TaskID}, PhaseRunID: PhaseRunID{value: wire.PhaseRunID},
 		RuntimeRunID: RuntimeRunID{value: wire.RuntimeRunID}, Kind: parseEnactmentKind(wire.Kind),

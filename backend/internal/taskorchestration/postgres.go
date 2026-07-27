@@ -369,16 +369,18 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 			lease_authority_id text NOT NULL DEFAULT '',
 			lease_authority_generation bigint NOT NULL DEFAULT 0,
 			lease_authority_reason smallint NOT NULL DEFAULT 0,
-			lease_fence bigint NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
-			lease_expires_at timestamptz,
-			delivery_count bigint NOT NULL DEFAULT 0 CHECK (delivery_count >= 0),
-			terminal boolean NOT NULL DEFAULT FALSE,
+				lease_fence bigint NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+				lease_expires_at timestamptz,
+				delivery_count bigint NOT NULL DEFAULT 0 CHECK (delivery_count >= 0),
+				send_started boolean NOT NULL DEFAULT FALSE,
+				terminal boolean NOT NULL DEFAULT FALSE,
 			result_digest bytea CHECK (result_digest IS NULL OR octet_length(result_digest) = 32),
 			retry_at timestamptz,
 			deferral_reason smallint NOT NULL DEFAULT 0,
 			reconcile_fence bigint NOT NULL DEFAULT 0 CHECK (reconcile_fence >= 0),
 			updated_at timestamptz NOT NULL
-		)`, delivery, outbox),
+			)`, delivery, outbox),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS send_started boolean NOT NULL DEFAULT FALSE", delivery),
 		fmt.Sprintf(`CREATE INDEX IF NOT EXISTS task_orchestration_outbox_delivery_claimable
 			ON %s (terminal, disposition, retry_at, lease_expires_at, operation_id)`, delivery),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (

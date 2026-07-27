@@ -62,6 +62,25 @@ func (value *postgresDispatcher) Claim(
 		value.adapter.table("task_orchestration_outbox")), DeliveryPending, now); err != nil {
 		return DeliveryClaimBatch{}, newDeliveryError(DeliveryUnavailable)
 	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s AS delivery SET
+		disposition=$1, terminal=TRUE, lease_authority_kind=0,
+		lease_authority_id='', lease_authority_generation=0,
+		lease_authority_reason=0, lease_expires_at=NULL, send_started=FALSE, updated_at=$2
+		FROM %s AS pending WHERE delivery.operation_id=pending.operation_id
+		AND delivery.terminal=FALSE AND delivery.send_started=FALSE
+		AND delivery.disposition<>$3 AND EXISTS (
+			SELECT 1 FROM %s AS newer WHERE newer.task_id=pending.task_id
+			AND newer.fence_kind=pending.fence_kind
+			AND newer.phase_run_id=pending.phase_run_id
+			AND newer.runtime_run_id=pending.runtime_run_id
+			AND (newer.activity_generation>pending.activity_generation OR
+				(newer.activity_generation=pending.activity_generation AND newer.fence>pending.fence))
+		)`, value.adapter.table("task_orchestration_outbox_delivery"),
+		value.adapter.table("task_orchestration_outbox"),
+		value.adapter.table("task_orchestration_outbox")), DeliverySuperseded, now,
+		DeliveryReconciliationRequired); err != nil {
+		return DeliveryClaimBatch{}, newDeliveryError(DeliveryUnavailable)
+	}
 	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`SELECT operation_id FROM %s
 		WHERE terminal=FALSE AND disposition<>$1
 		AND (retry_at IS NULL OR retry_at<=$2)
@@ -99,10 +118,11 @@ func (value *postgresDispatcher) Claim(
 		if err != nil {
 			return DeliveryClaimBatch{}, newDeliveryError(DeliveryUnavailable)
 		}
-		if deliveryState.Disposition == DeliveryClaimed && deliveryState.DeliveryCount > 0 {
+		if deliveryState.Disposition == DeliveryClaimed && deliveryState.SendStarted {
 			deliveryState.Disposition = DeliveryReconciliationRequired
 			deliveryState.Authority = authorityValue{}
 			deliveryState.LeaseExpiresAt = time.Time{}
+			deliveryState.SendStarted = false
 			if err := value.saveDelivery(ctx, tx, operationID, deliveryState, now); err != nil {
 				return DeliveryClaimBatch{}, err
 			}
@@ -112,7 +132,7 @@ func (value *postgresDispatcher) Claim(
 			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET disposition=$1,
 				terminal=TRUE, lease_authority_kind=0, lease_authority_id='',
 				lease_authority_generation=0, lease_authority_reason=0,
-				lease_expires_at=NULL, updated_at=$2 WHERE operation_id=$3`,
+				lease_expires_at=NULL, send_started=FALSE, updated_at=$2 WHERE operation_id=$3`,
 				value.adapter.table("task_orchestration_outbox_delivery")),
 				DeliverySuperseded, now, operationID.value); err != nil {
 				return DeliveryClaimBatch{}, newDeliveryError(DeliveryUnavailable)
@@ -125,7 +145,7 @@ func (value *postgresDispatcher) Claim(
 			lease_authority_kind=$2, lease_authority_id=$3,
 			lease_authority_generation=$4, lease_authority_reason=$5,
 			lease_fence=lease_fence+1, lease_expires_at=$6,
-			retry_at=NULL, deferral_reason=0, updated_at=$7
+			send_started=FALSE, retry_at=NULL, deferral_reason=0, updated_at=$7
 			WHERE operation_id=$8 RETURNING lease_fence`,
 			value.adapter.table("task_orchestration_outbox_delivery")),
 			DeliveryClaimed, request.Authority.value.kind, request.Authority.value.id.value,
@@ -133,9 +153,11 @@ func (value *postgresDispatcher) Claim(
 			leaseExpiresAt, now, operationID.value).Scan(&leaseFence); err != nil {
 			return DeliveryClaimBatch{}, newDeliveryError(DeliveryUnavailable)
 		}
+		transportRequest := value.transportRequest(record, request.Authority)
+		transportRequest.Deadline = leaseExpiresAt
 		batch.Claims = append(batch.Claims, DeliveryClaim{
 			OperationID: operationID,
-			Request:     value.transportRequest(record, request.Authority),
+			Request:     transportRequest,
 			LeaseFence:  leaseFence, LeaseExpiresAt: leaseExpiresAt,
 		})
 	}
@@ -185,9 +207,11 @@ func (value *postgresDispatcher) Heartbeat(
 	if err := tx.Commit(); err != nil {
 		return DeliveryClaim{}, newDeliveryError(DeliveryUnavailable)
 	}
+	transportRequest := value.transportRequest(record, request.Authority)
+	transportRequest.Deadline = state.LeaseExpiresAt
 	return DeliveryClaim{
 		OperationID: request.OperationID,
-		Request:     value.transportRequest(record, request.Authority),
+		Request:     transportRequest,
 		LeaseFence:  state.LeaseFence, LeaseExpiresAt: state.LeaseExpiresAt,
 	}, nil
 }
@@ -208,11 +232,29 @@ func (value *postgresDispatcher) Deliver(
 	if err != nil {
 		return DeliveryResult{}, err
 	}
+	if state.SendStarted {
+		return value.finishClaim(ctx, claim, authority, func(state *memoryDeliveryState) {
+			state.Disposition = DeliveryReconciliationRequired
+		}, false)
+	}
+	if deliveryCanBeSuperseded(state) {
+		superseded, err := value.supersededBeforeSend(ctx, record)
+		if err != nil {
+			return DeliveryResult{}, err
+		}
+		if superseded {
+			return value.finishClaim(ctx, claim, authority, func(state *memoryDeliveryState) {
+				state.Disposition = DeliverySuperseded
+				state.Terminal = true
+			}, false)
+		}
+	}
 	request := value.transportRequest(record, authority)
+	request.Deadline = state.LeaseExpiresAt
 	if value.failAt(DeliveryFaultBeforeSend) {
 		return DeliveryResult{}, newDeliveryError(DeliveryUnavailable)
 	}
-	state, err = value.markSendStarted(ctx, claim, authority)
+	_, err = value.markSendStarted(ctx, claim, authority)
 	if err != nil {
 		return DeliveryResult{}, err
 	}
@@ -226,52 +268,17 @@ func (value *postgresDispatcher) Deliver(
 	}
 	if transportErr != nil || response.Version != request.Version ||
 		response.OperationID != request.OperationID {
-		return value.finishClaim(finishContext, claim, authority, func(state *memoryDeliveryState) bool {
+		return value.finishClaim(finishContext, claim, authority, func(state *memoryDeliveryState) {
 			state.Disposition = DeliveryReconciliationRequired
-			return true
 		}, false)
 	}
-	switch response.Outcome {
-	case OwnedTransportAccepted:
-		if response.ResultDigest == (DeliveryResultDigest{}) {
-			return value.finishAmbiguous(finishContext, claim, authority)
-		}
-		return value.finishClaim(finishContext, claim, authority, func(state *memoryDeliveryState) bool {
-			state.Disposition = DeliveryAccepted
-			state.ResultDigest = response.ResultDigest
-			state.Terminal = true
-			return true
-		}, true)
-	case OwnedTransportBackpressured:
-		if response.RetryAt.Location() != time.UTC || !response.RetryAt.After(value.config.Now().UTC()) {
-			return value.finishAmbiguous(finishContext, claim, authority)
-		}
-		return value.finishClaim(finishContext, claim, authority, func(state *memoryDeliveryState) bool {
-			state.Disposition = DeliveryBackpressured
-			state.RetryAt = response.RetryAt
-			return true
-		}, false)
-	case OwnedTransportDeferred:
-		if response.DeferralReason != OwnedTransportPrerequisiteDeferred ||
-			response.RetryAt.Location() != time.UTC || !response.RetryAt.After(value.config.Now().UTC()) {
-			return value.finishAmbiguous(finishContext, claim, authority)
-		}
-		return value.finishClaim(finishContext, claim, authority, func(state *memoryDeliveryState) bool {
-			state.Disposition = DeliveryDeferred
-			state.DeferralReason = response.DeferralReason
-			state.RetryAt = response.RetryAt
-			return true
-		}, false)
-	case OwnedTransportSuperseded:
-		return value.finishTerminal(finishContext, claim, authority, DeliverySuperseded)
-	case OwnedTransportPoisoned, OwnedTransportUnsupportedVersion, OwnedTransportUnauthorized:
-		return value.finishTerminal(finishContext, claim, authority, DeliveryPoisoned)
-	case OwnedTransportIntegrityConflict:
-		return value.finishTerminal(finishContext, claim, authority, DeliveryIntegrityConflict)
-	default:
-		_ = state
+	outcome, ok := normalizeDeliveryOutcome(response, value.config.Now().UTC(), deliveryOutcomeFromSend)
+	if !ok {
 		return value.finishAmbiguous(finishContext, claim, authority)
 	}
+	return value.finishClaim(finishContext, claim, authority, func(state *memoryDeliveryState) {
+		applyNormalizedDeliveryOutcome(state, outcome)
+	}, outcome.disposition == DeliveryAccepted)
 }
 
 func (value *postgresDispatcher) Inspect(
@@ -344,44 +351,13 @@ func (value *postgresDispatcher) Reconcile(
 		current.ReconcileFence != reconcileFence {
 		return DeliveryResult{}, newDeliveryError(DeliveryClaimLost)
 	}
-	switch response.Outcome {
-	case OwnedTransportAccepted:
-		if response.ResultDigest == (DeliveryResultDigest{}) {
-			return deliveryResultFromState(request.OperationID, current), nil
-		}
-		current.Disposition = DeliveryAccepted
-		current.ResultDigest = response.ResultDigest
-		current.Terminal = true
-	case OwnedTransportUnknown:
-		current.Disposition = DeliveryPending
-	case OwnedTransportSuperseded:
-		current.Disposition = DeliverySuperseded
-		current.Terminal = true
-	case OwnedTransportIntegrityConflict:
-		current.Disposition = DeliveryIntegrityConflict
-		current.Terminal = true
-	case OwnedTransportPoisoned, OwnedTransportUnsupportedVersion, OwnedTransportUnauthorized:
-		current.Disposition = DeliveryPoisoned
-		current.Terminal = true
-	case OwnedTransportBackpressured:
-		if response.RetryAt.Location() != time.UTC ||
-			!response.RetryAt.After(value.config.Now().UTC()) {
-			return deliveryResultFromState(request.OperationID, current), nil
-		}
-		current.Disposition = DeliveryBackpressured
-		current.RetryAt = response.RetryAt
-	case OwnedTransportDeferred:
-		if response.DeferralReason != OwnedTransportPrerequisiteDeferred ||
-			response.RetryAt.Location() != time.UTC ||
-			!response.RetryAt.After(value.config.Now().UTC()) {
-			return deliveryResultFromState(request.OperationID, current), nil
-		}
-		current.Disposition = DeliveryDeferred
-		current.DeferralReason = response.DeferralReason
-		current.RetryAt = response.RetryAt
-	default:
+	outcome, ok := normalizeDeliveryOutcome(
+		response, value.config.Now().UTC(), deliveryOutcomeFromInspection,
+	)
+	if !ok {
 		return deliveryResultFromState(request.OperationID, current), nil
 	}
+	applyNormalizedDeliveryOutcome(&current, outcome)
 	if err := value.saveDelivery(ctx, tx, request.OperationID, current, value.config.Now().UTC()); err != nil {
 		return DeliveryResult{}, err
 	}
@@ -430,10 +406,12 @@ func (value *postgresDispatcher) markSendStarted(
 	defer func() { _ = tx.Rollback() }()
 	state, err := value.loadDelivery(ctx, tx, claim.OperationID, true)
 	if err != nil || state.Terminal || state.Authority != authority.value ||
-		state.LeaseFence != claim.LeaseFence || !state.LeaseExpiresAt.After(now) {
+		state.LeaseFence != claim.LeaseFence || !state.LeaseExpiresAt.After(now) ||
+		state.SendStarted {
 		return memoryDeliveryState{}, newDeliveryError(DeliveryClaimLost)
 	}
 	state.DeliveryCount++
+	state.SendStarted = true
 	if err := value.saveDelivery(ctx, tx, claim.OperationID, state, now); err != nil {
 		return memoryDeliveryState{}, err
 	}
@@ -443,27 +421,35 @@ func (value *postgresDispatcher) markSendStarted(
 	return state, nil
 }
 
+func (value *postgresDispatcher) supersededBeforeSend(
+	ctx context.Context,
+	record authoritativeOutboxRecord,
+) (bool, error) {
+	fenceKind, fence := postgresFenceValue(record.Fence)
+	var superseded bool
+	err := value.adapter.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT EXISTS (
+		SELECT 1 FROM %s WHERE task_id=$1 AND fence_kind=$2
+		AND phase_run_id=$3 AND runtime_run_id=$4
+		AND (activity_generation>$5 OR (activity_generation=$5 AND fence>$6))
+	) OR EXISTS (
+		SELECT 1 FROM %s WHERE singleton=TRUE AND safety_epoch>$7
+	)`, value.adapter.table("task_orchestration_outbox"),
+		value.adapter.table("task_orchestration_recovery_state")),
+		record.TaskID.value, fenceKind, record.PhaseRunID.value, record.RuntimeRunID.value,
+		record.ActivityGeneration, fence, record.SafetyEpoch).Scan(&superseded)
+	if err != nil {
+		return false, newDeliveryError(DeliveryUnavailable)
+	}
+	return superseded, nil
+}
+
 func (value *postgresDispatcher) finishAmbiguous(
 	ctx context.Context,
 	claim DeliveryClaim,
 	authority WorkerAuthority,
 ) (DeliveryResult, error) {
-	return value.finishClaim(ctx, claim, authority, func(state *memoryDeliveryState) bool {
+	return value.finishClaim(ctx, claim, authority, func(state *memoryDeliveryState) {
 		state.Disposition = DeliveryReconciliationRequired
-		return true
-	}, false)
-}
-
-func (value *postgresDispatcher) finishTerminal(
-	ctx context.Context,
-	claim DeliveryClaim,
-	authority WorkerAuthority,
-	disposition DeliveryDisposition,
-) (DeliveryResult, error) {
-	return value.finishClaim(ctx, claim, authority, func(state *memoryDeliveryState) bool {
-		state.Disposition = disposition
-		state.Terminal = true
-		return true
 	}, false)
 }
 
@@ -471,7 +457,7 @@ func (value *postgresDispatcher) finishClaim(
 	ctx context.Context,
 	claim DeliveryClaim,
 	authority WorkerAuthority,
-	apply func(*memoryDeliveryState) bool,
+	apply func(*memoryDeliveryState),
 	requireLiveLease bool,
 ) (DeliveryResult, error) {
 	now := value.config.Now().UTC()
@@ -485,11 +471,10 @@ func (value *postgresDispatcher) finishClaim(
 		state.LeaseFence != claim.LeaseFence || requireLiveLease && !state.LeaseExpiresAt.After(now) {
 		return DeliveryResult{}, newDeliveryError(DeliveryClaimLost)
 	}
-	if !apply(&state) {
-		return DeliveryResult{}, newDeliveryError(DeliveryUnavailable)
-	}
+	apply(&state)
 	state.Authority = authorityValue{}
 	state.LeaseExpiresAt = time.Time{}
+	state.SendStarted = false
 	if value.failAt(DeliveryFaultBeforeDispositionCommit) {
 		return DeliveryResult{}, newDeliveryError(DeliveryUnavailable)
 	}
@@ -555,6 +540,7 @@ func (value *postgresDispatcher) loadOutbox(
 		record.Prerequisites.AcceptedEvidenceIDs[index] = EvidenceID{value: evidenceID}
 	}
 	request := value.transportRequest(record, value.config.Authorities[0])
+	request.Deadline = record.CommittedAt.UTC()
 	if operationID != record.OperationID || !validOwnedTransportRequest(request) {
 		return authoritativeOutboxRecord{}, newDeliveryError(DeliveryUnavailable)
 	}
@@ -569,7 +555,7 @@ func (value *postgresDispatcher) loadDelivery(
 ) (memoryDeliveryState, error) {
 	query := fmt.Sprintf(`SELECT disposition, lease_authority_kind, lease_authority_id,
 		lease_authority_generation, lease_authority_reason, lease_fence,
-		lease_expires_at, delivery_count, terminal, result_digest, retry_at,
+		lease_expires_at, delivery_count, send_started, terminal, result_digest, retry_at,
 		deferral_reason, reconcile_fence FROM %s WHERE operation_id=$1`,
 		value.adapter.table("task_orchestration_outbox_delivery"))
 	if forUpdate {
@@ -585,7 +571,7 @@ func (value *postgresDispatcher) loadDeliveryFromDB(
 	return scanPostgresDeliveryState(value.adapter.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT
 		disposition, lease_authority_kind, lease_authority_id,
 		lease_authority_generation, lease_authority_reason, lease_fence,
-		lease_expires_at, delivery_count, terminal, result_digest, retry_at,
+		lease_expires_at, delivery_count, send_started, terminal, result_digest, retry_at,
 		deferral_reason, reconcile_fence FROM %s WHERE operation_id=$1`,
 		value.adapter.table("task_orchestration_outbox_delivery")), operationID.value))
 }
@@ -604,12 +590,13 @@ func scanPostgresDeliveryState(scanner postgresRowScanner) (memoryDeliveryState,
 	var leaseExpiresAt, retryAt sql.NullTime
 	var resultDigest []byte
 	err := scanner.Scan(&state.Disposition, &authorityKind, &authorityID, &authorityGeneration,
-		&authorityReason, &leaseFence, &leaseExpiresAt, &deliveryCount, &state.Terminal,
+		&authorityReason, &leaseFence, &leaseExpiresAt, &deliveryCount, &state.SendStarted, &state.Terminal,
 		&resultDigest, &retryAt, &state.DeferralReason, &reconcileFence)
 	if err != nil {
 		return memoryDeliveryState{}, err
 	}
 	if deliveryCount > math.MaxUint32 || leaseFence == 0 && leaseExpiresAt.Valid ||
+		state.SendStarted && (!leaseExpiresAt.Valid || state.Disposition != DeliveryClaimed) ||
 		len(resultDigest) != 0 && len(resultDigest) != 32 {
 		return memoryDeliveryState{}, newDeliveryError(DeliveryUnavailable)
 	}
@@ -654,14 +641,14 @@ func (value *postgresDispatcher) saveDelivery(
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET disposition=$1,
 		lease_authority_kind=$2, lease_authority_id=$3,
 		lease_authority_generation=$4, lease_authority_reason=$5,
-		lease_fence=$6, lease_expires_at=$7, delivery_count=$8, terminal=$9,
-		result_digest=$10, retry_at=$11, deferral_reason=$12,
-		reconcile_fence=$13, updated_at=$14 WHERE operation_id=$15`,
+		lease_fence=$6, lease_expires_at=$7, delivery_count=$8, send_started=$9,
+		terminal=$10, result_digest=$11, retry_at=$12, deferral_reason=$13,
+		reconcile_fence=$14, updated_at=$15 WHERE operation_id=$16`,
 		value.adapter.table("task_orchestration_outbox_delivery")),
 		state.Disposition, state.Authority.kind, state.Authority.id.value,
 		state.Authority.generation, state.Authority.reason, state.LeaseFence,
-		leaseExpiresAt, state.DeliveryCount, state.Terminal, resultDigest, retryAt,
-		state.DeferralReason, state.ReconcileFence, updatedAt.UTC(), operationID.value)
+		leaseExpiresAt, state.DeliveryCount, state.SendStarted, state.Terminal, resultDigest,
+		retryAt, state.DeferralReason, state.ReconcileFence, updatedAt.UTC(), operationID.value)
 	if err != nil {
 		return newDeliveryError(DeliveryUnavailable)
 	}

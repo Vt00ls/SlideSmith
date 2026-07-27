@@ -27,6 +27,7 @@ type DeliveryPrerequisites struct {
 type OwnedTransportRequest struct {
 	Version            OwnedTransportVersion
 	Authority          WorkerAuthority
+	Deadline           time.Time
 	OperationID        OperationID
 	DecisionID         DecisionID
 	TaskID             TaskID
@@ -97,9 +98,18 @@ type OwnedTransport interface {
 	Inspect(context.Context, OwnedTransportInspection) (OwnedTransportResponse, error)
 }
 
+type OwnedTransportPrerequisiteCheck func(
+	context.Context,
+	TaskID,
+	DeliveryPrerequisites,
+) bool
+
 type OwnedTransportConfig struct {
-	SupportedVersion OwnedTransportVersion
-	Authorities      []WorkerAuthority
+	SupportedVersion       OwnedTransportVersion
+	Authorities            []WorkerAuthority
+	Now                    func() time.Time
+	PrerequisiteRetryDelay time.Duration
+	PrerequisitesSatisfied OwnedTransportPrerequisiteCheck
 }
 
 type OwnedTransportErrorCode uint8
@@ -160,7 +170,9 @@ type ownedTransportOrder struct {
 func NewDeterministicOwnedTransport(
 	config OwnedTransportConfig,
 ) (*DeterministicOwnedTransport, error) {
-	if config.SupportedVersion != OwnedTransportV1 || len(config.Authorities) == 0 {
+	if config.SupportedVersion != OwnedTransportV1 || len(config.Authorities) == 0 ||
+		config.Now == nil || config.PrerequisiteRetryDelay <= 0 ||
+		config.PrerequisitesSatisfied == nil {
 		return nil, &OwnedTransportError{code: OwnedTransportInvalidConfiguration}
 	}
 	for _, authority := range config.Authorities {
@@ -230,6 +242,9 @@ func (transport *DeterministicOwnedTransport) Deliver(
 		response.Duplicate = true
 		return response, nil
 	}
+	if !request.Deadline.After(transport.config.Now().UTC()) {
+		return OwnedTransportResponse{}, &OwnedTransportError{code: OwnedTransportUnavailable}
+	}
 	scope := ownedTransportScope{
 		taskID: request.TaskID, fenceKind: request.FenceKind,
 		phaseRunID: request.PhaseRunID, runtimeRunID: request.RuntimeRunID,
@@ -246,6 +261,22 @@ func (transport *DeterministicOwnedTransport) Deliver(
 			binding: binding, response: response,
 		}
 		return response, nil
+	}
+	if !transport.config.PrerequisitesSatisfied(ctx, request.TaskID, DeliveryPrerequisites{
+		TaskRevision: request.Prerequisites.TaskRevision,
+		AcceptedEvidenceIDs: cloneEvidenceIDs(
+			request.Prerequisites.AcceptedEvidenceIDs,
+		),
+	}) {
+		now := transport.config.Now().UTC()
+		if now.IsZero() {
+			return OwnedTransportResponse{}, &OwnedTransportError{code: OwnedTransportUnavailable}
+		}
+		return OwnedTransportResponse{
+			Version: transport.config.SupportedVersion, OperationID: request.OperationID,
+			Outcome: OwnedTransportDeferred, DeferralReason: OwnedTransportPrerequisiteDeferred,
+			RetryAt: now.Add(transport.config.PrerequisiteRetryDelay),
+		}, nil
 	}
 	result := sha256.Sum256(append([]byte("owned-transport-result-v1|"), binding[:]...))
 	response := OwnedTransportResponse{
@@ -310,6 +341,7 @@ func (transport *DeterministicOwnedTransport) authorized(authority WorkerAuthori
 
 func validOwnedTransportRequest(request OwnedTransportRequest) bool {
 	if request.Version != OwnedTransportV1 || !validDeliveryAuthority(request.Authority) ||
+		request.Deadline.IsZero() || request.Deadline.Location() != time.UTC ||
 		!validOpaqueID(request.OperationID.value) || !validOpaqueID(request.DecisionID.value) ||
 		!validOpaqueID(request.TaskID.value) || !validOptionalOpaqueID(request.PhaseRunID.value) ||
 		!validOptionalOpaqueID(request.RuntimeRunID.value) || !validEnactmentKind(request.Kind) ||
@@ -343,9 +375,6 @@ func ownedTransportBinding(request OwnedTransportRequest) ([32]byte, error) {
 	sort.Strings(evidenceIDs)
 	encoded, err := json.Marshal(struct {
 		Version             OwnedTransportVersion
-		AuthorityKind       AuthorityKind
-		AuthorityID         string
-		AuthorityGeneration AuthorizationGeneration
 		OperationID         string
 		DecisionID          string
 		TaskID              string
@@ -361,10 +390,8 @@ func ownedTransportBinding(request OwnedTransportRequest) ([32]byte, error) {
 		TaskRevision        TaskRevision
 		AcceptedEvidenceIDs []string
 	}{
-		Version: request.Version, AuthorityKind: request.Authority.value.kind,
-		AuthorityID:         request.Authority.value.id.value,
-		AuthorityGeneration: request.Authority.value.generation,
-		OperationID:         request.OperationID.value, DecisionID: request.DecisionID.value,
+		Version:     request.Version,
+		OperationID: request.OperationID.value, DecisionID: request.DecisionID.value,
 		TaskID: request.TaskID.value, PhaseRunID: request.PhaseRunID.value,
 		RuntimeRunID: request.RuntimeRunID.value, Kind: request.Kind,
 		PayloadDigest:      request.PayloadDigest.String(),
@@ -570,10 +597,96 @@ type memoryDeliveryState struct {
 	Disposition    DeliveryDisposition
 	ResultDigest   DeliveryResultDigest
 	DeliveryCount  uint32
+	SendStarted    bool
 	Terminal       bool
 	ReconcileFence uint64
 	RetryAt        time.Time
 	DeferralReason OwnedTransportDeferralReason
+}
+
+func deliveryCanBeSuperseded(state memoryDeliveryState) bool {
+	if state.Terminal || state.Disposition == DeliveryReconciliationRequired {
+		return false
+	}
+	switch state.Disposition {
+	case 0, DeliveryPending, DeliveryBackpressured, DeliveryDeferred:
+		return true
+	case DeliveryClaimed:
+		return !state.SendStarted
+	default:
+		return false
+	}
+}
+
+type deliveryOutcomeSource uint8
+
+const (
+	deliveryOutcomeFromSend deliveryOutcomeSource = iota + 1
+	deliveryOutcomeFromInspection
+)
+
+type normalizedDeliveryOutcome struct {
+	disposition    DeliveryDisposition
+	resultDigest   DeliveryResultDigest
+	terminal       bool
+	retryAt        time.Time
+	deferralReason OwnedTransportDeferralReason
+}
+
+func normalizeDeliveryOutcome(
+	response OwnedTransportResponse,
+	now time.Time,
+	source deliveryOutcomeSource,
+) (normalizedDeliveryOutcome, bool) {
+	switch response.Outcome {
+	case OwnedTransportAccepted:
+		if response.ResultDigest == (DeliveryResultDigest{}) {
+			return normalizedDeliveryOutcome{}, false
+		}
+		return normalizedDeliveryOutcome{
+			disposition: DeliveryAccepted, resultDigest: response.ResultDigest, terminal: true,
+		}, true
+	case OwnedTransportUnknown:
+		if source != deliveryOutcomeFromInspection {
+			return normalizedDeliveryOutcome{}, false
+		}
+		return normalizedDeliveryOutcome{disposition: DeliveryPending}, true
+	case OwnedTransportBackpressured:
+		if response.RetryAt.Location() != time.UTC || !response.RetryAt.After(now) {
+			return normalizedDeliveryOutcome{}, false
+		}
+		return normalizedDeliveryOutcome{
+			disposition: DeliveryBackpressured, retryAt: response.RetryAt,
+		}, true
+	case OwnedTransportDeferred:
+		if response.DeferralReason != OwnedTransportPrerequisiteDeferred ||
+			response.RetryAt.Location() != time.UTC || !response.RetryAt.After(now) {
+			return normalizedDeliveryOutcome{}, false
+		}
+		return normalizedDeliveryOutcome{
+			disposition: DeliveryDeferred, retryAt: response.RetryAt,
+			deferralReason: response.DeferralReason,
+		}, true
+	case OwnedTransportSuperseded:
+		return normalizedDeliveryOutcome{disposition: DeliverySuperseded, terminal: true}, true
+	case OwnedTransportPoisoned, OwnedTransportUnsupportedVersion, OwnedTransportUnauthorized:
+		return normalizedDeliveryOutcome{disposition: DeliveryPoisoned, terminal: true}, true
+	case OwnedTransportIntegrityConflict:
+		return normalizedDeliveryOutcome{disposition: DeliveryIntegrityConflict, terminal: true}, true
+	default:
+		return normalizedDeliveryOutcome{}, false
+	}
+}
+
+func applyNormalizedDeliveryOutcome(
+	state *memoryDeliveryState,
+	outcome normalizedDeliveryOutcome,
+) {
+	state.Disposition = outcome.disposition
+	state.ResultDigest = outcome.resultDigest
+	state.Terminal = outcome.terminal
+	state.RetryAt = outcome.retryAt
+	state.DeferralReason = outcome.deferralReason
 }
 
 type dispatcher struct {
@@ -619,6 +732,10 @@ func (value *dispatcher) Claim(
 
 	value.persistence.mu.Lock()
 	defer value.persistence.mu.Unlock()
+	previousDeliveries := make(map[OperationID]memoryDeliveryState, len(value.persistence.deliveries))
+	for operationID, state := range value.persistence.deliveries {
+		previousDeliveries[operationID] = state
+	}
 	operationIDs := make([]OperationID, 0, len(value.persistence.outbox))
 	for operationID := range value.persistence.outbox {
 		operationIDs = append(operationIDs, operationID)
@@ -635,12 +752,24 @@ func (value *dispatcher) Claim(
 	for _, operationID := range operationIDs {
 		state := value.persistence.deliveries[operationID]
 		record := value.persistence.outbox[operationID]
-		task, taskExists := value.persistence.tasks[record.TaskID]
-		if taskExists && record.SafetyEpoch < effectiveSafetyEpoch(task, value.persistence.recovery) {
+		if deliveryCanBeSuperseded(state) &&
+			authoritativeOutboxRecordSuperseded(record, value.persistence.outbox) {
 			state.Disposition = DeliverySuperseded
 			state.Terminal = true
 			state.Authority = authorityValue{}
 			state.LeaseExpiresAt = time.Time{}
+			state.SendStarted = false
+			value.persistence.deliveries[operationID] = state
+			continue
+		}
+		task, taskExists := value.persistence.tasks[record.TaskID]
+		if deliveryCanBeSuperseded(state) && taskExists &&
+			record.SafetyEpoch < effectiveSafetyEpoch(task, value.persistence.recovery) {
+			state.Disposition = DeliverySuperseded
+			state.Terminal = true
+			state.Authority = authorityValue{}
+			state.LeaseExpiresAt = time.Time{}
+			state.SendStarted = false
 			value.persistence.deliveries[operationID] = state
 			continue
 		}
@@ -649,14 +778,24 @@ func (value *dispatcher) Claim(
 			state.LeaseFence != 0 && state.LeaseExpiresAt.After(now) {
 			continue
 		}
+		if state.Disposition == DeliveryClaimed && state.SendStarted {
+			state.Disposition = DeliveryReconciliationRequired
+			state.Authority = authorityValue{}
+			state.LeaseExpiresAt = time.Time{}
+			state.SendStarted = false
+			value.persistence.deliveries[operationID] = state
+			continue
+		}
 		state.Authority = request.Authority.value
 		state.LeaseFence++
 		state.LeaseExpiresAt = now.Add(value.config.LeaseDuration)
 		state.Disposition = DeliveryClaimed
+		state.SendStarted = false
 		state.RetryAt = time.Time{}
 		state.DeferralReason = 0
 		value.persistence.deliveries[operationID] = state
 		transportRequest := value.transportRequest(record, request.Authority)
+		transportRequest.Deadline = state.LeaseExpiresAt
 		batch.Claims = append(batch.Claims, DeliveryClaim{
 			OperationID: operationID, Request: transportRequest,
 			LeaseFence: state.LeaseFence, LeaseExpiresAt: state.LeaseExpiresAt,
@@ -664,6 +803,13 @@ func (value *dispatcher) Claim(
 		if uint32(len(batch.Claims)) == limit {
 			break
 		}
+	}
+	if value.failAt(DeliveryFaultBeforeClaimCommit) {
+		value.persistence.deliveries = previousDeliveries
+		return DeliveryClaimBatch{}, newDeliveryError(DeliveryUnavailable)
+	}
+	if value.failAt(DeliveryFaultAfterClaimCommit) {
+		return DeliveryClaimBatch{}, newDeliveryError(DeliveryUnavailable)
 	}
 	return batch, nil
 }
@@ -692,147 +838,102 @@ func (value *dispatcher) Deliver(
 		value.persistence.mu.Unlock()
 		return DeliveryResult{}, newDeliveryError(DeliveryClaimLost)
 	}
+	if state.SendStarted {
+		state.Disposition = DeliveryReconciliationRequired
+		state.Authority = authorityValue{}
+		state.LeaseExpiresAt = time.Time{}
+		state.SendStarted = false
+		value.persistence.deliveries[claim.OperationID] = state
+		value.persistence.mu.Unlock()
+		return deliveryResultFromState(claim.OperationID, state), nil
+	}
+	if deliveryCanBeSuperseded(state) &&
+		authoritativeOutboxRecordSuperseded(record, value.persistence.outbox) {
+		state.Disposition = DeliverySuperseded
+		state.Terminal = true
+		state.Authority = authorityValue{}
+		state.LeaseExpiresAt = time.Time{}
+		state.SendStarted = false
+		value.persistence.deliveries[claim.OperationID] = state
+		value.persistence.mu.Unlock()
+		return deliveryResultFromState(claim.OperationID, state), nil
+	}
+	if task, exists := value.persistence.tasks[record.TaskID]; deliveryCanBeSuperseded(state) && exists &&
+		record.SafetyEpoch < effectiveSafetyEpoch(task, value.persistence.recovery) {
+		state.Disposition = DeliverySuperseded
+		state.Terminal = true
+		state.Authority = authorityValue{}
+		state.LeaseExpiresAt = time.Time{}
+		state.SendStarted = false
+		value.persistence.deliveries[claim.OperationID] = state
+		value.persistence.mu.Unlock()
+		return deliveryResultFromState(claim.OperationID, state), nil
+	}
+	if value.failAt(DeliveryFaultBeforeSend) {
+		value.persistence.mu.Unlock()
+		return DeliveryResult{}, newDeliveryError(DeliveryUnavailable)
+	}
 	state.DeliveryCount++
+	state.SendStarted = true
 	value.persistence.deliveries[claim.OperationID] = state
 	request := value.transportRequest(record, authority)
+	request.Deadline = state.LeaseExpiresAt
 	value.persistence.mu.Unlock()
 
 	response, err := value.transport.Deliver(ctx, request)
+	if value.failAt(DeliveryFaultAfterSend) {
+		return DeliveryResult{}, newDeliveryError(DeliveryUnavailable)
+	}
 	if err != nil {
 		return value.markReconciliationRequired(claim, authority)
 	}
 	if response.Version != request.Version || response.OperationID != request.OperationID {
 		return value.markReconciliationRequired(claim, authority)
 	}
-	if response.Outcome == OwnedTransportBackpressured {
-		return value.markBackpressured(claim, authority, response.RetryAt)
-	}
-	if response.Outcome == OwnedTransportDeferred {
-		return value.markDeferred(claim, authority, response.DeferralReason, response.RetryAt)
-	}
-	if response.Outcome == OwnedTransportSuperseded {
-		return value.markTerminalDisposition(claim, authority, DeliverySuperseded)
-	}
-	if response.Outcome == OwnedTransportPoisoned ||
-		response.Outcome == OwnedTransportUnsupportedVersion ||
-		response.Outcome == OwnedTransportUnauthorized {
-		return value.markTerminalDisposition(claim, authority, DeliveryPoisoned)
-	}
-	if response.Outcome == OwnedTransportIntegrityConflict {
-		return value.markTerminalDisposition(claim, authority, DeliveryIntegrityConflict)
-	}
-	if response.Outcome != OwnedTransportAccepted ||
-		response.ResultDigest == (DeliveryResultDigest{}) {
+	outcome, ok := normalizeDeliveryOutcome(response, value.config.Now().UTC(), deliveryOutcomeFromSend)
+	if !ok {
 		return value.markReconciliationRequired(claim, authority)
 	}
-
-	finishedAt := value.config.Now().UTC()
-	value.persistence.mu.Lock()
-	defer value.persistence.mu.Unlock()
-	state, exists = value.persistence.deliveries[claim.OperationID]
-	if !exists || state.Terminal || state.Authority != authority.value ||
-		state.LeaseFence != claim.LeaseFence || !state.LeaseExpiresAt.After(finishedAt) {
-		return DeliveryResult{}, newDeliveryError(DeliveryClaimLost)
-	}
-	state.Disposition = DeliveryAccepted
-	state.ResultDigest = response.ResultDigest
-	state.Terminal = true
-	state.Authority = authorityValue{}
-	state.LeaseExpiresAt = time.Time{}
-	value.persistence.deliveries[claim.OperationID] = state
-	return DeliveryResult{
-		OperationID: claim.OperationID, Disposition: state.Disposition,
-		ResultDigest: state.ResultDigest, DeliveryCount: state.DeliveryCount,
-	}, nil
-}
-
-func (value *dispatcher) markDeferred(
-	claim DeliveryClaim,
-	authority WorkerAuthority,
-	reason OwnedTransportDeferralReason,
-	retryAt time.Time,
-) (DeliveryResult, error) {
-	now := value.config.Now().UTC()
-	if reason != OwnedTransportPrerequisiteDeferred || retryAt.Location() != time.UTC ||
-		!retryAt.After(now) {
-		return value.markReconciliationRequired(claim, authority)
-	}
-	value.persistence.mu.Lock()
-	defer value.persistence.mu.Unlock()
-	state, exists := value.persistence.deliveries[claim.OperationID]
-	if !exists || state.Terminal || state.Authority != authority.value ||
-		state.LeaseFence != claim.LeaseFence {
-		return DeliveryResult{}, newDeliveryError(DeliveryClaimLost)
-	}
-	state.Disposition = DeliveryDeferred
-	state.DeferralReason = reason
-	state.RetryAt = retryAt
-	state.Authority = authorityValue{}
-	state.LeaseExpiresAt = time.Time{}
-	value.persistence.deliveries[claim.OperationID] = state
-	return deliveryResultFromState(claim.OperationID, state), nil
-}
-
-func (value *dispatcher) markTerminalDisposition(
-	claim DeliveryClaim,
-	authority WorkerAuthority,
-	disposition DeliveryDisposition,
-) (DeliveryResult, error) {
-	value.persistence.mu.Lock()
-	defer value.persistence.mu.Unlock()
-	state, exists := value.persistence.deliveries[claim.OperationID]
-	if !exists || state.Terminal || state.Authority != authority.value ||
-		state.LeaseFence != claim.LeaseFence {
-		return DeliveryResult{}, newDeliveryError(DeliveryClaimLost)
-	}
-	state.Disposition = disposition
-	state.Terminal = true
-	state.Authority = authorityValue{}
-	state.LeaseExpiresAt = time.Time{}
-	value.persistence.deliveries[claim.OperationID] = state
-	return deliveryResultFromState(claim.OperationID, state), nil
-}
-
-func (value *dispatcher) markBackpressured(
-	claim DeliveryClaim,
-	authority WorkerAuthority,
-	retryAt time.Time,
-) (DeliveryResult, error) {
-	now := value.config.Now().UTC()
-	if retryAt.Location() != time.UTC || !retryAt.After(now) {
-		return value.markReconciliationRequired(claim, authority)
-	}
-	value.persistence.mu.Lock()
-	defer value.persistence.mu.Unlock()
-	state, exists := value.persistence.deliveries[claim.OperationID]
-	if !exists || state.Terminal || state.Authority != authority.value ||
-		state.LeaseFence != claim.LeaseFence {
-		return DeliveryResult{}, newDeliveryError(DeliveryClaimLost)
-	}
-	state.Disposition = DeliveryBackpressured
-	state.DeferralReason = 0
-	state.RetryAt = retryAt
-	state.Authority = authorityValue{}
-	state.LeaseExpiresAt = time.Time{}
-	value.persistence.deliveries[claim.OperationID] = state
-	return deliveryResultFromState(claim.OperationID, state), nil
+	return value.finishClaim(claim, authority, func(state *memoryDeliveryState) {
+		applyNormalizedDeliveryOutcome(state, outcome)
+	}, outcome.disposition == DeliveryAccepted)
 }
 
 func (value *dispatcher) markReconciliationRequired(
 	claim DeliveryClaim,
 	authority WorkerAuthority,
 ) (DeliveryResult, error) {
+	return value.finishClaim(claim, authority, func(state *memoryDeliveryState) {
+		state.Disposition = DeliveryReconciliationRequired
+	}, false)
+}
+
+func (value *dispatcher) finishClaim(
+	claim DeliveryClaim,
+	authority WorkerAuthority,
+	apply func(*memoryDeliveryState),
+	requireLiveLease bool,
+) (DeliveryResult, error) {
+	now := value.config.Now().UTC()
 	value.persistence.mu.Lock()
 	defer value.persistence.mu.Unlock()
 	state, exists := value.persistence.deliveries[claim.OperationID]
 	if !exists || state.Terminal || state.Authority != authority.value ||
-		state.LeaseFence != claim.LeaseFence {
+		state.LeaseFence != claim.LeaseFence ||
+		requireLiveLease && !state.LeaseExpiresAt.After(now) {
 		return DeliveryResult{}, newDeliveryError(DeliveryClaimLost)
 	}
-	state.Disposition = DeliveryReconciliationRequired
+	apply(&state)
 	state.Authority = authorityValue{}
 	state.LeaseExpiresAt = time.Time{}
+	state.SendStarted = false
+	if value.failAt(DeliveryFaultBeforeDispositionCommit) {
+		return DeliveryResult{}, newDeliveryError(DeliveryUnavailable)
+	}
 	value.persistence.deliveries[claim.OperationID] = state
+	if value.failAt(DeliveryFaultAfterDispositionCommit) {
+		return DeliveryResult{}, newDeliveryError(DeliveryUnavailable)
+	}
 	return deliveryResultFromState(claim.OperationID, state), nil
 }
 
@@ -903,42 +1004,13 @@ func (value *dispatcher) Reconcile(
 	if response.Version != value.config.TransportVersion || response.OperationID != request.OperationID {
 		return deliveryResultFromState(request.OperationID, state), nil
 	}
-	switch response.Outcome {
-	case OwnedTransportAccepted:
-		if response.ResultDigest == (DeliveryResultDigest{}) {
-			return deliveryResultFromState(request.OperationID, state), nil
-		}
-		state.Disposition = DeliveryAccepted
-		state.ResultDigest = response.ResultDigest
-		state.Terminal = true
-	case OwnedTransportUnknown:
-		state.Disposition = DeliveryPending
-	case OwnedTransportSuperseded:
-		state.Disposition = DeliverySuperseded
-		state.Terminal = true
-	case OwnedTransportIntegrityConflict:
-		state.Disposition = DeliveryIntegrityConflict
-		state.Terminal = true
-	case OwnedTransportPoisoned, OwnedTransportUnsupportedVersion, OwnedTransportUnauthorized:
-		state.Disposition = DeliveryPoisoned
-		state.Terminal = true
-	case OwnedTransportBackpressured:
-		if response.RetryAt.Location() != time.UTC || !response.RetryAt.After(value.config.Now().UTC()) {
-			return deliveryResultFromState(request.OperationID, state), nil
-		}
-		state.Disposition = DeliveryBackpressured
-		state.RetryAt = response.RetryAt
-	case OwnedTransportDeferred:
-		if response.DeferralReason != OwnedTransportPrerequisiteDeferred ||
-			response.RetryAt.Location() != time.UTC || !response.RetryAt.After(value.config.Now().UTC()) {
-			return deliveryResultFromState(request.OperationID, state), nil
-		}
-		state.Disposition = DeliveryDeferred
-		state.DeferralReason = response.DeferralReason
-		state.RetryAt = response.RetryAt
-	default:
+	outcome, ok := normalizeDeliveryOutcome(
+		response, value.config.Now().UTC(), deliveryOutcomeFromInspection,
+	)
+	if !ok {
 		return deliveryResultFromState(request.OperationID, state), nil
 	}
+	applyNormalizedDeliveryOutcome(&state, outcome)
 	value.persistence.deliveries[request.OperationID] = state
 	return deliveryResultFromState(request.OperationID, state), nil
 }
@@ -976,9 +1048,11 @@ func (value *dispatcher) Heartbeat(
 	}
 	state.LeaseExpiresAt = now.Add(value.config.LeaseDuration)
 	value.persistence.deliveries[request.OperationID] = state
+	transportRequest := value.transportRequest(record, request.Authority)
+	transportRequest.Deadline = state.LeaseExpiresAt
 	return DeliveryClaim{
 		OperationID:    request.OperationID,
-		Request:        value.transportRequest(record, request.Authority),
+		Request:        transportRequest,
 		LeaseFence:     state.LeaseFence,
 		LeaseExpiresAt: state.LeaseExpiresAt,
 	}, nil
@@ -994,6 +1068,10 @@ func (value *dispatcher) authorized(authority WorkerAuthority) bool {
 		}
 	}
 	return false
+}
+
+func (value *dispatcher) failAt(point DeliveryFaultPoint) bool {
+	return value.config.Faults != nil && value.config.Faults.FailAt(point)
 }
 
 func (value *dispatcher) transportRequest(
@@ -1019,6 +1097,35 @@ func cloneEvidenceIDs(values []EvidenceID) []EvidenceID {
 	cloned := make([]EvidenceID, len(values))
 	copy(cloned, values)
 	return cloned
+}
+
+func authoritativeOutboxRecordSuperseded(
+	record authoritativeOutboxRecord,
+	outbox map[OperationID]authoritativeOutboxRecord,
+) bool {
+	recordScope, recordOrder := authoritativeOutboxRecordPosition(record)
+	for operationID, candidate := range outbox {
+		if operationID == record.OperationID {
+			continue
+		}
+		candidateScope, candidateOrder := authoritativeOutboxRecordPosition(candidate)
+		if candidateScope == recordScope && recordOrder.before(candidateOrder) {
+			return true
+		}
+	}
+	return false
+}
+
+func authoritativeOutboxRecordPosition(
+	record authoritativeOutboxRecord,
+) (ownedTransportScope, ownedTransportOrder) {
+	fenceKind, fence := postgresFenceValue(record.Fence)
+	return ownedTransportScope{
+			taskID: record.TaskID, fenceKind: fenceKind,
+			phaseRunID: record.PhaseRunID, runtimeRunID: record.RuntimeRunID,
+		}, ownedTransportOrder{
+			activityGeneration: record.ActivityGeneration, fence: fence,
+		}
 }
 
 func validDeliveryAuthority(authority WorkerAuthority) bool {

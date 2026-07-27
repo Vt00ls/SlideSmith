@@ -45,17 +45,23 @@ func TestDispatcherClaimsOnlyCommittedOutboxRecordsWithinItsBatchBound(t *testin
 	if err != nil {
 		t.Fatalf("commit authoritative outbox record: %v", err)
 	}
-	cancelHeader := intentHeader(t, "delivery-cancel", "delivery-task", now.Add(2*time.Second))
-	cancelHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
-	cancel, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewCancelTaskByUserIntent(
-		cancelHeader, owner, taskorchestration.CancelReasonUserRequested,
+	secondStart, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		intentHeader(t, "delivery-second-start", "delivery-second-task", now.Add(2*time.Second)), owner, pinned,
 	))
-	if err != nil || len(cancel.EnactmentRefs) != 1 {
-		t.Fatalf("commit second authoritative outbox record: count=%d err=%v", len(cancel.EnactmentRefs), err)
+	if err != nil {
+		t.Fatalf("start second pinned Task: %v", err)
+	}
+	secondWorkHeader := intentHeader(t, "delivery-second-work", "delivery-second-task", now.Add(3*time.Second))
+	secondWorkHeader.ExpectedTaskRevision = secondStart.AcceptedTaskRevision
+	secondWork, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		secondWorkHeader, worker, operationID(t, "delivery-second-work-available"),
+	))
+	if err != nil || len(secondWork.EnactmentRefs) != 1 {
+		t.Fatalf("commit second authoritative outbox record: count=%d err=%v", len(secondWork.EnactmentRefs), err)
 	}
 
 	dispatcher, err := harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
-		Now:              func() time.Time { return now.Add(3 * time.Second) },
+		Now:              func() time.Time { return now.Add(4 * time.Second) },
 		MaxBatchSize:     1,
 		LeaseDuration:    time.Minute,
 		TransportVersion: taskorchestration.OwnedTransportV1,
@@ -126,8 +132,11 @@ func TestDispatcherHeartbeatExtendsLeaseAndExpiryRecoversTheOriginalOperation(t 
 		t.Fatalf("commit lease outbox record: %v", err)
 	}
 	transport, err := taskorchestration.NewDeterministicOwnedTransport(taskorchestration.OwnedTransportConfig{
-		SupportedVersion: taskorchestration.OwnedTransportV1,
-		Authorities:      []taskorchestration.WorkerAuthority{workerA, workerB},
+		SupportedVersion:       taskorchestration.OwnedTransportV1,
+		Authorities:            []taskorchestration.WorkerAuthority{workerA, workerB},
+		Now:                    func() time.Time { return now },
+		PrerequisiteRetryDelay: time.Minute,
+		PrerequisitesSatisfied: acceptOwnedTransportPrerequisites,
 	})
 	if err != nil {
 		t.Fatalf("create lease transport: %v", err)
@@ -184,6 +193,117 @@ func TestDispatcherHeartbeatExtendsLeaseAndExpiryRecoversTheOriginalOperation(t 
 	if err != nil || delivered.Disposition != taskorchestration.DeliveryAccepted ||
 		delivered.OperationID != work.EnactmentRefs[0].OperationID {
 		t.Fatalf("deliver recovered claim: result=%+v err=%v", delivered, err)
+	}
+}
+
+func TestInMemoryClaimResponseLossRecoversOriginalOperationAfterLeaseExpiry(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 16, 15, 0, 0, time.UTC)
+	current := now.Add(2 * time.Second)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+	if err != nil {
+		t.Fatalf("create deterministic harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "memory-claim-loss-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "memory-claim-loss-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "memory-claim-loss-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		intentHeader(t, "memory-claim-loss-start", "memory-claim-loss-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start claim-loss Task: %v", err)
+	}
+	workHeader := intentHeader(t, "memory-claim-loss-work", "memory-claim-loss-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	work, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "memory-claim-loss-work-available"),
+	))
+	if err != nil {
+		t.Fatalf("commit claim-loss outbox: %v", err)
+	}
+	faults := &taskorchestration.DeliveryFaultController{}
+	dispatcher, err := harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return current }, MaxBatchSize: 1, LeaseDuration: time.Minute,
+		TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities:      []taskorchestration.WorkerAuthority{worker}, Faults: faults,
+	}, unusedOwnedTransport{})
+	if err != nil {
+		t.Fatalf("create fault-injected dispatcher: %v", err)
+	}
+	if err := faults.FailNextAt(taskorchestration.DeliveryFaultAfterClaimCommit); err != nil {
+		t.Fatalf("inject post-claim crash: %v", err)
+	}
+	_, err = dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: worker, Limit: 1,
+	})
+	var deliveryError *taskorchestration.DeliveryError
+	if !errors.As(err, &deliveryError) || deliveryError.Code() != taskorchestration.DeliveryUnavailable {
+		t.Fatalf("post-claim crash = %T, want safe unavailable error", err)
+	}
+	current = current.Add(time.Minute + time.Nanosecond)
+	restartedDispatcher, err := harness.Restart().NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return current }, MaxBatchSize: 1, LeaseDuration: time.Minute,
+		TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities:      []taskorchestration.WorkerAuthority{worker},
+	}, unusedOwnedTransport{})
+	if err != nil {
+		t.Fatalf("restart claim-loss dispatcher: %v", err)
+	}
+	recovered, err := restartedDispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: worker, Limit: 1,
+	})
+	if err != nil || len(recovered.Claims) != 1 {
+		t.Fatalf("recover lost claim: count=%d err=%v", len(recovered.Claims), err)
+	}
+	if recovered.Claims[0].OperationID != work.EnactmentRefs[0].OperationID ||
+		recovered.Claims[0].LeaseFence <= 1 {
+		t.Fatal("claim-loss recovery changed the OperationID or reused the stale lease fence")
+	}
+}
+
+func TestInMemoryCrashBeforeClaimCommitLeavesOperationImmediatelyClaimable(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 16, 17, 0, 0, time.UTC)
+	fixture := newInMemoryDeliveryFixture(t, "memory-before-claim", now)
+	faults := &taskorchestration.DeliveryFaultController{}
+	dispatcher, err := fixture.harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return now.Add(2 * time.Second) }, MaxBatchSize: 1,
+		LeaseDuration: time.Minute, TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities: []taskorchestration.WorkerAuthority{fixture.worker}, Faults: faults,
+	}, fixture.transport)
+	if err != nil {
+		t.Fatalf("create before-claim dispatcher: %v", err)
+	}
+	if err := faults.FailNextAt(taskorchestration.DeliveryFaultBeforeClaimCommit); err != nil {
+		t.Fatalf("inject pre-claim crash: %v", err)
+	}
+	_, err = dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: fixture.worker, Limit: 1,
+	})
+	var deliveryError *taskorchestration.DeliveryError
+	if !errors.As(err, &deliveryError) || deliveryError.Code() != taskorchestration.DeliveryUnavailable {
+		t.Fatalf("pre-claim crash = %T, want safe unavailable error", err)
+	}
+	restarted, err := fixture.harness.Restart().NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return now.Add(2 * time.Second) }, MaxBatchSize: 1,
+		LeaseDuration: time.Minute, TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities: []taskorchestration.WorkerAuthority{fixture.worker},
+	}, fixture.transport.Restart())
+	if err != nil {
+		t.Fatalf("restart before-claim dispatcher: %v", err)
+	}
+	claimed, err := restarted.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: fixture.worker, Limit: 1,
+	})
+	if err != nil || len(claimed.Claims) != 1 || claimed.Claims[0].OperationID != fixture.operationID ||
+		claimed.Claims[0].LeaseFence != 1 {
+		t.Fatalf("claim after rolled-back claim commit: batch=%+v err=%v", claimed, err)
 	}
 }
 
@@ -289,6 +409,9 @@ func TestOwnedTransportReplaysExactDuplicateAndRejectsOperationRebinding(t *test
 	worker := taskorchestration.NewWorkerAuthority(
 		authorityID(t, "transport-worker"), taskorchestration.AuthorizationGeneration(1),
 	)
+	workerB := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "transport-worker-b"), taskorchestration.AuthorizationGeneration(2),
+	)
 	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
 		Key: phaseKey(t, "transport-phase"), Kind: taskorchestration.PhaseNonMutating,
 		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
@@ -323,8 +446,11 @@ func TestOwnedTransportReplaysExactDuplicateAndRejectsOperationRebinding(t *test
 	}
 	request := batch.Claims[0].Request
 	transport, err := taskorchestration.NewDeterministicOwnedTransport(taskorchestration.OwnedTransportConfig{
-		SupportedVersion: taskorchestration.OwnedTransportV1,
-		Authorities:      []taskorchestration.WorkerAuthority{worker},
+		SupportedVersion:       taskorchestration.OwnedTransportV1,
+		Authorities:            []taskorchestration.WorkerAuthority{worker, workerB},
+		Now:                    func() time.Time { return now },
+		PrerequisiteRetryDelay: time.Minute,
+		PrerequisitesSatisfied: acceptOwnedTransportPrerequisites,
 	})
 	if err != nil {
 		t.Fatalf("create deterministic owned transport: %v", err)
@@ -341,6 +467,17 @@ func TestOwnedTransportReplaysExactDuplicateAndRejectsOperationRebinding(t *test
 	if duplicate.Outcome != first.Outcome || duplicate.ResultDigest != first.ResultDigest ||
 		!duplicate.Duplicate {
 		t.Fatalf("exact duplicate did not return original acceptance: %+v", duplicate)
+	}
+	crossWorkerRequest := request
+	crossWorkerRequest.Authority = workerB
+	crossWorkerRequest.Deadline = now.Add(-time.Second)
+	crossWorkerDuplicate, err := transport.Deliver(context.Background(), crossWorkerRequest)
+	if err != nil {
+		t.Fatalf("deliver exact duplicate under a new worker claim: %v", err)
+	}
+	if crossWorkerDuplicate.Outcome != first.Outcome ||
+		crossWorkerDuplicate.ResultDigest != first.ResultDigest || !crossWorkerDuplicate.Duplicate {
+		t.Fatalf("cross-worker duplicate did not return original acceptance: %+v", crossWorkerDuplicate)
 	}
 	rebound := request
 	rebound.PayloadDigest = enactmentPayloadDigest(t, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -360,6 +497,100 @@ func TestOwnedTransportReplaysExactDuplicateAndRejectsOperationRebinding(t *test
 	}
 	if inspected.Outcome != first.Outcome || inspected.ResultDigest != first.ResultDigest {
 		t.Fatal("integrity conflict overwrote the original transport acceptance")
+	}
+}
+
+func TestOwnedTransportDefersRevisionGapUntilItsPrerequisiteArrives(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 16, 35, 0, 0, time.UTC)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+	if err != nil {
+		t.Fatalf("create deterministic harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "prerequisite-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "prerequisite-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "prerequisite-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		intentHeader(t, "prerequisite-start", "prerequisite-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start prerequisite Task: %v", err)
+	}
+	workHeader := intentHeader(t, "prerequisite-work", "prerequisite-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "prerequisite-work-available"),
+	)); err != nil {
+		t.Fatalf("commit prerequisite outbox record: %v", err)
+	}
+	dispatcher, err := harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return now.Add(2 * time.Second) }, MaxBatchSize: 1,
+		LeaseDuration: time.Minute, TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities: []taskorchestration.WorkerAuthority{worker},
+	}, unusedOwnedTransport{})
+	if err != nil {
+		t.Fatalf("create prerequisite envelope source: %v", err)
+	}
+	batch, err := dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: worker, Limit: 1,
+	})
+	if err != nil || len(batch.Claims) != 1 {
+		t.Fatalf("claim prerequisite envelope: count=%d err=%v", len(batch.Claims), err)
+	}
+	base := batch.Claims[0].Request
+	availableRevision := base.Prerequisites.TaskRevision
+	transport, err := taskorchestration.NewDeterministicOwnedTransport(taskorchestration.OwnedTransportConfig{
+		SupportedVersion:       taskorchestration.OwnedTransportV1,
+		Authorities:            []taskorchestration.WorkerAuthority{worker},
+		Now:                    func() time.Time { return now },
+		PrerequisiteRetryDelay: time.Minute,
+		PrerequisitesSatisfied: func(
+			_ context.Context,
+			task taskorchestration.TaskID,
+			prerequisites taskorchestration.DeliveryPrerequisites,
+		) bool {
+			return task == base.TaskID && prerequisites.TaskRevision <= availableRevision
+		},
+	})
+	if err != nil {
+		t.Fatalf("create prerequisite transport: %v", err)
+	}
+	if accepted, err := transport.Deliver(context.Background(), base); err != nil ||
+		accepted.Outcome != taskorchestration.OwnedTransportAccepted {
+		t.Fatalf("accept base prerequisite: response=%+v err=%v", accepted, err)
+	}
+
+	afterGap := base
+	afterGap.OperationID = operationID(t, "prerequisite-after-gap")
+	afterGap.PayloadDigest = enactmentPayloadDigest(t, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+	afterGap.Prerequisites.TaskRevision = base.Prerequisites.TaskRevision + 5
+	deferred, err := transport.Deliver(context.Background(), afterGap)
+	if err != nil {
+		t.Fatalf("defer out-of-order prerequisite: %v", err)
+	}
+	if deferred.Outcome != taskorchestration.OwnedTransportDeferred ||
+		deferred.DeferralReason != taskorchestration.OwnedTransportPrerequisiteDeferred ||
+		deferred.RetryAt.IsZero() {
+		t.Fatalf("revision-gap delivery = %+v, want typed prerequisite deferral", deferred)
+	}
+
+	availableRevision = afterGap.Prerequisites.TaskRevision
+	afterPrerequisite, err := transport.Deliver(context.Background(), afterGap)
+	if err != nil || afterPrerequisite.Outcome != taskorchestration.OwnedTransportAccepted ||
+		afterPrerequisite.ResultDigest == (taskorchestration.DeliveryResultDigest{}) {
+		t.Fatalf("accept original operation after prerequisite: response=%+v err=%v", afterPrerequisite, err)
+	}
+	exactReplay, err := transport.Deliver(context.Background(), afterGap)
+	if err != nil || exactReplay.Outcome != afterPrerequisite.Outcome ||
+		exactReplay.ResultDigest != afterPrerequisite.ResultDigest || !exactReplay.Duplicate {
+		t.Fatalf("replay accepted operation after prerequisite: response=%+v err=%v", exactReplay, err)
 	}
 }
 
@@ -402,8 +633,11 @@ func TestDispatcherReconcilesAcceptanceAfterAcknowledgementLoss(t *testing.T) {
 		t.Fatalf("query before ambiguous delivery: %v", err)
 	}
 	owned, err := taskorchestration.NewDeterministicOwnedTransport(taskorchestration.OwnedTransportConfig{
-		SupportedVersion: taskorchestration.OwnedTransportV1,
-		Authorities:      []taskorchestration.WorkerAuthority{worker},
+		SupportedVersion:       taskorchestration.OwnedTransportV1,
+		Authorities:            []taskorchestration.WorkerAuthority{worker},
+		Now:                    func() time.Time { return now },
+		PrerequisiteRetryDelay: time.Minute,
+		PrerequisitesSatisfied: acceptOwnedTransportPrerequisites,
 	})
 	if err != nil {
 		t.Fatalf("create owned transport: %v", err)
@@ -598,14 +832,17 @@ func TestOutOfOrderCancellationFenceSupersedesStalePendingEnactment(t *testing.T
 		t.Fatalf("query accepted cancellation history: %v", err)
 	}
 	transport, err := taskorchestration.NewDeterministicOwnedTransport(taskorchestration.OwnedTransportConfig{
-		SupportedVersion: taskorchestration.OwnedTransportV1,
-		Authorities:      []taskorchestration.WorkerAuthority{worker},
+		SupportedVersion:       taskorchestration.OwnedTransportV1,
+		Authorities:            []taskorchestration.WorkerAuthority{worker},
+		Now:                    func() time.Time { return now },
+		PrerequisiteRetryDelay: time.Minute,
+		PrerequisitesSatisfied: acceptOwnedTransportPrerequisites,
 	})
 	if err != nil {
 		t.Fatalf("create supersession transport: %v", err)
 	}
 	dispatcher, err := harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
-		Now: func() time.Time { return now.Add(3 * time.Second) }, MaxBatchSize: 2,
+		Now: func() time.Time { return now.Add(3 * time.Second) }, MaxBatchSize: 1,
 		LeaseDuration: time.Minute, TransportVersion: taskorchestration.OwnedTransportV1,
 		Authorities: []taskorchestration.WorkerAuthority{worker},
 	}, transport)
@@ -615,31 +852,22 @@ func TestOutOfOrderCancellationFenceSupersedesStalePendingEnactment(t *testing.T
 	batch, err := dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
 		Authority: worker, Limit: 2,
 	})
-	if err != nil || len(batch.Claims) != 2 {
-		t.Fatalf("claim pending and cancellation enactments: count=%d err=%v", len(batch.Claims), err)
+	if err != nil || len(batch.Claims) != 1 {
+		t.Fatalf("claim cancellation enactment: count=%d err=%v", len(batch.Claims), err)
 	}
-	claims := make(map[taskorchestration.OperationID]taskorchestration.DeliveryClaim, len(batch.Claims))
-	for _, claim := range batch.Claims {
-		claims[claim.OperationID] = claim
-	}
-	newer, err := dispatcher.Deliver(context.Background(), claims[cancel.EnactmentRefs[0].OperationID])
-	if err != nil || newer.Disposition != taskorchestration.DeliveryAccepted {
-		t.Fatalf("deliver cancellation fence first: result=%+v err=%v", newer, err)
-	}
-	stale, err := dispatcher.Deliver(context.Background(), claims[work.EnactmentRefs[0].OperationID])
-	if err != nil {
-		t.Fatalf("deliver stale pending enactment: %v", err)
-	}
-	if stale.OperationID != work.EnactmentRefs[0].OperationID ||
-		stale.Disposition != taskorchestration.DeliverySuperseded {
-		t.Fatalf("stale enactment disposition = %+v", stale)
+	if batch.Claims[0].OperationID != cancel.EnactmentRefs[0].OperationID {
+		t.Fatal("dispatcher claimed stale work before its committed cancellation fence")
 	}
 	staleView, err := dispatcher.Inspect(context.Background(), taskorchestration.DeliveryInspectionRequest{
-		Authority: worker, OperationID: stale.OperationID,
+		Authority: worker, OperationID: work.EnactmentRefs[0].OperationID,
 	})
 	if err != nil || !staleView.Terminal ||
 		staleView.Disposition != taskorchestration.DeliverySuperseded {
-		t.Fatalf("inspect superseded enactment: view=%+v err=%v", staleView, err)
+		t.Fatalf("inspect superseded enactment before remote I/O: view=%+v err=%v", staleView, err)
+	}
+	newer, err := dispatcher.Deliver(context.Background(), batch.Claims[0])
+	if err != nil || newer.Disposition != taskorchestration.DeliveryAccepted {
+		t.Fatalf("deliver cancellation fence first: result=%+v err=%v", newer, err)
 	}
 	afterDelivery, err := harness.Queries.Query(context.Background(), query)
 	if err != nil {
@@ -650,6 +878,115 @@ func TestOutOfOrderCancellationFenceSupersedesStalePendingEnactment(t *testing.T
 		acceptedHistory.CancellationState != afterDelivery.CancellationState ||
 		acceptedHistory.PhaseRuns[0].Outcome != afterDelivery.PhaseRuns[0].Outcome {
 		t.Fatal("stale delivery rewrote accepted cancellation or Phase history")
+	}
+}
+
+func TestCancellationCommittedAfterClaimSupersedesBeforeRemoteIO(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 17, 5, 0, 0, time.UTC)
+	fixture := newInMemoryDeliveryFixture(t, "claimed-before-cancel", now)
+	transport := &countingOwnedTransport{}
+	dispatcher, err := fixture.harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return now.Add(2 * time.Second) }, MaxBatchSize: 1,
+		LeaseDuration: time.Minute, TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities: []taskorchestration.WorkerAuthority{fixture.worker},
+	}, transport)
+	if err != nil {
+		t.Fatalf("create claimed-before-cancel dispatcher: %v", err)
+	}
+	batch, err := dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: fixture.worker, Limit: 1,
+	})
+	if err != nil || len(batch.Claims) != 1 || batch.Claims[0].OperationID != fixture.operationID {
+		t.Fatalf("claim work before cancellation: batch=%+v err=%v", batch, err)
+	}
+	cancelHeader := intentHeader(t, "claimed-before-cancel-request", fixture.taskID.String(), now.Add(3*time.Second))
+	cancelHeader.ExpectedTaskRevision = fixture.taskRevision
+	if _, err := fixture.harness.Mutations.Decide(context.Background(), taskorchestration.NewCancelTaskByUserIntent(
+		cancelHeader, fixture.owner, taskorchestration.CancelReasonUserRequested,
+	)); err != nil {
+		t.Fatalf("commit cancellation after claim: %v", err)
+	}
+	stale, err := dispatcher.Deliver(context.Background(), batch.Claims[0])
+	if err != nil || stale.OperationID != fixture.operationID ||
+		stale.Disposition != taskorchestration.DeliverySuperseded {
+		t.Fatalf("deliver stale claimed work: result=%+v err=%v", stale, err)
+	}
+	if transport.deliveries() != 0 {
+		t.Fatal("stale claimed work performed remote I/O after cancellation committed")
+	}
+}
+
+func TestRecoveryFenceCommittedAfterClaimSupersedesBeforeRemoteIO(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 17, 7, 0, 0, time.UTC)
+	recoveryAuthority := taskorchestration.NewRecoveryAuthority(
+		authorityID(t, "claimed-before-recovery-authority"), taskorchestration.AuthorizationGeneration(1),
+	)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{
+		Now: now,
+		Recovery: taskorchestration.HarnessRecoveryFixture{
+			Authority: recoveryAuthority, Generation: 1, Fence: 1, SafetyEpoch: 1,
+			Mode: taskorchestration.OperationalFullReady,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create claimed-before-recovery harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "claimed-before-recovery-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "claimed-before-recovery-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "claimed-before-recovery-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		intentHeader(t, "claimed-before-recovery-start", "claimed-before-recovery-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start claimed-before-recovery Task: %v", err)
+	}
+	workHeader := intentHeader(t, "claimed-before-recovery-work", "claimed-before-recovery-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	work, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "claimed-before-recovery-work-available"),
+	))
+	if err != nil {
+		t.Fatalf("commit pre-recovery outbox record: %v", err)
+	}
+	transport := &countingOwnedTransport{}
+	dispatcher, err := harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return now.Add(2 * time.Second) }, MaxBatchSize: 1,
+		LeaseDuration: time.Minute, TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities: []taskorchestration.WorkerAuthority{worker},
+	}, transport)
+	if err != nil {
+		t.Fatalf("create claimed-before-recovery dispatcher: %v", err)
+	}
+	batch, err := dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: worker, Limit: 1,
+	})
+	if err != nil || len(batch.Claims) != 1 || batch.Claims[0].OperationID != work.EnactmentRefs[0].OperationID {
+		t.Fatalf("claim work before recovery fence: batch=%+v err=%v", batch, err)
+	}
+	fenceHeader := intentHeader(t, "claimed-before-recovery-fence", "claimed-before-recovery-task", now.Add(3*time.Second))
+	fenceHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
+	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewApplyOperationalFenceIntent(
+		fenceHeader, recoveryAuthority, taskorchestration.OperationalFenceBinding{
+			Generation: 2, Fence: 2, SafetyEpoch: 2, Mode: taskorchestration.OperationalReadOnly,
+		},
+	)); err != nil {
+		t.Fatalf("commit recovery fence after claim: %v", err)
+	}
+	stale, err := dispatcher.Deliver(context.Background(), batch.Claims[0])
+	if err != nil || stale.OperationID != work.EnactmentRefs[0].OperationID ||
+		stale.Disposition != taskorchestration.DeliverySuperseded {
+		t.Fatalf("deliver pre-recovery claim: result=%+v err=%v", stale, err)
+	}
+	if transport.deliveries() != 0 {
+		t.Fatal("pre-recovery claim performed remote I/O after recovery fence committed")
 	}
 }
 
@@ -955,12 +1292,16 @@ func TestOwnedTransportWireIsVersionedStrictAndSafe(t *testing.T) {
 		t.Fatalf("claim wire envelope: count=%d err=%v", len(batch.Claims), err)
 	}
 	request := batch.Claims[0].Request
+	if !request.Deadline.Equal(batch.Claims[0].LeaseExpiresAt) {
+		t.Fatal("owned transport deadline is not bound to the fenced delivery lease")
+	}
 	wire, err := taskorchestration.EncodeOwnedTransportRequest(request)
 	if err != nil {
 		t.Fatalf("encode owned transport request: %v", err)
 	}
 	if !bytes.Contains(wire, []byte(`"schema_version":"1.0"`)) ||
 		!bytes.Contains(wire, []byte(`"operation_id":"`+request.OperationID.String()+`"`)) ||
+		!bytes.Contains(wire, []byte(`"deadline":"`)) ||
 		bytes.Contains(wire, []byte("content")) || bytes.Contains(wire, []byte("path")) ||
 		bytes.Contains(wire, []byte("session")) || bytes.Contains(wire, []byte("credential")) {
 		t.Fatalf("unsafe or incomplete request wire: %s", wire)
@@ -983,8 +1324,11 @@ func TestOwnedTransportWireIsVersionedStrictAndSafe(t *testing.T) {
 		t.Fatal("wire error leaked the rejected credential field")
 	}
 	transport, err := taskorchestration.NewDeterministicOwnedTransport(taskorchestration.OwnedTransportConfig{
-		SupportedVersion: taskorchestration.OwnedTransportV1,
-		Authorities:      []taskorchestration.WorkerAuthority{worker},
+		SupportedVersion:       taskorchestration.OwnedTransportV1,
+		Authorities:            []taskorchestration.WorkerAuthority{worker},
+		Now:                    func() time.Time { return now },
+		PrerequisiteRetryDelay: time.Minute,
+		PrerequisitesSatisfied: acceptOwnedTransportPrerequisites,
 	})
 	if err != nil {
 		t.Fatalf("create version-negotiating transport: %v", err)
@@ -1043,8 +1387,11 @@ func TestDispatcherAndOwnedTransportRestartReconcileTheOriginalAcceptance(t *tes
 		t.Fatalf("commit restart outbox record: %v", err)
 	}
 	owned, err := taskorchestration.NewDeterministicOwnedTransport(taskorchestration.OwnedTransportConfig{
-		SupportedVersion: taskorchestration.OwnedTransportV1,
-		Authorities:      []taskorchestration.WorkerAuthority{worker},
+		SupportedVersion:       taskorchestration.OwnedTransportV1,
+		Authorities:            []taskorchestration.WorkerAuthority{worker},
+		Now:                    func() time.Time { return now },
+		PrerequisiteRetryDelay: time.Minute,
+		PrerequisitesSatisfied: acceptOwnedTransportPrerequisites,
 	})
 	if err != nil {
 		t.Fatalf("create restart transport: %v", err)
@@ -1089,6 +1436,345 @@ func TestDispatcherAndOwnedTransportRestartReconcileTheOriginalAcceptance(t *tes
 		reconciled.DeliveryCount != 1 ||
 		reconciled.ResultDigest == (taskorchestration.DeliveryResultDigest{}) {
 		t.Fatalf("restart reconciliation = %+v", reconciled)
+	}
+}
+
+func TestInMemoryCrashAfterSendThenCancellationStillRequiresInspection(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 18, 10, 0, 0, time.UTC)
+	current := now.Add(2 * time.Second)
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+	if err != nil {
+		t.Fatalf("create deterministic harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "memory-send-crash-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "memory-send-crash-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "memory-send-crash-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		intentHeader(t, "memory-send-crash-start", "memory-send-crash-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start send-crash Task: %v", err)
+	}
+	workHeader := intentHeader(t, "memory-send-crash-work", "memory-send-crash-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	work, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "memory-send-crash-work-available"),
+	))
+	if err != nil {
+		t.Fatalf("commit send-crash outbox: %v", err)
+	}
+	transport, err := taskorchestration.NewDeterministicOwnedTransport(taskorchestration.OwnedTransportConfig{
+		SupportedVersion:       taskorchestration.OwnedTransportV1,
+		Authorities:            []taskorchestration.WorkerAuthority{worker},
+		Now:                    func() time.Time { return current },
+		PrerequisiteRetryDelay: time.Minute,
+		PrerequisitesSatisfied: acceptOwnedTransportPrerequisites,
+	})
+	if err != nil {
+		t.Fatalf("create send-crash transport: %v", err)
+	}
+	faults := &taskorchestration.DeliveryFaultController{}
+	dispatcher, err := harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return current }, MaxBatchSize: 1, LeaseDuration: time.Minute,
+		TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities:      []taskorchestration.WorkerAuthority{worker}, Faults: faults,
+	}, transport)
+	if err != nil {
+		t.Fatalf("create send-crash dispatcher: %v", err)
+	}
+	batch, err := dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: worker, Limit: 1,
+	})
+	if err != nil || len(batch.Claims) != 1 {
+		t.Fatalf("claim send-crash delivery: count=%d err=%v", len(batch.Claims), err)
+	}
+	if err := faults.FailNextAt(taskorchestration.DeliveryFaultAfterSend); err != nil {
+		t.Fatalf("inject post-send crash: %v", err)
+	}
+	_, err = dispatcher.Deliver(context.Background(), batch.Claims[0])
+	var deliveryError *taskorchestration.DeliveryError
+	if !errors.As(err, &deliveryError) || deliveryError.Code() != taskorchestration.DeliveryUnavailable {
+		t.Fatalf("post-send crash = %T, want safe unavailable error", err)
+	}
+	cancelHeader := intentHeader(t, "memory-send-crash-cancel", "memory-send-crash-task", now.Add(3*time.Second))
+	cancelHeader.ExpectedTaskRevision = work.AcceptedTaskRevision
+	if _, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewCancelTaskByUserIntent(
+		cancelHeader, owner, taskorchestration.CancelReasonUserRequested,
+	)); err != nil {
+		t.Fatalf("commit cancellation after ambiguous send: %v", err)
+	}
+	continued, err := dispatcher.Deliver(context.Background(), batch.Claims[0])
+	if err != nil || continued.Disposition != taskorchestration.DeliveryReconciliationRequired ||
+		continued.DeliveryCount != 1 {
+		t.Fatalf("continue send-started claim after cancellation: result=%+v err=%v", continued, err)
+	}
+
+	current = current.Add(time.Minute + time.Nanosecond)
+	restartedDispatcher, err := harness.Restart().NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return current }, MaxBatchSize: 1, LeaseDuration: time.Minute,
+		TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities:      []taskorchestration.WorkerAuthority{worker},
+	}, transport.Restart())
+	if err != nil {
+		t.Fatalf("restart post-send dispatcher: %v", err)
+	}
+	retry, err := restartedDispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: worker, Limit: 1,
+	})
+	if err != nil {
+		t.Fatalf("claim after ambiguous send and cancellation: %v", err)
+	}
+	for _, claim := range retry.Claims {
+		if claim.OperationID == work.EnactmentRefs[0].OperationID {
+			t.Fatal("ambiguous operation was blindly redelivered after cancellation")
+		}
+	}
+	ambiguous, err := restartedDispatcher.Inspect(context.Background(), taskorchestration.DeliveryInspectionRequest{
+		Authority: worker, OperationID: work.EnactmentRefs[0].OperationID,
+	})
+	if err != nil || ambiguous.Disposition != taskorchestration.DeliveryReconciliationRequired ||
+		ambiguous.Terminal {
+		t.Fatalf("post-send crash inspection = %+v err=%v", ambiguous, err)
+	}
+	reconciled, err := restartedDispatcher.Reconcile(context.Background(), taskorchestration.DeliveryReconcileRequest{
+		Authority: worker, OperationID: work.EnactmentRefs[0].OperationID,
+	})
+	if err != nil || reconciled.Disposition != taskorchestration.DeliveryAccepted ||
+		reconciled.DeliveryCount != 1 {
+		t.Fatalf("reconcile post-send crash: result=%+v err=%v", reconciled, err)
+	}
+}
+
+func TestCancellationAfterReclaimSupersedesOperationWhenInspectionProvedUnknown(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 18, 12, 0, 0, time.UTC)
+	fixture := newInMemoryDeliveryFixture(t, "inspected-unknown-cancel", now)
+	dispatcher, err := fixture.harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return now.Add(2 * time.Second) }, MaxBatchSize: 1,
+		LeaseDuration: time.Minute, TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities: []taskorchestration.WorkerAuthority{fixture.worker},
+	}, fixedOutcomeTransport{response: taskorchestration.OwnedTransportResponse{
+		Version: taskorchestration.OwnedTransportV1,
+		Outcome: taskorchestration.OwnedTransportUnknown,
+	}})
+	if err != nil {
+		t.Fatalf("create inspected-unknown dispatcher: %v", err)
+	}
+	batch, err := dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: fixture.worker, Limit: 1,
+	})
+	if err != nil || len(batch.Claims) != 1 {
+		t.Fatalf("claim inspected-unknown operation: count=%d err=%v", len(batch.Claims), err)
+	}
+	ambiguous, err := dispatcher.Deliver(context.Background(), batch.Claims[0])
+	if err != nil || ambiguous.Disposition != taskorchestration.DeliveryReconciliationRequired {
+		t.Fatalf("record unknown send outcome: result=%+v err=%v", ambiguous, err)
+	}
+	unknown, err := dispatcher.Reconcile(context.Background(), taskorchestration.DeliveryReconcileRequest{
+		Authority: fixture.worker, OperationID: fixture.operationID,
+	})
+	if err != nil || unknown.Disposition != taskorchestration.DeliveryPending ||
+		unknown.DeliveryCount != 1 {
+		t.Fatalf("reconcile authoritative unknown outcome: result=%+v err=%v", unknown, err)
+	}
+	retry, err := dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: fixture.worker, Limit: 1,
+	})
+	if err != nil || len(retry.Claims) != 1 || retry.Claims[0].OperationID != fixture.operationID {
+		t.Fatalf("reclaim operation after authoritative unknown: batch=%+v err=%v", retry, err)
+	}
+	cancelHeader := intentHeader(t, "inspected-unknown-cancel-request", fixture.taskID.String(), now.Add(3*time.Second))
+	cancelHeader.ExpectedTaskRevision = fixture.taskRevision
+	if _, err := fixture.harness.Mutations.Decide(context.Background(), taskorchestration.NewCancelTaskByUserIntent(
+		cancelHeader, fixture.owner, taskorchestration.CancelReasonUserRequested,
+	)); err != nil {
+		t.Fatalf("commit cancellation after inspected-unknown reclaim: %v", err)
+	}
+	stale, err := dispatcher.Deliver(context.Background(), retry.Claims[0])
+	if err != nil || stale.OperationID != fixture.operationID ||
+		stale.Disposition != taskorchestration.DeliverySuperseded {
+		t.Fatalf("deliver reclaimed operation after cancellation: result=%+v err=%v", stale, err)
+	}
+	view, err := dispatcher.Inspect(context.Background(), taskorchestration.DeliveryInspectionRequest{
+		Authority: fixture.worker, OperationID: fixture.operationID,
+	})
+	if err != nil || !view.Terminal || view.Disposition != taskorchestration.DeliverySuperseded {
+		t.Fatalf("inspect superseded unknown operation: view=%+v err=%v", view, err)
+	}
+}
+
+func TestInMemoryDispositionResponseLossRetainsTerminalAcceptance(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 18, 15, 0, 0, time.UTC)
+	fixture := newInMemoryDeliveryFixture(t, "memory-disposition-loss", now)
+	faults := &taskorchestration.DeliveryFaultController{}
+	dispatcher, err := fixture.harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return now.Add(2 * time.Second) }, MaxBatchSize: 1,
+		LeaseDuration: time.Minute, TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities: []taskorchestration.WorkerAuthority{fixture.worker}, Faults: faults,
+	}, fixture.transport)
+	if err != nil {
+		t.Fatalf("create disposition-loss dispatcher: %v", err)
+	}
+	batch, err := dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: fixture.worker, Limit: 1,
+	})
+	if err != nil || len(batch.Claims) != 1 {
+		t.Fatalf("claim disposition-loss delivery: count=%d err=%v", len(batch.Claims), err)
+	}
+	if err := faults.FailNextAt(taskorchestration.DeliveryFaultAfterDispositionCommit); err != nil {
+		t.Fatalf("inject disposition response loss: %v", err)
+	}
+	_, err = dispatcher.Deliver(context.Background(), batch.Claims[0])
+	var deliveryError *taskorchestration.DeliveryError
+	if !errors.As(err, &deliveryError) || deliveryError.Code() != taskorchestration.DeliveryUnavailable {
+		t.Fatalf("disposition response loss = %T, want safe unavailable error", err)
+	}
+	restartedDispatcher, err := fixture.harness.Restart().NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return now.Add(time.Hour) }, MaxBatchSize: 1,
+		LeaseDuration: time.Minute, TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities: []taskorchestration.WorkerAuthority{fixture.worker},
+	}, fixture.transport.Restart())
+	if err != nil {
+		t.Fatalf("restart disposition-loss dispatcher: %v", err)
+	}
+	view, err := restartedDispatcher.Inspect(context.Background(), taskorchestration.DeliveryInspectionRequest{
+		Authority: fixture.worker, OperationID: fixture.operationID,
+	})
+	if err != nil || !view.Terminal || view.Disposition != taskorchestration.DeliveryAccepted ||
+		view.ResultDigest == (taskorchestration.DeliveryResultDigest{}) || view.DeliveryCount != 1 {
+		t.Fatalf("inspect committed disposition after response loss: view=%+v err=%v", view, err)
+	}
+	retry, err := restartedDispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: fixture.worker, Limit: 1,
+	})
+	if err != nil || len(retry.Claims) != 0 {
+		t.Fatalf("terminal disposition was redriven: count=%d err=%v", len(retry.Claims), err)
+	}
+}
+
+func TestInMemoryCrashBeforeDispositionCommitRequiresInspectionAfterRestart(t *testing.T) {
+	now := time.Date(2026, time.July, 27, 18, 17, 0, 0, time.UTC)
+	current := now.Add(2 * time.Second)
+	fixture := newInMemoryDeliveryFixture(t, "memory-before-disposition", now)
+	faults := &taskorchestration.DeliveryFaultController{}
+	dispatcher, err := fixture.harness.NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return current }, MaxBatchSize: 1, LeaseDuration: time.Minute,
+		TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities:      []taskorchestration.WorkerAuthority{fixture.worker}, Faults: faults,
+	}, fixture.transport)
+	if err != nil {
+		t.Fatalf("create before-disposition dispatcher: %v", err)
+	}
+	batch, err := dispatcher.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: fixture.worker, Limit: 1,
+	})
+	if err != nil || len(batch.Claims) != 1 {
+		t.Fatalf("claim before-disposition operation: count=%d err=%v", len(batch.Claims), err)
+	}
+	if err := faults.FailNextAt(taskorchestration.DeliveryFaultBeforeDispositionCommit); err != nil {
+		t.Fatalf("inject pre-disposition crash: %v", err)
+	}
+	_, err = dispatcher.Deliver(context.Background(), batch.Claims[0])
+	var deliveryError *taskorchestration.DeliveryError
+	if !errors.As(err, &deliveryError) || deliveryError.Code() != taskorchestration.DeliveryUnavailable {
+		t.Fatalf("pre-disposition crash = %T, want safe unavailable error", err)
+	}
+	current = current.Add(time.Minute + time.Nanosecond)
+	restarted, err := fixture.harness.Restart().NewOutboxDispatcher(taskorchestration.DispatcherConfig{
+		Now: func() time.Time { return current }, MaxBatchSize: 1, LeaseDuration: time.Minute,
+		TransportVersion: taskorchestration.OwnedTransportV1,
+		Authorities:      []taskorchestration.WorkerAuthority{fixture.worker},
+	}, fixture.transport.Restart())
+	if err != nil {
+		t.Fatalf("restart before-disposition dispatcher: %v", err)
+	}
+	retry, err := restarted.Claim(context.Background(), taskorchestration.DeliveryClaimRequest{
+		Authority: fixture.worker, Limit: 1,
+	})
+	if err != nil || len(retry.Claims) != 0 {
+		t.Fatalf("pre-disposition crash was blindly redelivered: count=%d err=%v", len(retry.Claims), err)
+	}
+	view, err := restarted.Inspect(context.Background(), taskorchestration.DeliveryInspectionRequest{
+		Authority: fixture.worker, OperationID: fixture.operationID,
+	})
+	if err != nil || view.Disposition != taskorchestration.DeliveryReconciliationRequired || view.Terminal {
+		t.Fatalf("inspect pre-disposition ambiguity: view=%+v err=%v", view, err)
+	}
+	reconciled, err := restarted.Reconcile(context.Background(), taskorchestration.DeliveryReconcileRequest{
+		Authority: fixture.worker, OperationID: fixture.operationID,
+	})
+	if err != nil || reconciled.Disposition != taskorchestration.DeliveryAccepted ||
+		reconciled.DeliveryCount != 1 {
+		t.Fatalf("reconcile pre-disposition acceptance: result=%+v err=%v", reconciled, err)
+	}
+}
+
+type inMemoryDeliveryFixture struct {
+	harness      *taskorchestration.DeterministicHarness
+	owner        taskorchestration.UserAuthority
+	worker       taskorchestration.WorkerAuthority
+	taskID       taskorchestration.TaskID
+	taskRevision taskorchestration.TaskRevision
+	operationID  taskorchestration.OperationID
+	transport    *taskorchestration.DeterministicOwnedTransport
+}
+
+func newInMemoryDeliveryFixture(
+	t *testing.T,
+	prefix string,
+	now time.Time,
+) inMemoryDeliveryFixture {
+	t.Helper()
+	harness, err := taskorchestration.NewDeterministicHarness(taskorchestration.HarnessConfig{Now: now})
+	if err != nil {
+		t.Fatalf("create deterministic harness: %v", err)
+	}
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, prefix+"-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, prefix+"-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, prefix+"-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	start, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		intentHeader(t, prefix+"-start", prefix+"-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start delivery fixture Task: %v", err)
+	}
+	workHeader := intentHeader(t, prefix+"-work", prefix+"-task", now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = start.AcceptedTaskRevision
+	work, err := harness.Mutations.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, prefix+"-work-available"),
+	))
+	if err != nil {
+		t.Fatalf("commit delivery fixture outbox: %v", err)
+	}
+	transport, err := taskorchestration.NewDeterministicOwnedTransport(taskorchestration.OwnedTransportConfig{
+		SupportedVersion:       taskorchestration.OwnedTransportV1,
+		Authorities:            []taskorchestration.WorkerAuthority{worker},
+		Now:                    func() time.Time { return now },
+		PrerequisiteRetryDelay: time.Minute,
+		PrerequisitesSatisfied: acceptOwnedTransportPrerequisites,
+	})
+	if err != nil {
+		t.Fatalf("create delivery fixture transport: %v", err)
+	}
+	return inMemoryDeliveryFixture{
+		harness: harness, owner: owner, worker: worker,
+		taskID: work.TaskProjection.TaskID, taskRevision: work.AcceptedTaskRevision,
+		operationID: work.EnactmentRefs[0].OperationID, transport: transport,
 	}
 }
 
@@ -1241,6 +1927,14 @@ func (transport *acceptingOwnedTransport) lastRequest() taskorchestration.OwnedT
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	return transport.request
+}
+
+func acceptOwnedTransportPrerequisites(
+	context.Context,
+	taskorchestration.TaskID,
+	taskorchestration.DeliveryPrerequisites,
+) bool {
+	return true
 }
 
 func deliveryResultDigest(t *testing.T, value string) taskorchestration.DeliveryResultDigest {
