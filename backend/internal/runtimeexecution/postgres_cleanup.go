@@ -392,6 +392,7 @@ func (authority *PostgresAuthority) resolveCleanupDebt(
 	if err := authority.verifyRetainedCleanupResolutionEvidence(ctx, tx, runtime, resolution.EvidenceRoot); err != nil {
 		return cleanupDebtRecord{}, err
 	}
+	before := record
 	record.Revision++
 	record.Status = cleanupDebtResolved
 	record.Unresolved = false
@@ -407,16 +408,24 @@ func (authority *PostgresAuthority) resolveCleanupDebt(
 	record.ResolutionEvidenceRoot = resolution.EvidenceRoot
 	record.ResolutionExpiresAt = resolution.ExceptionUntil
 	record.LastMutationID = resolution.MutationID
+	proof, err := authority.verifyRetainedCleanupResolutionProof(ctx, tx, record)
+	if err != nil {
+		return cleanupDebtRecord{}, err
+	}
 	if authority.failAt(PersistenceFaultBeforeMandatoryAudit) {
 		return cleanupDebtRecord{}, newError(ErrorDependencyUnavailable)
 	}
-	if err := authority.insertCleanupResolutionAudit(ctx, tx, record); err != nil {
+	if err := authority.insertCleanupResolutionAudit(
+		ctx, tx, before, record, runtime, mutationDigest, proof,
+	); err != nil {
 		return cleanupDebtRecord{}, err
 	}
 	if authority.failAt(PersistenceFaultAfterMandatoryAudit) {
 		return cleanupDebtRecord{}, newError(ErrorDependencyUnavailable)
 	}
-	if err := authority.verifyCleanupResolutionAuthority(ctx, tx, record); err != nil {
+	if err := authority.verifyPendingCleanupResolutionAuthority(
+		ctx, tx, before, record, runtime, mutationDigest,
+	); err != nil {
 		return cleanupDebtRecord{}, err
 	}
 	return authority.commitCleanupDebtMutation(ctx, tx, cleanupMutationResolve, resolution.MutationID,

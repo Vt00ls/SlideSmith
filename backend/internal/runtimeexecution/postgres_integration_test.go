@@ -473,6 +473,20 @@ func TestPostgresCleanupDebtPersistsRetryEstimationBlockersAndResolution(t *test
 		authorizationError.RetryDisposition() != RetryNever {
 		t.Fatalf("Task Orchestration exception resolution error = %T %v, want non-retryable authorization denial", err, err)
 	}
+	_, err = store.resolveCleanupDebt(context.Background(), resolution)
+	var missingClassProofError *Error
+	if !errors.As(err, &missingClassProofError) || missingClassProofError.Code() != ErrorIntegrityConflict ||
+		missingClassProofError.RetryDisposition() != RetryNever {
+		t.Fatalf("unretained class-specific cleanup proof error = %T %v, want non-retryable integrity conflict", err, err)
+	}
+	stillOpen, err = store.loadCleanupDebt(context.Background(), cleanupDebtRef{
+		DebtID: created.DebtID, PersonalWorkspaceID: fixture.PersonalWorkspaceID,
+		RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+	})
+	if err != nil || !stillOpen.Unresolved || stillOpen.Revision != second.Revision {
+		t.Fatalf("missing class-specific proof changed Cleanup Debt: %#v err=%v", stillOpen, err)
+	}
+	installPostgresCleanupResolutionProof(t, db, schema, second, resolution, resolvedAt)
 
 	faults := &PersistenceFaultController{}
 	faultedStore, err := NewPostgresAuthority(db, PostgresConfig{
@@ -523,6 +537,56 @@ func TestPostgresCleanupDebtPersistsRetryEstimationBlockersAndResolution(t *test
 		resolved.ResolutionEvidenceRoot != resolution.EvidenceRoot || resolved.Blockers != (cleanupBlockerSummary{}) ||
 		resolved.AttemptCount != 2 || resolved.FirstAttemptAt == resolved.LastAttemptAt {
 		t.Fatalf("resolved Cleanup Debt omitted final authority: %#v", resolved)
+	}
+	var retainedAuditDigest, retainedAuditState []byte
+	if err := db.QueryRowContext(context.Background(), `SELECT canonical_digest, audit_state FROM `+schema+
+		`.runtime_execution_cleanup_resolution_audit WHERE audit_fact_id=$1`, resolved.ResolutionAuditFactID).Scan(
+		&retainedAuditDigest, &retainedAuditState,
+	); err != nil {
+		t.Fatalf("load retained cleanup resolution audit: %v", err)
+	}
+	auditState, auditDigest, err := decodeCleanupResolutionAudit(retainedAuditState)
+	if err != nil || !bytes.Equal(retainedAuditDigest, auditDigest[:]) {
+		t.Fatalf("decode retained cleanup resolution audit: state=%#v digest=%x err=%v", auditState, retainedAuditDigest, err)
+	}
+	wantAuditState := cleanupResolutionAuditState{
+		AuditFactID: resolved.ResolutionAuditFactID, SchemaVersion: SchemaV1,
+		IntegrityVersion: postgresCleanupResolutionAuditIntegrityVersion,
+		OwningModule:     postgresCleanupOwnerModule,
+		OperationID:      resolution.MutationID, OperationDigest: auditState.OperationDigest,
+		Action: postgresCleanupResolutionAuditAction, Result: postgresCleanupResolutionAuditAccepted,
+		DebtID: created.DebtID, DebtRevision: resolved.Revision,
+		BeforeDebtRevision: second.Revision, AfterDebtRevision: resolved.Revision,
+		BeforeDebtStatus: second.Status, AfterDebtStatus: cleanupDebtResolved,
+		BeforeUnresolved: true, AfterUnresolved: false,
+		PersonalWorkspaceID: fixture.PersonalWorkspaceID.String(), TaskID: fixture.TaskID.String(),
+		PhaseRunID: fixture.PhaseRunID.String(), RuntimeRunID: fixture.RuntimeRunID.String(),
+		ResourceClass: created.ResourceClass, ResourceIdentityDigest: created.ResourceIdentityDigest.String(),
+		ResourceGeneration: created.ResourceGeneration, ResourceFence: created.ResourceFence,
+		BeforeResourceGeneration: created.ResourceGeneration, AfterResourceGeneration: created.ResourceGeneration,
+		BeforeResourceFence: created.ResourceFence, AfterResourceFence: created.ResourceFence,
+		CleanupIntent: created.CleanupIntent, CauseDecisionID: created.CauseDecisionID.String(),
+		CauseOperationID: created.CauseOperationID.String(), ResolutionClass: resolution.Class,
+		ResolutionReason: resolution.Reason, ResolutionAuthorityKind: owner.kind,
+		ResolutionAuthorityID: owner.id.String(), ResolutionAuthorityGeneration: owner.generation,
+		BeforeRuntimeRevision: fixture.RuntimeRevision, AfterRuntimeRevision: fixture.RuntimeRevision,
+		BeforeOperationGeneration: fixture.OperationGeneration, AfterOperationGeneration: fixture.OperationGeneration,
+		BeforeRuntimeFence: fixture.RuntimeFence, AfterRuntimeFence: fixture.RuntimeFence,
+		AuthorizationEpoch: owner.generation,
+		BeforeSafetyEpoch:  fixture.SafetyEpoch, AfterSafetyEpoch: fixture.SafetyEpoch,
+		EvidenceSchemaVersion: fixture.EvidenceRoot.SchemaVersion,
+		EvidenceRootID:        fixture.EvidenceRoot.EvidenceRootID.String(),
+		EvidenceRootDigest:    fixture.EvidenceRoot.Digest.String(),
+		ResolutionProofID:     "cleanup-resolution-proof-already-absent",
+		ResolutionProofDigest: auditState.ResolutionProofDigest,
+		OccurredAt:            formatCleanupTime(resolvedAt), RecordedAt: formatCleanupTime(resolvedAt),
+		SourceClockID:        postgresMandatoryAuditSourceClock,
+		IdempotencyReference: resolution.MutationID, RetryDisposition: RetryNever,
+		ReconciliationDisposition: ReconciliationNotRequired,
+	}
+	if auditState.OperationDigest == (Digest{}).String() ||
+		auditState.ResolutionProofDigest == (Digest{}).String() || auditState != wantAuditState {
+		t.Fatalf("cleanup resolution audit = %#v, want complete canonical fact %#v", auditState, wantAuditState)
 	}
 	exactResolved, err := store.resolveCleanupDebt(context.Background(), resolution)
 	if err != nil || exactResolved != resolved {
@@ -577,6 +641,32 @@ func TestPostgresCleanupDebtPersistsRetryEstimationBlockersAndResolution(t *test
 	if replayed, err := restarted.resolveCleanupDebt(context.Background(), resolution); err != nil || replayed != resolved {
 		t.Fatalf("restored cleanup evidence replay = %#v err=%v, want %#v", replayed, err, resolved)
 	}
+	var retainedProofDigest []byte
+	if err := db.QueryRowContext(context.Background(), `SELECT canonical_digest FROM `+schema+
+		`.runtime_execution_cleanup_resolution_proofs WHERE proof_id=$1`,
+		"cleanup-resolution-proof-already-absent").Scan(&retainedProofDigest); err != nil {
+		t.Fatalf("load retained cleanup proof digest: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `DROP TRIGGER reject_immutable_mutation ON `+schema+
+		`.runtime_execution_cleanup_resolution_proofs`); err != nil {
+		t.Fatal("disable immutable cleanup-proof trigger for corruption fixture")
+	}
+	corruptProofDigest := digest(116)
+	if _, err := db.ExecContext(context.Background(), `UPDATE `+schema+`.runtime_execution_cleanup_resolution_proofs
+		SET canonical_digest=$1 WHERE proof_id=$2`, corruptProofDigest[:],
+		"cleanup-resolution-proof-already-absent"); err != nil {
+		t.Fatal("install corrupt cleanup-proof fixture")
+	}
+	assertIntegrityConflict("corrupt cleanup proof readback", loadResolved())
+	assertIntegrityConflict("corrupt cleanup proof replay", replayResolution())
+	if _, err := db.ExecContext(context.Background(), `UPDATE `+schema+`.runtime_execution_cleanup_resolution_proofs
+		SET canonical_digest=$1 WHERE proof_id=$2`, retainedProofDigest,
+		"cleanup-resolution-proof-already-absent"); err != nil {
+		t.Fatal("restore cleanup-proof fixture")
+	}
+	if replayed, err := restarted.resolveCleanupDebt(context.Background(), resolution); err != nil || replayed != resolved {
+		t.Fatalf("restored cleanup proof replay = %#v err=%v, want %#v", replayed, err, resolved)
+	}
 
 	if _, err := db.ExecContext(context.Background(), `DROP TRIGGER reject_immutable_mutation ON `+schema+
 		`.runtime_execution_cleanup_resolution_audit`); err != nil {
@@ -611,6 +701,48 @@ func installPostgresCleanupEvidenceRoot(
 	) VALUES ($1,$2,$3,$4,$5)`, evidenceRoot.EvidenceRootID.String(), runtimeRunID.String(),
 		evidenceRoot.SchemaVersion, evidenceRoot.Digest[:], postgresTimestamp(acceptedAt)); err != nil {
 		t.Fatal("install retained Cleanup Debt resolution evidence")
+	}
+}
+
+func installPostgresCleanupResolutionProof(
+	t *testing.T,
+	db *sql.DB,
+	schema string,
+	debt cleanupDebtRecord,
+	resolution cleanupDebtResolution,
+	verifiedAt time.Time,
+) {
+	t.Helper()
+	state := cleanupResolutionProofState{
+		ProofID: "cleanup-resolution-proof-already-absent", SchemaVersion: SchemaV1,
+		IntegrityVersion: postgresCleanupResolutionProofIntegrityVersion,
+		OwningModule:     postgresCleanupOwnerModule,
+		DebtID:           debt.DebtID, RuntimeRunID: debt.RuntimeRunID.String(),
+		ResourceClass: debt.ResourceClass, ResourceIdentityDigest: debt.ResourceIdentityDigest.String(),
+		ResourceGeneration: debt.ResourceGeneration, ResourceFence: debt.ResourceFence,
+		ResolutionClass: resolution.Class, ResolutionReason: resolution.Reason,
+		Disposition:           cleanupProofExactGenerationAbsent,
+		EvidenceSchemaVersion: resolution.EvidenceRoot.SchemaVersion,
+		EvidenceRootID:        resolution.EvidenceRoot.EvidenceRootID.String(),
+		EvidenceRootDigest:    resolution.EvidenceRoot.Digest.String(),
+		ExactGenerationAbsent: true, ReferencesClear: true, ContainmentClear: true,
+		ObservedAt: formatCleanupTime(verifiedAt), RecordedAt: formatCleanupTime(verifiedAt),
+		SourceClockID: postgresMandatoryAuditSourceClock,
+	}
+	encoded, digest, err := encodeCleanupResolutionProof(state)
+	if err != nil {
+		t.Fatalf("encode cleanup resolution proof: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `INSERT INTO `+schema+`.runtime_execution_cleanup_resolution_proofs (
+		proof_id, debt_id, runtime_run_id, resource_identity_digest, resource_generation, resource_fence,
+		resolution_class, resolution_reason, proof_disposition, evidence_root_id, evidence_root_digest,
+		observed_at, recorded_at, source_clock_id, canonical_digest, proof_state
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, state.ProofID,
+		debt.DebtID, debt.RuntimeRunID.String(), debt.ResourceIdentityDigest[:], debt.ResourceGeneration,
+		debt.ResourceFence, resolution.Class, resolution.Reason, state.Disposition,
+		resolution.EvidenceRoot.EvidenceRootID.String(), resolution.EvidenceRoot.Digest[:],
+		postgresTimestamp(verifiedAt), postgresTimestamp(verifiedAt), state.SourceClockID, digest[:], encoded); err != nil {
+		t.Fatalf("install retained cleanup resolution proof: %v", err)
 	}
 }
 
