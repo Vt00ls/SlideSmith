@@ -77,7 +77,7 @@ An immutable, versioned scheduling definition for the exact enforceable CPU, mem
 _Avoid_: Worker type, host size, best-effort request, mutable resource profile
 
 **Admission Grant**:
-A time-bounded, fenced Scheduler decision that reserves global, Personal Workspace, capability, Resource Class, and Execution Node capacity for one exact Scheduler Work Item and node. Runtime Execution must revalidate it before granting a Sandbox Lease.
+A time-bounded, fenced Scheduler decision that reserves logical global, Personal Workspace, capability, and Resource Class counters for one exact Scheduler Work Item and selects one Execution Node. It begins unbound, binds once to the durable C03 acceptance of that Work Item's immutable Task enactment operation and payload digest, and is never authority that physical node capacity is safe to reuse. Runtime Execution must revalidate the bound grant before granting a Sandbox Lease.
 _Avoid_: Delivery Claim, Sandbox Lease, Quota Reservation, worker slot
 
 **Recovery Point**:

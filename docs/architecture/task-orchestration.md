@@ -14,6 +14,9 @@ catalog selection, lifecycle, and Template Lock closure authority,
 Lease, worker, and evidence authority,
 [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)
 defines Work Item delivery, Personal Workspace fairness, and Admission Grants,
+[ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
+defines the exact Runtime enactment/Work Item/grant binding and post-lease
+prerequisite order,
 [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
 defines Phase Run Quota Reservation and provider-usage settlement, and
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 commit
@@ -180,14 +183,25 @@ without changing this seam.
    Catalog Publication before any consuming Phase. A missing lock or incomplete
    bundle closure fails closed.
 2. Work availability causes `Decide` to select the current Phase from that
-   pinned graph, create one new Phase Run attempt, and persist the required
-   enactment in the same transaction.
+   pinned graph, create one new Phase Run attempt and its required existing
+   Runtime Run identities, and build each complete canonical C03 start request.
+   The Task enactment outbox record and Scheduler Work Item commit atomically
+   through the restricted Scheduler transactional participant. The Work Item
+   has its own WorkItemID and references the enactment's exact OperationID and
+   payload digest; a dispatcher may not construct, supplement, or rewrite the
+   Runtime request.
 3. If the Phase may schedule quota-bearing Runtime work, Usage Accounting must
    activate the Phase Run's Quota Reservation before Scheduler Admission or a
    Gateway Grant becomes eligible. Enterprise V1 observes rather than enforces
    quota shortage, but missing or invalid reservation evidence fails closed.
-4. A worker claims the enactment through a delivery adapter. The claim is not a
-   Phase outcome and does not become Task authority.
+4. Scheduler `ClaimAndAdmit` selects the Work Item, reserves logical counters,
+   and creates an unbound Admission Grant. Authenticated delivery sends the
+   unchanged start request and grant to C03. The C03 start-acceptance
+   transaction atomically marks the Work Item Accepted and grant Bound through
+   a restricted Scheduler participant. C03 does not create a second
+   admission-enactment path. Sandbox Lease, C04/Gateway prerequisites,
+   Execution Capsule, and worker dispatch follow that acceptance. The delivery
+   claim is not a Phase outcome and does not become Task authority.
 
 ### Runtime, validation, and commit
 
@@ -273,6 +287,11 @@ linearization point.
 - Enactments have stable operation identities and live in the transactionally
   committed outbox. Delivery can be at least once. Downstream adapters must
   replay the same result or report the existing operation.
+- For Runtime start, the Scheduler Work Item stores that same immutable
+  operation and canonical payload digest in the Task decision transaction. A
+  replacement unbound Admission Grant can bind the existing Work Item only
+  before C03 acceptance; it never changes the enactment digest or creates a
+  new Task/Runtime attempt.
 - Delivery leases are fenced and expiring. Claim loss returns the enactment to
   delivery without changing Task, Phase Run, or Runtime Run outcome.
 - A worker or node crash never implies Runtime failure or Phase retry. The
@@ -395,7 +414,11 @@ Task Workspace Revision, or Checkpoint from ambiguous legacy state.
   prioritize and lease durable enactments, but Delivery Claim ownership,
   fairness, capacity admission, and queue delivery cannot mutate Task state.
   Quota-bearing admission requires an active Phase Run Reservation, but the
-  Scheduler cannot create, renew, settle, or inspect Ledger entries.
+  Scheduler cannot create, renew, settle, or inspect Ledger entries. Runtime
+  Work Item enqueue is a restricted participant in the Task decision
+  transaction; downstream Accepted/Grant Bound is a restricted participant in
+  the C03 start transaction. Neither participant exposes a general repository
+  or cross-module mutation escape hatch.
 - The resolved [LLM Gateway and Usage Accounting contract](./llm-gateway-and-usage-accounting.md)
   receives idempotent Phase Run reserve and close intents. Task Orchestration
   never calls a provider, verifies a Usage Receipt, appends Ledger entries, or

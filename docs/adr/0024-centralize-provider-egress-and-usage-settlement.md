@@ -18,6 +18,7 @@ Enterprise V1 keeps Quota Reservation in observation mode. A quota shortage does
 ## Consequences
 
 - A Gateway Call may own one or more Gateway Attempts. Every real retry or permitted fallback is a new Attempt, while duplicate observation of the same scoped provider object is ingested once.
+- A Gateway Grant is short-lived and cannot outlive its Runtime deadline, current Sandbox Lease, authorization generation, Runtime fence, Provider Route policy, or Active Quota Reservation. Long Runtime Runs refresh or rotate it through a stable, idempotent grant operation and monotonic grant generation; activation of a replacement fences the prior generation from new Calls without changing the Runtime start, lease, or already accepted Attempts.
 - The Gateway persists an Attempt before sending. A crash around egress creates ambiguity and reconciliation work; it never authorizes blind replay of that Attempt.
 - Runtime cancellation or fencing rejects new Calls but does not erase usage from an already accepted Attempt. Gateway and ledger failure semantics are therefore independent of Runtime outcome.
 - Usage Receipts carry explicit provider-reported, estimated, unknown, not-applicable, or proven-no-send evidence state. Content-bearing provider bodies are not Ledger material.

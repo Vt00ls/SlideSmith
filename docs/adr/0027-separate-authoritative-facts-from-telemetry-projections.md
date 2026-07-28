@@ -56,6 +56,11 @@ directory, bucket listing, or process observation.
 - Cleanup Debt records owner, opaque resource, retry, failure, estimated bytes
   and inodes, age, fence, blockers, and resolution evidence until verified or
   explicitly accepted through mandatory audit.
+- Protected Runtime node/containment/reset and C03 Cleanup Debt operations use
+  the owning module's separate audited maintenance port; neither the public
+  Runtime start/cancel seam nor an observability/diagnostic adapter gains that
+  mutation authority. Scheduler logical-counter release and C03 physical-node
+  release readiness remain distinct authoritative facts and projections.
 - Implementation hard-replaces post-transition best-effort Task events,
   path-bearing cleanup markers, and caller-defined telemetry maps rather than
   wrapping them as target audit or observability authority.
