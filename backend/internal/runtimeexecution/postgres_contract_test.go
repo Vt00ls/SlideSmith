@@ -63,7 +63,7 @@ func TestPostgresDriverFailuresNormalizeWithoutPrivateDetail(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			normalized := normalizeFoundationWriteFailure(&pgconn.PgError{
+			normalized := normalizeRuntimePersistenceFailure(&pgconn.PgError{
 				Code: test.sqlState, Message: canary, Detail: canary, Where: canary,
 			})
 			var safeError *Error

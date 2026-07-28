@@ -169,9 +169,11 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	leaseRoots := authority.table("runtime_execution_lease_roots")
 	evidenceRoots := authority.table("runtime_execution_evidence_roots")
 	cleanup := authority.table("runtime_execution_cleanup_obligations")
+	cleanupMutations := authority.table("runtime_execution_cleanup_mutations")
 	heartbeats := authority.table("runtime_execution_heartbeat_history")
 	compaction := authority.table("runtime_execution_heartbeat_compaction")
 	immutableFunction := authority.table("runtime_execution_reject_immutable_mutation")
+	cleanupRebindingFunction := authority.table("runtime_execution_reject_cleanup_rebinding")
 	return []string{
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_decision_sequence")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
@@ -325,34 +327,41 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		)`, leaseRoots, runtimes, evidenceRoots),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			debt_id text PRIMARY KEY,
+			personal_workspace_id text NOT NULL,
+			task_id text NOT NULL,
+			phase_run_id text NOT NULL,
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
-			owner_module text NOT NULL DEFAULT 'runtime_execution',
-			resource_class smallint NOT NULL DEFAULT 1,
+			owner_module text NOT NULL,
+			resource_class smallint NOT NULL,
 			resource_identity_digest bytea NOT NULL CHECK (octet_length(resource_identity_digest) = 32),
 			resource_generation bigint NOT NULL CHECK (resource_generation > 0),
 			resource_fence bigint NOT NULL CHECK (resource_fence > 0),
+			cleanup_intent smallint NOT NULL,
+			cause_decision_id text NOT NULL REFERENCES %s(decision_id),
+			cause_operation_id text NOT NULL,
+			retention_fact_digest bytea NOT NULL CHECK (octet_length(retention_fact_digest) = 32),
+			eligibility_fact_digest bytea NOT NULL CHECK (octet_length(eligibility_fact_digest) = 32),
+			debt_revision bigint NOT NULL CHECK (debt_revision > 0),
 			status smallint NOT NULL,
 			unresolved boolean NOT NULL,
 			uncontained boolean NOT NULL,
-			first_recorded_at timestamptz NOT NULL,
-			last_recorded_at timestamptz NOT NULL,
-			attempt_count bigint NOT NULL CHECK (attempt_count > 0),
-			eligible_at timestamptz,
-			next_retry_at timestamptz,
-			failure_count bigint NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
-			estimated_bytes bigint CHECK (estimated_bytes IS NULL OR estimated_bytes >= 0),
-			estimated_inodes bigint CHECK (estimated_inodes IS NULL OR estimated_inodes >= 0),
-			blocker_digest bytea CHECK (blocker_digest IS NULL OR octet_length(blocker_digest) = 32),
-			safe_reason smallint NOT NULL,
-			evidence_root_id text NOT NULL REFERENCES %s(evidence_root_id),
-			evidence_root_digest bytea NOT NULL CHECK (octet_length(evidence_root_digest) = 32),
-			resolved_at timestamptz,
-			resolution_class smallint,
-			resolution_authority_kind smallint,
-			resolution_authority_id text NOT NULL DEFAULT '',
-			resolution_authority_generation bigint CHECK (resolution_authority_generation IS NULL OR resolution_authority_generation > 0),
-			resolution_audit_fact_id text NOT NULL DEFAULT ''
-		)`, cleanup, runtimes, evidenceRoots),
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			debt_state jsonb NOT NULL,
+			updated_at timestamptz NOT NULL,
+			UNIQUE (owner_module, resource_class, resource_identity_digest,
+				resource_generation, resource_fence, cleanup_intent)
+		)`, cleanup, runtimes, decisions),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			debt_id text NOT NULL REFERENCES %s(debt_id),
+			mutation_id text NOT NULL,
+			mutation_kind smallint NOT NULL,
+			mutation_digest bytea NOT NULL CHECK (octet_length(mutation_digest) = 32),
+			result_revision bigint NOT NULL CHECK (result_revision > 0),
+			result_digest bytea NOT NULL CHECK (octet_length(result_digest) = 32),
+			result_state jsonb NOT NULL,
+			committed_at timestamptz NOT NULL,
+			PRIMARY KEY (debt_id, mutation_id)
+		)`, cleanupMutations, cleanup),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
 			operation_id text NOT NULL,
@@ -403,6 +412,30 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		)`, compaction, runtimes, evidenceRoots),
 		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN RAISE EXCEPTION 'immutable runtime execution fact'; END $$`, immutableFunction),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF TG_OP = 'DELETE' THEN
+				RAISE EXCEPTION USING ERRCODE = '23000', MESSAGE = 'immutable cleanup authority';
+			END IF;
+			IF OLD.debt_id IS DISTINCT FROM NEW.debt_id
+				OR OLD.personal_workspace_id IS DISTINCT FROM NEW.personal_workspace_id
+				OR OLD.task_id IS DISTINCT FROM NEW.task_id
+				OR OLD.phase_run_id IS DISTINCT FROM NEW.phase_run_id
+				OR OLD.runtime_run_id IS DISTINCT FROM NEW.runtime_run_id
+				OR OLD.owner_module IS DISTINCT FROM NEW.owner_module
+				OR OLD.resource_class IS DISTINCT FROM NEW.resource_class
+				OR OLD.resource_identity_digest IS DISTINCT FROM NEW.resource_identity_digest
+				OR OLD.resource_generation IS DISTINCT FROM NEW.resource_generation
+				OR OLD.resource_fence IS DISTINCT FROM NEW.resource_fence
+				OR OLD.cleanup_intent IS DISTINCT FROM NEW.cleanup_intent
+				OR OLD.cause_decision_id IS DISTINCT FROM NEW.cause_decision_id
+				OR OLD.cause_operation_id IS DISTINCT FROM NEW.cause_operation_id
+				OR OLD.retention_fact_digest IS DISTINCT FROM NEW.retention_fact_digest
+				OR OLD.eligibility_fact_digest IS DISTINCT FROM NEW.eligibility_fact_digest THEN
+				RAISE EXCEPTION USING ERRCODE = '23000', MESSAGE = 'immutable cleanup authority';
+			END IF;
+			RETURN NEW;
+		END $$`, cleanupRebindingFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", decisions),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", decisions, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", requests),
@@ -419,6 +452,10 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", compaction, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", integrityIncidents),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", integrityIncidents, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", cleanupMutations),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanupMutations, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_cleanup_rebinding ON %s", cleanup),
+		fmt.Sprintf("CREATE TRIGGER reject_cleanup_rebinding BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanup, cleanupRebindingFunction),
 	}
 }
 
@@ -612,52 +649,17 @@ func (authority *PostgresAuthority) loadRetainedDecision(
 		fact.PreviousRuntimeRevision != previousRevision || fact.ResultingRuntimeRevision != resultingRevision {
 		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
 	}
-	var auditFactID, auditRuntimeRunID, auditOperationID, auditAuthorityID string
-	var auditOwningModule, auditSourceClockID string
-	var auditRequestDigest, auditCanonicalDigest, auditStateBytes []byte
-	var auditSchemaVersion SchemaVersion
-	var auditIntegrityVersion uint16
-	var auditAuthorityKind AuthorityKind
-	var auditAuthorityGeneration AuthorizationGeneration
-	var auditAction postgresMandatoryAuditAction
-	var auditResult postgresMandatoryAuditResult
-	var auditBeforeRevision, auditAfterRevision RuntimeRevision
-	var auditOccurredAt, auditRecordedAt time.Time
-	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT audit_fact_id, runtime_run_id, operation_id,
-		request_digest, schema_version, integrity_version, owning_module, canonical_digest,
-		authority_kind, authority_id, authority_generation, action, result,
-		before_revision, after_revision, occurred_at, recorded_at, source_clock_id, audit_state
-		FROM %s WHERE decision_id=$1`,
-		authority.table("runtime_execution_mandatory_audit")), decisionID).Scan(
-		&auditFactID, &auditRuntimeRunID, &auditOperationID, &auditRequestDigest,
-		&auditSchemaVersion, &auditIntegrityVersion, &auditOwningModule, &auditCanonicalDigest,
-		&auditAuthorityKind, &auditAuthorityID, &auditAuthorityGeneration,
-		&auditAction, &auditResult, &auditBeforeRevision, &auditAfterRevision,
-		&auditOccurredAt, &auditRecordedAt, &auditSourceClockID, &auditStateBytes,
-	)
+	auditView, err := authority.loadMandatoryAuditInTransaction(ctx, tx, postgresMandatoryAuditRef{
+		DecisionID: fact.DecisionID, PersonalWorkspaceID: binding.workspaceID,
+		RuntimeRunID: binding.runtimeRunID, OperationID: binding.operationID,
+		RequestDigest: binding.digest, Authority: binding.caller,
+	})
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
-		}
-		return RuntimeDecisionFact{}, normalizeRuntimePersistenceFailure(err)
+		return RuntimeDecisionFact{}, err
 	}
-	auditState, err := decodePostgresMandatoryAuditState(auditStateBytes)
-	if err != nil {
-		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
-	}
-	wantAuditDigest, err := auditState.canonicalDigest()
-	if err != nil || auditFactID != auditState.AuditFactID || auditRuntimeRunID != binding.runtimeRunID.String() ||
-		auditOperationID != binding.operationID.String() || !bytes.Equal(auditRequestDigest, binding.digest[:]) ||
-		auditSchemaVersion != auditState.SchemaVersion || auditIntegrityVersion != auditState.IntegrityVersion ||
-		auditOwningModule != auditState.OwningModule || !bytes.Equal(auditCanonicalDigest, wantAuditDigest[:]) ||
-		auditAuthorityKind != binding.caller.kind || auditAuthorityID != binding.caller.id.String() ||
-		auditAuthorityGeneration != binding.caller.generation || auditAction != binding.auditAction ||
-		auditResult != postgresAuditAccepted || auditBeforeRevision != fact.PreviousRuntimeRevision ||
-		auditAfterRevision != fact.ResultingRuntimeRevision ||
-		!auditOccurredAt.Equal(mustParsePostgresAuditTime(auditState.OccurredAt)) ||
-		!auditRecordedAt.Equal(mustParsePostgresAuditTime(auditState.RecordedAt)) ||
-		auditSourceClockID != postgresMandatoryAuditSourceClock ||
-		!auditStateMatchesBinding(auditState, fact, binding) {
+	if auditView.State.Action != binding.auditAction ||
+		auditView.State.Result != postgresAuditAccepted ||
+		!auditStateMatchesBinding(auditView.State, fact, binding) {
 		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
 	}
 	var outboxDecisionID, outboxRuntimeRunID string
@@ -679,24 +681,6 @@ func (authority *PostgresAuthority) loadRetainedDecision(
 	if outboxDecisionID != decisionID || outboxRuntimeRunID != binding.runtimeRunID.String() ||
 		!bytes.Equal(outboxCanonicalDigest, binding.digest[:]) || !bytes.Equal(outboxScopeDigest, wantScopeDigest[:]) ||
 		!bytes.Equal(outboxPayload, binding.canonical) || !bytes.Equal(outboxPayloadDigest, wantPayloadDigest[:]) {
-		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
-	}
-	var projectionAuditFactID string
-	var projectionAuditDigest []byte
-	var projectionRevision RuntimeRevision
-	var projectionSchema SchemaVersion
-	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT audit_fact_id, audit_canonical_digest,
-		fact_revision, projection_schema_version FROM %s WHERE fact_id=$1`,
-		authority.table("runtime_execution_projection_backlog")), decisionID).Scan(
-		&projectionAuditFactID, &projectionAuditDigest, &projectionRevision, &projectionSchema)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
-		}
-		return RuntimeDecisionFact{}, normalizeRuntimePersistenceFailure(err)
-	}
-	if projectionAuditFactID != auditFactID || !bytes.Equal(projectionAuditDigest, wantAuditDigest[:]) ||
-		projectionRevision != fact.ResultingRuntimeRevision || projectionSchema != SchemaV1 {
 		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
 	}
 	return fact, nil

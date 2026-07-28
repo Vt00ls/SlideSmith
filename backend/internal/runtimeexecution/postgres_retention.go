@@ -14,19 +14,6 @@ const (
 	HeartbeatTerminalHistory HeartbeatHistoryReason = iota + 1
 )
 
-type CleanupObligationStatus uint8
-
-const (
-	CleanupObligationOpen CleanupObligationStatus = iota + 1
-	CleanupObligationResolved
-)
-
-type CleanupReason uint8
-
-const (
-	CleanupReasonUncontained CleanupReason = iota + 1
-)
-
 type heartbeatCompactionRequest struct {
 	RuntimeRunID    RuntimeRunID
 	LeaseID         SandboxLeaseID
@@ -136,7 +123,7 @@ func (authority *PostgresAuthority) compactTerminalHeartbeatHistory(
 				request.RuntimeRunID.String(), request.LeaseID.String(), request.LeaseGeneration, request.LeaseFence,
 				request.Reason, request.EvidenceRoot.EvidenceRootID.String(), request.EvidenceRoot.Digest[:],
 				view.FirstObservedAt, view.LastObservedAt, view.CompactedCount, view.AuthenticatedDigest[:]); err != nil {
-				return heartbeatCompactionView{}, normalizeFoundationWriteFailure(err)
+				return heartbeatCompactionView{}, normalizeRuntimePersistenceFailure(err)
 			}
 			result, err := tx.ExecContext(ctx, fmt.Sprintf(`DELETE FROM %s
 				WHERE runtime_run_id=$1 AND lease_id=$2 AND lease_generation=$3 AND lease_fence=$4

@@ -2,8 +2,11 @@ package runtimeexecution
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -91,6 +94,140 @@ type postgresMandatoryAuditInput struct {
 	OccurredAt                time.Time
 	RecordedAt                time.Time
 	EvidenceRoot              EvidenceRootSnapshot
+}
+
+type postgresMandatoryAuditRef struct {
+	DecisionID          RuntimeDecisionID
+	PersonalWorkspaceID PersonalWorkspaceID
+	RuntimeRunID        RuntimeRunID
+	OperationID         OperationID
+	RequestDigest       Digest
+	Authority           RuntimeAuthority
+}
+
+type postgresMandatoryAuditView struct {
+	State           postgresMandatoryAuditState
+	CanonicalDigest Digest
+	Projection      ProjectionFact
+}
+
+func (authority *PostgresAuthority) loadMandatoryAudit(
+	ctx context.Context,
+	ref postgresMandatoryAuditRef,
+) (postgresMandatoryAuditView, error) {
+	if ctx == nil || ctx.Err() != nil {
+		return postgresMandatoryAuditView{}, newError(ErrorDependencyUnavailable)
+	}
+	if !validPostgresMandatoryAuditRef(ref) {
+		return postgresMandatoryAuditView{}, newError(ErrorInvalidRequest)
+	}
+	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return postgresMandatoryAuditView{}, normalizeRuntimePersistenceFailure(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	runtime, err := authority.loadRuntimeForRead(ctx, tx, ref.RuntimeRunID)
+	if err == sql.ErrNoRows || err == nil && !authorized(runtime, ref.PersonalWorkspaceID, ref.Authority) {
+		return postgresMandatoryAuditView{}, newError(ErrorAuthorizationDenied)
+	}
+	if err != nil {
+		return postgresMandatoryAuditView{}, normalizeRuntimePersistenceFailure(err)
+	}
+	view, err := authority.loadMandatoryAuditInTransaction(ctx, tx, ref)
+	if err != nil {
+		return postgresMandatoryAuditView{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return postgresMandatoryAuditView{}, normalizeRuntimePersistenceFailure(err)
+	}
+	return view, nil
+}
+
+func (authority *PostgresAuthority) loadMandatoryAuditInTransaction(
+	ctx context.Context,
+	tx *sql.Tx,
+	ref postgresMandatoryAuditRef,
+) (postgresMandatoryAuditView, error) {
+	var auditFactID, runtimeRunID, operationID, authorityID string
+	var owningModule, sourceClockID string
+	var requestDigest, canonicalDigest, stateBytes []byte
+	var schemaVersion SchemaVersion
+	var integrityVersion uint16
+	var authorityKind AuthorityKind
+	var authorityGeneration AuthorizationGeneration
+	var action postgresMandatoryAuditAction
+	var result postgresMandatoryAuditResult
+	var beforeRevision, afterRevision RuntimeRevision
+	var occurredAt, recordedAt time.Time
+	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT audit_fact_id, runtime_run_id, operation_id,
+		request_digest, schema_version, integrity_version, owning_module, canonical_digest,
+		authority_kind, authority_id, authority_generation, action, result,
+		before_revision, after_revision, occurred_at, recorded_at, source_clock_id, audit_state
+		FROM %s WHERE decision_id=$1`, authority.table("runtime_execution_mandatory_audit")),
+		ref.DecisionID.String()).Scan(
+		&auditFactID, &runtimeRunID, &operationID, &requestDigest, &schemaVersion,
+		&integrityVersion, &owningModule, &canonicalDigest, &authorityKind, &authorityID,
+		&authorityGeneration, &action, &result, &beforeRevision, &afterRevision,
+		&occurredAt, &recordedAt, &sourceClockID, &stateBytes,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return postgresMandatoryAuditView{}, newError(ErrorIntegrityConflict)
+		}
+		return postgresMandatoryAuditView{}, normalizeRuntimePersistenceFailure(err)
+	}
+	state, err := decodePostgresMandatoryAuditState(stateBytes)
+	if err != nil {
+		return postgresMandatoryAuditView{}, newError(ErrorIntegrityConflict)
+	}
+	wantDigest, err := state.canonicalDigest()
+	if err != nil || auditFactID != state.AuditFactID || state.DecisionID != ref.DecisionID.String() ||
+		runtimeRunID != ref.RuntimeRunID.String() || state.RuntimeRunID != ref.RuntimeRunID.String() ||
+		operationID != ref.OperationID.String() || state.OperationID != ref.OperationID.String() ||
+		!bytes.Equal(requestDigest, ref.RequestDigest[:]) || state.RequestDigest != ref.RequestDigest.String() ||
+		schemaVersion != state.SchemaVersion || integrityVersion != state.IntegrityVersion ||
+		owningModule != state.OwningModule || !bytes.Equal(canonicalDigest, wantDigest[:]) ||
+		authorityKind != ref.Authority.kind || state.AuthorityKind != ref.Authority.kind ||
+		authorityID != ref.Authority.id.String() || state.AuthorityID != ref.Authority.id.String() ||
+		authorityGeneration != ref.Authority.generation || state.AuthorityGeneration != ref.Authority.generation ||
+		action != state.Action || result != state.Result || beforeRevision != state.BeforeRevision ||
+		afterRevision != state.AfterRevision || !occurredAt.Equal(mustParsePostgresAuditTime(state.OccurredAt)) ||
+		!recordedAt.Equal(mustParsePostgresAuditTime(state.RecordedAt)) || sourceClockID != state.SourceClockID {
+		return postgresMandatoryAuditView{}, newError(ErrorIntegrityConflict)
+	}
+	var projectionAuditFactID string
+	var projectionAuditDigest []byte
+	var projectionRevision RuntimeRevision
+	var projectionSchema SchemaVersion
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT audit_fact_id, audit_canonical_digest,
+		fact_revision, projection_schema_version FROM %s WHERE fact_id=$1`,
+		authority.table("runtime_execution_projection_backlog")), ref.DecisionID.String()).Scan(
+		&projectionAuditFactID, &projectionAuditDigest, &projectionRevision, &projectionSchema)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return postgresMandatoryAuditView{}, newError(ErrorIntegrityConflict)
+		}
+		return postgresMandatoryAuditView{}, normalizeRuntimePersistenceFailure(err)
+	}
+	if projectionAuditFactID != auditFactID || !bytes.Equal(projectionAuditDigest, wantDigest[:]) ||
+		projectionRevision != state.AfterRevision || projectionSchema != SchemaV1 {
+		return postgresMandatoryAuditView{}, newError(ErrorIntegrityConflict)
+	}
+	return postgresMandatoryAuditView{
+		State: state, CanonicalDigest: wantDigest,
+		Projection: ProjectionFact{
+			DecisionID: ref.DecisionID, RuntimeRunID: ref.RuntimeRunID, OperationID: ref.OperationID,
+			CanonicalDigest: ref.RequestDigest, RuntimeRevision: state.AfterRevision,
+			AuditFactID: state.AuditFactID, AuditCanonicalDigest: wantDigest,
+			ProjectionSchemaVersion: projectionSchema,
+		},
+	}, nil
+}
+
+func validPostgresMandatoryAuditRef(ref postgresMandatoryAuditRef) bool {
+	return validOpaqueID(ref.DecisionID.String()) && validOpaqueID(ref.PersonalWorkspaceID.String()) &&
+		validOpaqueID(ref.RuntimeRunID.String()) && validOpaqueID(ref.OperationID.String()) &&
+		ref.RequestDigest != (Digest{}) && validAuthority(ref.Authority)
 }
 
 func newPostgresMandatoryAuditState(input postgresMandatoryAuditInput) postgresMandatoryAuditState {

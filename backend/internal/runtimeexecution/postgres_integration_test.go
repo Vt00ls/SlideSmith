@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -197,67 +196,269 @@ func TestPostgresMandatoryAuditPersistsCompleteCanonicalFact(t *testing.T) {
 	if err != nil {
 		t.Fatalf("persist reconciliation foundation: %v", err)
 	}
+	ref := postgresMandatoryAuditRef{
+		DecisionID: decision.Fact.DecisionID, PersonalWorkspaceID: fixture.PersonalWorkspaceID,
+		RuntimeRunID: fixture.RuntimeRunID,
+		OperationID:  intent.OperationID, RequestDigest: intent.CanonicalDigest, Authority: owner,
+	}
+	view, err := store.loadMandatoryAudit(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("load complete mandatory AuditFact: %v", err)
+	}
+	if !validOpaqueID(view.State.AuditFactID) {
+		t.Fatalf("mandatory AuditFact has invalid identity: %#v", view.State)
+	}
+	expected := postgresMandatoryAuditState{
+		AuditFactID: view.State.AuditFactID, SchemaVersion: SchemaV1, IntegrityVersion: 1,
+		OwningModule: "runtime_execution", DecisionID: decision.Fact.DecisionID.String(),
+		RuntimeRunID: fixture.RuntimeRunID.String(), OperationID: intent.OperationID.String(),
+		RequestDigest: intent.CanonicalDigest.String(), AuthorityKind: owner.kind,
+		AuthorityID: owner.id.String(), AuthorityGeneration: owner.generation,
+		Action: postgresAuditReconciliationRequired, Result: postgresAuditAccepted,
+		ReasonCode:     uint8(ReconciliationTransportAmbiguous),
+		BeforeRevision: decision.Fact.PreviousRuntimeRevision, AfterRevision: decision.Fact.ResultingRuntimeRevision,
+		BeforeState: RuntimeWaitingForLease, AfterState: RuntimeReconciling,
+		BeforeOperationGeneration: fixture.OperationGeneration,
+		AfterOperationGeneration:  fixture.OperationGeneration,
+		BeforeRuntimeFence:        fixture.RuntimeFence,
+		AfterRuntimeFence:         fixture.RuntimeFence,
+		AuthorizationEpoch:        owner.generation,
+		BeforeSafetyEpoch:         fixture.SafetyEpoch,
+		AfterSafetyEpoch:          fixture.SafetyEpoch,
+		OccurredAt:                postgresTimestamp(now).Format(canonicalTimeFormat),
+		RecordedAt:                postgresTimestamp(now).Format(canonicalTimeFormat),
+		SourceClockID:             "platform_control_plane", EvidenceRootDigest: fixture.EvidenceRoot.Digest.String(),
+		IdempotencyReference: intent.OperationID.String(), RetryDisposition: decision.Fact.Retry,
+		ReconciliationDisposition: decision.Fact.Reconciliation,
+	}
+	wantProjection := ProjectionFact{
+		DecisionID: decision.Fact.DecisionID, RuntimeRunID: fixture.RuntimeRunID,
+		OperationID: intent.OperationID, CanonicalDigest: intent.CanonicalDigest,
+		RuntimeRevision: decision.Fact.ResultingRuntimeRevision,
+		AuditFactID:     expected.AuditFactID, AuditCanonicalDigest: view.CanonicalDigest,
+		ProjectionSchemaVersion: SchemaV1,
+	}
+	if view.State != expected || view.CanonicalDigest == (Digest{}) || view.Projection != wantProjection {
+		t.Fatalf("mandatory AuditFact view = %#v, want state=%#v and projection=%#v",
+			view, expected, wantProjection)
+	}
 
-	var auditFactID, owningModule, sourceClockID string
-	var schemaVersion SchemaVersion
-	var integrityVersion uint16
-	var action, result uint8
-	var occurredAt, recordedAt time.Time
-	var canonicalDigest, auditState []byte
-	if err := db.QueryRowContext(context.Background(), `SELECT audit_fact_id, schema_version,
-		integrity_version, owning_module, action, result, occurred_at, recorded_at,
-		source_clock_id, canonical_digest, audit_state
-		FROM `+schema+`.runtime_execution_mandatory_audit WHERE decision_id=$1`,
-		decision.Fact.DecisionID.String()).Scan(
-		&auditFactID, &schemaVersion, &integrityVersion, &owningModule, &action, &result,
-		&occurredAt, &recordedAt, &sourceClockID, &canonicalDigest, &auditState,
-	); err != nil {
-		t.Fatalf("read complete mandatory AuditFact: %v", err)
+	restarted, err := NewPostgresAuthority(db, PostgresConfig{Schema: schema, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("restart PostgreSQL authority: %v", err)
 	}
-	if auditFactID == "" || schemaVersion != SchemaV1 || integrityVersion != 1 ||
-		owningModule != "runtime_execution" || action == 0 || result == 0 ||
-		sourceClockID != "platform_control_plane" || len(canonicalDigest) != 32 ||
-		!occurredAt.Equal(recordedAt) || !recordedAt.Equal(now.Truncate(time.Microsecond)) {
-		t.Fatalf("incomplete mandatory AuditFact columns: id=%q schema=%v integrity=%d module=%q action=%d result=%d occurred=%v recorded=%v clock=%q digest=%x",
-			auditFactID, schemaVersion, integrityVersion, owningModule, action, result,
-			occurredAt, recordedAt, sourceClockID, canonicalDigest)
+	replayed, err := restarted.persistReconciliationFoundation(context.Background(), intent)
+	if err != nil || replayed.Fact != decision.Fact {
+		t.Fatalf("restart replay = %#v err=%v, want original Decision", replayed, err)
 	}
-	var state map[string]any
-	if err := json.Unmarshal(auditState, &state); err != nil {
-		t.Fatalf("decode mandatory AuditFact state: %v", err)
-	}
-	for _, field := range []string{
-		"audit_fact_id", "schema_version", "integrity_version", "owning_module", "decision_id",
-		"runtime_run_id", "operation_id", "request_digest", "authority_kind", "authority_id",
-		"authority_generation", "action", "result", "reason_code", "before_revision", "after_revision",
-		"before_state", "after_state", "before_operation_generation", "after_operation_generation",
-		"before_runtime_fence", "after_runtime_fence", "policy_epoch", "authorization_epoch",
-		"recovery_generation", "before_safety_epoch", "after_safety_epoch",
-		"occurred_at", "recorded_at", "source_clock_id", "evidence_root_id", "evidence_root_digest",
-		"approval_reference", "idempotency_reference", "retry_disposition", "reconciliation_disposition",
-		"superseding_audit_fact_id", "safe_error_code",
-	} {
-		if _, present := state[field]; !present {
-			t.Fatalf("mandatory AuditFact state omitted %q: %s", field, auditState)
-		}
+	reloaded, err := restarted.loadMandatoryAudit(context.Background(), ref)
+	if err != nil || reloaded != view {
+		t.Fatalf("reloaded mandatory AuditFact = %#v err=%v, want %#v", reloaded, err, view)
 	}
 }
 
-func TestPostgresFoundationSchemasRetainReconciliationAndCleanupAuthority(t *testing.T) {
+func TestPostgresCleanupDebtCreationReplaysAndSurvivesRestart(t *testing.T) {
 	db, schema := testpostgres.Open(t, "runtime_execution_test")
-	_ = newMigratedPostgresAuthority(t, db, schema, time.Date(2026, 7, 28, 11, 40, 0, 0, time.UTC))
+	now := time.Date(2026, 7, 28, 11, 40, 0, 123456789, time.UTC)
+	owner := mustTaskOrchestrationAuthority(t, "postgres-cleanup-owner", 15)
+	start := standardStart(t, now, owner, "postgres-cleanup-create")
+	store := newMigratedPostgresAuthority(t, db, schema, now)
+	fixture := acceptedPostgresRuntimeFixture(start, owner, now)
+	installPostgresRuntimeFixture(t, db, schema, fixture, now)
+	fact := retainedAcceptedStartFact(start, "runtime-decision-postgres-cleanup-create")
+	installPostgresAcceptedStartFacts(t, db, schema, start, fact, now)
 
-	assertPostgresColumns(t, db, schema, "runtime_execution_reconciliation_obligations", []string{
-		"owner_authority_kind", "owner_authority_id", "owner_authority_generation",
-		"runtime_revision", "operation_generation", "runtime_fence", "result",
-		"next_retry_at", "safe_failure_count", "stale_evidence_count",
+	creation := cleanupDebtCreation{
+		MutationID: "cleanup-mutation-create", DebtID: "cleanup-debt-create",
+		PersonalWorkspaceID: fixture.PersonalWorkspaceID, RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+		ResourceClass: cleanupResourceSandbox, ResourceIdentityDigest: digest(101),
+		ResourceGeneration: 3, ResourceFence: 5, Intent: cleanupIntentReclaim,
+		CauseDecisionID: fact.DecisionID, CauseOperationID: fact.OperationID,
+		RetentionFactDigest: digest(102), EligibilityFactDigest: digest(103),
+		CreatedAt: now, EligibleAt: now.Add(-time.Minute),
+		Estimation: cleanupEstimation{State: cleanupEstimateUnknown},
+		Blockers: cleanupBlockerSummary{
+			Classes: cleanupBlockerGracePeriod | cleanupBlockerQuarantine, Digest: digest(104),
+		},
+		Uncontained: true,
+	}
+	created, err := store.createCleanupDebt(context.Background(), creation)
+	if err != nil {
+		t.Fatalf("create Cleanup Debt: %v", err)
+	}
+	if created.DebtID != creation.DebtID || created.Revision != 1 || created.Status != cleanupDebtBlocked ||
+		created.OwnerModule != postgresCleanupOwnerModule || created.PersonalWorkspaceID != fixture.PersonalWorkspaceID ||
+		created.TaskID != fixture.TaskID || created.PhaseRunID != fixture.PhaseRunID ||
+		created.RuntimeRunID != fixture.RuntimeRunID || created.CleanupIntent != creation.Intent ||
+		created.CauseDecisionID != fact.DecisionID || created.CauseOperationID != fact.OperationID ||
+		created.RetentionFactDigest != creation.RetentionFactDigest ||
+		created.EligibilityFactDigest != creation.EligibilityFactDigest ||
+		created.CreatedAt != now.Truncate(time.Microsecond) ||
+		created.EligibleAt != creation.EligibleAt.Truncate(time.Microsecond) ||
+		created.FirstAttemptAt != (time.Time{}) || created.LastAttemptAt != (time.Time{}) ||
+		created.Estimation.State != cleanupEstimateUnknown || created.Blockers != creation.Blockers ||
+		created.RetryDisposition != cleanupRetryBlocked || !created.Unresolved || !created.Uncontained {
+		t.Fatalf("created Cleanup Debt omitted authoritative bindings: %#v", created)
+	}
+	exact, err := store.createCleanupDebt(context.Background(), creation)
+	if err != nil || exact != created {
+		t.Fatalf("exact Cleanup Debt replay = %#v err=%v, want %#v", exact, err, created)
+	}
+
+	conflict := creation
+	conflict.ResourceFence++
+	_, err = store.createCleanupDebt(context.Background(), conflict)
+	var safeError *Error
+	if !errors.As(err, &safeError) || safeError.Code() != ErrorIntegrityConflict ||
+		safeError.RetryDisposition() != RetryNever {
+		t.Fatalf("conflicting Cleanup Debt binding error = %T %v, want non-retryable integrity conflict", err, err)
+	}
+
+	restarted, err := NewPostgresAuthority(db, PostgresConfig{Schema: schema, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatalf("restart PostgreSQL authority: %v", err)
+	}
+	loaded, err := restarted.loadCleanupDebt(context.Background(), cleanupDebtRef{
+		DebtID: creation.DebtID, PersonalWorkspaceID: fixture.PersonalWorkspaceID,
+		RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
 	})
-	assertPostgresColumns(t, db, schema, "runtime_execution_cleanup_obligations", []string{
-		"owner_module", "resource_class", "eligible_at", "next_retry_at", "failure_count",
-		"estimated_bytes", "estimated_inodes", "blocker_digest", "resolved_at", "resolution_class",
-		"resolution_authority_kind", "resolution_authority_id", "resolution_authority_generation",
-		"resolution_audit_fact_id",
+	if err != nil || loaded != created {
+		t.Fatalf("restart Cleanup Debt readback = %#v err=%v, want %#v", loaded, err, created)
+	}
+}
+
+func TestPostgresCleanupDebtPersistsRetryEstimationBlockersAndResolution(t *testing.T) {
+	db, schema := testpostgres.Open(t, "runtime_execution_test")
+	now := time.Date(2026, 7, 28, 12, 0, 0, 987654321, time.UTC)
+	owner := mustTaskOrchestrationAuthority(t, "postgres-cleanup-lifecycle-owner", 16)
+	start := standardStart(t, now, owner, "postgres-cleanup-lifecycle")
+	store := newMigratedPostgresAuthority(t, db, schema, now)
+	fixture := acceptedPostgresRuntimeFixture(start, owner, now)
+	installPostgresRuntimeFixture(t, db, schema, fixture, now)
+	fact := retainedAcceptedStartFact(start, "runtime-decision-postgres-cleanup-lifecycle")
+	installPostgresAcceptedStartFacts(t, db, schema, start, fact, now)
+
+	created, err := store.createCleanupDebt(context.Background(), cleanupDebtCreation{
+		MutationID: "cleanup-mutation-lifecycle-create", DebtID: "cleanup-debt-lifecycle",
+		PersonalWorkspaceID: fixture.PersonalWorkspaceID, RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+		ResourceClass: cleanupResourceContainment, ResourceIdentityDigest: digest(105),
+		ResourceGeneration: 7, ResourceFence: 9, Intent: cleanupIntentContain,
+		CauseDecisionID: fact.DecisionID, CauseOperationID: fact.OperationID,
+		RetentionFactDigest: digest(106), EligibilityFactDigest: digest(107),
+		CreatedAt: now, EligibleAt: now, Estimation: cleanupEstimation{State: cleanupEstimateUnknown},
 	})
+	if err != nil {
+		t.Fatalf("create lifecycle Cleanup Debt: %v", err)
+	}
+	firstAttemptAt := now.Add(time.Minute)
+	first, err := store.recordCleanupDebtAttempt(context.Background(), cleanupDebtAttempt{
+		MutationID: "cleanup-mutation-attempt-1", DebtID: created.DebtID,
+		PersonalWorkspaceID: fixture.PersonalWorkspaceID, RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+		ExpectedRevision: created.Revision, ResourceGeneration: created.ResourceGeneration,
+		ResourceFence: created.ResourceFence, ClaimGeneration: 2, ClaimFence: 11,
+		AttemptedAt: firstAttemptAt, NextRetryAt: firstAttemptAt.Add(5 * time.Minute),
+		RetryDisposition: cleanupRetryBlocked, FailureCategory: cleanupFailureUnavailable,
+		LastErrorDigest: digest(108), LastErrorEvidenceReference: "cleanup-error-evidence-1",
+		Estimation: cleanupEstimation{
+			State: cleanupEstimateKnown, Method: cleanupEstimateAdapterObservation,
+			Bytes: 4096, Inodes: 12, ObservedAt: firstAttemptAt,
+		},
+		Blockers: cleanupBlockerSummary{
+			Classes: cleanupBlockerLease | cleanupBlockerIncident, Digest: digest(109),
+		},
+		Uncontained: true,
+	})
+	if err != nil {
+		t.Fatalf("record first Cleanup Debt attempt: %v", err)
+	}
+	lastAttemptAt := firstAttemptAt.Add(2 * time.Minute)
+	secondInput := cleanupDebtAttempt{
+		MutationID: "cleanup-mutation-attempt-2", DebtID: created.DebtID,
+		PersonalWorkspaceID: fixture.PersonalWorkspaceID, RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+		ExpectedRevision: first.Revision, ResourceGeneration: created.ResourceGeneration,
+		ResourceFence: created.ResourceFence, ClaimGeneration: 3, ClaimFence: 12,
+		AttemptedAt: lastAttemptAt, NextRetryAt: lastAttemptAt.Add(10 * time.Minute),
+		RetryDisposition: cleanupRetryBlocked, FailureCategory: cleanupFailureUnavailable,
+		LastErrorDigest: digest(110), LastErrorEvidenceReference: "cleanup-error-evidence-2",
+		Estimation: cleanupEstimation{
+			State: cleanupEstimateKnown, Method: cleanupEstimateAdapterObservation,
+			Bytes: 6144, Inodes: 14, ObservedAt: lastAttemptAt,
+		},
+		Blockers: cleanupBlockerSummary{
+			Classes: cleanupBlockerReference | cleanupBlockerQuarantine, Digest: digest(111),
+		},
+		Uncontained: true,
+	}
+	second, err := store.recordCleanupDebtAttempt(context.Background(), secondInput)
+	if err != nil {
+		t.Fatalf("record second Cleanup Debt attempt: %v", err)
+	}
+	if second.Revision != 3 || second.AttemptCount != 2 || second.ConsecutiveFailureCount != 2 ||
+		second.FirstAttemptAt != firstAttemptAt.Truncate(time.Microsecond) ||
+		second.LastAttemptAt != lastAttemptAt.Truncate(time.Microsecond) ||
+		second.ClaimGeneration != 3 || second.ClaimFence != 12 ||
+		second.RetryDisposition != cleanupRetryBlocked || second.LastErrorCategory != cleanupFailureUnavailable ||
+		second.LastErrorDigest != secondInput.LastErrorDigest ||
+		second.LastErrorEvidenceReference != secondInput.LastErrorEvidenceReference ||
+		second.Estimation != (cleanupEstimation{
+			State: cleanupEstimateKnown, Method: cleanupEstimateAdapterObservation,
+			Bytes: 6144, Inodes: 14, ObservedAt: lastAttemptAt.Truncate(time.Microsecond),
+		}) ||
+		second.Blockers != secondInput.Blockers || !second.Unresolved || !second.Uncontained {
+		t.Fatalf("Cleanup Debt retry facts were not authoritative: %#v", second)
+	}
+	exactSecond, err := store.recordCleanupDebtAttempt(context.Background(), secondInput)
+	if err != nil || exactSecond != second {
+		t.Fatalf("exact retry replay = %#v err=%v, want %#v", exactSecond, err, second)
+	}
+	conflictingSecond := secondInput
+	conflictingSecond.LastErrorDigest = digest(112)
+	_, err = store.recordCleanupDebtAttempt(context.Background(), conflictingSecond)
+	var safeError *Error
+	if !errors.As(err, &safeError) || safeError.Code() != ErrorIntegrityConflict {
+		t.Fatalf("conflicting retry binding error = %T %v, want integrity conflict", err, err)
+	}
+
+	resolvedAt := lastAttemptAt.Add(time.Minute)
+	resolution := cleanupDebtResolution{
+		MutationID: "cleanup-mutation-resolve", DebtID: created.DebtID,
+		PersonalWorkspaceID: fixture.PersonalWorkspaceID, RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+		ExpectedRevision: second.Revision, ResourceGeneration: created.ResourceGeneration,
+		ResourceFence: created.ResourceFence, ResolvedAt: resolvedAt,
+		Class: cleanupResolutionAlreadyAbsent, Reason: cleanupResolutionExactGenerationAbsent,
+		ResolutionAuthority: owner, AuditFactID: "runtime-audit-cleanup-resolution",
+		EvidenceRoot: EvidenceRootSnapshot{
+			SchemaVersion: SchemaV1, EvidenceRootID: EvidenceRootID{value: "cleanup-resolution-evidence"},
+			Digest: digest(113),
+		},
+	}
+	resolved, err := store.resolveCleanupDebt(context.Background(), resolution)
+	if err != nil {
+		t.Fatalf("resolve Cleanup Debt: %v", err)
+	}
+	if resolved.Revision != 4 || resolved.Status != cleanupDebtResolved || resolved.Unresolved ||
+		resolved.RetryDisposition != cleanupRetryNone || resolved.ResolvedAt != resolvedAt.Truncate(time.Microsecond) ||
+		resolved.ResolutionClass != resolution.Class || resolved.ResolutionReason != resolution.Reason ||
+		resolved.ResolutionAuthority != owner || resolved.ResolutionAuditFactID != resolution.AuditFactID ||
+		resolved.ResolutionEvidenceRoot != resolution.EvidenceRoot || resolved.Blockers != (cleanupBlockerSummary{}) ||
+		resolved.AttemptCount != 2 || resolved.FirstAttemptAt == resolved.LastAttemptAt {
+		t.Fatalf("resolved Cleanup Debt omitted final authority: %#v", resolved)
+	}
+	exactResolved, err := store.resolveCleanupDebt(context.Background(), resolution)
+	if err != nil || exactResolved != resolved {
+		t.Fatalf("exact resolution replay = %#v err=%v, want %#v", exactResolved, err, resolved)
+	}
+	restarted, err := NewPostgresAuthority(db, PostgresConfig{Schema: schema, Now: func() time.Time { return resolvedAt }})
+	if err != nil {
+		t.Fatalf("restart PostgreSQL authority: %v", err)
+	}
+	loaded, err := restarted.loadCleanupDebt(context.Background(), cleanupDebtRef{
+		DebtID: created.DebtID, PersonalWorkspaceID: fixture.PersonalWorkspaceID,
+		RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+	})
+	if err != nil || loaded != resolved {
+		t.Fatalf("resolved Cleanup Debt readback = %#v err=%v, want %#v", loaded, err, resolved)
+	}
 }
 
 func TestPostgresPermissionFailureIsNotRetryableTransport(t *testing.T) {
@@ -449,6 +650,19 @@ func TestPostgresHeartbeatCompactionPreservesCurrentAuthorityFacts(t *testing.T)
 	}
 	installPostgresAcceptedStartFacts(t, db, schema, start, original, now)
 	installPostgresRetentionFacts(t, db, schema, fixture, original.DecisionID, now)
+	if _, err := store.createCleanupDebt(context.Background(), cleanupDebtCreation{
+		MutationID: "cleanup-mutation-retention", DebtID: "cleanup-debt-retention",
+		PersonalWorkspaceID: fixture.PersonalWorkspaceID, RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+		ResourceClass: cleanupResourceContainment, ResourceIdentityDigest: digest(71),
+		ResourceGeneration: 4, ResourceFence: 8, Intent: cleanupIntentContain,
+		CauseDecisionID: original.DecisionID, CauseOperationID: original.OperationID,
+		RetentionFactDigest: digest(72), EligibilityFactDigest: digest(73),
+		CreatedAt: now, EligibleAt: now, Estimation: cleanupEstimation{State: cleanupEstimateUnknown},
+		Blockers:    cleanupBlockerSummary{Classes: cleanupBlockerQuarantine, Digest: digest(74)},
+		Uncontained: true,
+	}); err != nil {
+		t.Fatalf("persist retained Cleanup Debt authority: %v", err)
+	}
 
 	request := heartbeatCompactionRequest{
 		RuntimeRunID: fixture.RuntimeRunID, LeaseID: fixture.Lease.LeaseID,
@@ -846,6 +1060,16 @@ func TestPostgresCorruptMandatoryAuditFailsClosedOnReplay(t *testing.T) {
 		SET canonical_digest=$1 WHERE decision_id=$2`, corruptDigest[:], fact.DecisionID.String()); err != nil {
 		t.Fatal("install corrupt mandatory-audit fixture")
 	}
+	_, loadErr := store.loadMandatoryAudit(context.Background(), postgresMandatoryAuditRef{
+		DecisionID: fact.DecisionID, PersonalWorkspaceID: start.PersonalWorkspaceID,
+		RuntimeRunID: start.RuntimeRunID, OperationID: start.OperationID,
+		RequestDigest: start.CanonicalRequestDigest, Authority: owner,
+	})
+	var loadSafeError *Error
+	if !errors.As(loadErr, &loadSafeError) || loadSafeError.Code() != ErrorIntegrityConflict ||
+		loadSafeError.RetryDisposition() != RetryNever {
+		t.Fatalf("corrupt mandatory-audit loader error = %T %v, want non-retryable integrity conflict", loadErr, loadErr)
+	}
 
 	_, err := store.Execute(context.Background(), start)
 	var safeError *Error
@@ -1024,38 +1248,6 @@ func retainedAcceptedStartFact(start StartRuntimeRun, decisionID string) Runtime
 		ResultingRuntimeRevision: start.ExpectedRuntimeRevision + 1,
 		StateAtDecision:          RuntimeWaitingForLease, OutcomeAtDecision: RuntimeOutcomeNone,
 		Retry: RetryNever, Reconciliation: ReconciliationNotRequired,
-	}
-}
-
-func assertPostgresColumns(
-	t *testing.T,
-	db *sql.DB,
-	schema string,
-	table string,
-	want []string,
-) {
-	t.Helper()
-	rows, err := db.QueryContext(context.Background(), `SELECT column_name FROM information_schema.columns
-		WHERE table_schema=$1 AND table_name=$2`, schema, table)
-	if err != nil {
-		t.Fatalf("inspect PostgreSQL columns for %s", table)
-	}
-	defer func() { _ = rows.Close() }()
-	present := make(map[string]bool)
-	for rows.Next() {
-		var column string
-		if err := rows.Scan(&column); err != nil {
-			t.Fatalf("scan PostgreSQL column for %s", table)
-		}
-		present[column] = true
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatalf("iterate PostgreSQL columns for %s", table)
-	}
-	for _, column := range want {
-		if !present[column] {
-			t.Errorf("%s is missing authority column %s", table, column)
-		}
 	}
 }
 
@@ -1244,16 +1436,6 @@ func installPostgresRetentionFacts(
 		ReconciliationTransportAmbiguous, ReconciliationObligationOpen, DecisionAccepted, now.UTC(),
 		fixture.EvidenceRoot.EvidenceRootID.String(), fixture.EvidenceRoot.Digest[:]); err != nil {
 		t.Fatal("install unresolved reconciliation authority")
-	}
-	resourceDigest := digest(71)
-	if _, err := tx.ExecContext(context.Background(), `INSERT INTO `+schema+`.runtime_execution_cleanup_obligations (
-		debt_id, runtime_run_id, resource_identity_digest, resource_generation,
-		resource_fence, status, unresolved, uncontained, first_recorded_at,
-		last_recorded_at, attempt_count, safe_reason, evidence_root_id, evidence_root_digest
-	) VALUES ($1,$2,$3,$4,$5,$6,TRUE,TRUE,$7,$7,1,$8,$9,$10)`, "cleanup-debt-retention",
-		fixture.RuntimeRunID.String(), resourceDigest[:], uint64(4), uint64(8), CleanupObligationOpen,
-		now.UTC(), CleanupReasonUncontained, fixture.EvidenceRoot.EvidenceRootID.String(), fixture.EvidenceRoot.Digest[:]); err != nil {
-		t.Fatal("install unresolved Cleanup Debt authority")
 	}
 	for sequence, flags := range []struct {
 		terminal, conflict, uncontained, unresolved bool
