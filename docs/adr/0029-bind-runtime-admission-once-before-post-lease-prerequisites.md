@@ -1,6 +1,13 @@
 # Bind Runtime admission once before post-lease prerequisites
 
-Status: Accepted
+Status: Proposed — Class C Owner approval is required before merge.
+
+This record proposes a narrow supersession of accepted ADR 0022 and the #24
+Runtime Execution resolution. Delegated mode can resolve the derived failure
+mechanics below, but it cannot accept this public/cross-module contract change.
+The PR must remain unmerged, and implementation decomposition and
+`to-tickets` must remain blocked, until the Owner explicitly approves this
+record and the approved documentation is merged into the default branch.
 
 SlideSmith will use one admission path for a Runtime Run. Task Orchestration
 atomically commits its immutable Runtime enactment/outbox and the Scheduler Work
@@ -22,6 +29,31 @@ accepted start. Once start acceptance binds a grant, a later grant cannot
 rebind that Runtime Run. Delivery or acknowledgement ambiguity is reconciled
 by replaying or inspecting the original C03 operation.
 
+Binding also fixes a `LeaseAcquireBy` no later than the existing grant expiry
+or Runtime deadline and creates a C03 Runtime fence independent of any
+Sandbox Lease fence. A bound grant never becomes unbound, never returns its
+Accepted Work Item to eligibility, and never receives another generation.
+Temporary same-generation node-readiness or prerequisite ambiguity may remain
+`WaitingForLease`/`Reconciling` only until `LeaseAcquireBy`, using the same
+durable lease-acquire operation. A permanently stale node generation,
+Reservation, authorization, policy, or safety binding terminates the accepted
+run as `Rejected`; an accepted cancel terminates it as `Cancelled`; the Runtime
+deadline terminates it as `TimedOut`; bound-authority expiry before the Runtime
+deadline terminates it as `Rejected`. None of those outcomes is `Lost` when C03
+can prove that no lease or dispatch committed.
+
+Every no-lease terminal transaction atomically records the terminal outcome,
+advances the Runtime fence, emits `RuntimeFencedOrTerminal`, and records
+`NoLeasePhysicalDisposition` for the exact Work Item, grant generation,
+Runtime, operation, selected node generation, and stable lease-acquire
+operation. This disposition proves only that this run acquired no physical
+occupancy; it does not assert that the selected node is Ready or reset. C03
+crash recovery inspects PostgreSQL and resumes the same lease-acquire operation:
+before its transaction commits there is no lease, after it commits there is
+exactly one, and ambiguity cannot be resolved from transport, telemetry, or
+timeout. `PhysicalCapacityReleaseReady` applies only after a lease/physical
+occupancy actually existed.
+
 Scheduler logical capacity and C03 physical capacity are separate facts.
 Scheduler may CAS-release global, Personal Workspace, capability, and Resource
 Class counters from exact `RuntimeFencedOrTerminal` evidence under its current
@@ -39,8 +71,8 @@ Inspect(RuntimeRunRef) -> RuntimeSnapshot
 ```
 
 Node-execution fences, containment/reset confirmation, and C03-owned Cleanup
-Debt exception/reopen operations use a separate, protected internal
-`RuntimeMaintenance` port. It accepts only closed operational intents from
+Debt exception/reopen operations use a separate protected operational
+interface, `RuntimeMaintenance`. It accepts only closed operational intents from
 their typed Scheduler, security, recovery, or cleanup authorities, records
 mandatory audit in the authoritative transaction, and cannot start/cancel a
 Runtime Run, mutate Task/Phase state, change Scheduler counters, or resolve
@@ -92,11 +124,12 @@ Task decision/outbox + Scheduler Work Item atomic commit
 ## Consequences
 
 - ADR 0022's earlier wording that start binds a Runtime View capability is
-  superseded by the requirement-then-open contract above.
-- ADR 0022's public interface remains unchanged; maintenance is formally an
-  independent internal operational seam.
+  proposed to be superseded by the requirement-then-open contract above.
+- ADR 0022's public interface remains unchanged; maintenance is proposed as a
+  separate protected operational interface.
 - ADRs 0020, 0024, 0026, and 0027 retain their authorities and are clarified by
   this ordering, capacity split, Gateway-grant lifecycle, and audit boundary.
 - Runtime Execution implementation and tests must prove one admission path,
-  exact generation/replay behavior, and separate logical/physical release
-  evidence before #71 can be considered complete.
+  exact generation/replay behavior, the complete post-bind/pre-lease matrix,
+  and separate logical/no-lease/physical-release evidence before #71 can be
+  considered complete.

@@ -8,8 +8,8 @@ resolving
 [ADR 0026](../adr/0026-schedule-durable-work-through-fair-fenced-admission.md)
 records the durable module choice,
 [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-records the exact Work Item/grant/C03 binding and logical-versus-physical
-release correction,
+proposes the exact Work Item/grant/C03 binding and logical-versus-physical
+release correction, effective only after explicit Owner approval and merge,
 [task-orchestration.md](./task-orchestration.md) defines Task, Phase Run,
 Runtime Run, and enactment authority,
 [runtime-execution.md](./runtime-execution.md) defines Sandbox Lease, fence,
@@ -168,8 +168,9 @@ Queued -> Delivering -> Accepted
 The corresponding Admission Grant progression is:
 
 ~~~text
-ReservedUnbound -> Bound -> Releasing -> Released
-       \-> ExpiredUnbound
+ReservedUnbound -> Bound -> LeaseAttached -> Releasing -> Released
+ReservedUnbound -> ExpiredUnbound
+Bound -> TerminalNoLease -> Released
 ~~~
 
 Linearization points are:
@@ -201,6 +202,15 @@ monotonic generation, and expiry. The grant authenticates an already canonical
 C03 start; it does not become part of, replace, or rewrite that canonical
 digest. The bound record additionally references the accepted C03 Decision,
 Runtime revision, and operation.
+
+Binding also records the C03 `LeaseAcquireBy` and independent Runtime fence.
+`Bound` never transitions back to `ReservedUnbound` or `ExpiredUnbound`.
+`TerminalNoLease` is a downstream disposition for an already Accepted Work
+Item; it is not delivery failure, requeue, dead-letter, or new admission.
+`Released` in this grant diagram means only that the grant's Scheduler-owned
+logical and selected-node reservations reached their fenced release
+dispositions. Execution Node readiness and physical-vector reuse remain in the
+separate node-capacity state machine and cannot be inferred from this state.
 
 Runtime Execution may only revalidate and bind the presented grant in the
 atomic acceptance transaction. It cannot issue or refresh an Admission Grant,
@@ -298,7 +308,12 @@ The exact evidence classes are intentionally separate. `RuntimeFencedOrTerminal`
 authorizes Scheduler to evaluate a logical counter release under its current
 Scheduler epoch, policy version, Work Item, grant generation, Runtime Run,
 operation/start digest, Runtime revision, and fence CAS. It does not claim the
-node is safe. `PhysicalCapacityReleaseReady` additionally binds the Execution
+node is safe. `NoLeasePhysicalDisposition` is exact C03 evidence that an
+Accepted/Bound Runtime never committed a Sandbox Lease, physical occupancy, or
+worker dispatch. It allows Scheduler to clear only that grant's selected-node
+scheduling reservation; it does not make the node Ready. A future placement
+still requires a current C03 readiness fact for the same node-capacity
+generation. `PhysicalCapacityReleaseReady` additionally binds the Execution
 Node and physical-capacity generation, Sandbox Lease/generation, process-tree
 termination, secret/network revocation, and containment/reset evidence. Only
 the latter can make the node vector allocatable again. Neither evidence edits
@@ -368,8 +383,20 @@ eligible nodes. They cannot prove availability, integrity, ownership, or
 recovery and never override fairness or a hard constraint.
 
 Runtime Execution revalidates current node facts and the exact Admission Grant
-before granting a Sandbox Lease. If a binding or fact changed, the grant is
-rejected or expires unbound and the Work Item is safely reconsidered.
+before granting a Sandbox Lease. Before C03 acceptance, a stale or expired
+unbound grant follows the re-admission rules above. After Accepted/Bound, the
+Work Item is final for delivery and is never reconsidered: temporary
+same-generation node or prerequisite ambiguity keeps the same logical and node
+reservation only until `LeaseAcquireBy`; permanent binding/generation failure
+terminates the accepted Runtime as `Rejected`; cancel and Runtime deadline
+terminate it as `Cancelled` and `TimedOut`. C03 crash recovery replays the same
+lease-acquire operation and proves zero or one lease from PostgreSQL.
+
+Every post-bind terminal with zero committed lease must deliver both exact
+`RuntimeFencedOrTerminal` and `NoLeasePhysicalDisposition`. Scheduler may then
+CAS-release global/Workspace/capability/class counters and clear the exact
+grant's selected-node scheduling reservation. It cannot infer the no-lease
+fact, synthesize physical readiness, or reuse a stale/quarantined node.
 
 ## Quota Reservation seam
 
@@ -447,9 +474,12 @@ Delivery Claim binds Work Item, claim generation, worker authority, operation,
 payload digest, Admission Grant, Scheduling Policy version, Scheduler epoch,
 heartbeat, and expiry. Claim expiry changes delivery ownership only.
 
-Runtime completion still requires the Runtime Run, operation, Sandbox Lease,
-fence, Runtime Binding, Task revision, and safety epochs defined by Runtime
-Execution. A queue token is not a Runtime fence.
+Post-lease Runtime completion requires the Runtime Run, operation, Sandbox
+Lease, fence, Runtime Binding, Task revision, and safety epochs defined by
+Runtime Execution. A pre-lease `Rejected`, `Cancelled`, or `TimedOut` decision
+instead requires the independent C03 Runtime fence and exact
+`NoLeasePhysicalDisposition`; it cannot require or fabricate a Sandbox Lease.
+A queue token is not a Runtime fence.
 
 ## Stale completion and capacity release
 
@@ -471,6 +501,18 @@ Execution. A queue token is not a Runtime fence.
 - Once the C03 start-acceptance transaction binds the grant, Delivery Claim
   loss cannot release its logical reservations. Later release follows exact
   fenced/terminal evidence and Scheduler CAS rather than claim state.
+- A Bound grant that has no committed lease never expires unbound and never
+  requeues. Temporary validation ambiguity retains the same reservations only
+  until `LeaseAcquireBy`. Permanent stale node generation, Reservation,
+  authorization, policy, or safety binding ends the accepted Runtime as
+  `Rejected`; cancel and Runtime deadline end it as `Cancelled` or `TimedOut`.
+- For those no-lease terminals, `RuntimeFencedOrTerminal` releases logical
+  global/Workspace/capability/class counters and
+  `NoLeasePhysicalDisposition` clears the exact selected-node scheduling
+  reservation. Neither fact makes a stale node allocatable.
+- A crash around lease grant retains both reservations until C03 proves from
+  the atomic lease transaction whether zero or one lease committed. Timeout,
+  transport failure, or telemetry cannot manufacture either disposition.
 - Runtime cancellation, timeout, revocation, or loss fences before best-effort
   stop. Late success cannot cross the fence.
 - Node loss may release logical counters after exact
@@ -630,6 +672,11 @@ Execution, Usage Accounting, and broker faults covers:
 - re-admission of the same Work Item with a higher grant generation before C03
   acceptance, exact C03 replay after grant rotation, and prohibition of
   re-admission or rebinding after Accepted/Bound;
+- temporary and permanent post-bind/pre-lease node and Reservation failures,
+  bound-authority expiry, cancel, deadline, and crashes before/during/after
+  lease commit; bounded same-operation retry; atomic no-lease terminal facts;
+  logical release plus selected-node reservation clearing; no `Lost` or
+  physical readiness inference without a possible lease/process;
 - delivery backoff, immediate poison work, eight-failure dead-letter, immutable
   redrive and new-payload rejection;
 - restore with queued, delivering, bound, dead-lettered and ambiguous work;

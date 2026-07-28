@@ -80,6 +80,10 @@ _Avoid_: Worker type, host size, best-effort request, mutable resource profile
 A time-bounded, fenced Scheduler decision that reserves logical global, Personal Workspace, capability, and Resource Class counters for one exact Scheduler Work Item and selects one Execution Node. It begins unbound, binds once to the durable C03 acceptance of that Work Item's immutable Task enactment operation and payload digest, and is never authority that physical node capacity is safe to reuse. Runtime Execution must revalidate the bound grant before granting a Sandbox Lease.
 _Avoid_: Delivery Claim, Sandbox Lease, Quota Reservation, worker slot
 
+**No-Lease Physical Disposition**:
+An exact C03 fact for one accepted Runtime Run and bound Admission Grant proving that no Sandbox Lease, process, or worker dispatch committed for that grant generation. It lets Scheduler clear that grant's selected-node scheduling reservation without pretending the Execution Node itself is Ready, contained, reset, or physically reusable.
+_Avoid_: PhysicalCapacityReleaseReady, node reset, unbound grant expiry, telemetry inference
+
 **Recovery Point**:
 A validated joint recovery identity that binds one PostgreSQL point-in-time target to the exact committed durable-object and runtime-package inventories required to restore it.
 _Avoid_: Database snapshot, object-store snapshot, backup job, live replica

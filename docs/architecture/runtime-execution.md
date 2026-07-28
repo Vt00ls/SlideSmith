@@ -8,8 +8,9 @@ is authoritative for domain language,
 [ADR 0022](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/adr/0022-run-runtime-capabilities-through-fenced-sandbox-leases.md)
 records the durable module choice,
 [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-records the superseding admission, maintenance, logical/physical capacity, and
-post-lease Runtime View ordering,
+proposes the superseding admission, maintenance, logical/physical capacity,
+and post-lease Runtime View ordering; it becomes effective only after explicit
+Owner approval and merge,
 [task-orchestration.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/task-orchestration.md)
 defines Phase Run and Runtime Run membership authority,
 [runtime-and-pipeline-releases.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/runtime-and-pipeline-releases.md)
@@ -160,8 +161,8 @@ execution retry requires Task Orchestration to create a new Runtime Run.
 
 The public seam is intentionally unchanged by node and cleanup operations.
 Node-execution fences, containment/reset confirmation, and C03-owned Cleanup
-Debt resolution or exception expiry enter a separate protected internal
-`RuntimeMaintenance` port. It accepts only closed operational intents with
+Debt resolution or exception expiry enter the separate protected operational
+interface `RuntimeMaintenance`. It accepts only closed operational intents with
 typed Scheduler, security, recovery, or cleanup authority and reason-bound
 mandatory audit. It cannot start or cancel a Runtime Run, mutate Task/Phase
 state, alter Scheduler counters, resolve C04 debt, or select a production site
@@ -220,7 +221,10 @@ Its start-acceptance PostgreSQL transaction uses a restricted Scheduler
 transactional participant so C03 start acceptance, downstream Work Item
 `Accepted`, and Admission Grant `Bound` are one linearization point. The grant
 binds to that exact C03 Decision, Runtime Run, operation, digest, and accepted
-revision. The transaction may schedule private lease/reconciliation work, but
+revision. The same transaction creates a C03 Runtime fence that exists even if
+no Sandbox Lease is ever granted and fixes `LeaseAcquireBy` no later than the
+already presented grant expiry or Runtime deadline. It may schedule private
+lease/reconciliation work, but
 it must not create an admission-enactment outbox, call `ClaimAndAdmit` again, or
 manufacture a second admission state machine.
 
@@ -243,10 +247,35 @@ The failure and replay rules are:
 - if start is already accepted, presenting a newer grant generation returns
   the original C03 decision and marks the extra grant unnecessary/stale for
   Scheduler release; it never rebinds the accepted start;
-- after Accepted/Bound, the Work Item is not re-admitted. A bound grant that
-  cannot reach a valid lease is reconciled or ends the accepted run according
-  to its prerequisite policy. A true execution retry requires a new Runtime
-  Run and Task enactment.
+- after Accepted/Bound, the Work Item is not re-admitted, the bound grant never
+  returns to unbound, and no later generation is valid for that Runtime Run. A
+  true execution retry requires a new Runtime Run and Task enactment.
+
+### Post-bind, pre-lease failure contract
+
+C03 owns the complete interval between Accepted/Bound and the lease-grant
+transaction. The stable lease-acquire OperationID and canonical digest are
+persisted before an attempt; retry and recovery always inspect or replay that
+operation. Scheduler delivery has already completed and cannot reconsider the
+Work Item.
+
+| Observation before lease commit | C03 state and terminal result | Replay and capacity disposition |
+| --- | --- | --- |
+| Same node-capacity generation is temporarily unavailable, or Reservation/authority validation is explicitly retryable or ambiguous | `WaitingForLease` or `Reconciling` only while the Runtime deadline and `LeaseAcquireBy` remain current | Revalidate the same bound grant and same lease-acquire operation. Keep logical counters and the selected-node scheduling reservation; do not re-admit. |
+| Node-capacity generation changed, node is permanently ineligible, or Reservation, authorization, Resource Class, Execution Policy, Scheduler policy/epoch, release/catalog safety, or other immutable binding is definitively stale/revoked | Terminal `Rejected` with a safe reason; never `Lost` | Atomically advance the Runtime fence and emit `RuntimeFencedOrTerminal` plus `NoLeasePhysicalDisposition`. Exact Start/Inspect replay returns the same terminal decision. |
+| Bound grant/lease-acquire authority expires before the Runtime deadline | Terminal `Rejected` with `admission_authority_expired_before_lease` | Same no-lease terminal transaction; the grant does not become unbound and the Work Item is not eligible again. |
+| Authorized cancel wins before lease commit | Terminal `Cancelled` | Advance the Runtime fence and emit the same two no-lease dispositions; no stop, C04 discard, or physical release is fabricated. |
+| Runtime deadline wins before lease commit | Terminal `TimedOut` | Advance the Runtime fence and emit the same two no-lease dispositions; grant expiry cannot rewrite this outcome after the deadline. |
+| C03 crashes before or during lease acquisition | No outcome is inferred from the crash | If acceptance did not commit, Scheduler still owns the unbound path. If Accepted/Bound committed, inspect PostgreSQL and replay the same lease-acquire operation. Transaction state proves zero or one lease. Until that proof, keep the logical/node reservation and emit neither no-lease nor release-ready evidence. |
+
+The no-lease terminal transaction atomically persists the outcome, Runtime
+revision/fence, mandatory audit, `RuntimeFencedOrTerminal`, and
+`NoLeasePhysicalDisposition` with its owned outbox. The latter binds Work Item,
+grant generation, Runtime/operation/start digest, selected node and
+node-capacity generation, stable lease-acquire operation, and an explicit
+proof that no Sandbox Lease, physical occupancy, process, secret/network
+capability, Runtime View, Execution Capsule, or worker dispatch committed. It
+does not claim the selected node is Ready, contained, reset, or reusable.
 
 Scheduler alone decides admission and logical counters. C03 only revalidates a
 grant, accepts the exact start, owns lease/physical truth, and returns evidence.
@@ -291,8 +320,10 @@ Item states rather than C03 Runtime states. C03's semantic non-terminal
 progression begins only after the atomic Start/Accepted/Bound transaction:
 
 ```text
-Accepted -> WaitingForLease -> PreparingPrerequisites -> Starting -> Running
-         -> Reconciling | Stopping
+Accepted -> WaitingForLease <-> Reconciling
+         -> Rejected | Cancelled | TimedOut       (no lease committed)
+         -> PreparingPrerequisites -> Starting -> Running
+                                    -> Reconciling | Stopping
 ```
 
 `PreparingPrerequisites` is post-lease and includes the exact C04 Runtime View
@@ -307,7 +338,7 @@ The immutable terminal outcomes are:
 - `Cancelled`: cancellation fenced the run before success linearized;
 - `TimedOut`: the Platform deadline fenced the run;
 - `Lost`: the worker, daemon, node, or operation can no longer be reconciled
-  and its lease is fenced;
+  after a lease or possible process effect existed and its lease is fenced;
 - `Rejected`: a non-retryable authorization, binding, policy, compatibility,
   or integrity condition prevented execution.
 
@@ -319,9 +350,13 @@ authorities.
 The command-acceptance PostgreSQL transaction described above is the start,
 Work Item Accepted, and Admission Grant Bound linearization point. The later
 lease-grant transaction binds the selected node and fence before any process
-may start. It does not repeat admission. A terminal result linearizes only when authenticated evidence
-matching the current operation, Runtime Binding, Task revision, lease fence,
-and safety epoch commits in PostgreSQL.
+may start. It does not repeat admission. A pre-lease `Rejected`, `Cancelled`,
+or `TimedOut` result linearizes through the authoritative no-lease terminal
+transaction above and requires the Runtime fence, not a nonexistent lease
+fence or worker evidence. After lease grant, a terminal adapter result
+linearizes only when authenticated evidence matching the current operation,
+Runtime Binding, Task revision, lease fence, and safety epoch commits in
+PostgreSQL.
 
 Cancellation, timeout, and revocation first advance the authoritative fence
 and then request downstream termination. Terminal evidence and a fence use
@@ -365,6 +400,12 @@ Logical concurrency and physical reuse are deliberately different:
   capability, and Resource Class counters. Node loss may produce this evidence
   after C03 fences the run or records `Lost`; it does not need containment or
   reset proof.
+- `NoLeasePhysicalDisposition` is exact C03 evidence for an Accepted/Bound run
+  that proves the lease-grant transaction, physical occupancy, and worker
+  dispatch never committed. Scheduler may use it to clear only that grant's
+  selected-node scheduling reservation. It does not attest node readiness; a
+  stale or unavailable node remains quarantined until a current C03 readiness
+  fact for the exact node-capacity generation exists.
 - `PhysicalCapacityReleaseReady` is exact C03 evidence bound additionally to
   Execution Node and physical-capacity generation, Sandbox Lease/generation,
   process tree, secret/network revocation, and containment/reset evidence. C03
@@ -376,8 +417,10 @@ Logical concurrency and physical reuse are deliberately different:
   physical release fact never edits Scheduler policy counters directly.
 
 Thus a lost node can stop consuming unrelated Workspace concurrency while all
-of its physical capacity remains quarantined. Metrics and audit report logical
-release lag and physical release lag separately.
+of its physical capacity remains quarantined. A no-lease run can release its
+logical and selected-node scheduling reservations without fabricating physical
+release. Metrics and audit report logical release lag, no-lease disposition
+lag, and physical release lag separately.
 
 ## Execution Capsule, Runtime View, inputs, secrets, and network
 
@@ -462,9 +505,12 @@ not change Task, Phase Run, or Runtime Run outcome.
 
 Platform timeout first fences the run as `TimedOut`, then requests process
 termination, revokes capabilities, and asks C04 to discard the Runtime View.
-Node or daemon loss fences the lease and eventually produces `Lost`; the node
-remains quarantined until containment and reset are proved. A returning stale
-worker cannot cross the fence.
+After a lease or possible process effect exists, node or daemon loss fences the
+lease and may eventually produce `Lost` if the exact operation cannot be
+reconciled; the node remains quarantined until containment and reset are
+proved. When C03 proves that no lease or process effect committed, loss cannot
+produce `Lost` and follows the no-lease terminal contract instead. A returning
+stale worker cannot cross the fence.
 
 Process termination, prevention of C04 commit, and capacity release are three
 independent facts. Agent Compose `succeeded`, `failed`, or `canceled` proves
@@ -560,8 +606,11 @@ expiring execution material under the
 Backup retains authoritative Runtime Run and evidence metadata and necessary
 opaque references. It does not back up or restore a live sandbox, Agent Compose
 session, Runtime View, node-local database, or queue projection. Restore fences
-or marks old non-terminal Runtime Runs lost and creates new Runtime Runs from
-validated Checkpoints when Task Orchestration permits recovery.
+old non-terminal Runtime Runs. An Accepted/Bound run with proof that no lease
+committed becomes pre-process `Rejected` with `NoLeasePhysicalDisposition`; a
+run with an ambiguous or possible lease/process may become `Lost` and keeps the
+node quarantined. Recovery creates new Runtime Runs from validated Checkpoints
+only when Task Orchestration permits it.
 
 Repair can restore only evidence or bytes that exactly match the original
 authority, schema, digest, and manifest. It cannot adopt an orphan output,
@@ -612,6 +661,11 @@ scenario suite covers:
 - Work Item/admission atomicity, unbound-grant expiry, stale/new grant
   generations, delivery/acknowledgement loss, and the absence of a second
   admission path;
+- every post-bind/pre-lease matrix row, including temporary same-generation
+  node/Reservation ambiguity, permanent stale binding, bound-authority expiry,
+  cancel, deadline, and crash on both sides of the lease transaction; exact
+  replay; no `Lost` without possible physical effect; and atomic
+  `RuntimeFencedOrTerminal` plus `NoLeasePhysicalDisposition`;
 - lease grant, renew, expiry, revoke, release, reset, and node quarantine;
 - worker, daemon, node, acknowledgement, poll, callback, and queue loss;
 - duplicate, missing, delayed, out-of-order, unauthorized, corrupt, cross-Task,

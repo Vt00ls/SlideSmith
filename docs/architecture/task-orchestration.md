@@ -15,8 +15,8 @@ Lease, worker, and evidence authority,
 [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)
 defines Work Item delivery, Personal Workspace fairness, and Admission Grants,
 [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-defines the exact Runtime enactment/Work Item/grant binding and post-lease
-prerequisite order,
+proposes the exact Runtime enactment/Work Item/grant binding and post-lease
+prerequisite order, effective only after explicit Owner approval and merge,
 [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
 defines Phase Run Quota Reservation and provider-usage settlement, and
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 commit
@@ -202,6 +202,11 @@ without changing this seam.
    admission-enactment path. Sandbox Lease, C04/Gateway prerequisites,
    Execution Capsule, and worker dispatch follow that acceptance. The delivery
    claim is not a Phase outcome and does not become Task authority.
+   If the accepted run terminates before any lease commits, C03 returns an
+   authoritative `Rejected`, `Cancelled`, or `TimedOut` decision together with
+   `RuntimeFencedOrTerminal` and `NoLeasePhysicalDisposition`; Task
+   Orchestration does not ask Scheduler to re-admit that Work Item. A business
+   retry still creates a new Runtime Run and enactment.
 
 ### Runtime, validation, and commit
 
@@ -295,8 +300,11 @@ linearization point.
 - Delivery leases are fenced and expiring. Claim loss returns the enactment to
   delivery without changing Task, Phase Run, or Runtime Run outcome.
 - A worker or node crash never implies Runtime failure or Phase retry. The
-  reconciler observes the exact Runtime/C04 operation first; only accepted
-  terminal evidence can fail an attempt or make a new attempt eligible.
+  reconciler observes the exact Runtime/lease/C04 operation first; only an
+  authoritative C03 terminal decision or accepted terminal evidence can fail
+  an attempt or make a new attempt eligible. A pre-lease terminal uses the C03
+  Runtime fence and `NoLeasePhysicalDisposition`, not fabricated worker or
+  lease evidence.
 - Stale writers and completions are rejected by Task revision plus the exact
   Phase Run, Runtime Run, operation, and fence identities. Errors do not expose
   ownership, content, path, locator, or credential details.

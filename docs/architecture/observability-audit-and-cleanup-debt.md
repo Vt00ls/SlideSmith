@@ -11,8 +11,9 @@ decision authority,
 [runtime-execution.md](./runtime-execution.md) defines Runtime Run and Sandbox
 Lease facts,
 [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-defines C03's protected maintenance port and separate logical/physical
-capacity evidence,
+proposes C03's protected operational maintenance interface and separate
+logical/no-lease/physical capacity evidence, effective only after explicit
+Owner approval and merge,
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 and
 Cleanup Debt ownership,
 [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)
@@ -125,8 +126,8 @@ Callers do not receive a generic label map, logger, telemetry repository, audit
 table, or external sink client as a business interface.
 
 C03 node fences, containment/reset confirmation, and C03-owned Cleanup Debt
-exception/reopen operations use C03's separate protected internal
-`RuntimeMaintenance` port. They are not variants of public
+exception/reopen operations use C03's separate protected operational
+interface `RuntimeMaintenance`. They are not variants of public
 `Execute(StartRuntimeRun | CancelRuntimeRun)` or public
 `Inspect(RuntimeRunRef)`. Each maintenance intent is closed, reason-bound,
 generation/fence checked, typed to its Scheduler/security/recovery/cleanup
@@ -518,10 +519,12 @@ known missing sources, safe error category, current owner, next reconciliation
 step, and evidence references. They never expose raw paths, locators,
 credentials, content, or a mutation-capable repository.
 
-Runtime capacity diagnostics expose `RuntimeFencedOrTerminal` and logical
-counter release disposition separately from `PhysicalCapacityReleaseReady`,
-node quarantine, containment, and reset. A dashboard may show both clocks but
-cannot infer one from the other or use either projection to release capacity.
+Runtime capacity diagnostics expose three independent dispositions:
+`RuntimeFencedOrTerminal` and logical-counter release;
+`NoLeasePhysicalDisposition` and clearing of the exact grant's selected-node
+scheduling reservation; and `PhysicalCapacityReleaseReady`, node quarantine,
+containment, and reset after an actual lease. A dashboard may show all clocks
+but cannot infer one from another or use a projection to release capacity.
 
 ## Retention
 
@@ -604,6 +607,13 @@ independently CAS-release logical Workspace/policy counters after exact C03
 `RuntimeFencedOrTerminal` evidence, but the node remains unknown/quarantined
 until C03 emits `PhysicalCapacityReleaseReady` from termination and
 containment/reset evidence.
+
+For an Accepted/Bound run that never acquired a lease, C03 must emit exact
+`NoLeasePhysicalDisposition` before Scheduler clears that grant's selected-node
+reservation. The fact proves no occupancy by that run, not node readiness; a
+stale node remains quarantined. Missing or ambiguous lease-transaction state
+keeps the reservation and raises reconciliation lag rather than inferring
+either no-lease or release-ready state.
 
 ## Backup, restore, and repair
 
