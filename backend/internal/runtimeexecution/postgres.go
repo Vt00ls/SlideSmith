@@ -130,24 +130,27 @@ func (authority *PostgresAuthority) Migrate(ctx context.Context) error {
 		return newPersistenceError(PersistenceUnavailable)
 	}
 	var version int
-	if err := authority.db.QueryRowContext(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil || version < 120000 {
+	if err := authority.db.QueryRowContext(ctx, "SELECT current_setting('server_version_num')::int").Scan(&version); err != nil {
+		return normalizePostgresPersistenceFailure(err)
+	}
+	if version < 120000 {
 		return newPersistenceError(PersistenceUnavailable)
 	}
 	tx, err := authority.db.BeginTx(ctx, nil)
 	if err != nil {
-		return newPersistenceError(PersistenceUnavailable)
+		return normalizePostgresPersistenceFailure(err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock(740074)"); err != nil {
-		return newPersistenceError(PersistenceUnavailable)
+		return normalizePostgresPersistenceFailure(err)
 	}
 	for _, statement := range authority.migrationStatements() {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
-			return newPersistenceError(PersistenceUnavailable)
+			return normalizePostgresPersistenceFailure(err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return newPersistenceError(PersistenceUnavailable)
+		return normalizePostgresPersistenceFailure(err)
 	}
 	return nil
 }
@@ -162,6 +165,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	delivery := authority.table("runtime_execution_outbox_delivery")
 	reconciliation := authority.table("runtime_execution_reconciliation_obligations")
 	projection := authority.table("runtime_execution_projection_backlog")
+	integrityIncidents := authority.table("runtime_execution_integrity_incidents")
 	leaseRoots := authority.table("runtime_execution_lease_roots")
 	evidenceRoots := authority.table("runtime_execution_evidence_roots")
 	cleanup := authority.table("runtime_execution_cleanup_obligations")
@@ -209,8 +213,9 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			canonical_request bytea NOT NULL,
 			decision_id text NOT NULL REFERENCES %s(decision_id),
 			admission_grant_id text NOT NULL DEFAULT '',
+			admission_work_item_id text NOT NULL DEFAULT '',
 			admission_grant_generation bigint NOT NULL DEFAULT 0 CHECK (admission_grant_generation >= 0),
-			PRIMARY KEY (runtime_run_id, command_kind, operation_id)
+			PRIMARY KEY (runtime_run_id, operation_id)
 		)`, requests, runtimes, decisions),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
@@ -226,13 +231,21 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
 			operation_id text NOT NULL,
 			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			schema_version bigint NOT NULL,
+			integrity_version smallint NOT NULL,
+			owning_module text NOT NULL,
 			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
 			authority_kind smallint NOT NULL,
 			authority_id text NOT NULL,
 			authority_generation bigint NOT NULL CHECK (authority_generation > 0),
+			action smallint NOT NULL,
+			result smallint NOT NULL,
 			before_revision bigint NOT NULL CHECK (before_revision > 0),
 			after_revision bigint NOT NULL CHECK (after_revision > 0),
-			recorded_at timestamptz NOT NULL
+			occurred_at timestamptz NOT NULL,
+			recorded_at timestamptz NOT NULL,
+			source_clock_id text NOT NULL,
+			audit_state jsonb NOT NULL
 		)`, audit, decisions, runtimes),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY,
@@ -257,17 +270,31 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			operation_id text PRIMARY KEY,
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
 			decision_id text NOT NULL UNIQUE REFERENCES %s(decision_id),
+			owner_authority_kind smallint NOT NULL,
+			owner_authority_id text NOT NULL,
+			owner_authority_generation bigint NOT NULL CHECK (owner_authority_generation > 0),
+			runtime_revision bigint NOT NULL CHECK (runtime_revision > 0),
+			operation_generation bigint NOT NULL CHECK (operation_generation > 0),
+			runtime_fence bigint NOT NULL CHECK (runtime_fence > 0),
 			reason smallint NOT NULL,
 			status smallint NOT NULL,
+			result smallint NOT NULL,
 			first_recorded_at timestamptz NOT NULL,
 			last_recorded_at timestamptz NOT NULL,
 			observation_count bigint NOT NULL CHECK (observation_count > 0),
 			unresolved boolean NOT NULL,
+			next_retry_at timestamptz,
+			safe_failure_count bigint NOT NULL DEFAULT 0 CHECK (safe_failure_count >= 0),
+			stale_evidence_count bigint NOT NULL DEFAULT 0 CHECK (stale_evidence_count >= 0),
 			evidence_root_id text NOT NULL DEFAULT '',
 			evidence_root_digest bytea CHECK (evidence_root_digest IS NULL OR octet_length(evidence_root_digest) = 32)
 		)`, reconciliation, runtimes, decisions),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			fact_id text PRIMARY KEY REFERENCES %s(decision_id),
+			audit_fact_id text NOT NULL REFERENCES %s(audit_fact_id),
+			audit_canonical_digest bytea NOT NULL CHECK (octet_length(audit_canonical_digest) = 32),
+			fact_revision bigint NOT NULL CHECK (fact_revision > 0),
+			projection_schema_version bigint NOT NULL,
 			audit_delivery_status smallint NOT NULL,
 			telemetry_delivery_status smallint NOT NULL,
 			attempt_count bigint NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
@@ -276,7 +303,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			first_attempt_at timestamptz,
 			last_attempt_at timestamptz,
 			delivered_at timestamptz
-		)`, projection, decisions),
+		)`, projection, decisions, audit),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			evidence_root_id text PRIMARY KEY,
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
@@ -299,6 +326,8 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			debt_id text PRIMARY KEY,
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			owner_module text NOT NULL DEFAULT 'runtime_execution',
+			resource_class smallint NOT NULL DEFAULT 1,
 			resource_identity_digest bytea NOT NULL CHECK (octet_length(resource_identity_digest) = 32),
 			resource_generation bigint NOT NULL CHECK (resource_generation > 0),
 			resource_fence bigint NOT NULL CHECK (resource_fence > 0),
@@ -308,10 +337,40 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			first_recorded_at timestamptz NOT NULL,
 			last_recorded_at timestamptz NOT NULL,
 			attempt_count bigint NOT NULL CHECK (attempt_count > 0),
+			eligible_at timestamptz,
+			next_retry_at timestamptz,
+			failure_count bigint NOT NULL DEFAULT 0 CHECK (failure_count >= 0),
+			estimated_bytes bigint CHECK (estimated_bytes IS NULL OR estimated_bytes >= 0),
+			estimated_inodes bigint CHECK (estimated_inodes IS NULL OR estimated_inodes >= 0),
+			blocker_digest bytea CHECK (blocker_digest IS NULL OR octet_length(blocker_digest) = 32),
 			safe_reason smallint NOT NULL,
 			evidence_root_id text NOT NULL REFERENCES %s(evidence_root_id),
-			evidence_root_digest bytea NOT NULL CHECK (octet_length(evidence_root_digest) = 32)
+			evidence_root_digest bytea NOT NULL CHECK (octet_length(evidence_root_digest) = 32),
+			resolved_at timestamptz,
+			resolution_class smallint,
+			resolution_authority_kind smallint,
+			resolution_authority_id text NOT NULL DEFAULT '',
+			resolution_authority_generation bigint CHECK (resolution_authority_generation IS NULL OR resolution_authority_generation > 0),
+			resolution_audit_fact_id text NOT NULL DEFAULT ''
 		)`, cleanup, runtimes, evidenceRoots),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			operation_id text NOT NULL,
+			retained_command_kind smallint NOT NULL,
+			attempted_command_kind smallint NOT NULL,
+			retained_request_digest bytea NOT NULL CHECK (octet_length(retained_request_digest) = 32),
+			attempted_request_digest bytea NOT NULL CHECK (octet_length(attempted_request_digest) = 32),
+			retained_grant_id text NOT NULL,
+			attempted_grant_id text NOT NULL,
+			retained_work_item_id text NOT NULL,
+			attempted_work_item_id text NOT NULL,
+			retained_grant_generation bigint NOT NULL CHECK (retained_grant_generation >= 0),
+			attempted_grant_generation bigint NOT NULL CHECK (attempted_grant_generation >= 0),
+			authority_scope_digest bytea NOT NULL CHECK (octet_length(authority_scope_digest) = 32),
+			observed_at timestamptz NOT NULL,
+			PRIMARY KEY (runtime_run_id, operation_id, attempted_command_kind,
+				attempted_request_digest, attempted_grant_id, attempted_work_item_id, attempted_grant_generation)
+		)`, integrityIncidents, runtimes),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
 			heartbeat_sequence bigint NOT NULL CHECK (heartbeat_sequence > 0),
@@ -358,6 +417,8 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", evidenceRoots, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", compaction),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", compaction, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", integrityIncidents),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", integrityIncidents, immutableFunction),
 	}
 }
 
@@ -365,17 +426,35 @@ func (authority *PostgresAuthority) failAt(point PersistenceFaultPoint) bool {
 	return authority.faults != nil && authority.faults.FailAt(point)
 }
 
+type retainedCommandBindingValue struct {
+	kind                        int16
+	operationID                 OperationID
+	workspaceID                 PersonalWorkspaceID
+	runtimeRunID                RuntimeRunID
+	caller                      RuntimeAuthority
+	digest                      Digest
+	canonical                   []byte
+	admissionGrantID            AdmissionGrantID
+	admissionWorkItemID         WorkItemID
+	admissionGrantGeneration    AdmissionGrantGeneration
+	expectedOperationGeneration OperationGeneration
+	expectedRuntimeFence        RuntimeFence
+	safetyEpoch                 ReleaseSafetyEpoch
+	auditAction                 postgresMandatoryAuditAction
+	auditReasonCode             uint8
+}
+
 func (authority *PostgresAuthority) Execute(ctx context.Context, command RuntimeCommand) (RuntimeDecision, error) {
 	if ctx == nil || ctx.Err() != nil {
 		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
 	}
-	kind, operationID, workspaceID, runtimeRunID, caller, digest, canonical, err := retainedCommandBinding(command)
+	binding, err := retainedCommandBinding(command)
 	if err != nil {
 		return RuntimeDecision{}, err
 	}
-	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
-		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -383,9 +462,9 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 		owner_authority_id, owner_authority_generation, owner_authority_kind,
 		task_revision, runtime_revision, operation_generation, runtime_fence,
 		safety_epoch, runtime_state, runtime_outcome, terminal_evidence_id, aggregate_state
-		FROM %s WHERE runtime_run_id=$1`, authority.table("runtime_execution_runtimes")), runtimeRunID.String())
-	record, err := scanPostgresRuntimeRecord(runtimeRow, runtimeRunID)
-	if err == sql.ErrNoRows || err == nil && !authorized(record, workspaceID, caller) {
+		FROM %s WHERE runtime_run_id=$1`, authority.table("runtime_execution_runtimes")), binding.runtimeRunID.String())
+	record, err := scanPostgresRuntimeRecord(runtimeRow, binding.runtimeRunID)
+	if err == sql.ErrNoRows || err == nil && !authorized(record, binding.workspaceID, binding.caller) {
 		return RuntimeDecision{}, newError(ErrorAuthorizationDenied)
 	}
 	if err != nil {
@@ -394,25 +473,40 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 
 	var retainedDigest []byte
 	var retainedCanonical []byte
-	var decisionID string
-	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT canonical_request_digest, canonical_request, decision_id
-		FROM %s WHERE runtime_run_id=$1 AND command_kind=$2 AND operation_id=$3`,
-		authority.table("runtime_execution_requests")), runtimeRunID.String(), kind, operationID.String()).
-		Scan(&retainedDigest, &retainedCanonical, &decisionID)
+	var retainedWorkspaceID, decisionID, retainedGrantID, retainedWorkItemID string
+	var retainedKind int16
+	var retainedGrantGeneration AdmissionGrantGeneration
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT personal_workspace_id, command_kind, canonical_request_digest,
+		canonical_request, decision_id, admission_grant_id, admission_work_item_id,
+		admission_grant_generation FROM %s WHERE runtime_run_id=$1 AND operation_id=$2`,
+		authority.table("runtime_execution_requests")), binding.runtimeRunID.String(), binding.operationID.String()).Scan(
+		&retainedWorkspaceID, &retainedKind, &retainedDigest, &retainedCanonical, &decisionID,
+		&retainedGrantID, &retainedWorkItemID, &retainedGrantGeneration,
+	)
 	if err == sql.ErrNoRows {
 		// #75 owns fresh Start/Accepted/Bound. This foundation can only replay a
 		// retained command and therefore cannot create a half-admission state.
 		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
 	}
 	if err != nil {
-		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
-	if !bytes.Equal(retainedDigest, digest[:]) || !bytes.Equal(retainedCanonical, canonical) {
+	if retainedWorkspaceID != binding.workspaceID.String() || retainedKind != binding.kind ||
+		!bytes.Equal(retainedDigest, binding.digest[:]) ||
+		!bytes.Equal(retainedCanonical, binding.canonical) ||
+		retainedGrantID != binding.admissionGrantID.String() ||
+		retainedWorkItemID != binding.admissionWorkItemID.String() ||
+		retainedGrantGeneration != binding.admissionGrantGeneration {
+		if err := authority.recordIntegrityIncident(ctx, tx, binding, retainedKind, retainedDigest,
+			retainedGrantID, retainedWorkItemID, retainedGrantGeneration); err != nil {
+			return RuntimeDecision{}, err
+		}
+		if err := tx.Commit(); err != nil {
+			return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
+		}
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
-	fact, err := authority.loadRetainedDecision(
-		ctx, tx, decisionID, workspaceID, runtimeRunID, operationID, digest, canonical, caller,
-	)
+	fact, err := authority.loadRetainedDecision(ctx, tx, decisionID, binding)
 	if err != nil {
 		return RuntimeDecision{}, err
 	}
@@ -421,77 +515,82 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
 	if err := tx.Commit(); err != nil {
-		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
 	return RuntimeDecision{Fact: fact, Snapshot: projected}, nil
 }
 
-func retainedCommandBinding(command RuntimeCommand) (
-	CommandKind,
-	OperationID,
-	PersonalWorkspaceID,
-	RuntimeRunID,
-	RuntimeAuthority,
-	Digest,
-	[]byte,
-	error,
-) {
+func retainedCommandBinding(command RuntimeCommand) (retainedCommandBindingValue, error) {
 	if command == nil {
-		return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, newError(ErrorInvalidRequest)
+		return retainedCommandBindingValue{}, newError(ErrorInvalidRequest)
 	}
 	switch typed := command.(type) {
 	case StartRuntimeRun:
 		if typed.SchemaVersion == 0 {
-			return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, newError(ErrorInvalidRequest)
+			return retainedCommandBindingValue{}, newError(ErrorInvalidRequest)
 		}
 		if typed.SchemaVersion.Major() != SchemaV1.Major() {
-			return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, newError(ErrorUnsupportedSchema)
+			return retainedCommandBindingValue{}, newError(ErrorUnsupportedSchema)
 		}
 		canonical, err := canonicalStartEncoding(typed)
 		if err != nil {
-			return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, err
+			return retainedCommandBindingValue{}, err
 		}
-		digest := Digest(sha256.Sum256(append([]byte(canonicalRequestDomain), canonical...)))
+		digest := canonicalRequestDigest(canonical)
 		if digest != typed.CanonicalRequestDigest {
-			return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, newError(ErrorIntegrityConflict)
+			return retainedCommandBindingValue{}, newError(ErrorIntegrityConflict)
 		}
 		if typed.Authority.kind != AuthorityTaskOrchestration {
-			return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, newError(ErrorAuthorizationDenied)
+			return retainedCommandBindingValue{}, newError(ErrorAuthorizationDenied)
 		}
-		return CommandStartRuntimeRun, typed.OperationID, typed.PersonalWorkspaceID, typed.RuntimeRunID,
-			typed.Authority, digest, canonical, nil
+		return retainedCommandBindingValue{
+			kind: int16(CommandStartRuntimeRun), operationID: typed.OperationID,
+			workspaceID: typed.PersonalWorkspaceID, runtimeRunID: typed.RuntimeRunID,
+			caller: typed.Authority, digest: digest, canonical: canonical,
+			admissionGrantID:            typed.AdmissionGrant.AdmissionGrantID,
+			admissionWorkItemID:         typed.AdmissionGrant.WorkItemID,
+			admissionGrantGeneration:    typed.AdmissionGrant.Generation,
+			expectedOperationGeneration: typed.ExpectedOperationGeneration,
+			expectedRuntimeFence:        typed.ExpectedRuntimeFence, safetyEpoch: typed.ReleaseSafetyEpoch,
+			auditAction: postgresAuditStartAccepted,
+		}, nil
 	case CancelRuntimeRun:
 		if typed.SchemaVersion == 0 {
-			return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, newError(ErrorInvalidRequest)
+			return retainedCommandBindingValue{}, newError(ErrorInvalidRequest)
 		}
 		if typed.SchemaVersion.Major() != SchemaV1.Major() {
-			return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, newError(ErrorUnsupportedSchema)
+			return retainedCommandBindingValue{}, newError(ErrorUnsupportedSchema)
 		}
 		canonical, err := canonicalCancelEncoding(typed)
 		if err != nil {
-			return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, err
+			return retainedCommandBindingValue{}, err
 		}
-		digest := Digest(sha256.Sum256(append([]byte(canonicalRequestDomain), canonical...)))
+		digest := canonicalRequestDigest(canonical)
 		if digest != typed.CanonicalRequestDigest {
-			return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, newError(ErrorIntegrityConflict)
+			return retainedCommandBindingValue{}, newError(ErrorIntegrityConflict)
 		}
-		return CommandCancelRuntimeRun, typed.OperationID, typed.PersonalWorkspaceID, typed.RuntimeRunID,
-			typed.Authority, digest, canonical, nil
+		return retainedCommandBindingValue{
+			kind: int16(CommandCancelRuntimeRun), operationID: typed.OperationID,
+			workspaceID: typed.PersonalWorkspaceID, runtimeRunID: typed.RuntimeRunID,
+			caller: typed.Authority, digest: digest, canonical: canonical,
+			expectedOperationGeneration: typed.ExpectedOperationGeneration,
+			expectedRuntimeFence:        typed.ExpectedRuntimeFence, safetyEpoch: typed.SafetyEpoch,
+			auditAction: postgresAuditCancelAccepted, auditReasonCode: uint8(typed.Reason),
+		}, nil
 	default:
-		return 0, OperationID{}, PersonalWorkspaceID{}, RuntimeRunID{}, RuntimeAuthority{}, Digest{}, nil, newError(ErrorInvalidRequest)
+		return retainedCommandBindingValue{}, newError(ErrorInvalidRequest)
 	}
+}
+
+func canonicalRequestDigest(canonical []byte) Digest {
+	return Digest(sha256.Sum256(append([]byte(canonicalRequestDomain), canonical...)))
 }
 
 func (authority *PostgresAuthority) loadRetainedDecision(
 	ctx context.Context,
 	tx *sql.Tx,
 	decisionID string,
-	workspaceID PersonalWorkspaceID,
-	runtimeRunID RuntimeRunID,
-	operationID OperationID,
-	digest Digest,
-	canonical []byte,
-	caller RuntimeAuthority,
+	binding retainedCommandBindingValue,
 ) (RuntimeDecisionFact, error) {
 	var storedRuntimeRunID, storedOperationID string
 	var storedDigest, state []byte
@@ -507,48 +606,65 @@ func (authority *PostgresAuthority) loadRetainedDecision(
 		return RuntimeDecisionFact{}, normalizeRuntimePersistenceFailure(err)
 	}
 	fact, err := decodePostgresDecisionFact(state)
-	if err != nil || fact.DecisionID.String() != decisionID || storedRuntimeRunID != runtimeRunID.String() ||
-		storedOperationID != operationID.String() || !bytes.Equal(storedDigest, digest[:]) ||
-		fact.OperationID != operationID || fact.CanonicalRequestDigest != digest ||
+	if err != nil || fact.DecisionID.String() != decisionID || storedRuntimeRunID != binding.runtimeRunID.String() ||
+		storedOperationID != binding.operationID.String() || !bytes.Equal(storedDigest, binding.digest[:]) ||
+		fact.OperationID != binding.operationID || fact.CanonicalRequestDigest != binding.digest ||
 		fact.PreviousRuntimeRevision != previousRevision || fact.ResultingRuntimeRevision != resultingRevision {
 		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
 	}
-	var auditRuntimeRunID, auditOperationID, auditAuthorityID string
-	var auditRequestDigest, auditCanonicalDigest []byte
+	var auditFactID, auditRuntimeRunID, auditOperationID, auditAuthorityID string
+	var auditOwningModule, auditSourceClockID string
+	var auditRequestDigest, auditCanonicalDigest, auditStateBytes []byte
+	var auditSchemaVersion SchemaVersion
+	var auditIntegrityVersion uint16
 	var auditAuthorityKind AuthorityKind
 	var auditAuthorityGeneration AuthorizationGeneration
+	var auditAction postgresMandatoryAuditAction
+	var auditResult postgresMandatoryAuditResult
 	var auditBeforeRevision, auditAfterRevision RuntimeRevision
-	var auditRecordedAt time.Time
-	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT runtime_run_id, operation_id, request_digest,
-		canonical_digest, authority_kind, authority_id, authority_generation,
-		before_revision, after_revision, recorded_at FROM %s WHERE decision_id=$1`,
+	var auditOccurredAt, auditRecordedAt time.Time
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT audit_fact_id, runtime_run_id, operation_id,
+		request_digest, schema_version, integrity_version, owning_module, canonical_digest,
+		authority_kind, authority_id, authority_generation, action, result,
+		before_revision, after_revision, occurred_at, recorded_at, source_clock_id, audit_state
+		FROM %s WHERE decision_id=$1`,
 		authority.table("runtime_execution_mandatory_audit")), decisionID).Scan(
-		&auditRuntimeRunID, &auditOperationID, &auditRequestDigest, &auditCanonicalDigest,
+		&auditFactID, &auditRuntimeRunID, &auditOperationID, &auditRequestDigest,
+		&auditSchemaVersion, &auditIntegrityVersion, &auditOwningModule, &auditCanonicalDigest,
 		&auditAuthorityKind, &auditAuthorityID, &auditAuthorityGeneration,
-		&auditBeforeRevision, &auditAfterRevision, &auditRecordedAt,
+		&auditAction, &auditResult, &auditBeforeRevision, &auditAfterRevision,
+		&auditOccurredAt, &auditRecordedAt, &auditSourceClockID, &auditStateBytes,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
 		}
-		return RuntimeDecisionFact{}, newError(ErrorDependencyUnavailable)
+		return RuntimeDecisionFact{}, normalizeRuntimePersistenceFailure(err)
 	}
-	wantAuditDigest := mandatoryAuditCanonicalDigest(
-		RuntimeDecisionID{value: decisionID}, runtimeRunID, operationID, digest, caller,
-		auditBeforeRevision, auditAfterRevision, auditRecordedAt.UTC(),
-	)
-	if auditRuntimeRunID != runtimeRunID.String() || auditOperationID != operationID.String() ||
-		!bytes.Equal(auditRequestDigest, digest[:]) || !bytes.Equal(auditCanonicalDigest, wantAuditDigest[:]) ||
-		auditAuthorityKind != caller.kind || auditAuthorityID != caller.id.String() ||
-		auditAuthorityGeneration != caller.generation || auditBeforeRevision != fact.PreviousRuntimeRevision ||
-		auditAfterRevision != fact.ResultingRuntimeRevision {
+	auditState, err := decodePostgresMandatoryAuditState(auditStateBytes)
+	if err != nil {
+		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
+	}
+	wantAuditDigest, err := auditState.canonicalDigest()
+	if err != nil || auditFactID != auditState.AuditFactID || auditRuntimeRunID != binding.runtimeRunID.String() ||
+		auditOperationID != binding.operationID.String() || !bytes.Equal(auditRequestDigest, binding.digest[:]) ||
+		auditSchemaVersion != auditState.SchemaVersion || auditIntegrityVersion != auditState.IntegrityVersion ||
+		auditOwningModule != auditState.OwningModule || !bytes.Equal(auditCanonicalDigest, wantAuditDigest[:]) ||
+		auditAuthorityKind != binding.caller.kind || auditAuthorityID != binding.caller.id.String() ||
+		auditAuthorityGeneration != binding.caller.generation || auditAction != binding.auditAction ||
+		auditResult != postgresAuditAccepted || auditBeforeRevision != fact.PreviousRuntimeRevision ||
+		auditAfterRevision != fact.ResultingRuntimeRevision ||
+		!auditOccurredAt.Equal(mustParsePostgresAuditTime(auditState.OccurredAt)) ||
+		!auditRecordedAt.Equal(mustParsePostgresAuditTime(auditState.RecordedAt)) ||
+		auditSourceClockID != postgresMandatoryAuditSourceClock ||
+		!auditStateMatchesBinding(auditState, fact, binding) {
 		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
 	}
 	var outboxDecisionID, outboxRuntimeRunID string
 	var outboxCanonicalDigest, outboxScopeDigest, outboxPayload, outboxPayloadDigest []byte
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT decision_id, runtime_run_id,
 		canonical_request_digest, authority_scope_digest, payload, payload_digest
-		FROM %s WHERE operation_id=$1`, authority.table("runtime_execution_outbox")), operationID.String()).Scan(
+		FROM %s WHERE operation_id=$1`, authority.table("runtime_execution_outbox")), binding.operationID.String()).Scan(
 		&outboxDecisionID, &outboxRuntimeRunID, &outboxCanonicalDigest, &outboxScopeDigest,
 		&outboxPayload, &outboxPayloadDigest,
 	)
@@ -556,16 +672,86 @@ func (authority *PostgresAuthority) loadRetainedDecision(
 		if err == sql.ErrNoRows {
 			return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
 		}
-		return RuntimeDecisionFact{}, newError(ErrorDependencyUnavailable)
+		return RuntimeDecisionFact{}, normalizeRuntimePersistenceFailure(err)
 	}
-	wantScopeDigest := authorityScopeDigest(workspaceID, runtimeRunID)
-	wantPayloadDigest := digestBytes(canonical)
-	if outboxDecisionID != decisionID || outboxRuntimeRunID != runtimeRunID.String() ||
-		!bytes.Equal(outboxCanonicalDigest, digest[:]) || !bytes.Equal(outboxScopeDigest, wantScopeDigest[:]) ||
-		!bytes.Equal(outboxPayload, canonical) || !bytes.Equal(outboxPayloadDigest, wantPayloadDigest[:]) {
+	wantScopeDigest := authorityScopeDigest(binding.workspaceID, binding.runtimeRunID)
+	wantPayloadDigest := digestBytes(binding.canonical)
+	if outboxDecisionID != decisionID || outboxRuntimeRunID != binding.runtimeRunID.String() ||
+		!bytes.Equal(outboxCanonicalDigest, binding.digest[:]) || !bytes.Equal(outboxScopeDigest, wantScopeDigest[:]) ||
+		!bytes.Equal(outboxPayload, binding.canonical) || !bytes.Equal(outboxPayloadDigest, wantPayloadDigest[:]) {
+		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
+	}
+	var projectionAuditFactID string
+	var projectionAuditDigest []byte
+	var projectionRevision RuntimeRevision
+	var projectionSchema SchemaVersion
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT audit_fact_id, audit_canonical_digest,
+		fact_revision, projection_schema_version FROM %s WHERE fact_id=$1`,
+		authority.table("runtime_execution_projection_backlog")), decisionID).Scan(
+		&projectionAuditFactID, &projectionAuditDigest, &projectionRevision, &projectionSchema)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
+		}
+		return RuntimeDecisionFact{}, normalizeRuntimePersistenceFailure(err)
+	}
+	if projectionAuditFactID != auditFactID || !bytes.Equal(projectionAuditDigest, wantAuditDigest[:]) ||
+		projectionRevision != fact.ResultingRuntimeRevision || projectionSchema != SchemaV1 {
 		return RuntimeDecisionFact{}, newError(ErrorIntegrityConflict)
 	}
 	return fact, nil
+}
+
+func mustParsePostgresAuditTime(value string) time.Time {
+	parsed, _ := time.Parse(canonicalTimeFormat, value)
+	return parsed
+}
+
+func auditStateMatchesBinding(
+	state postgresMandatoryAuditState,
+	fact RuntimeDecisionFact,
+	binding retainedCommandBindingValue,
+) bool {
+	return state.DecisionID == fact.DecisionID.String() && state.RuntimeRunID == binding.runtimeRunID.String() &&
+		state.OperationID == binding.operationID.String() && state.RequestDigest == binding.digest.String() &&
+		state.AuthorityKind == binding.caller.kind && state.AuthorityID == binding.caller.id.String() &&
+		state.AuthorityGeneration == binding.caller.generation && state.Action == binding.auditAction &&
+		state.ReasonCode == binding.auditReasonCode && state.BeforeRevision == fact.PreviousRuntimeRevision &&
+		state.AfterRevision == fact.ResultingRuntimeRevision && state.AfterState == fact.StateAtDecision &&
+		state.BeforeOperationGeneration == binding.expectedOperationGeneration &&
+		state.BeforeRuntimeFence == binding.expectedRuntimeFence && state.BeforeSafetyEpoch == binding.safetyEpoch &&
+		state.RetryDisposition == fact.Retry && state.ReconciliationDisposition == fact.Reconciliation
+}
+
+func (authority *PostgresAuthority) recordIntegrityIncident(
+	ctx context.Context,
+	tx *sql.Tx,
+	binding retainedCommandBindingValue,
+	retainedKind int16,
+	retainedDigest []byte,
+	retainedGrantID string,
+	retainedWorkItemID string,
+	retainedGrantGeneration AdmissionGrantGeneration,
+) error {
+	if len(retainedDigest) != len(binding.digest) {
+		return newError(ErrorIntegrityConflict)
+	}
+	scopeDigest := authorityScopeDigest(binding.workspaceID, binding.runtimeRunID)
+	_, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
+		runtime_run_id, operation_id, retained_command_kind, attempted_command_kind,
+		retained_request_digest, attempted_request_digest, retained_grant_id, attempted_grant_id,
+		retained_work_item_id, attempted_work_item_id, retained_grant_generation,
+		attempted_grant_generation, authority_scope_digest, observed_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+	ON CONFLICT DO NOTHING`, authority.table("runtime_execution_integrity_incidents")),
+		binding.runtimeRunID.String(), binding.operationID.String(), retainedKind, binding.kind,
+		retainedDigest, binding.digest[:], retainedGrantID, binding.admissionGrantID.String(),
+		retainedWorkItemID, binding.admissionWorkItemID.String(), retainedGrantGeneration,
+		binding.admissionGrantGeneration, scopeDigest[:], postgresTimestamp(authority.now()))
+	if err != nil {
+		return normalizeRuntimePersistenceFailure(err)
+	}
+	return nil
 }
 
 func digestBytes(payload []byte) Digest {
@@ -591,7 +777,7 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref RuntimeRunR
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
 	if err != nil {
-		return RuntimeSnapshot{}, newError(ErrorDependencyUnavailable)
+		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -615,7 +801,7 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref RuntimeRunR
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
 	}
 	if err := tx.Commit(); err != nil {
-		return RuntimeSnapshot{}, newError(ErrorDependencyUnavailable)
+		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
 	}
 	return projected, nil
 }
@@ -634,6 +820,10 @@ func normalizeRuntimePersistenceFailure(err error) error {
 	default:
 		return newError(ErrorDependencyUnavailable)
 	}
+}
+
+func normalizePostgresPersistenceFailure(err error) error {
+	return newPersistenceError(classifyPersistenceFailure(err))
 }
 
 func classifyPersistenceFailure(err error) PersistenceErrorCode {

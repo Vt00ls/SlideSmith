@@ -158,7 +158,7 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	record, err := authority.loadRuntimeForUpdate(ctx, tx, intent.RuntimeRunID)
@@ -172,7 +172,7 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 		return RuntimeDecision{}, err
 	} else if found {
 		if err := tx.Commit(); err != nil {
-			return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+			return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 		}
 		return replay, nil
 	}
@@ -191,6 +191,8 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 	}
 
 	previousRevision := record.fixture.RuntimeRevision
+	beforeState := record.fixture.State
+	beforeSafetyEpoch := record.fixture.SafetyEpoch
 	record.fixture.RuntimeRevision++
 	record.fixture.State = RuntimeReconciling
 	record.reconciliation = ReconciliationRequiredStatus
@@ -202,9 +204,9 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET runtime_revision=$1, runtime_state=$2,
 		aggregate_state=$3, updated_at=$4 WHERE runtime_run_id=$5 AND runtime_revision=$6`,
 		authority.table("runtime_execution_runtimes")), record.fixture.RuntimeRevision, record.fixture.State,
-		aggregateState, authority.now().UTC(), intent.RuntimeRunID.String(), previousRevision)
+		aggregateState, postgresTimestamp(authority.now()), intent.RuntimeRunID.String(), previousRevision)
 	if err != nil {
-		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
 	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
@@ -215,7 +217,7 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 
 	var sequence uint64
 	if err := tx.QueryRowContext(ctx, "SELECT nextval('"+authority.table("runtime_execution_decision_sequence")+"')").Scan(&sequence); err != nil {
-		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
 	decisionID := RuntimeDecisionID{value: fmt.Sprintf("runtime-decision-postgres-%020d", sequence)}
 	fact := RuntimeDecisionFact{
@@ -255,17 +257,38 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
 	}
 	auditID := "runtime-audit-postgres-" + fmt.Sprintf("%020d", sequence)
-	auditDigest := mandatoryAuditCanonicalDigest(
-		decisionID, intent.RuntimeRunID, intent.OperationID, intent.CanonicalDigest, intent.Authority,
-		previousRevision, record.fixture.RuntimeRevision, committedAt,
-	)
+	auditState := newPostgresMandatoryAuditState(postgresMandatoryAuditInput{
+		AuditFactID: auditID, Action: postgresAuditReconciliationRequired,
+		ReasonCode: uint8(intent.Reason), Decision: fact, RuntimeRunID: intent.RuntimeRunID,
+		RequestDigest: intent.CanonicalDigest, Authority: intent.Authority,
+		BeforeState: beforeState, AfterState: record.fixture.State,
+		BeforeOperationGeneration: record.fixture.OperationGeneration,
+		AfterOperationGeneration:  record.fixture.OperationGeneration,
+		BeforeRuntimeFence:        record.fixture.RuntimeFence,
+		AfterRuntimeFence:         record.fixture.RuntimeFence,
+		BeforeSafetyEpoch:         beforeSafetyEpoch, AfterSafetyEpoch: record.fixture.SafetyEpoch,
+		OccurredAt: committedAt, RecordedAt: committedAt, EvidenceRoot: record.evidenceRoot,
+	})
+	auditStateBytes, err := auditState.encode()
+	if err != nil {
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	auditDigest, err := auditState.canonicalDigest()
+	if err != nil {
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
-		audit_fact_id, decision_id, runtime_run_id, operation_id, request_digest, canonical_digest,
-		authority_kind, authority_id, authority_generation, before_revision, after_revision, recorded_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, authority.table("runtime_execution_mandatory_audit")),
-		auditID, decisionID.String(), intent.RuntimeRunID.String(), intent.OperationID.String(), intent.CanonicalDigest[:], auditDigest[:],
-		intent.Authority.kind, intent.Authority.id.String(), intent.Authority.generation,
-		previousRevision, record.fixture.RuntimeRevision, committedAt); err != nil {
+		audit_fact_id, decision_id, runtime_run_id, operation_id, request_digest,
+		schema_version, integrity_version, owning_module, canonical_digest,
+		authority_kind, authority_id, authority_generation, action, result,
+		before_revision, after_revision, occurred_at, recorded_at, source_clock_id, audit_state
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+		authority.table("runtime_execution_mandatory_audit")),
+		auditState.AuditFactID, decisionID.String(), intent.RuntimeRunID.String(), intent.OperationID.String(),
+		intent.CanonicalDigest[:], auditState.SchemaVersion, auditState.IntegrityVersion, auditState.OwningModule,
+		auditDigest[:], auditState.AuthorityKind, auditState.AuthorityID, auditState.AuthorityGeneration,
+		auditState.Action, auditState.Result, auditState.BeforeRevision, auditState.AfterRevision,
+		committedAt, committedAt, auditState.SourceClockID, auditStateBytes); err != nil {
 		return RuntimeDecision{}, normalizeFoundationWriteFailure(err)
 	}
 	if authority.failAt(PersistenceFaultAfterMandatoryAudit) || authority.failAt(PersistenceFaultBeforeOutbox) {
@@ -291,25 +314,33 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 		evidenceDigest = record.evidenceRoot.Digest[:]
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
-		operation_id, runtime_run_id, decision_id, reason, status,
-		first_recorded_at, last_recorded_at, observation_count, unresolved,
+		operation_id, runtime_run_id, decision_id, owner_authority_kind, owner_authority_id,
+		owner_authority_generation, runtime_revision, operation_generation, runtime_fence,
+		reason, status, result, first_recorded_at, last_recorded_at, observation_count,
+		unresolved, next_retry_at, safe_failure_count, stale_evidence_count,
 		evidence_root_id, evidence_root_digest
-	) VALUES ($1,$2,$3,$4,$5,$6,$6,1,TRUE,$7,$8)`, authority.table("runtime_execution_reconciliation_obligations")),
-		intent.OperationID.String(), intent.RuntimeRunID.String(), decisionID.String(), intent.Reason,
-		ReconciliationObligationOpen, committedAt, record.evidenceRoot.EvidenceRootID.String(), evidenceDigest); err != nil {
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,1,TRUE,$13,0,0,$14,$15)`,
+		authority.table("runtime_execution_reconciliation_obligations")),
+		intent.OperationID.String(), intent.RuntimeRunID.String(), decisionID.String(),
+		intent.Authority.kind, intent.Authority.id.String(), intent.Authority.generation,
+		record.fixture.RuntimeRevision, record.fixture.OperationGeneration, record.fixture.RuntimeFence,
+		intent.Reason, ReconciliationObligationOpen, DecisionAccepted, committedAt,
+		record.evidenceRoot.EvidenceRootID.String(), evidenceDigest); err != nil {
 		return RuntimeDecision{}, normalizeFoundationWriteFailure(err)
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
-		fact_id, audit_delivery_status, telemetry_delivery_status, degraded
-	) VALUES ($1,$2,$2,TRUE)`, authority.table("runtime_execution_projection_backlog")),
-		decisionID.String(), ProjectionPending); err != nil {
+		fact_id, audit_fact_id, audit_canonical_digest, fact_revision,
+		projection_schema_version, audit_delivery_status, telemetry_delivery_status, degraded
+	) VALUES ($1,$2,$3,$4,$5,$6,$6,TRUE)`, authority.table("runtime_execution_projection_backlog")),
+		decisionID.String(), auditID, auditDigest[:], record.fixture.RuntimeRevision,
+		SchemaV1, ProjectionPending); err != nil {
 		return RuntimeDecision{}, normalizeFoundationWriteFailure(err)
 	}
 	if authority.failAt(PersistenceFaultBeforeCommit) {
 		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
 	}
 	if err := tx.Commit(); err != nil {
-		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
 	decision := RuntimeDecision{Fact: fact, Snapshot: snapshot(record, SnapshotSchemaCurrent)}
 	if authority.failAt(PersistenceFaultAfterCommit) {
@@ -318,28 +349,12 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 	authority.deliverProjection(ctx, ProjectionFact{
 		DecisionID: decisionID, RuntimeRunID: intent.RuntimeRunID, OperationID: intent.OperationID,
 		CanonicalDigest: intent.CanonicalDigest, RuntimeRevision: record.fixture.RuntimeRevision,
+		AuditFactID: auditID, AuditCanonicalDigest: auditDigest, ProjectionSchemaVersion: SchemaV1,
 	})
 	if authority.failAt(PersistenceFaultBeforeResponse) {
 		return RuntimeDecision{}, newError(ErrorReconciliationRequired)
 	}
 	return decision, nil
-}
-
-func mandatoryAuditCanonicalDigest(
-	decisionID RuntimeDecisionID,
-	runtimeRunID RuntimeRunID,
-	operationID OperationID,
-	requestDigest Digest,
-	authority RuntimeAuthority,
-	beforeRevision RuntimeRevision,
-	afterRevision RuntimeRevision,
-	recordedAt time.Time,
-) Digest {
-	payload := fmt.Sprintf("slidesmith.runtime-execution.mandatory-audit/v1\n%s\n%s\n%s\n%s\n%d\n%s\n%d\n%d\n%d\n%s",
-		decisionID.String(), runtimeRunID.String(), operationID.String(), requestDigest.String(), authority.kind,
-		authority.id.String(), authority.generation, beforeRevision, afterRevision,
-		postgresTimestamp(recordedAt).Format(canonicalTimeFormat))
-	return digestBytes([]byte(payload))
 }
 
 func postgresTimestamp(value time.Time) time.Time {
@@ -366,24 +381,35 @@ func (authority *PostgresAuthority) lookupFoundationReplay(
 	intent reconciliationFoundationIntent,
 ) (RuntimeDecision, bool, error) {
 	var retainedDigest, retainedCanonical []byte
-	var decisionID string
-	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT canonical_request_digest, canonical_request, decision_id
-		FROM %s WHERE runtime_run_id=$1 AND command_kind=$2 AND operation_id=$3`,
-		authority.table("runtime_execution_requests")), intent.RuntimeRunID.String(), postgresReconciliationCommandKind,
-		intent.OperationID.String()).Scan(&retainedDigest, &retainedCanonical, &decisionID)
+	var retainedWorkspaceID, decisionID, retainedGrantID, retainedWorkItemID string
+	var retainedKind int16
+	var retainedGrantGeneration AdmissionGrantGeneration
+	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT personal_workspace_id, command_kind, canonical_request_digest,
+		canonical_request, decision_id, admission_grant_id, admission_work_item_id,
+		admission_grant_generation FROM %s WHERE runtime_run_id=$1 AND operation_id=$2`,
+		authority.table("runtime_execution_requests")), intent.RuntimeRunID.String(), intent.OperationID.String()).Scan(
+		&retainedWorkspaceID, &retainedKind, &retainedDigest, &retainedCanonical, &decisionID,
+		&retainedGrantID, &retainedWorkItemID, &retainedGrantGeneration)
 	if err == sql.ErrNoRows {
 		return RuntimeDecision{}, false, nil
 	}
 	if err != nil {
-		return RuntimeDecision{}, false, newError(ErrorDependencyUnavailable)
+		return RuntimeDecision{}, false, normalizeRuntimePersistenceFailure(err)
 	}
-	if !bytes.Equal(retainedDigest, intent.CanonicalDigest[:]) || !bytes.Equal(retainedCanonical, intent.canonical) {
+	if retainedWorkspaceID != intent.PersonalWorkspaceID.String() || retainedKind != postgresReconciliationCommandKind ||
+		!bytes.Equal(retainedDigest, intent.CanonicalDigest[:]) || !bytes.Equal(retainedCanonical, intent.canonical) ||
+		retainedGrantID != "" || retainedWorkItemID != "" || retainedGrantGeneration != 0 {
 		return RuntimeDecision{}, false, newError(ErrorIntegrityConflict)
 	}
-	fact, err := authority.loadRetainedDecision(
-		ctx, tx, decisionID, intent.PersonalWorkspaceID, intent.RuntimeRunID, intent.OperationID,
-		intent.CanonicalDigest, intent.canonical, intent.Authority,
-	)
+	binding := retainedCommandBindingValue{
+		kind: postgresReconciliationCommandKind, operationID: intent.OperationID,
+		workspaceID: intent.PersonalWorkspaceID, runtimeRunID: intent.RuntimeRunID,
+		caller: intent.Authority, digest: intent.CanonicalDigest, canonical: intent.canonical,
+		expectedOperationGeneration: intent.ExpectedOperationGeneration,
+		expectedRuntimeFence:        intent.ExpectedRuntimeFence, safetyEpoch: record.fixture.SafetyEpoch,
+		auditAction: postgresAuditReconciliationRequired, auditReasonCode: uint8(intent.Reason),
+	}
+	fact, err := authority.loadRetainedDecision(ctx, tx, decisionID, binding)
 	if err != nil {
 		return RuntimeDecision{}, false, err
 	}
@@ -447,7 +473,7 @@ func (authority *PostgresAuthority) acknowledgeOutbox(
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return outboxDeliveryView{}, newError(ErrorDependencyUnavailable)
+		return outboxDeliveryView{}, normalizeRuntimePersistenceFailure(err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	var decisionID string
@@ -465,7 +491,7 @@ func (authority *PostgresAuthority) acknowledgeOutbox(
 		return outboxDeliveryView{}, newError(ErrorAuthorizationDenied)
 	}
 	if err != nil {
-		return outboxDeliveryView{}, newError(ErrorDependencyUnavailable)
+		return outboxDeliveryView{}, normalizeRuntimePersistenceFailure(err)
 	}
 	if decisionID != acknowledgement.DecisionID.String() ||
 		!bytes.Equal(canonicalDigest, acknowledgement.CanonicalRequestDigest[:]) ||
@@ -477,7 +503,7 @@ func (authority *PostgresAuthority) acknowledgeOutbox(
 			return outboxDeliveryView{}, newError(ErrorIntegrityConflict)
 		}
 		if err := tx.Commit(); err != nil {
-			return outboxDeliveryView{}, newError(ErrorDependencyUnavailable)
+			return outboxDeliveryView{}, normalizeRuntimePersistenceFailure(err)
 		}
 		return outboxDeliveryView{
 			OperationID: acknowledgement.OperationID, DecisionID: acknowledgement.DecisionID,
@@ -488,19 +514,19 @@ func (authority *PostgresAuthority) acknowledgeOutbox(
 	if disposition != OutboxPending || len(retainedAck) != 0 {
 		return outboxDeliveryView{}, newError(ErrorIntegrityConflict)
 	}
-	now := authority.now().UTC()
+	now := postgresTimestamp(authority.now())
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET disposition=$1, ack_digest=$2,
 		delivery_count=1, first_attempt_at=$3, last_attempt_at=$3, acknowledged_at=$3
 		WHERE operation_id=$4 AND disposition=$5`, authority.table("runtime_execution_outbox_delivery")),
 		OutboxAcknowledged, acknowledgement.AckDigest[:], now, acknowledgement.OperationID.String(), OutboxPending)
 	if err != nil {
-		return outboxDeliveryView{}, newError(ErrorDependencyUnavailable)
+		return outboxDeliveryView{}, normalizeRuntimePersistenceFailure(err)
 	}
 	if rows, err := result.RowsAffected(); err != nil || rows != 1 {
 		return outboxDeliveryView{}, newError(ErrorIntegrityConflict)
 	}
 	if err := tx.Commit(); err != nil {
-		return outboxDeliveryView{}, newError(ErrorDependencyUnavailable)
+		return outboxDeliveryView{}, normalizeRuntimePersistenceFailure(err)
 	}
 	return outboxDeliveryView{
 		OperationID: acknowledgement.OperationID, DecisionID: acknowledgement.DecisionID,
@@ -534,11 +560,14 @@ const (
 // ProjectionFact is content-free and carries only authoritative correlation.
 // Delivery occurs strictly after the protected PostgreSQL commit.
 type ProjectionFact struct {
-	DecisionID      RuntimeDecisionID
-	RuntimeRunID    RuntimeRunID
-	OperationID     OperationID
-	CanonicalDigest Digest
-	RuntimeRevision RuntimeRevision
+	DecisionID              RuntimeDecisionID
+	RuntimeRunID            RuntimeRunID
+	OperationID             OperationID
+	CanonicalDigest         Digest
+	RuntimeRevision         RuntimeRevision
+	AuditFactID             string
+	AuditCanonicalDigest    Digest
+	ProjectionSchemaVersion SchemaVersion
 }
 
 type ProjectionDelivery interface {
@@ -564,7 +593,7 @@ func (authority *PostgresAuthority) deliverProjection(ctx context.Context, fact 
 		safeFailure = ProjectionFailureUnavailable
 		degraded = true
 	}
-	now := authority.now().UTC()
+	now := postgresTimestamp(authority.now())
 	var deliveredAt any
 	if status == ProjectionDelivered {
 		deliveredAt = now
@@ -574,6 +603,8 @@ func (authority *PostgresAuthority) deliverProjection(ctx context.Context, fact 
 		attempt_count=attempt_count+1, last_safe_failure=$2, degraded=$3,
 		first_attempt_at=COALESCE(first_attempt_at,$4), last_attempt_at=$4,
 		delivered_at=COALESCE($5,delivered_at)
-		WHERE fact_id=$6`, authority.table("runtime_execution_projection_backlog")),
-		status, safeFailure, degraded, now, deliveredAt, fact.DecisionID.String())
+		WHERE fact_id=$6 AND audit_fact_id=$7 AND audit_canonical_digest=$8
+		AND fact_revision=$9 AND projection_schema_version=$10`, authority.table("runtime_execution_projection_backlog")),
+		status, safeFailure, degraded, now, deliveredAt, fact.DecisionID.String(), fact.AuditFactID,
+		fact.AuditCanonicalDigest[:], fact.RuntimeRevision, fact.ProjectionSchemaVersion)
 }

@@ -1,6 +1,7 @@
 package runtimeexecution
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -64,7 +65,7 @@ func (authority *PostgresAuthority) compactTerminalHeartbeatHistory(
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
-		return heartbeatCompactionView{}, newError(ErrorDependencyUnavailable)
+		return heartbeatCompactionView{}, normalizeRuntimePersistenceFailure(err)
 	}
 	defer func() { _ = tx.Rollback() }()
 	record, err := authority.loadRuntimeForUpdate(ctx, tx, request.RuntimeRunID)
@@ -86,7 +87,7 @@ func (authority *PostgresAuthority) compactTerminalHeartbeatHistory(
 		request.RuntimeRunID.String(), request.LeaseID.String(), request.LeaseGeneration, request.LeaseFence,
 		request.EvidenceRoot.EvidenceRootID.String(), request.EvidenceRoot.Digest[:]).Scan(&currentLeaseRoots)
 	if err != nil {
-		return heartbeatCompactionView{}, newError(ErrorDependencyUnavailable)
+		return heartbeatCompactionView{}, normalizeRuntimePersistenceFailure(err)
 	}
 	if currentLeaseRoots != 1 {
 		return heartbeatCompactionView{}, newError(ErrorIntegrityConflict)
@@ -105,19 +106,19 @@ func (authority *PostgresAuthority) compactTerminalHeartbeatHistory(
 			request.RuntimeRunID.String(), request.LeaseID.String(), request.LeaseGeneration, request.LeaseFence,
 			request.Reason, request.EvidenceRoot.EvidenceRootID.String(), request.EvidenceRoot.Digest[:])
 		if err != nil {
-			return heartbeatCompactionView{}, newError(ErrorDependencyUnavailable)
+			return heartbeatCompactionView{}, normalizeRuntimePersistenceFailure(err)
 		}
 		var observations []time.Time
 		for rows.Next() {
 			var observedAt time.Time
 			if err := rows.Scan(&observedAt); err != nil {
 				_ = rows.Close()
-				return heartbeatCompactionView{}, newError(ErrorDependencyUnavailable)
+				return heartbeatCompactionView{}, normalizeRuntimePersistenceFailure(err)
 			}
 			observations = append(observations, observedAt.UTC())
 		}
 		if err := rows.Close(); err != nil {
-			return heartbeatCompactionView{}, newError(ErrorDependencyUnavailable)
+			return heartbeatCompactionView{}, normalizeRuntimePersistenceFailure(err)
 		}
 		if len(observations) > 0 {
 			view = heartbeatCompactionView{
@@ -145,7 +146,7 @@ func (authority *PostgresAuthority) compactTerminalHeartbeatHistory(
 				request.LeaseGeneration, request.LeaseFence, request.Reason,
 				request.EvidenceRoot.EvidenceRootID.String(), request.EvidenceRoot.Digest[:])
 			if err != nil {
-				return heartbeatCompactionView{}, newError(ErrorDependencyUnavailable)
+				return heartbeatCompactionView{}, normalizeRuntimePersistenceFailure(err)
 			}
 			if deleted, err := result.RowsAffected(); err != nil || uint64(deleted) != view.CompactedCount {
 				return heartbeatCompactionView{}, newError(ErrorIntegrityConflict)
@@ -153,10 +154,10 @@ func (authority *PostgresAuthority) compactTerminalHeartbeatHistory(
 		}
 	}
 	if err := authority.addPreservedRetentionCounts(ctx, tx, request.RuntimeRunID, &view); err != nil {
-		return heartbeatCompactionView{}, err
+		return heartbeatCompactionView{}, normalizeRuntimePersistenceFailure(err)
 	}
 	if err := tx.Commit(); err != nil {
-		return heartbeatCompactionView{}, newError(ErrorDependencyUnavailable)
+		return heartbeatCompactionView{}, normalizeRuntimePersistenceFailure(err)
 	}
 	return view, nil
 }
@@ -170,20 +171,20 @@ func (authority *PostgresAuthority) loadHeartbeatCompaction(
 		RuntimeRunID: request.RuntimeRunID, LeaseID: request.LeaseID,
 		LeaseGeneration: request.LeaseGeneration, LeaseFence: request.LeaseFence,
 	}
-	var authenticated []byte
+	var authenticated, evidenceRootDigest []byte
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT first_observed_at, last_observed_at,
-		observation_count, authenticated_digest FROM %s WHERE runtime_run_id=$1 AND lease_id=$2
+		observation_count, authenticated_digest, evidence_root_digest FROM %s WHERE runtime_run_id=$1 AND lease_id=$2
 		AND lease_generation=$3 AND lease_fence=$4 AND reason=$5 AND evidence_root_id=$6`,
 		authority.table("runtime_execution_heartbeat_compaction")), request.RuntimeRunID.String(), request.LeaseID.String(),
 		request.LeaseGeneration, request.LeaseFence, request.Reason, request.EvidenceRoot.EvidenceRootID.String()).
-		Scan(&view.FirstObservedAt, &view.LastObservedAt, &view.CompactedCount, &authenticated)
+		Scan(&view.FirstObservedAt, &view.LastObservedAt, &view.CompactedCount, &authenticated, &evidenceRootDigest)
 	if err == sql.ErrNoRows {
 		return view, false, nil
 	}
 	if err != nil {
-		return heartbeatCompactionView{}, false, newError(ErrorDependencyUnavailable)
+		return heartbeatCompactionView{}, false, normalizeRuntimePersistenceFailure(err)
 	}
-	if len(authenticated) != len(view.AuthenticatedDigest) {
+	if len(authenticated) != len(view.AuthenticatedDigest) || !bytes.Equal(evidenceRootDigest, request.EvidenceRoot.Digest[:]) {
 		return heartbeatCompactionView{}, false, newError(ErrorIntegrityConflict)
 	}
 	copy(view.AuthenticatedDigest[:], authenticated)

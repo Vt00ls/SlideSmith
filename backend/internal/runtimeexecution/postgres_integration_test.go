@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -72,6 +73,69 @@ func TestPostgresMalformedCancelIsInvalidRequest(t *testing.T) {
 	}
 }
 
+func TestPostgresOperationIdentityCannotCrossCommandKinds(t *testing.T) {
+	db, schema := testpostgres.Open(t, "runtime_execution_test")
+	now := time.Date(2026, 7, 28, 10, 40, 0, 0, time.UTC)
+	owner := mustTaskOrchestrationAuthority(t, "postgres-cross-kind-owner", 13)
+	start := standardStart(t, now, owner, "postgres-cross-kind")
+	store := newMigratedPostgresAuthority(t, db, schema, now)
+	fixture := acceptedPostgresRuntimeFixture(start, owner, now)
+	installPostgresRuntimeFixture(t, db, schema, fixture, now)
+	fact := retainedAcceptedStartFact(start, "runtime-decision-postgres-cross-kind")
+	installPostgresAcceptedStartFacts(t, db, schema, start, fact, now)
+	cancel, err := NewCancelRuntimeRun(CancelRuntimeRunInput{
+		SchemaVersion: SchemaV1, OperationID: start.OperationID,
+		PersonalWorkspaceID: start.PersonalWorkspaceID, TaskID: start.TaskID,
+		PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID,
+		ExpectedRuntimeRevision: fixture.RuntimeRevision, ExpectedStartOperationID: start.OperationID,
+		ExpectedOperationGeneration: fixture.OperationGeneration, ExpectedRuntimeFence: fixture.RuntimeFence,
+		Authority: owner, Reason: CancellationUserRequested,
+		SafetyEpoch: start.ReleaseSafetyEpoch, OccurredAt: now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("new cross-kind Cancel: %v", err)
+	}
+
+	_, err = store.Execute(context.Background(), cancel)
+	var safeError *Error
+	if !errors.As(err, &safeError) || safeError.Code() != ErrorIntegrityConflict ||
+		safeError.RetryDisposition() != RetryNever {
+		t.Fatalf("cross-kind operation reuse error = %T %v, want non-retryable integrity conflict", err, err)
+	}
+	var incidents int
+	if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM `+schema+
+		`.runtime_execution_integrity_incidents WHERE runtime_run_id=$1 AND operation_id=$2`,
+		start.RuntimeRunID.String(), start.OperationID.String()).Scan(&incidents); err != nil || incidents != 1 {
+		t.Fatalf("cross-kind conflict incidents = %d err=%v, want one durable content-free incident", incidents, err)
+	}
+}
+
+func TestPostgresRetainedStartReplayRejectsGrantRebinding(t *testing.T) {
+	db, schema := testpostgres.Open(t, "runtime_execution_test")
+	now := time.Date(2026, 7, 28, 10, 50, 0, 0, time.UTC)
+	owner := mustTaskOrchestrationAuthority(t, "postgres-grant-rebind-owner", 13)
+	start := standardStart(t, now, owner, "postgres-grant-rebind")
+	store := newMigratedPostgresAuthority(t, db, schema, now)
+	fixture := acceptedPostgresRuntimeFixture(start, owner, now)
+	installPostgresRuntimeFixture(t, db, schema, fixture, now)
+	fact := retainedAcceptedStartFact(start, "runtime-decision-postgres-grant-rebind")
+	installPostgresAcceptedStartFacts(t, db, schema, start, fact, now)
+
+	reboundInput := start.StartRuntimeRunInput
+	reboundInput.AdmissionGrant.AdmissionGrantID = mustAdmissionGrantID(t, "grant-postgres-rebound")
+	reboundInput.AdmissionGrant.Generation++
+	rebound := mustStart(t, reboundInput)
+	if rebound.CanonicalRequestDigest != start.CanonicalRequestDigest {
+		t.Fatal("replaceable delivery grant unexpectedly changed the canonical Start digest")
+	}
+	_, err := store.Execute(context.Background(), rebound)
+	var safeError *Error
+	if !errors.As(err, &safeError) || safeError.Code() != ErrorIntegrityConflict ||
+		safeError.RetryDisposition() != RetryNever {
+		t.Fatalf("accepted Start grant rebinding error = %T %v, want non-retryable integrity conflict", err, err)
+	}
+}
+
 func TestPostgresMandatoryAuditFailureRollsBackProtectedReconciliation(t *testing.T) {
 	db, schema := testpostgres.Open(t, "runtime_execution_test")
 	now := time.Date(2026, 7, 28, 11, 0, 0, 0, time.UTC)
@@ -115,6 +179,121 @@ func TestPostgresMandatoryAuditFailureRollsBackProtectedReconciliation(t *testin
 	counts := postgresFoundationCounts(t, db, schema)
 	if counts != (foundationCounts{}) {
 		t.Fatalf("mandatory-audit failure left partial authoritative facts: %+v", counts)
+	}
+}
+
+func TestPostgresMandatoryAuditPersistsCompleteCanonicalFact(t *testing.T) {
+	db, schema := testpostgres.Open(t, "runtime_execution_test")
+	now := time.Date(2026, 7, 28, 11, 30, 0, 987654321, time.UTC)
+	owner := mustTaskOrchestrationAuthority(t, "postgres-complete-audit-owner", 14)
+	start := standardStart(t, now, owner, "postgres-complete-audit")
+	store := newMigratedPostgresAuthority(t, db, schema, now)
+	fixture := acceptedPostgresRuntimeFixture(start, owner, now)
+	installPostgresRuntimeFixture(t, db, schema, fixture, now)
+	intent := newReconciliationFoundationIntent(
+		fixture, mustOperationID(t, "reconcile-complete-audit"), owner, ReconciliationTransportAmbiguous,
+	)
+	decision, err := store.persistReconciliationFoundation(context.Background(), intent)
+	if err != nil {
+		t.Fatalf("persist reconciliation foundation: %v", err)
+	}
+
+	var auditFactID, owningModule, sourceClockID string
+	var schemaVersion SchemaVersion
+	var integrityVersion uint16
+	var action, result uint8
+	var occurredAt, recordedAt time.Time
+	var canonicalDigest, auditState []byte
+	if err := db.QueryRowContext(context.Background(), `SELECT audit_fact_id, schema_version,
+		integrity_version, owning_module, action, result, occurred_at, recorded_at,
+		source_clock_id, canonical_digest, audit_state
+		FROM `+schema+`.runtime_execution_mandatory_audit WHERE decision_id=$1`,
+		decision.Fact.DecisionID.String()).Scan(
+		&auditFactID, &schemaVersion, &integrityVersion, &owningModule, &action, &result,
+		&occurredAt, &recordedAt, &sourceClockID, &canonicalDigest, &auditState,
+	); err != nil {
+		t.Fatalf("read complete mandatory AuditFact: %v", err)
+	}
+	if auditFactID == "" || schemaVersion != SchemaV1 || integrityVersion != 1 ||
+		owningModule != "runtime_execution" || action == 0 || result == 0 ||
+		sourceClockID != "platform_control_plane" || len(canonicalDigest) != 32 ||
+		!occurredAt.Equal(recordedAt) || !recordedAt.Equal(now.Truncate(time.Microsecond)) {
+		t.Fatalf("incomplete mandatory AuditFact columns: id=%q schema=%v integrity=%d module=%q action=%d result=%d occurred=%v recorded=%v clock=%q digest=%x",
+			auditFactID, schemaVersion, integrityVersion, owningModule, action, result,
+			occurredAt, recordedAt, sourceClockID, canonicalDigest)
+	}
+	var state map[string]any
+	if err := json.Unmarshal(auditState, &state); err != nil {
+		t.Fatalf("decode mandatory AuditFact state: %v", err)
+	}
+	for _, field := range []string{
+		"audit_fact_id", "schema_version", "integrity_version", "owning_module", "decision_id",
+		"runtime_run_id", "operation_id", "request_digest", "authority_kind", "authority_id",
+		"authority_generation", "action", "result", "reason_code", "before_revision", "after_revision",
+		"before_state", "after_state", "before_operation_generation", "after_operation_generation",
+		"before_runtime_fence", "after_runtime_fence", "policy_epoch", "authorization_epoch",
+		"recovery_generation", "before_safety_epoch", "after_safety_epoch",
+		"occurred_at", "recorded_at", "source_clock_id", "evidence_root_id", "evidence_root_digest",
+		"approval_reference", "idempotency_reference", "retry_disposition", "reconciliation_disposition",
+		"superseding_audit_fact_id", "safe_error_code",
+	} {
+		if _, present := state[field]; !present {
+			t.Fatalf("mandatory AuditFact state omitted %q: %s", field, auditState)
+		}
+	}
+}
+
+func TestPostgresFoundationSchemasRetainReconciliationAndCleanupAuthority(t *testing.T) {
+	db, schema := testpostgres.Open(t, "runtime_execution_test")
+	_ = newMigratedPostgresAuthority(t, db, schema, time.Date(2026, 7, 28, 11, 40, 0, 0, time.UTC))
+
+	assertPostgresColumns(t, db, schema, "runtime_execution_reconciliation_obligations", []string{
+		"owner_authority_kind", "owner_authority_id", "owner_authority_generation",
+		"runtime_revision", "operation_generation", "runtime_fence", "result",
+		"next_retry_at", "safe_failure_count", "stale_evidence_count",
+	})
+	assertPostgresColumns(t, db, schema, "runtime_execution_cleanup_obligations", []string{
+		"owner_module", "resource_class", "eligible_at", "next_retry_at", "failure_count",
+		"estimated_bytes", "estimated_inodes", "blocker_digest", "resolved_at", "resolution_class",
+		"resolution_authority_kind", "resolution_authority_id", "resolution_authority_generation",
+		"resolution_audit_fact_id",
+	})
+}
+
+func TestPostgresPermissionFailureIsNotRetryableTransport(t *testing.T) {
+	db, schema := testpostgres.Open(t, "runtime_execution_test")
+	now := time.Date(2026, 7, 28, 11, 50, 0, 0, time.UTC)
+	owner := mustTaskOrchestrationAuthority(t, "postgres-permission-owner", 14)
+	start := standardStart(t, now, owner, "postgres-permission")
+	store := newMigratedPostgresAuthority(t, db, schema, now)
+	installPostgresRuntimeFixture(t, db, schema, acceptedPostgresRuntimeFixture(start, owner, now), now)
+
+	role := schema + "_denied"
+	if _, err := db.ExecContext(context.Background(), "CREATE ROLE "+role); err != nil {
+		t.Fatal("create restricted PostgreSQL role")
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), "RESET ROLE")
+		_, _ = db.ExecContext(context.Background(), "DROP ROLE "+role)
+	})
+	if _, err := db.ExecContext(context.Background(), "GRANT USAGE ON SCHEMA "+schema+" TO "+role); err != nil {
+		t.Fatal("grant restricted schema access")
+	}
+	if _, err := db.ExecContext(context.Background(), "GRANT SELECT ON "+schema+".runtime_execution_runtimes TO "+role); err != nil {
+		t.Fatal("grant restricted Runtime access")
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(context.Background(), "SET ROLE "+role); err != nil {
+		t.Fatal("activate restricted PostgreSQL role")
+	}
+	_, executeErr := store.Execute(context.Background(), start)
+	if _, err := db.ExecContext(context.Background(), "RESET ROLE"); err != nil {
+		t.Fatal("reset restricted PostgreSQL role")
+	}
+	var safeError *Error
+	if !errors.As(executeErr, &safeError) || safeError.Code() != ErrorAuthorizationDenied ||
+		safeError.RetryDisposition() != RetryNever {
+		t.Fatalf("PostgreSQL permission failure = %T %v, want non-retryable authorization denial", executeErr, executeErr)
 	}
 }
 
@@ -180,7 +359,9 @@ func TestPostgresProjectionFailureDoesNotRollbackCommittedAuthority(t *testing.T
 	owner := mustTaskOrchestrationAuthority(t, "postgres-projection-owner", 16)
 	start := standardStart(t, now, owner, "postgres-projection")
 	observedCommitted := false
+	var observedFact ProjectionFact
 	projection := ProjectionDeliveryFunc(func(ctx context.Context, fact ProjectionFact) error {
+		observedFact = fact
 		var decisions int
 		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM `+schema+`.runtime_execution_decisions
 			WHERE decision_id=$1`, fact.DecisionID.String()).Scan(&decisions); err == nil && decisions == 1 {
@@ -208,6 +389,10 @@ func TestPostgresProjectionFailureDoesNotRollbackCommittedAuthority(t *testing.T
 	}
 	if !observedCommitted {
 		t.Fatal("projection delivery ran before the authoritative transaction committed")
+	}
+	if observedFact.AuditFactID == "" || observedFact.AuditCanonicalDigest == (Digest{}) ||
+		observedFact.ProjectionSchemaVersion != SchemaV1 || observedFact.RuntimeRevision != committed.Snapshot.RuntimeRevision {
+		t.Fatalf("projection omitted authoritative AuditFact identity: %+v", observedFact)
 	}
 	counts := postgresFoundationCounts(t, db, schema)
 	if counts != (foundationCounts{Decisions: 1, Requests: 1, Revisions: 1, AuditFacts: 1, Outbox: 1, Reconciliation: 1, Projection: 1}) {
@@ -831,6 +1016,49 @@ func newMigratedPostgresAuthority(
 	return authority
 }
 
+func retainedAcceptedStartFact(start StartRuntimeRun, decisionID string) RuntimeDecisionFact {
+	return RuntimeDecisionFact{
+		DecisionID: RuntimeDecisionID{value: decisionID}, Disposition: DecisionAccepted,
+		OperationID: start.OperationID, CanonicalRequestDigest: start.CanonicalRequestDigest,
+		PreviousRuntimeRevision:  start.ExpectedRuntimeRevision,
+		ResultingRuntimeRevision: start.ExpectedRuntimeRevision + 1,
+		StateAtDecision:          RuntimeWaitingForLease, OutcomeAtDecision: RuntimeOutcomeNone,
+		Retry: RetryNever, Reconciliation: ReconciliationNotRequired,
+	}
+}
+
+func assertPostgresColumns(
+	t *testing.T,
+	db *sql.DB,
+	schema string,
+	table string,
+	want []string,
+) {
+	t.Helper()
+	rows, err := db.QueryContext(context.Background(), `SELECT column_name FROM information_schema.columns
+		WHERE table_schema=$1 AND table_name=$2`, schema, table)
+	if err != nil {
+		t.Fatalf("inspect PostgreSQL columns for %s", table)
+	}
+	defer func() { _ = rows.Close() }()
+	present := make(map[string]bool)
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			t.Fatalf("scan PostgreSQL column for %s", table)
+		}
+		present[column] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate PostgreSQL columns for %s", table)
+	}
+	for _, column := range want {
+		if !present[column] {
+			t.Errorf("%s is missing authority column %s", table, column)
+		}
+	}
+}
+
 func installPostgresRuntimeFixture(
 	t *testing.T,
 	db *sql.DB,
@@ -913,24 +1141,44 @@ func installPostgresAcceptedStartFacts(
 	if _, err := tx.ExecContext(context.Background(), `INSERT INTO `+schema+`.runtime_execution_requests (
 		personal_workspace_id, runtime_run_id, command_kind, operation_id,
 		canonical_request_digest, canonical_request, decision_id,
-		admission_grant_id, admission_grant_generation
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		admission_grant_id, admission_work_item_id, admission_grant_generation
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		start.PersonalWorkspaceID.String(), start.RuntimeRunID.String(), CommandStartRuntimeRun, start.OperationID.String(),
 		start.CanonicalRequestDigest[:], canonicalPayload, fact.DecisionID.String(),
-		start.AdmissionGrant.AdmissionGrantID.String(), start.AdmissionGrant.Generation); err != nil {
+		start.AdmissionGrant.AdmissionGrantID.String(), start.AdmissionGrant.WorkItemID.String(),
+		start.AdmissionGrant.Generation); err != nil {
 		t.Fatal("install retained request fixture")
 	}
-	auditDigest := mandatoryAuditCanonicalDigest(
-		fact.DecisionID, start.RuntimeRunID, start.OperationID, start.CanonicalRequestDigest,
-		start.Authority, fact.PreviousRuntimeRevision, fact.ResultingRuntimeRevision, now.UTC(),
-	)
+	auditState := newPostgresMandatoryAuditState(postgresMandatoryAuditInput{
+		AuditFactID: "runtime-audit-postgres-replay", Action: postgresAuditStartAccepted,
+		Decision: fact, RuntimeRunID: start.RuntimeRunID, RequestDigest: start.CanonicalRequestDigest,
+		Authority: start.Authority, BeforeState: RuntimeCreated, AfterState: fact.StateAtDecision,
+		BeforeOperationGeneration: start.ExpectedOperationGeneration,
+		AfterOperationGeneration:  start.ExpectedOperationGeneration + 1,
+		BeforeRuntimeFence:        start.ExpectedRuntimeFence,
+		AfterRuntimeFence:         start.ExpectedRuntimeFence + 1,
+		BeforeSafetyEpoch:         start.ReleaseSafetyEpoch, AfterSafetyEpoch: start.ReleaseSafetyEpoch,
+		OccurredAt: now, RecordedAt: now,
+	})
+	auditStateBytes, err := auditState.encode()
+	if err != nil {
+		t.Fatal("encode retained mandatory AuditFact")
+	}
+	auditDigest, err := auditState.canonicalDigest()
+	if err != nil {
+		t.Fatal("digest retained mandatory AuditFact")
+	}
 	if _, err := tx.ExecContext(context.Background(), `INSERT INTO `+schema+`.runtime_execution_mandatory_audit (
-		audit_fact_id, decision_id, runtime_run_id, operation_id, request_digest, canonical_digest,
-		authority_kind, authority_id, authority_generation, before_revision, after_revision, recorded_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		"runtime-audit-postgres-replay", fact.DecisionID.String(), start.RuntimeRunID.String(), start.OperationID.String(),
-		start.CanonicalRequestDigest[:], auditDigest[:], start.Authority.kind, start.Authority.id.String(), start.Authority.generation,
-		fact.PreviousRuntimeRevision, fact.ResultingRuntimeRevision, now.UTC()); err != nil {
+		audit_fact_id, decision_id, runtime_run_id, operation_id, request_digest,
+		schema_version, integrity_version, owning_module, canonical_digest,
+		authority_kind, authority_id, authority_generation, action, result,
+		before_revision, after_revision, occurred_at, recorded_at, source_clock_id, audit_state
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
+		auditState.AuditFactID, fact.DecisionID.String(), start.RuntimeRunID.String(), start.OperationID.String(),
+		start.CanonicalRequestDigest[:], auditState.SchemaVersion, auditState.IntegrityVersion, auditState.OwningModule,
+		auditDigest[:], auditState.AuthorityKind, auditState.AuthorityID, auditState.AuthorityGeneration,
+		auditState.Action, auditState.Result, auditState.BeforeRevision, auditState.AfterRevision,
+		postgresTimestamp(now), postgresTimestamp(now), auditState.SourceClockID, auditStateBytes); err != nil {
 		t.Fatal("install retained mandatory audit fixture")
 	}
 	payloadDigest := digestBytes(canonicalPayload)
@@ -942,6 +1190,13 @@ func installPostgresAcceptedStartFacts(
 		start.OperationID.String(), fact.DecisionID.String(), start.RuntimeRunID.String(), start.CanonicalRequestDigest[:],
 		scopeDigest[:], canonicalPayload, payloadDigest[:], now.UTC()); err != nil {
 		t.Fatal("install retained outbox fixture")
+	}
+	if _, err := tx.ExecContext(context.Background(), `INSERT INTO `+schema+`.runtime_execution_projection_backlog (
+		fact_id, audit_fact_id, audit_canonical_digest, fact_revision,
+		projection_schema_version, audit_delivery_status, telemetry_delivery_status, degraded
+	) VALUES ($1,$2,$3,$4,$5,$6,$6,TRUE)`, fact.DecisionID.String(), auditState.AuditFactID,
+		auditDigest[:], fact.ResultingRuntimeRevision, SchemaV1, ProjectionPending); err != nil {
+		t.Fatal("install retained projection fixture")
 	}
 	if err := tx.Commit(); err != nil {
 		t.Fatal("commit retained Decision fixture")
@@ -977,11 +1232,16 @@ func installPostgresRetentionFacts(
 		t.Fatal("install current lease authority root")
 	}
 	if _, err := tx.ExecContext(context.Background(), `INSERT INTO `+schema+`.runtime_execution_reconciliation_obligations (
-		operation_id, runtime_run_id, decision_id, reason, status,
-		first_recorded_at, last_recorded_at, observation_count, unresolved,
+		operation_id, runtime_run_id, decision_id, owner_authority_kind, owner_authority_id,
+		owner_authority_generation, runtime_revision, operation_generation, runtime_fence,
+		reason, status, result, first_recorded_at, last_recorded_at, observation_count,
+		unresolved, next_retry_at, safe_failure_count, stale_evidence_count,
 		evidence_root_id, evidence_root_digest
-	) VALUES ($1,$2,$3,$4,$5,$6,$6,1,TRUE,$7,$8)`, "reconcile-retention", fixture.RuntimeRunID.String(),
-		decisionID.String(), ReconciliationTransportAmbiguous, ReconciliationObligationOpen, now.UTC(),
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$13,1,TRUE,$13,0,0,$14,$15)`,
+		"reconcile-retention", fixture.RuntimeRunID.String(), decisionID.String(),
+		fixture.Owner.kind, fixture.Owner.id.String(), fixture.Owner.generation,
+		fixture.RuntimeRevision, fixture.OperationGeneration, fixture.RuntimeFence,
+		ReconciliationTransportAmbiguous, ReconciliationObligationOpen, DecisionAccepted, now.UTC(),
 		fixture.EvidenceRoot.EvidenceRootID.String(), fixture.EvidenceRoot.Digest[:]); err != nil {
 		t.Fatal("install unresolved reconciliation authority")
 	}
