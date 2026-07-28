@@ -334,6 +334,10 @@ func TestPostgresCleanupDebtPersistsRetryEstimationBlockersAndResolution(t *test
 	start := standardStart(t, now, owner, "postgres-cleanup-lifecycle")
 	store := newMigratedPostgresAuthority(t, db, schema, now)
 	fixture := acceptedPostgresRuntimeFixture(start, owner, now)
+	fixture.EvidenceRoot = EvidenceRootSnapshot{
+		SchemaVersion: SchemaV1, EvidenceRootID: EvidenceRootID{value: "cleanup-resolution-evidence"},
+		Digest: digest(113),
+	}
 	installPostgresRuntimeFixture(t, db, schema, fixture, now)
 	fact := retainedAcceptedStartFact(start, "runtime-decision-postgres-cleanup-lifecycle")
 	installPostgresAcceptedStartFacts(t, db, schema, start, fact, now)
@@ -426,12 +430,88 @@ func TestPostgresCleanupDebtPersistsRetryEstimationBlockersAndResolution(t *test
 		ExpectedRevision: second.Revision, ResourceGeneration: created.ResourceGeneration,
 		ResourceFence: created.ResourceFence, ResolvedAt: resolvedAt,
 		Class: cleanupResolutionAlreadyAbsent, Reason: cleanupResolutionExactGenerationAbsent,
-		ResolutionAuthority: owner, AuditFactID: "runtime-audit-cleanup-resolution",
-		EvidenceRoot: EvidenceRootSnapshot{
-			SchemaVersion: SchemaV1, EvidenceRootID: EvidenceRootID{value: "cleanup-resolution-evidence"},
-			Digest: digest(113),
-		},
+		EvidenceRoot: fixture.EvidenceRoot,
 	}
+	_, err = store.resolveCleanupDebt(context.Background(), resolution)
+	var missingProofError *Error
+	if !errors.As(err, &missingProofError) || missingProofError.Code() != ErrorIntegrityConflict ||
+		missingProofError.RetryDisposition() != RetryNever {
+		t.Fatalf("unretained cleanup evidence error = %T %v, want non-retryable integrity conflict", err, err)
+	}
+	stillOpen, err := store.loadCleanupDebt(context.Background(), cleanupDebtRef{
+		DebtID: created.DebtID, PersonalWorkspaceID: fixture.PersonalWorkspaceID,
+		RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+	})
+	if err != nil || !stillOpen.Unresolved || stillOpen.Revision != second.Revision {
+		t.Fatalf("missing resolution proof changed Cleanup Debt: %#v err=%v", stillOpen, err)
+	}
+	installPostgresCleanupEvidenceRoot(t, db, schema, fixture.RuntimeRunID, fixture.EvidenceRoot, resolvedAt)
+
+	uncontainedResolution := resolution
+	uncontainedResolution.Uncontained = true
+	_, err = store.resolveCleanupDebt(context.Background(), uncontainedResolution)
+	var unsafeDispositionError *Error
+	if !errors.As(err, &unsafeDispositionError) || unsafeDispositionError.Code() != ErrorInvalidRequest ||
+		unsafeDispositionError.RetryDisposition() != RetryNever {
+		t.Fatalf("uncontained already-absent resolution error = %T %v, want non-retryable invalid request", err, err)
+	}
+	stillOpen, err = store.loadCleanupDebt(context.Background(), cleanupDebtRef{
+		DebtID: created.DebtID, PersonalWorkspaceID: fixture.PersonalWorkspaceID,
+		RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+	})
+	if err != nil || !stillOpen.Unresolved || stillOpen.Revision != second.Revision {
+		t.Fatalf("unsafe resolution changed Cleanup Debt: %#v err=%v", stillOpen, err)
+	}
+
+	unauthorizedException := resolution
+	unauthorizedException.Class = cleanupResolutionAcceptedException
+	unauthorizedException.Reason = cleanupResolutionAdministratorException
+	unauthorizedException.ExceptionUntil = resolvedAt.Add(time.Hour)
+	_, err = store.resolveCleanupDebt(context.Background(), unauthorizedException)
+	var authorizationError *Error
+	if !errors.As(err, &authorizationError) || authorizationError.Code() != ErrorAuthorizationDenied ||
+		authorizationError.RetryDisposition() != RetryNever {
+		t.Fatalf("Task Orchestration exception resolution error = %T %v, want non-retryable authorization denial", err, err)
+	}
+
+	faults := &PersistenceFaultController{}
+	faultedStore, err := NewPostgresAuthority(db, PostgresConfig{
+		Schema: schema, Now: func() time.Time { return resolvedAt }, Faults: faults,
+	})
+	if err != nil {
+		t.Fatalf("new faulted PostgreSQL authority: %v", err)
+	}
+	if err := faults.FailNextAt(PersistenceFaultBeforeMandatoryAudit); err != nil {
+		t.Fatalf("configure cleanup mandatory-audit fault: %v", err)
+	}
+	_, err = faultedStore.resolveCleanupDebt(context.Background(), resolution)
+	var auditFailure *Error
+	if !errors.As(err, &auditFailure) || auditFailure.Code() != ErrorDependencyUnavailable {
+		t.Fatalf("cleanup mandatory-audit fault error = %T %v, want safe unavailable", err, err)
+	}
+	stillOpen, err = store.loadCleanupDebt(context.Background(), cleanupDebtRef{
+		DebtID: created.DebtID, PersonalWorkspaceID: fixture.PersonalWorkspaceID,
+		RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+	})
+	if err != nil || !stillOpen.Unresolved || stillOpen.Revision != second.Revision {
+		t.Fatalf("cleanup mandatory-audit failure changed Cleanup Debt: %#v err=%v", stillOpen, err)
+	}
+	if err := faults.FailNextAt(PersistenceFaultAfterMandatoryAudit); err != nil {
+		t.Fatalf("configure post-cleanup-audit fault: %v", err)
+	}
+	_, err = faultedStore.resolveCleanupDebt(context.Background(), resolution)
+	var postAuditFailure *Error
+	if !errors.As(err, &postAuditFailure) || postAuditFailure.Code() != ErrorDependencyUnavailable {
+		t.Fatalf("post-cleanup-audit fault error = %T %v, want safe unavailable", err, err)
+	}
+	stillOpen, err = store.loadCleanupDebt(context.Background(), cleanupDebtRef{
+		DebtID: created.DebtID, PersonalWorkspaceID: fixture.PersonalWorkspaceID,
+		RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+	})
+	if err != nil || !stillOpen.Unresolved || stillOpen.Revision != second.Revision {
+		t.Fatalf("post-cleanup-audit failure changed Cleanup Debt: %#v err=%v", stillOpen, err)
+	}
+
 	resolved, err := store.resolveCleanupDebt(context.Background(), resolution)
 	if err != nil {
 		t.Fatalf("resolve Cleanup Debt: %v", err)
@@ -439,7 +519,7 @@ func TestPostgresCleanupDebtPersistsRetryEstimationBlockersAndResolution(t *test
 	if resolved.Revision != 4 || resolved.Status != cleanupDebtResolved || resolved.Unresolved ||
 		resolved.RetryDisposition != cleanupRetryNone || resolved.ResolvedAt != resolvedAt.Truncate(time.Microsecond) ||
 		resolved.ResolutionClass != resolution.Class || resolved.ResolutionReason != resolution.Reason ||
-		resolved.ResolutionAuthority != owner || resolved.ResolutionAuditFactID != resolution.AuditFactID ||
+		resolved.ResolutionAuthority != owner || !validOpaqueID(resolved.ResolutionAuditFactID) ||
 		resolved.ResolutionEvidenceRoot != resolution.EvidenceRoot || resolved.Blockers != (cleanupBlockerSummary{}) ||
 		resolved.AttemptCount != 2 || resolved.FirstAttemptAt == resolved.LastAttemptAt {
 		t.Fatalf("resolved Cleanup Debt omitted final authority: %#v", resolved)
@@ -458,6 +538,79 @@ func TestPostgresCleanupDebtPersistsRetryEstimationBlockersAndResolution(t *test
 	})
 	if err != nil || loaded != resolved {
 		t.Fatalf("resolved Cleanup Debt readback = %#v err=%v, want %#v", loaded, err, resolved)
+	}
+	assertIntegrityConflict := func(label string, err error) {
+		t.Helper()
+		var integrityError *Error
+		if !errors.As(err, &integrityError) || integrityError.Code() != ErrorIntegrityConflict ||
+			integrityError.RetryDisposition() != RetryNever {
+			t.Fatalf("%s error = %T %v, want non-retryable integrity conflict", label, err, err)
+		}
+	}
+	loadResolved := func() error {
+		_, err := restarted.loadCleanupDebt(context.Background(), cleanupDebtRef{
+			DebtID: created.DebtID, PersonalWorkspaceID: fixture.PersonalWorkspaceID,
+			RuntimeRunID: fixture.RuntimeRunID, Authority: owner,
+		})
+		return err
+	}
+	replayResolution := func() error {
+		_, err := restarted.resolveCleanupDebt(context.Background(), resolution)
+		return err
+	}
+
+	if _, err := db.ExecContext(context.Background(), `DROP TRIGGER reject_immutable_mutation ON `+schema+
+		`.runtime_execution_evidence_roots`); err != nil {
+		t.Fatal("disable immutable evidence trigger for corruption fixture")
+	}
+	corruptEvidenceDigest := digest(114)
+	if _, err := db.ExecContext(context.Background(), `UPDATE `+schema+`.runtime_execution_evidence_roots
+		SET digest=$1 WHERE evidence_root_id=$2`, corruptEvidenceDigest[:], fixture.EvidenceRoot.EvidenceRootID.String()); err != nil {
+		t.Fatal("install corrupt cleanup evidence fixture")
+	}
+	assertIntegrityConflict("corrupt cleanup evidence readback", loadResolved())
+	assertIntegrityConflict("corrupt cleanup evidence replay", replayResolution())
+	if _, err := db.ExecContext(context.Background(), `UPDATE `+schema+`.runtime_execution_evidence_roots
+		SET digest=$1 WHERE evidence_root_id=$2`, fixture.EvidenceRoot.Digest[:], fixture.EvidenceRoot.EvidenceRootID.String()); err != nil {
+		t.Fatal("restore cleanup evidence fixture")
+	}
+	if replayed, err := restarted.resolveCleanupDebt(context.Background(), resolution); err != nil || replayed != resolved {
+		t.Fatalf("restored cleanup evidence replay = %#v err=%v, want %#v", replayed, err, resolved)
+	}
+
+	if _, err := db.ExecContext(context.Background(), `DROP TRIGGER reject_immutable_mutation ON `+schema+
+		`.runtime_execution_cleanup_resolution_audit`); err != nil {
+		t.Fatal("disable immutable cleanup-audit trigger for corruption fixture")
+	}
+	corruptAuditDigest := digest(115)
+	if _, err := db.ExecContext(context.Background(), `UPDATE `+schema+`.runtime_execution_cleanup_resolution_audit
+		SET canonical_digest=$1 WHERE audit_fact_id=$2`, corruptAuditDigest[:], resolved.ResolutionAuditFactID); err != nil {
+		t.Fatal("install corrupt cleanup-audit fixture")
+	}
+	assertIntegrityConflict("corrupt cleanup audit readback", loadResolved())
+	assertIntegrityConflict("corrupt cleanup audit replay", replayResolution())
+	if _, err := db.ExecContext(context.Background(), `DELETE FROM `+schema+
+		`.runtime_execution_cleanup_resolution_audit WHERE audit_fact_id=$1`, resolved.ResolutionAuditFactID); err != nil {
+		t.Fatal("install missing cleanup-audit fixture")
+	}
+	assertIntegrityConflict("missing cleanup audit readback", loadResolved())
+	assertIntegrityConflict("missing cleanup audit replay", replayResolution())
+}
+
+func installPostgresCleanupEvidenceRoot(
+	t *testing.T,
+	db *sql.DB,
+	schema string,
+	runtimeRunID RuntimeRunID,
+	evidenceRoot EvidenceRootSnapshot,
+	acceptedAt time.Time,
+) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `INSERT INTO `+schema+`.runtime_execution_evidence_roots (
+		evidence_root_id, runtime_run_id, schema_version, digest, accepted_at
+	) VALUES ($1,$2,$3,$4,$5)`, evidenceRoot.EvidenceRootID.String(), runtimeRunID.String(),
+		evidenceRoot.SchemaVersion, evidenceRoot.Digest[:], postgresTimestamp(acceptedAt)); err != nil {
+		t.Fatal("install retained Cleanup Debt resolution evidence")
 	}
 }
 

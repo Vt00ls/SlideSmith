@@ -311,7 +311,7 @@ func validCleanupDebtRecord(record cleanupDebtRecord) bool {
 		return validResolvedCleanupDebt(record)
 	}
 	if !record.Unresolved || !record.ResolvedAt.IsZero() || record.ResolutionClass != 0 ||
-		record.ResolutionReason != 0 || validAuthority(record.ResolutionAuthority) ||
+		record.ResolutionReason != 0 || record.ResolutionAuthority != (RuntimeAuthority{}) ||
 		record.ResolutionAuditFactID != "" || record.ResolutionEvidenceRoot != (EvidenceRootSnapshot{}) ||
 		!record.ResolutionExpiresAt.IsZero() {
 		return false
@@ -348,10 +348,12 @@ func validResolvedCleanupDebt(record cleanupDebtRecord) bool {
 func validCleanupResolutionDisposition(record cleanupDebtRecord) bool {
 	switch record.ResolutionClass {
 	case cleanupResolutionReclaimed:
-		return record.ResolutionReason == cleanupResolutionCleanupProven && record.Blockers.Classes == 0 &&
+		return record.ResolutionReason == cleanupResolutionCleanupProven && !record.Uncontained &&
+			record.Blockers.Classes == 0 &&
 			record.ResolutionExpiresAt.IsZero()
 	case cleanupResolutionAlreadyAbsent:
-		return record.ResolutionReason == cleanupResolutionExactGenerationAbsent && record.Blockers.Classes == 0 &&
+		return record.ResolutionReason == cleanupResolutionExactGenerationAbsent && !record.Uncontained &&
+			record.Blockers.Classes == 0 &&
 			record.ResolutionExpiresAt.IsZero()
 	case cleanupResolutionRetainedByAuthority:
 		return record.ResolutionReason == cleanupResolutionCurrentAuthorityRetention &&

@@ -80,8 +80,6 @@ type cleanupDebtResolution struct {
 	ResolvedAt          time.Time
 	Class               cleanupResolutionClass
 	Reason              cleanupResolutionReason
-	ResolutionAuthority RuntimeAuthority
-	AuditFactID         string
 	EvidenceRoot        EvidenceRootSnapshot
 	RemainingBlockers   cleanupBlockerSummary
 	Uncontained         bool
@@ -149,31 +147,27 @@ type canonicalCleanupAttempt struct {
 }
 
 type canonicalCleanupResolution struct {
-	Schema                        string                  `json:"schema"`
-	MutationID                    string                  `json:"mutation_id"`
-	DebtID                        string                  `json:"debt_id"`
-	PersonalWorkspaceID           string                  `json:"personal_workspace_id"`
-	RuntimeRunID                  string                  `json:"runtime_run_id"`
-	AuthorityKind                 AuthorityKind           `json:"authority_kind"`
-	AuthorityID                   string                  `json:"authority_id"`
-	AuthorityGeneration           AuthorizationGeneration `json:"authority_generation"`
-	ExpectedRevision              uint64                  `json:"expected_revision"`
-	ResourceGeneration            uint64                  `json:"resource_generation"`
-	ResourceFence                 uint64                  `json:"resource_fence"`
-	ResolvedAt                    string                  `json:"resolved_at"`
-	ResolutionClass               cleanupResolutionClass  `json:"resolution_class"`
-	ResolutionReason              cleanupResolutionReason `json:"resolution_reason"`
-	ResolutionAuthorityKind       AuthorityKind           `json:"resolution_authority_kind"`
-	ResolutionAuthorityID         string                  `json:"resolution_authority_id"`
-	ResolutionAuthorityGeneration AuthorizationGeneration `json:"resolution_authority_generation"`
-	AuditFactID                   string                  `json:"audit_fact_id"`
-	EvidenceSchema                SchemaVersion           `json:"evidence_schema"`
-	EvidenceRootID                string                  `json:"evidence_root_id"`
-	EvidenceRootDigest            string                  `json:"evidence_root_digest"`
-	RemainingBlockerClasses       cleanupBlockerClass     `json:"remaining_blocker_classes"`
-	RemainingBlockerDigest        string                  `json:"remaining_blocker_digest"`
-	Uncontained                   bool                    `json:"uncontained"`
-	ExceptionUntil                string                  `json:"exception_until"`
+	Schema                  string                  `json:"schema"`
+	MutationID              string                  `json:"mutation_id"`
+	DebtID                  string                  `json:"debt_id"`
+	PersonalWorkspaceID     string                  `json:"personal_workspace_id"`
+	RuntimeRunID            string                  `json:"runtime_run_id"`
+	AuthorityKind           AuthorityKind           `json:"authority_kind"`
+	AuthorityID             string                  `json:"authority_id"`
+	AuthorityGeneration     AuthorizationGeneration `json:"authority_generation"`
+	ExpectedRevision        uint64                  `json:"expected_revision"`
+	ResourceGeneration      uint64                  `json:"resource_generation"`
+	ResourceFence           uint64                  `json:"resource_fence"`
+	ResolvedAt              string                  `json:"resolved_at"`
+	ResolutionClass         cleanupResolutionClass  `json:"resolution_class"`
+	ResolutionReason        cleanupResolutionReason `json:"resolution_reason"`
+	EvidenceSchema          SchemaVersion           `json:"evidence_schema"`
+	EvidenceRootID          string                  `json:"evidence_root_id"`
+	EvidenceRootDigest      string                  `json:"evidence_root_digest"`
+	RemainingBlockerClasses cleanupBlockerClass     `json:"remaining_blocker_classes"`
+	RemainingBlockerDigest  string                  `json:"remaining_blocker_digest"`
+	Uncontained             bool                    `json:"uncontained"`
+	ExceptionUntil          string                  `json:"exception_until"`
 }
 
 func (authority *PostgresAuthority) createCleanupDebt(
@@ -366,10 +360,11 @@ func (authority *PostgresAuthority) resolveCleanupDebt(
 		return cleanupDebtRecord{}, normalizeRuntimePersistenceFailure(err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := authority.authorizeCleanupMutation(ctx, tx, cleanupDebtRef{
+	runtime, err := authority.authorizeCleanupMutation(ctx, tx, cleanupDebtRef{
 		DebtID: resolution.DebtID, PersonalWorkspaceID: resolution.PersonalWorkspaceID,
 		RuntimeRunID: resolution.RuntimeRunID, Authority: resolution.Authority,
-	}); err != nil {
+	})
+	if err != nil {
 		return cleanupDebtRecord{}, err
 	}
 	if replay, found, err := authority.loadCleanupMutationReplay(
@@ -394,6 +389,9 @@ func (authority *PostgresAuthority) resolveCleanupDebt(
 		resolution.ResourceFence, record) || record.Status == cleanupDebtResolved {
 		return cleanupDebtRecord{}, newError(ErrorIntegrityConflict)
 	}
+	if err := authority.verifyRetainedCleanupResolutionEvidence(ctx, tx, runtime, resolution.EvidenceRoot); err != nil {
+		return cleanupDebtRecord{}, err
+	}
 	record.Revision++
 	record.Status = cleanupDebtResolved
 	record.Unresolved = false
@@ -404,11 +402,23 @@ func (authority *PostgresAuthority) resolveCleanupDebt(
 	record.ResolvedAt = resolution.ResolvedAt
 	record.ResolutionClass = resolution.Class
 	record.ResolutionReason = resolution.Reason
-	record.ResolutionAuthority = resolution.ResolutionAuthority
-	record.ResolutionAuditFactID = resolution.AuditFactID
+	record.ResolutionAuthority = resolution.Authority
+	record.ResolutionAuditFactID = cleanupResolutionAuditFactID(mutationDigest)
 	record.ResolutionEvidenceRoot = resolution.EvidenceRoot
 	record.ResolutionExpiresAt = resolution.ExceptionUntil
 	record.LastMutationID = resolution.MutationID
+	if authority.failAt(PersistenceFaultBeforeMandatoryAudit) {
+		return cleanupDebtRecord{}, newError(ErrorDependencyUnavailable)
+	}
+	if err := authority.insertCleanupResolutionAudit(ctx, tx, record); err != nil {
+		return cleanupDebtRecord{}, err
+	}
+	if authority.failAt(PersistenceFaultAfterMandatoryAudit) {
+		return cleanupDebtRecord{}, newError(ErrorDependencyUnavailable)
+	}
+	if err := authority.verifyCleanupResolutionAuthority(ctx, tx, record); err != nil {
+		return cleanupDebtRecord{}, err
+	}
 	return authority.commitCleanupDebtMutation(ctx, tx, cleanupMutationResolve, resolution.MutationID,
 		resolution.ExpectedRevision, record, mutationDigest)
 }
@@ -590,6 +600,11 @@ func (authority *PostgresAuthority) loadCleanupMutationReplay(
 		record.Revision != retainedRevision || !bytes.Equal(retainedResultDigest, recordDigest[:]) {
 		return cleanupDebtRecord{}, false, newError(ErrorIntegrityConflict)
 	}
+	if record.Status == cleanupDebtResolved {
+		if err := authority.verifyCleanupResolutionAuthority(ctx, tx, record); err != nil {
+			return cleanupDebtRecord{}, false, err
+		}
+	}
 	return record, true, nil
 }
 
@@ -642,6 +657,11 @@ func (authority *PostgresAuthority) loadCleanupDebtRow(
 		record.Status != status || record.Unresolved != unresolved || record.Uncontained != uncontained ||
 		!bytes.Equal(canonicalDigest, wantDigest[:]) {
 		return cleanupDebtRecord{}, false, newError(ErrorIntegrityConflict)
+	}
+	if record.Status == cleanupDebtResolved {
+		if err := authority.verifyCleanupResolutionAuthority(ctx, tx, record); err != nil {
+			return cleanupDebtRecord{}, false, err
+		}
 	}
 	return record, true, nil
 }
@@ -717,17 +737,19 @@ func cleanupResolutionDigest(resolution cleanupDebtResolution) (Digest, error) {
 		resolution.ResourceGeneration == 0 || resolution.ResourceFence == 0 || resolution.ResolvedAt.IsZero() ||
 		resolution.Class < cleanupResolutionReclaimed || resolution.Class > cleanupResolutionAcceptedException ||
 		resolution.Reason < cleanupResolutionCleanupProven || resolution.Reason > cleanupResolutionAdministratorException ||
-		!validAuthority(resolution.ResolutionAuthority) || !validOpaqueID(resolution.AuditFactID) ||
 		!knownEvidenceRoot(resolution.EvidenceRoot) || resolution.EvidenceRoot.EvidenceRootID == (EvidenceRootID{}) ||
 		!validCleanupBlockers(resolution.RemainingBlockers) {
 		return Digest{}, newError(ErrorInvalidRequest)
 	}
+	if resolution.Class == cleanupResolutionAcceptedException && resolution.Authority.kind != AuthorityAdministrator {
+		return Digest{}, newError(ErrorAuthorizationDenied)
+	}
 	candidate := cleanupDebtRecord{
 		Status: cleanupDebtResolved, Unresolved: false, RetryDisposition: cleanupRetryNone,
 		ResolvedAt: resolution.ResolvedAt, ResolutionClass: resolution.Class, ResolutionReason: resolution.Reason,
-		ResolutionAuthority: resolution.ResolutionAuthority, ResolutionAuditFactID: resolution.AuditFactID,
+		ResolutionAuthority: resolution.Authority, ResolutionAuditFactID: "pending-cleanup-resolution-audit",
 		ResolutionEvidenceRoot: resolution.EvidenceRoot, ResolutionExpiresAt: resolution.ExceptionUntil,
-		Blockers: resolution.RemainingBlockers,
+		Blockers: resolution.RemainingBlockers, Uncontained: resolution.Uncontained,
 	}
 	if !validCleanupResolutionDisposition(candidate) {
 		return Digest{}, newError(ErrorInvalidRequest)
@@ -740,10 +762,7 @@ func cleanupResolutionDigest(resolution cleanupDebtResolution) (Digest, error) {
 		ExpectedRevision: resolution.ExpectedRevision, ResourceGeneration: resolution.ResourceGeneration,
 		ResourceFence: resolution.ResourceFence, ResolvedAt: formatCleanupTime(resolution.ResolvedAt),
 		ResolutionClass: resolution.Class, ResolutionReason: resolution.Reason,
-		ResolutionAuthorityKind:       resolution.ResolutionAuthority.kind,
-		ResolutionAuthorityID:         resolution.ResolutionAuthority.id.String(),
-		ResolutionAuthorityGeneration: resolution.ResolutionAuthority.generation,
-		AuditFactID:                   resolution.AuditFactID, EvidenceSchema: resolution.EvidenceRoot.SchemaVersion,
+		EvidenceSchema:          resolution.EvidenceRoot.SchemaVersion,
 		EvidenceRootID:          resolution.EvidenceRoot.EvidenceRootID.String(),
 		EvidenceRootDigest:      resolution.EvidenceRoot.Digest.String(),
 		RemainingBlockerClasses: resolution.RemainingBlockers.Classes,

@@ -170,6 +170,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	evidenceRoots := authority.table("runtime_execution_evidence_roots")
 	cleanup := authority.table("runtime_execution_cleanup_obligations")
 	cleanupMutations := authority.table("runtime_execution_cleanup_mutations")
+	cleanupResolutionAudit := authority.table("runtime_execution_cleanup_resolution_audit")
 	heartbeats := authority.table("runtime_execution_heartbeat_history")
 	compaction := authority.table("runtime_execution_heartbeat_compaction")
 	immutableFunction := authority.table("runtime_execution_reject_immutable_mutation")
@@ -363,6 +364,25 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			PRIMARY KEY (debt_id, mutation_id)
 		)`, cleanupMutations, cleanup),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			audit_fact_id text PRIMARY KEY,
+			debt_id text NOT NULL UNIQUE REFERENCES %s(debt_id),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			resource_identity_digest bytea NOT NULL CHECK (octet_length(resource_identity_digest) = 32),
+			resource_generation bigint NOT NULL CHECK (resource_generation > 0),
+			resource_fence bigint NOT NULL CHECK (resource_fence > 0),
+			resolution_class smallint NOT NULL,
+			resolution_reason smallint NOT NULL,
+			authority_kind smallint NOT NULL,
+			authority_id text NOT NULL,
+			authority_generation bigint NOT NULL CHECK (authority_generation > 0),
+			evidence_root_id text NOT NULL REFERENCES %s(evidence_root_id),
+			evidence_root_digest bytea NOT NULL CHECK (octet_length(evidence_root_digest) = 32),
+			occurred_at timestamptz NOT NULL,
+			recorded_at timestamptz NOT NULL,
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			audit_state jsonb NOT NULL
+		)`, cleanupResolutionAudit, cleanup, runtimes, evidenceRoots),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
 			operation_id text NOT NULL,
 			retained_command_kind smallint NOT NULL,
@@ -454,6 +474,8 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", integrityIncidents, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", cleanupMutations),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanupMutations, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", cleanupResolutionAudit),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanupResolutionAudit, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_cleanup_rebinding ON %s", cleanup),
 		fmt.Sprintf("CREATE TRIGGER reject_cleanup_rebinding BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanup, cleanupRebindingFunction),
 	}
