@@ -1,6 +1,6 @@
 # Task Workspace Lifecycle
 
-This document records the C04 decisions confirmed during the enterprise-platform architecture grilling. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0015](../adr/0015-manage-task-workspace-state-through-an-opaque-lifecycle-seam.md) records the durable lifecycle seam, [ADR 0016](../adr/0016-hard-cut-over-legacy-execution-state.md) records the hard cutover, [runtime-execution.md](./runtime-execution.md) defines C03 Runtime Run, Sandbox Lease, worker, and execution-evidence authority, [durable-object-storage.md](./durable-object-storage.md) defines the shared verified-content mechanism used by C04, and [observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md) defines correlation, projections, alerts, retention, and Cleanup Debt evidence. This document deliberately fixes module authority and invariants without designing every method in the interface.
+This document records the C04 decisions confirmed during the enterprise-platform architecture grilling. [CONTEXT.md](../../CONTEXT.md) is authoritative for domain language, [ADR 0015](../adr/0015-manage-task-workspace-state-through-an-opaque-lifecycle-seam.md) records the durable lifecycle seam, [ADR 0016](../adr/0016-hard-cut-over-legacy-execution-state.md) records the hard cutover, [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md) records the Owner-approved post-lease Runtime View open correction effective upon default-branch merge, [runtime-execution.md](./runtime-execution.md) defines C03 Runtime Run, Sandbox Lease, worker, and execution-evidence authority, [durable-object-storage.md](./durable-object-storage.md) defines the shared verified-content mechanism used by C04, and [observability-audit-and-cleanup-debt.md](./observability-audit-and-cleanup-debt.md) defines correlation, projections, alerts, retention, and Cleanup Debt evidence. This document deliberately fixes module authority and invariants without designing every method in the interface.
 
 The record-by-record migration matrix, freeze and cutover sequence, rollback
 boundary, and legacy execution deletion inventory are defined in
@@ -17,9 +17,9 @@ flowchart LR
     Durable[(Node-independent<br/>durable content)]
     Local[Disposable materialization<br/>and local cache]
 
-    CP -->|opaque lifecycle intent| C04
+    CP -->|commit, restore, and other<br/>opaque lifecycle intent| C04
     C04 -->|revision, Checkpoint,<br/>evidence identities| CP
-    C03 -->|open, commit, or discard<br/>Runtime View| C04
+    C03 -->|open, fence, or discard<br/>Runtime View| C04
     C04 -->|validated read-only export view| C05
     C04 --> Durable
     C04 --> Local
@@ -31,6 +31,8 @@ flowchart LR
 - The interface does not expose host or session paths, mounts, files, globs, copy/delete operations, storage vendors, buckets, or execution-node details.
 - C03 remains the deep module for Runtime Run, Sandbox Lease, execution capacity, and process lifecycle. C05 remains the deep module for publication and immutable Artifact Versions. C04 owns neither responsibility.
 - Agent Compose remains a production execution adapter under C03. It may enact work inside an opaque Runtime View but does not own Task Workspace lifecycle or recovery authority.
+- A Task Orchestration Runtime start does not carry an already-open Runtime View. It carries an exact `RuntimeViewRequirement`. C03 may call `OpenRuntimeView` only after Scheduler admission is durably accepted and C03 has granted the one Sandbox Lease.
+- `SandboxLeaseAuthority` is a mandatory canonical field of every mutating `OpenRuntimeViewRequest`. It binds Task, Phase Run, Runtime Run, Runtime operation, effect, lease generation/fence, and expiry. C04 rejects a missing, stale, cross-scope, or digest-mismatched authority.
 
 ## State and commit semantics
 
@@ -42,21 +44,36 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-    participant CP as Platform Control Plane
-    participant C04 as Task Workspace Lifecycle
+    participant TO as Task Orchestration
+    participant Scheduler
     participant C03 as Runtime Execution
+    participant C04 as Task Workspace Lifecycle
+    participant Worker
     participant DS as Durable Store
 
-    CP->>C04: materialize from authoritative revision
-    C04->>C03: isolated Runtime View identity
-    C03-->>CP: explicit output and execution evidence
-    CP->>CP: validate Phase Run contract
-    CP->>C04: fenced commit intent
+    TO->>Scheduler: atomic Runtime enactment + Work Item
+    Scheduler->>C03: exact start + unbound Admission Grant
+    C03->>C03: start accepted + grant bound, then Sandbox Lease
+    C03->>C04: exact OpenRuntimeViewRequest with SandboxLeaseAuthority
+    C04-->>C03: one isolated Runtime View capability
+    C03->>Worker: Execution Capsule and dispatch
+    Worker-->>C03: output and adapter evidence
+    C03-->>TO: verified Runtime Evidence
+    TO->>TO: validate Phase Run contract
+    TO->>C04: exact fenced commit intent
     C04->>DS: persist declared recoverable content
     DS-->>C04: durable acknowledgement
-    C04-->>CP: revision, Checkpoint, digest evidence
-    CP->>CP: record successful Phase Run binding
+    C04-->>TO: revision, Checkpoint, digest evidence
+    TO->>TO: record successful Phase Run binding
 ```
+
+C03 derives a stable open OperationID and canonical digest from the immutable
+start requirement plus the exact Sandbox Lease authority and persists them
+before remote delivery. Response loss replays the same request, then uses
+`InspectOperation` and `ReconcileOperation` for that OperationID. A retry never
+creates a second Runtime View, changes the expected digest, scans a path, or
+adopts a worker/Agent Compose view. C03 persists C04 acceptance before placing
+the Runtime View capability in an Execution Capsule or dispatching a worker.
 
 ## Checkpoint contents and durability
 

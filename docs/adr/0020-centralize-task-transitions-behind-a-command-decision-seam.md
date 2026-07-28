@@ -18,6 +18,7 @@ The decision is supported by the throwaway prototype on branch `codex/prototype-
 ## Consequences
 
 - The PostgreSQL transaction that records a transition decision and its enactments is the linearization point. A response lost after commit is replayed by idempotency identity; a crash before commit leaves no decision.
+- Owner-approved [ADR 0029](./0029-bind-runtime-admission-once-before-post-lease-prerequisites.md), effective upon default-branch merge, requires a Runtime enactment transaction also to create the Scheduler Work Item through the restricted Scheduler transactional participant. The Work Item references the exact Task enactment OperationID and canonical C03 start-payload digest; delivery is not allowed to assemble or rewrite the start request later.
 - Workers and queue adapters deliver durable enactments. Claim loss changes only delivery ownership, not Task or Phase Run outcome. Reconciliation reissues the same enactment identity instead of creating a new attempt.
 - Each Phase Run references one Phase definition in the pinned Pipeline Version and owns zero or more Runtime Runs. Confirmation and publication Phases may have zero Runtime Runs. Only Phase validation and required C04 commit evidence can make a mutating attempt successful.
 - Cancellation first fences new work and any possible C04 commit. The Task becomes terminally cancelled only after fencing evidence proves that no mutation can still commit; a commit that already linearized is recorded before later work is stopped.

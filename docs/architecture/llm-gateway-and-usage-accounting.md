@@ -12,6 +12,9 @@ reservation boundary,
 records the central egress and settlement choice,
 [runtime-execution.md](./runtime-execution.md) defines Runtime Run and fence
 authority,
+[ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
+records the Owner-approved post-lease prerequisite order in which the first
+Gateway Grant is obtained, effective upon default-branch merge,
 [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)
 defines quota-bearing admission and the opaque Reservation validation seam,
 and the
@@ -154,6 +157,39 @@ If the Runtime fence commits first, a new Call is rejected. If Gateway Call
 acceptance commits first, the accepted Call may send and its usage is settled
 even if cancellation commits later. Usage settlement does not resurrect a
 Runtime Run or permit its output to cross a fence.
+
+### Gateway Grant lifetime, refresh, and rotation
+
+The first Gateway Grant is requested only after C03 start acceptance and the
+current Sandbox Lease. Its maximum expiry is the earliest of Runtime deadline,
+Sandbox Lease expiry, machine authorization expiry, Active Quota Reservation
+validity, Provider Route-policy validity, recovery-mode allowance, and the
+configured short grant lifetime. A grant can never keep a lease, Reservation,
+or Runtime Run alive.
+
+A long Runtime Run refreshes or rotates the grant through an owned,
+machine-authorized operation that binds the original Runtime Run, start
+operation, Runtime Binding, lease/fence, Reservation, capability and route
+policy. The refresh OperationID and canonical digest are stable for one
+requested replacement generation. Exact replay returns the original result;
+same-key/different-digest conflicts, and response loss uses Inspect/Reconcile
+for that operation rather than issuing another grant blindly.
+
+Each accepted replacement advances a monotonic Gateway Grant generation and
+may preserve or narrow scope; it cannot broaden destinations, capability,
+route policy, Reservation, deadline, or authorization. Activation and
+revocation use compare-and-swap so only one current generation accepts new
+Gateway Calls. Credential or signing-key rotation may change adapter-private
+material without changing business scope. The prior generation becomes stale
+for new Calls when replacement activation linearizes; Calls and Attempts
+already accepted under it remain valid evidence and settle normally.
+
+If refresh is unavailable or a grant expires, the sandbox receives no direct
+provider fallback and the Gateway rejects new Calls. C03 may let declared
+non-provider work continue; a capability that still requires provider access
+pauses in reconciliation and ultimately follows its Runtime policy. Grant
+expiry or rotation alone does not fabricate Runtime failure, cancel an already
+accepted Attempt, report zero usage, or create a new Runtime Run.
 
 ## Provider Route Revision and onboarding
 
@@ -493,6 +529,9 @@ cursors covers:
 - zero, one, and many Calls per Runtime Run and Attempts per Call;
 - exact replay, same-key/different-payload conflict, concurrent Invoke and
   cancel, and stale grants, fences, route revisions, and signing keys;
+- short grant expiry, long-run refresh, response-loss replay, concurrent
+  rotation, old-generation rejection, and settlement of Attempts accepted
+  before rotation;
 - crash before send, during handoff, after provider acceptance, before Receipt
   commit, after Receipt commit, and around Ledger commit or response delivery;
 - streaming terminal success, terminal-before-disconnect, disconnect-before-
