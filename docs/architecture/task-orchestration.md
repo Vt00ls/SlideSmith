@@ -15,8 +15,8 @@ Lease, worker, and evidence authority,
 [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)
 defines Work Item delivery, Personal Workspace fairness, and Admission Grants,
 [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-proposes the exact Runtime enactment/Work Item/grant binding and post-lease
-prerequisite order, effective only after explicit Owner approval and merge,
+records the Owner-approved exact Runtime enactment/Work Item/grant binding and
+post-lease prerequisite order, effective upon default-branch merge,
 [llm-gateway-and-usage-accounting.md](./llm-gateway-and-usage-accounting.md)
 defines Phase Run Quota Reservation and provider-usage settlement, and
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 commit

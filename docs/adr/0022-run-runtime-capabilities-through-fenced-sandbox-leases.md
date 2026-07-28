@@ -1,9 +1,10 @@
 # Run runtime capabilities through fenced sandbox leases
 
 Status: Accepted. [ADR 0029](./0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-is a proposed Class C amendment pending explicit Owner approval and merge.
+is an Owner-approved Class C amendment that becomes effective when merged to
+the default branch.
 
-If approved, ADR 0029 supersedes two narrow parts of this record. A canonical start binds a
+Upon that merge, ADR 0029 supersedes two narrow parts of this record. A canonical start binds a
 `RuntimeViewRequirement`, not a pre-existing Runtime View capability; C03 opens
 the view only after a Sandbox Lease exists. The public Runtime Execution seam
 remains `Execute(StartRuntimeRun | CancelRuntimeRun)` and

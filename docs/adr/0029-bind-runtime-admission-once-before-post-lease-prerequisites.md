@@ -1,13 +1,13 @@
 # Bind Runtime admission once before post-lease prerequisites
 
-Status: Proposed — Class C Owner approval is required before merge.
+Status: Approved by Owner — effective when merged to the default branch.
 
-This record proposes a narrow supersession of accepted ADR 0022 and the #24
-Runtime Execution resolution. Delegated mode can resolve the derived failure
-mechanics below, but it cannot accept this public/cross-module contract change.
-The PR must remain unmerged, and implementation decomposition and
-`to-tickets` must remain blocked, until the Owner explicitly approves this
-record and the approved documentation is merged into the default branch.
+This record contains the narrow supersession of accepted ADR 0022 and the #24
+Runtime Execution resolution explicitly approved by the Owner in the
+[#24 Class C approval](https://github.com/Vt00ls/SlideSmith/issues/24#issuecomment-5100851705).
+The approval resolves the decision gate but does not itself authorize PR merge.
+Implementation decomposition and `to-tickets` remain blocked until the
+approved documentation is merged into the default branch.
 
 SlideSmith will use one admission path for a Runtime Run. Task Orchestration
 atomically commits its immutable Runtime enactment/outbox and the Scheduler Work
@@ -124,9 +124,10 @@ Task decision/outbox + Scheduler Work Item atomic commit
 ## Consequences
 
 - ADR 0022's earlier wording that start binds a Runtime View capability is
-  proposed to be superseded by the requirement-then-open contract above.
-- ADR 0022's public interface remains unchanged; maintenance is proposed as a
-  separate protected operational interface.
+  superseded by the requirement-then-open contract above upon default-branch
+  merge.
+- ADR 0022's public interface remains unchanged; maintenance is a separate
+  protected operational interface.
 - ADRs 0020, 0024, 0026, and 0027 retain their authorities and are clarified by
   this ordering, capacity split, Gateway-grant lifecycle, and audit boundary.
 - Runtime Execution implementation and tests must prove one admission path,

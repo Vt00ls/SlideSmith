@@ -11,9 +11,9 @@ decision authority,
 [runtime-execution.md](./runtime-execution.md) defines Runtime Run and Sandbox
 Lease facts,
 [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-proposes C03's protected operational maintenance interface and separate
-logical/no-lease/physical capacity evidence, effective only after explicit
-Owner approval and merge,
+records the Owner-approved C03 protected operational maintenance interface and
+separate logical/no-lease/physical capacity evidence, effective upon
+default-branch merge,
 [task-workspace-lifecycle.md](./task-workspace-lifecycle.md) defines C04 and
 Cleanup Debt ownership,
 [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)

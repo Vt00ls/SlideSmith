@@ -13,8 +13,8 @@ records the central egress and settlement choice,
 [runtime-execution.md](./runtime-execution.md) defines Runtime Run and fence
 authority,
 [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-proposes the post-lease prerequisite order in which the first Gateway Grant is
-obtained, effective only after explicit Owner approval and merge,
+records the Owner-approved post-lease prerequisite order in which the first
+Gateway Grant is obtained, effective upon default-branch merge,
 [scheduling-and-capacity-admission.md](./scheduling-and-capacity-admission.md)
 defines quota-bearing admission and the opaque Reservation validation seam,
 and the

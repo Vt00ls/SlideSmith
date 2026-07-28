@@ -56,8 +56,8 @@ directory, bucket listing, or process observation.
 - Cleanup Debt records owner, opaque resource, retry, failure, estimated bytes
   and inodes, age, fence, blockers, and resolution evidence until verified or
   explicitly accepted through mandatory audit.
-- Proposed [ADR 0029](./0029-bind-runtime-admission-once-before-post-lease-prerequisites.md),
-  pending explicit Owner approval and merge, places protected Runtime
+- Owner-approved [ADR 0029](./0029-bind-runtime-admission-once-before-post-lease-prerequisites.md),
+  effective upon default-branch merge, places protected Runtime
   node/containment/reset and C03 Cleanup Debt operations on the owning module's
   separate audited operational maintenance interface; neither the public
   Runtime start/cancel seam nor an observability/diagnostic adapter gains that

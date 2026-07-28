@@ -8,9 +8,9 @@ is authoritative for domain language,
 [ADR 0022](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/adr/0022-run-runtime-capabilities-through-fenced-sandbox-leases.md)
 records the durable module choice,
 [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-proposes the superseding admission, maintenance, logical/physical capacity,
-and post-lease Runtime View ordering; it becomes effective only after explicit
-Owner approval and merge,
+records the Owner-approved superseding admission, maintenance,
+logical/no-lease/physical capacity, and post-lease Runtime View ordering; it
+becomes effective when merged to the default branch,
 [task-orchestration.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/task-orchestration.md)
 defines Phase Run and Runtime Run membership authority,
 [runtime-and-pipeline-releases.md](https://github.com/Vt00ls/SlideSmith/blob/codex/ARCH-01-enterprise-platform-review/docs/architecture/runtime-and-pipeline-releases.md)

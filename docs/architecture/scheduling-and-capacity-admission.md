@@ -8,8 +8,9 @@ resolving
 [ADR 0026](../adr/0026-schedule-durable-work-through-fair-fenced-admission.md)
 records the durable module choice,
 [ADR 0029](../adr/0029-bind-runtime-admission-once-before-post-lease-prerequisites.md)
-proposes the exact Work Item/grant/C03 binding and logical-versus-physical
-release correction, effective only after explicit Owner approval and merge,
+records the Owner-approved exact Work Item/grant/C03 binding and
+logical/no-lease/physical release correction, effective upon default-branch
+merge,
 [task-orchestration.md](./task-orchestration.md) defines Task, Phase Run,
 Runtime Run, and enactment authority,
 [runtime-execution.md](./runtime-execution.md) defines Sandbox Lease, fence,
