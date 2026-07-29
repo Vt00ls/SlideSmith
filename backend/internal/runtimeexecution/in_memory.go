@@ -1225,7 +1225,8 @@ func nodeEligibleForLease(node *ExecutionNodeFixture, record *runtimeRecord, now
 		!node.AttestedAt.After(now) && now.Before(node.ExpiresAt) && now.Before(node.AuthorizationExpiresAt) &&
 		node.AuthorizationGeneration > 0 && node.ResourceClassID == record.operation.ResourceClassID &&
 		node.ExecutionPolicyID == record.operation.ExecutionPolicyID &&
-		node.ReleaseSafetyEpoch == record.fixture.SafetyEpoch && validOpaqueID(node.WorkerAuthorityID.String()) &&
+		node.ReleaseSafetyEpoch == record.fixture.SafetyEpoch &&
+		node.CatalogSafetyEpoch == record.catalogSafetyEpoch && validOpaqueID(node.WorkerAuthorityID.String()) &&
 		node.WorkerGeneration > 0 && validOpaqueID(node.NodeAuthorityID.String())
 }
 

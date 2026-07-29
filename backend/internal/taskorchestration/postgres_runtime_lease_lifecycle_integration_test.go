@@ -2,6 +2,7 @@ package taskorchestration_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -510,11 +511,7 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 		SandboxFence: fenced.Lease.SandboxFence, ExecutionNodeID: node.ExecutionNodeID,
 		NodeGeneration: node.Generation, Authority: system.resetAuthority,
 		EvidenceID: resetEvidenceID, EvidenceDigest: runtimeexecution.Digest{31: 76},
-		ProcessStopped: true, ChildProcessesStopped: true, SecretsRevoked: true, NetworkRemoved: true,
-		ContainmentEstablished: true, ResetCompleted: true, NoUnresolvedOccupancy: true,
-		NoStaleWorkerAuthority: true, NoPriorTaskBytes: true, NoPriorSecrets: true,
-		NoWritableCacheMutations: true, NoLogsOrTranscripts: true, NoPriorEvidence: true,
-		NoProcessState: true, NoNetworkState: true, NoPriorOperationIdentities: true, OccurredAt: now,
+		OccurredAt: now,
 	}
 	forgedBeforeReset := runtimeexecution.PhysicalCapacityReleaseReadyEvidence{
 		WorkItemID:       first.Snapshot.Operation.WorkItemID,
@@ -530,18 +527,45 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 		NodeCapacityGeneration: first.Snapshot.Operation.NodeCapacityGeneration,
 		ResetEvidenceID:        resetEvidenceID, ResetEvidenceDigest: resetInput.EvidenceDigest,
 	}
+	if err := poolCanary.ApplyPhysicalRelease(forgedBeforeReset); err == nil {
+		t.Fatal("physical-release evidence erased sandbox residue before independently observed cleanup")
+	}
+	if poolCanary.Observe() == (issue76SandboxResidueCanaries{}) {
+		t.Fatal("rejected pre-reset physical release erased sandbox residue")
+	}
 	err = system.scheduling.ApplyPhysicalCapacityReleaseReady(context.Background(), forgedBeforeReset)
 	assertIssue76SchedulerCode(t, err, scheduler.ErrorIntegrityConflict)
-	incompleteInput := resetInput
-	incompleteInput.NoPriorTaskBytes = false
-	incomplete, err := runtimeexecution.NewConfirmSandboxReset(incompleteInput)
-	if err != nil {
-		t.Fatal(err)
+	for index, omitted := range allIssue76SandboxResidueSurfaces {
+		probe := newIssue76SandboxPoolCanaryAdapter(lease, node.ExecutionNodeID, firstWork.start.OperationID)
+		probe.Inject(poolCanary.Observe())
+		for _, surface := range allIssue76SandboxResidueSurfaces {
+			if surface != omitted {
+				probe.ApplyObservedCleanup(surface)
+			}
+		}
+		probe.ObserveContainmentAndReset()
+		incompleteInput := probe.BindObservedResetEvidence(resetInput)
+		incompleteInput.OperationID, _ = runtimeexecution.NewOperationID(fmt.Sprintf("issue-76-incomplete-reset-%d", index))
+		if issue76ResetEvidenceClaimsSurfaceClean(incompleteInput, omitted) {
+			t.Fatalf("omitted cleanup surface %s was not observable in reset evidence", omitted)
+		}
+		incomplete, constructErr := runtimeexecution.NewConfirmSandboxReset(incompleteInput)
+		if constructErr != nil {
+			t.Fatal(constructErr)
+		}
+		_, maintainErr := system.runtime.Maintain(context.Background(), incomplete)
+		assertRuntimeExecutionErrorCode(t, maintainErr, runtimeexecution.ErrorIntegrityConflict)
+		if probe.Observe() == (issue76SandboxResidueCanaries{}) {
+			t.Fatalf("omitted cleanup surface %s was erased by another reset step", omitted)
+		}
 	}
-	_, err = system.runtime.Maintain(context.Background(), incomplete)
-	assertRuntimeExecutionErrorCode(t, err, runtimeexecution.ErrorIntegrityConflict)
-	if poolCanary.Observe() == (issue76SandboxResidueCanaries{}) {
-		t.Fatal("rejected incomplete reset cleared physical sandbox canaries")
+	for _, surface := range allIssue76SandboxResidueSurfaces {
+		poolCanary.ApplyObservedCleanup(surface)
+	}
+	poolCanary.ObserveContainmentAndReset()
+	resetInput = poolCanary.BindObservedResetEvidence(resetInput)
+	if poolCanary.Observe() != (issue76SandboxResidueCanaries{}) {
+		t.Fatalf("complete observed cleanup retained sandbox residue: %+v", poolCanary.Observe())
 	}
 	cleanupAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-cleanup-authority")
 	wrongCleanupAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-wrong-cleanup-authority")
@@ -1128,6 +1152,13 @@ func TestPostgresLeaseCommitRelocksExactGrantAndAuthoritativeNodeTruth(t *testin
 				t.Fatal(err)
 			}
 		}},
+		{name: "catalog safety epoch", mutate: func(t *testing.T, system *postgresRuntimeAdmissionSystem, _ admittedRuntimeWork) {
+			_, err := system.db.ExecContext(context.Background(), fmt.Sprintf(`UPDATE %s.runtime_execution_nodes
+				SET catalog_safety_epoch=catalog_safety_epoch+1`, system.schema))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}},
 		{name: "authorization expiry", mutate: func(t *testing.T, system *postgresRuntimeAdmissionSystem, _ admittedRuntimeWork) {
 			_, err := system.db.ExecContext(context.Background(), fmt.Sprintf(`UPDATE %s.runtime_execution_nodes
 				SET authorization_expires_at=$1`, system.schema), system.clock.Now())
@@ -1214,6 +1245,32 @@ type issue76SandboxResidueCanaries struct {
 	PriorOperationIdentity string
 }
 
+type issue76SandboxResidueSurface string
+
+const (
+	issue76TaskWorkspaceBytesSurface issue76SandboxResidueSurface = "Task/Workspace bytes"
+	issue76SecretsSurface            issue76SandboxResidueSurface = "secrets"
+	issue76WritableCacheSurface      issue76SandboxResidueSurface = "writable cache"
+	issue76LogsTranscriptsSurface    issue76SandboxResidueSurface = "logs/transcripts"
+	issue76EvidenceSurface           issue76SandboxResidueSurface = "evidence"
+	issue76MainProcessSurface        issue76SandboxResidueSurface = "main process state"
+	issue76ChildProcessSurface       issue76SandboxResidueSurface = "child process state"
+	issue76NetworkSurface            issue76SandboxResidueSurface = "network state"
+	issue76OperationIdentitySurface  issue76SandboxResidueSurface = "prior operation identity"
+)
+
+var allIssue76SandboxResidueSurfaces = []issue76SandboxResidueSurface{
+	issue76TaskWorkspaceBytesSurface,
+	issue76SecretsSurface,
+	issue76WritableCacheSurface,
+	issue76LogsTranscriptsSurface,
+	issue76EvidenceSurface,
+	issue76MainProcessSurface,
+	issue76ChildProcessSurface,
+	issue76NetworkSurface,
+	issue76OperationIdentitySurface,
+}
+
 type issue76SandboxPoolCanaryAdapter struct {
 	leaseID           runtimeexecution.SandboxLeaseID
 	leaseGeneration   runtimeexecution.LeaseGeneration
@@ -1224,6 +1281,10 @@ type issue76SandboxPoolCanaryAdapter struct {
 	nodeID            runtimeexecution.ExecutionNodeID
 	operationID       runtimeexecution.OperationID
 	residue           issue76SandboxResidueCanaries
+	containment       bool
+	reset             bool
+	occupancyResolved bool
+	workerAuthority   bool
 	released          bool
 }
 
@@ -1247,6 +1308,90 @@ func (adapter *issue76SandboxPoolCanaryAdapter) Observe() issue76SandboxResidueC
 	return adapter.residue
 }
 
+func (adapter *issue76SandboxPoolCanaryAdapter) ApplyObservedCleanup(surface issue76SandboxResidueSurface) {
+	switch surface {
+	case issue76TaskWorkspaceBytesSurface:
+		adapter.residue.TaskWorkspaceBytes = ""
+	case issue76SecretsSurface:
+		adapter.residue.Secrets = ""
+	case issue76WritableCacheSurface:
+		adapter.residue.WritableCacheMutations = ""
+	case issue76LogsTranscriptsSurface:
+		adapter.residue.LogsAndTranscripts = ""
+	case issue76EvidenceSurface:
+		adapter.residue.Evidence = ""
+	case issue76MainProcessSurface:
+		adapter.residue.MainProcessState = ""
+	case issue76ChildProcessSurface:
+		adapter.residue.ChildProcessState = ""
+	case issue76NetworkSurface:
+		adapter.residue.NetworkState = ""
+	case issue76OperationIdentitySurface:
+		adapter.residue.PriorOperationIdentity = ""
+	}
+}
+
+func (adapter *issue76SandboxPoolCanaryAdapter) ObserveContainmentAndReset() {
+	adapter.containment = true
+	adapter.reset = true
+	adapter.occupancyResolved = true
+	adapter.workerAuthority = true
+}
+
+func (adapter *issue76SandboxPoolCanaryAdapter) BindObservedResetEvidence(
+	input runtimeexecution.ConfirmSandboxResetInput,
+) runtimeexecution.ConfirmSandboxResetInput {
+	residue := adapter.Observe()
+	input.ProcessStopped = residue.MainProcessState == ""
+	input.ChildProcessesStopped = residue.ChildProcessState == ""
+	input.SecretsRevoked = residue.Secrets == ""
+	input.NetworkRemoved = residue.NetworkState == ""
+	input.ContainmentEstablished = adapter.containment
+	input.ResetCompleted = adapter.reset
+	input.NoUnresolvedOccupancy = adapter.occupancyResolved
+	input.NoStaleWorkerAuthority = adapter.workerAuthority
+	input.NoPriorTaskBytes = residue.TaskWorkspaceBytes == ""
+	input.NoPriorSecrets = residue.Secrets == ""
+	input.NoWritableCacheMutations = residue.WritableCacheMutations == ""
+	input.NoLogsOrTranscripts = residue.LogsAndTranscripts == ""
+	input.NoPriorEvidence = residue.Evidence == ""
+	input.NoProcessState = residue.MainProcessState == "" && residue.ChildProcessState == ""
+	input.NoNetworkState = residue.NetworkState == ""
+	input.NoPriorOperationIdentities = residue.PriorOperationIdentity == ""
+	canonicalObservation := fmt.Sprintf("%+v\n%t\n%t\n%t\n%t", residue, adapter.containment,
+		adapter.reset, adapter.occupancyResolved, adapter.workerAuthority)
+	input.EvidenceDigest = runtimeexecution.Digest(sha256.Sum256([]byte(canonicalObservation)))
+	return input
+}
+
+func issue76ResetEvidenceClaimsSurfaceClean(
+	input runtimeexecution.ConfirmSandboxResetInput,
+	surface issue76SandboxResidueSurface,
+) bool {
+	switch surface {
+	case issue76TaskWorkspaceBytesSurface:
+		return input.NoPriorTaskBytes
+	case issue76SecretsSurface:
+		return input.SecretsRevoked && input.NoPriorSecrets
+	case issue76WritableCacheSurface:
+		return input.NoWritableCacheMutations
+	case issue76LogsTranscriptsSurface:
+		return input.NoLogsOrTranscripts
+	case issue76EvidenceSurface:
+		return input.NoPriorEvidence
+	case issue76MainProcessSurface:
+		return input.ProcessStopped && input.NoProcessState
+	case issue76ChildProcessSurface:
+		return input.ChildProcessesStopped && input.NoProcessState
+	case issue76NetworkSurface:
+		return input.NetworkRemoved && input.NoNetworkState
+	case issue76OperationIdentitySurface:
+		return input.NoPriorOperationIdentities
+	default:
+		return false
+	}
+}
+
 func (adapter *issue76SandboxPoolCanaryAdapter) ApplyPhysicalRelease(
 	evidence runtimeexecution.PhysicalCapacityReleaseReadyEvidence,
 ) error {
@@ -1255,10 +1400,11 @@ func (adapter *issue76SandboxPoolCanaryAdapter) ApplyPhysicalRelease(
 		evidence.SandboxID != adapter.sandboxID || evidence.SandboxGeneration != adapter.sandboxGeneration ||
 		evidence.SandboxFence <= adapter.sandboxFence || evidence.ExecutionNodeID != adapter.nodeID ||
 		evidence.StartOperationID != adapter.operationID || evidence.ResetEvidenceID.String() == "" ||
-		evidence.ResetEvidenceDigest == (runtimeexecution.Digest{}) {
+		evidence.ResetEvidenceDigest == (runtimeexecution.Digest{}) ||
+		adapter.residue != (issue76SandboxResidueCanaries{}) || !adapter.containment || !adapter.reset ||
+		!adapter.occupancyResolved || !adapter.workerAuthority {
 		return errors.New("physical release evidence did not exactly fence the occupied sandbox")
 	}
-	adapter.residue = issue76SandboxResidueCanaries{}
 	adapter.released = true
 	return nil
 }

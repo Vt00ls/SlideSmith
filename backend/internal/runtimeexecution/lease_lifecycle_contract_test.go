@@ -172,6 +172,48 @@ func TestProviderCapableLeaseRequiresExactActiveQuotaReservation(t *testing.T) {
 	}
 }
 
+func TestLeaseAcquireRejectsStaleNodeCatalogSafetyEpoch(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 29, 16, 45, 0, 0, time.UTC)
+	authority := mustTaskOrchestrationAuthority(t, "catalog-lease-authority", 7)
+	input := standardStart(t, now, authority, "catalog-lease").StartRuntimeRunInput
+	input.CatalogBinding = &CatalogExecutionBinding{
+		TemplateLockID:     mustTemplateLockID(t, "catalog-lease-template-lock"),
+		TemplateLockDigest: digest(71), ClosureRootDigest: digest(72), SafetyEpoch: 13,
+	}
+	start := mustStart(t, input)
+	grant := grantFixtureForStart(start, now.Add(10*time.Minute), true)
+	grant.ExecutionNodeID = startNodeID(t, "catalog-lease-node")
+	grant.NodeCapacityGeneration = 1
+	node := executionNodeFixtureForStart(t, start, grant, now)
+	node.CatalogSafetyEpoch = start.CatalogBinding.SafetyEpoch - 1
+	harness, err := NewDeterministicHarness(HarnessConfig{
+		Now: now, IDs: DeterministicIDConfig{DecisionStart: 1, LeaseStart: 1, SandboxStart: 1},
+		Runtimes:        []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants: []AdmissionGrantFixture{grant}, Nodes: []ExecutionNodeFixture{node},
+		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
+			context.Context,
+			LeaseAcquisitionRequest,
+		) (LeaseAcquisitionObservation, error) {
+			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil {
+		t.Fatalf("execute with stale node catalog epoch: %v", err)
+	}
+	if decision.Snapshot.State != RuntimeTerminal || decision.Snapshot.Outcome != RuntimeRejected ||
+		decision.Snapshot.PreLeaseTerminalReason != PreLeaseTerminalNodeIneligible ||
+		decision.Snapshot.Lease.Disposition != LeaseDispositionNone ||
+		decision.Snapshot.Capacity.Physical != PhysicalCapacityNotApplicable {
+		t.Fatalf("stale node catalog epoch did not fail closed before lease: %+v", decision.Snapshot)
+	}
+}
+
 func TestLeaseRenewalIsFencedIdempotentAndInspectable(t *testing.T) {
 	t.Parallel()
 
@@ -589,6 +631,30 @@ func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 		second.Snapshot.Lease.Disposition != LeaseActive {
 		t.Fatalf("pool reuse crossed lease identity or fence: first=%+v second=%+v", lease, second.Snapshot.Lease)
 	}
+}
+
+func TestSchedulerAuthorityCannotManufactureExecutionNodeTruth(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 29, 18, 30, 0, 0, time.UTC)
+	_, err := NewAttestExecutionNode(AttestExecutionNodeInput{
+		SchemaVersion: SchemaV1, OperationID: mustOperationID(t, "scheduler-node-attestation"),
+		Authority: NodeAttestationAuthority{
+			kind: MaintenanceAuthorityScheduler, id: mustAuthorityID(t, "scheduler-node-authority"), generation: 7,
+		},
+		ExecutionNodeID: startNodeID(t, "scheduler-attested-node"), NodeGeneration: 1,
+		AttestationID: startNodeAttestationID(t, "scheduler-attestation"), AttestationGeneration: 1,
+		AttestedAt: now, ExpiresAt: now.Add(5 * time.Minute),
+		ResourceClassID:   mustResourceClassID(t, "scheduler-resource-class"),
+		ExecutionPolicyID: mustExecutionPolicyID(t, "scheduler-execution-policy"),
+		NodeAuthorityID:   startNodeAuthorityID(t, "scheduler-node-runtime-authority"),
+		WorkerAuthorityID: startWorkerAuthorityID(t, "scheduler-worker-authority"), WorkerGeneration: 1,
+		AuthorizationGeneration: 1, AuthorizationExpiresAt: now.Add(5 * time.Minute),
+		ReleaseSafetyEpoch: 1, CatalogSafetyEpoch: 1,
+		ResetEvidenceID: mustEvidenceID(t, "scheduler-reset-evidence"), ResetEvidenceDigest: digest(92),
+		OccurredAt: now,
+	})
+	assertRuntimeLifecycleErrorCode(t, err, ErrorInvalidRequest)
 }
 
 func assertRuntimeLifecycleErrorCode(t *testing.T, err error, want ErrorCode) {

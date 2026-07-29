@@ -538,43 +538,12 @@ func (authority *PostgresAuthority) renewPostgresSandboxLease(
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
 	now := postgresTimestamp(authority.now())
-	lease := record.lease
-	workerAuthority := command.Authority
-	if record.fixture.State == RuntimeTerminal || lease.AcquireStatus != LeaseGranted ||
-		lease.Disposition != LeaseActive || lease.LeaseID != command.SandboxLeaseID ||
-		lease.Generation != command.LeaseGeneration || lease.Fence != command.LeaseFence ||
-		lease.WorkerAuthorityID != workerAuthority.workerAuthorityID ||
-		lease.WorkerGeneration != workerAuthority.workerGeneration ||
-		lease.NodeAuthorityID != workerAuthority.nodeAuthorityID ||
-		lease.AuthorizationGeneration != workerAuthority.authorizationGeneration ||
-		command.ReleaseSafetyEpoch != record.fixture.SafetyEpoch ||
-		command.CatalogSafetyEpoch != record.catalogSafetyEpoch ||
-		node.ExecutionNodeID != record.operation.ExecutionNodeID || node.Generation != command.NodeGeneration ||
-		node.AttestationID != command.AttestationID ||
-		node.AttestationGeneration != command.AttestationGeneration || node.Readiness != NodeReady ||
-		node.Quarantined || node.Occupancy != NodeOccupied ||
-		node.ActiveRuntimeRunID != command.RuntimeRunID || node.ActiveLeaseID != command.SandboxLeaseID ||
-		!now.Before(node.ExpiresAt) || !now.Before(node.AuthorizationExpiresAt) ||
-		!now.Before(lease.ExpiresAt) || !now.Before(lease.AuthorizationExpiresAt) || command.OccurredAt.After(now) {
-		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
-	}
-	maximumExpiry := earliestTime(record.deadline, record.leaseAcquireBy, node.ExpiresAt,
-		node.AuthorizationExpiresAt, lease.AuthorizationExpiresAt)
-	if !command.RequestedExpiresAt.After(lease.ExpiresAt) || command.RequestedExpiresAt.After(maximumExpiry) {
+	if !validLeaseRenewalTransition(record, &node.ExecutionNodeFixture, command, now) {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
 	previousRevision, previousFence, previousState := record.fixture.RuntimeRevision,
 		record.fixture.RuntimeFence, record.fixture.State
-	record.fixture.RuntimeRevision++
-	record.lease.Generation++
-	record.lease.Fence++
-	record.lease.ExpiresAt = command.RequestedExpiresAt
-	record.node = nodeSnapshot(node.ExecutionNodeFixture)
-	decision := RuntimeMaintenanceDecision{
-		OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
-		RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
-		Lease: record.lease, Node: record.node, Cleanup: record.cleanup,
-	}
+	decision := applyLeaseRenewalTransition(record, &node.ExecutionNodeFixture, command)
 	if err := authority.updatePostgresRuntimeAggregate(ctx, tx, record, previousRevision, previousFence,
 		previousState, now); err != nil {
 		return RuntimeMaintenanceDecision{}, err
@@ -789,8 +758,7 @@ func (authority *PostgresAuthority) attestPostgresExecutionNode(
 		return RuntimeMaintenanceDecision{}, err
 	}
 	now := postgresTimestamp(authority.now())
-	if command.AttestedAt.After(now) || !now.Before(command.ExpiresAt) ||
-		!now.Before(command.AuthorizationExpiresAt) {
+	if !validExecutionNodeAttestationTiming(command, now) {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
 	node, err := authority.loadPostgresNodeForUpdate(ctx, tx, command.ExecutionNodeID)
@@ -798,20 +766,9 @@ func (authority *PostgresAuthority) attestPostgresExecutionNode(
 	if err != nil && !fresh {
 		return RuntimeMaintenanceDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
+	var decision RuntimeMaintenanceDecision
 	if fresh {
-		node = &postgresExecutionNodeRecord{ExecutionNodeFixture: ExecutionNodeFixture{
-			ExecutionNodeID: command.ExecutionNodeID, Generation: command.NodeGeneration,
-			Readiness: NodeReady, AttestationID: command.AttestationID,
-			AttestationGeneration: command.AttestationGeneration, AttestedAt: command.AttestedAt,
-			ExpiresAt: command.ExpiresAt, ResourceClassID: command.ResourceClassID,
-			ExecutionPolicyID: command.ExecutionPolicyID, NodeAuthorityID: command.NodeAuthorityID,
-			WorkerAuthorityID: command.WorkerAuthorityID, WorkerGeneration: command.WorkerGeneration,
-			AuthorizationGeneration: command.AuthorizationGeneration,
-			AuthorizationExpiresAt:  command.AuthorizationExpiresAt,
-			ReleaseSafetyEpoch:      command.ReleaseSafetyEpoch, CatalogSafetyEpoch: command.CatalogSafetyEpoch,
-			Occupancy: NodeUnoccupied, Containment: ContainmentEstablished, Reset: ResetCompleted,
-			LastResetEvidenceID: command.ResetEvidenceID, LastResetEvidenceDigest: command.ResetEvidenceDigest,
-		}}
+		node = &postgresExecutionNodeRecord{ExecutionNodeFixture: executionNodeFixtureFromAttestation(command)}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
 			execution_node_id, node_generation, readiness, attestation_id, attestation_generation,
 			attested_at, expires_at, resource_class_id, execution_policy_id, node_authority_id,
@@ -829,38 +786,18 @@ func (authority *PostgresAuthority) attestPostgresExecutionNode(
 			command.ResetEvidenceID.String(), command.ResetEvidenceDigest[:], now); err != nil {
 			return RuntimeMaintenanceDecision{}, normalizeRuntimePersistenceFailure(err)
 		}
+		decision = RuntimeMaintenanceDecision{
+			OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
+			Node: nodeSnapshot(node.ExecutionNodeFixture),
+		}
 	} else {
-		if !node.Quarantined || node.Occupancy != NodeUnoccupied || command.NodeGeneration < node.Generation ||
-			command.NodeGeneration == node.Generation && command.AttestationGeneration <= node.AttestationGeneration ||
-			command.ResetEvidenceID != node.LastResetEvidenceID ||
-			command.ResetEvidenceDigest != node.LastResetEvidenceDigest ||
-			command.ResourceClassID != node.ResourceClassID ||
-			command.ExecutionPolicyID != node.ExecutionPolicyID ||
-			command.ReleaseSafetyEpoch != node.ReleaseSafetyEpoch {
+		if !validExecutionNodeAttestationTransition(&node.ExecutionNodeFixture, command, now) {
 			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 		}
-		node.Generation = command.NodeGeneration
-		node.Readiness = NodeReady
-		node.AttestationID = command.AttestationID
-		node.AttestationGeneration = command.AttestationGeneration
-		node.AttestedAt = command.AttestedAt
-		node.ExpiresAt = command.ExpiresAt
-		node.NodeAuthorityID = command.NodeAuthorityID
-		node.WorkerAuthorityID = command.WorkerAuthorityID
-		node.WorkerGeneration = command.WorkerGeneration
-		node.AuthorizationGeneration = command.AuthorizationGeneration
-		node.AuthorizationExpiresAt = command.AuthorizationExpiresAt
-		node.CatalogSafetyEpoch = command.CatalogSafetyEpoch
-		node.Quarantined = false
-		node.Containment = ContainmentEstablished
-		node.Reset = ResetCompleted
+		decision = applyExecutionNodeAttestationTransition(&node.ExecutionNodeFixture, command)
 		if err := authority.updatePostgresNode(ctx, tx, node, now); err != nil {
 			return RuntimeMaintenanceDecision{}, err
 		}
-	}
-	decision := RuntimeMaintenanceDecision{
-		OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
-		Node: nodeSnapshot(node.ExecutionNodeFixture),
 	}
 	if err := authority.persistPostgresMaintenance(ctx, tx, postgresMaintenanceAttestNode, canonical, decision,
 		RuntimeRunID{}, command.ExecutionNodeID, command.Authority.caller(), 0, 0, command.OccurredAt); err != nil {

@@ -223,10 +223,6 @@ type NodeAttestationAuthority struct {
 	generation AuthorizationGeneration
 }
 
-func NewSchedulerNodeAttestationAuthority(id AuthorityID, generation AuthorizationGeneration) NodeAttestationAuthority {
-	return NodeAttestationAuthority{kind: MaintenanceAuthorityScheduler, id: id, generation: generation}
-}
-
 func NewRecoveryNodeAttestationAuthority(id AuthorityID, generation AuthorizationGeneration) NodeAttestationAuthority {
 	return NodeAttestationAuthority{kind: MaintenanceAuthorityRecovery, id: id, generation: generation}
 }
@@ -456,8 +452,7 @@ func validSandboxResetAuthority(authority SandboxResetAuthority) bool {
 }
 
 func validNodeAttestationAuthority(authority NodeAttestationAuthority) bool {
-	return (authority.kind == MaintenanceAuthorityScheduler || authority.kind == MaintenanceAuthorityRecovery) &&
-		validMaintenanceCaller(authority.caller())
+	return authority.kind == MaintenanceAuthorityRecovery && validMaintenanceCaller(authority.caller())
 }
 
 func validMaintenanceAuthorityBinding(binding RuntimeMaintenanceAuthorityBinding) bool {
@@ -546,6 +541,23 @@ func (engine *invariantEngine) renewSandboxLease(
 	}
 	now := engine.clock.current()
 	node := engine.store.nodes[command.ExecutionNodeID]
+	if !validLeaseRenewalTransition(record, node, command, now) {
+		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+	}
+	decision := applyLeaseRenewalTransition(record, node, command)
+	engine.store.maintenance[command.OperationID] = decision
+	return decision, nil
+}
+
+func validLeaseRenewalTransition(
+	record *runtimeRecord,
+	node *ExecutionNodeFixture,
+	command RenewSandboxLease,
+	now time.Time,
+) bool {
+	if record == nil || node == nil {
+		return false
+	}
 	lease := record.lease
 	authority := command.Authority
 	if record.fixture.State == RuntimeTerminal || lease.AcquireStatus != LeaseGranted ||
@@ -555,33 +567,35 @@ func (engine *invariantEngine) renewSandboxLease(
 		lease.NodeAuthorityID != authority.nodeAuthorityID ||
 		lease.AuthorizationGeneration != authority.authorizationGeneration ||
 		command.ReleaseSafetyEpoch != record.fixture.SafetyEpoch ||
-		command.CatalogSafetyEpoch != record.catalogSafetyEpoch || node == nil ||
+		command.CatalogSafetyEpoch != record.catalogSafetyEpoch ||
 		node.ExecutionNodeID != record.operation.ExecutionNodeID || node.Generation != command.NodeGeneration ||
 		node.AttestationID != command.AttestationID || node.AttestationGeneration != command.AttestationGeneration ||
 		node.Readiness != NodeReady || node.Quarantined || node.Occupancy != NodeOccupied ||
 		node.ActiveRuntimeRunID != command.RuntimeRunID || node.ActiveLeaseID != command.SandboxLeaseID ||
 		!now.Before(node.ExpiresAt) || !now.Before(node.AuthorizationExpiresAt) ||
-		!now.Before(lease.ExpiresAt) || !now.Before(lease.AuthorizationExpiresAt) {
-		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		!now.Before(lease.ExpiresAt) || !now.Before(lease.AuthorizationExpiresAt) || command.OccurredAt.After(now) {
+		return false
 	}
 	maximumExpiry := earliestTime(record.deadline, record.leaseAcquireBy, node.ExpiresAt,
 		node.AuthorizationExpiresAt, lease.AuthorizationExpiresAt)
-	if !command.RequestedExpiresAt.After(lease.ExpiresAt) || command.RequestedExpiresAt.After(maximumExpiry) ||
-		command.OccurredAt.After(now) {
-		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
-	}
+	return command.RequestedExpiresAt.After(lease.ExpiresAt) && !command.RequestedExpiresAt.After(maximumExpiry)
+}
+
+func applyLeaseRenewalTransition(
+	record *runtimeRecord,
+	node *ExecutionNodeFixture,
+	command RenewSandboxLease,
+) RuntimeMaintenanceDecision {
 	record.fixture.RuntimeRevision++
 	record.lease.Generation++
 	record.lease.Fence++
 	record.lease.ExpiresAt = command.RequestedExpiresAt
 	record.node = nodeSnapshot(*node)
-	decision := RuntimeMaintenanceDecision{
+	return RuntimeMaintenanceDecision{
 		OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
 		RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
-		Lease: record.lease, Node: record.node,
+		Lease: record.lease, Node: record.node, Cleanup: record.cleanup,
 	}
-	engine.store.maintenance[command.OperationID] = decision
-	return decision, nil
 }
 
 func (engine *invariantEngine) fenceSandboxLease(
@@ -791,15 +805,37 @@ func (engine *invariantEngine) attestExecutionNode(
 		return RuntimeMaintenanceDecision{}, newError(ErrorAuthorizationDenied)
 	}
 	node := engine.store.nodes[command.ExecutionNodeID]
-	if node == nil || !node.Quarantined || node.Occupancy != NodeUnoccupied ||
-		command.NodeGeneration < node.Generation || command.NodeGeneration == node.Generation &&
-		command.AttestationGeneration <= node.AttestationGeneration ||
-		command.ResetEvidenceID != node.LastResetEvidenceID ||
-		command.ResetEvidenceDigest != node.LastResetEvidenceDigest || command.AttestedAt.After(engine.clock.current()) ||
-		command.ResourceClassID != node.ResourceClassID || command.ExecutionPolicyID != node.ExecutionPolicyID ||
-		command.ReleaseSafetyEpoch != node.ReleaseSafetyEpoch {
+	if !validExecutionNodeAttestationTransition(node, command, engine.clock.current()) {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
+	decision := applyExecutionNodeAttestationTransition(node, command)
+	engine.store.maintenance[command.OperationID] = decision
+	return decision, nil
+}
+
+func validExecutionNodeAttestationTiming(command AttestExecutionNode, now time.Time) bool {
+	return !command.AttestedAt.After(now) && now.Before(command.ExpiresAt) &&
+		now.Before(command.AuthorizationExpiresAt) && !command.OccurredAt.After(now)
+}
+
+func validExecutionNodeAttestationTransition(
+	node *ExecutionNodeFixture,
+	command AttestExecutionNode,
+	now time.Time,
+) bool {
+	return node != nil && validExecutionNodeAttestationTiming(command, now) && node.Quarantined &&
+		node.Occupancy == NodeUnoccupied && command.NodeGeneration >= node.Generation &&
+		(command.NodeGeneration > node.Generation || command.AttestationGeneration > node.AttestationGeneration) &&
+		command.ResetEvidenceID == node.LastResetEvidenceID &&
+		command.ResetEvidenceDigest == node.LastResetEvidenceDigest &&
+		command.ResourceClassID == node.ResourceClassID && command.ExecutionPolicyID == node.ExecutionPolicyID &&
+		command.ReleaseSafetyEpoch == node.ReleaseSafetyEpoch
+}
+
+func applyExecutionNodeAttestationTransition(
+	node *ExecutionNodeFixture,
+	command AttestExecutionNode,
+) RuntimeMaintenanceDecision {
 	node.Generation = command.NodeGeneration
 	node.Readiness = NodeReady
 	node.AttestationID = command.AttestationID
@@ -815,12 +851,26 @@ func (engine *invariantEngine) attestExecutionNode(
 	node.Quarantined = false
 	node.Containment = ContainmentEstablished
 	node.Reset = ResetCompleted
-	decision := RuntimeMaintenanceDecision{
+	return RuntimeMaintenanceDecision{
 		OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
 		Node: nodeSnapshot(*node),
 	}
-	engine.store.maintenance[command.OperationID] = decision
-	return decision, nil
+}
+
+func executionNodeFixtureFromAttestation(command AttestExecutionNode) ExecutionNodeFixture {
+	return ExecutionNodeFixture{
+		ExecutionNodeID: command.ExecutionNodeID, Generation: command.NodeGeneration,
+		Readiness: NodeReady, AttestationID: command.AttestationID,
+		AttestationGeneration: command.AttestationGeneration, AttestedAt: command.AttestedAt,
+		ExpiresAt: command.ExpiresAt, ResourceClassID: command.ResourceClassID,
+		ExecutionPolicyID: command.ExecutionPolicyID, NodeAuthorityID: command.NodeAuthorityID,
+		WorkerAuthorityID: command.WorkerAuthorityID, WorkerGeneration: command.WorkerGeneration,
+		AuthorizationGeneration: command.AuthorizationGeneration,
+		AuthorizationExpiresAt:  command.AuthorizationExpiresAt,
+		ReleaseSafetyEpoch:      command.ReleaseSafetyEpoch, CatalogSafetyEpoch: command.CatalogSafetyEpoch,
+		Occupancy: NodeUnoccupied, Containment: ContainmentEstablished, Reset: ResetCompleted,
+		LastResetEvidenceID: command.ResetEvidenceID, LastResetEvidenceDigest: command.ResetEvidenceDigest,
+	}
 }
 
 var _ RuntimeMaintenance = (*invariantEngine)(nil)
