@@ -148,13 +148,14 @@ type QuotaReservationFixture struct {
 }
 
 type HarnessConfig struct {
-	Now               time.Time
-	IDs               DeterministicIDConfig
-	Runtimes          []RuntimeFixture
-	AdmissionGrants   []AdmissionGrantFixture
-	Nodes             []ExecutionNodeFixture
-	QuotaReservations []QuotaReservationFixture
-	LeaseAcquisition  LeaseAcquisitionAdapter
+	Now                    time.Time
+	IDs                    DeterministicIDConfig
+	Runtimes               []RuntimeFixture
+	AdmissionGrants        []AdmissionGrantFixture
+	Nodes                  []ExecutionNodeFixture
+	QuotaReservations      []QuotaReservationFixture
+	MaintenanceAuthorities []RuntimeMaintenanceAuthorityBinding
+	LeaseAcquisition       LeaseAcquisitionAdapter
 }
 
 type DeterministicHarness struct {
@@ -171,15 +172,16 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		return nil, newError(ErrorInvalidRequest)
 	}
 	store := &memoryStore{
-		runtimes:        make(map[RuntimeRunID]*runtimeRecord),
-		grants:          make(map[grantKey]AdmissionGrantFixture),
-		nextDecision:    config.IDs.DecisionStart,
-		nextObservation: config.IDs.ObservationStart,
-		nextLease:       config.IDs.LeaseStart,
-		nextSandbox:     config.IDs.SandboxStart,
-		nodes:           make(map[ExecutionNodeID]*ExecutionNodeFixture),
-		reservations:    make(map[QuotaReservationID]*QuotaReservationFixture),
-		maintenance:     make(map[OperationID]RuntimeMaintenanceDecision),
+		runtimes:               make(map[RuntimeRunID]*runtimeRecord),
+		grants:                 make(map[grantKey]AdmissionGrantFixture),
+		nextDecision:           config.IDs.DecisionStart,
+		nextObservation:        config.IDs.ObservationStart,
+		nextLease:              config.IDs.LeaseStart,
+		nextSandbox:            config.IDs.SandboxStart,
+		nodes:                  make(map[ExecutionNodeID]*ExecutionNodeFixture),
+		reservations:           make(map[QuotaReservationID]*QuotaReservationFixture),
+		maintenance:            make(map[OperationID]RuntimeMaintenanceDecision),
+		maintenanceAuthorities: make(map[maintenanceAuthorityKey]maintenanceCallerAuthority),
 	}
 	if store.nextDecision == 0 {
 		store.nextDecision = 1
@@ -266,6 +268,16 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		reservation.ExpiresAt = reservation.ExpiresAt.UTC()
 		copyReservation := reservation
 		store.reservations[reservation.QuotaReservationID] = &copyReservation
+	}
+	for _, binding := range config.MaintenanceAuthorities {
+		if !validMaintenanceAuthorityBinding(binding) {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		key := maintenanceAuthorityKey{executionNodeID: binding.executionNodeID, kind: binding.caller.kind}
+		if retained, exists := store.maintenanceAuthorities[key]; exists && retained != binding.caller {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		store.maintenanceAuthorities[key] = binding.caller
 	}
 	clock := &controlledClock{now: config.Now.UTC()}
 	return newHarness(store, clock, config.LeaseAcquisition), nil
@@ -383,17 +395,23 @@ func (clock *controlledClock) current() time.Time {
 }
 
 type memoryStore struct {
-	mu              sync.Mutex
-	runtimes        map[RuntimeRunID]*runtimeRecord
-	grants          map[grantKey]AdmissionGrantFixture
-	observations    []IngressObservation
-	nextDecision    uint64
-	nextObservation uint64
-	nextLease       uint64
-	nextSandbox     uint64
-	nodes           map[ExecutionNodeID]*ExecutionNodeFixture
-	reservations    map[QuotaReservationID]*QuotaReservationFixture
-	maintenance     map[OperationID]RuntimeMaintenanceDecision
+	mu                     sync.Mutex
+	runtimes               map[RuntimeRunID]*runtimeRecord
+	grants                 map[grantKey]AdmissionGrantFixture
+	observations           []IngressObservation
+	nextDecision           uint64
+	nextObservation        uint64
+	nextLease              uint64
+	nextSandbox            uint64
+	nodes                  map[ExecutionNodeID]*ExecutionNodeFixture
+	reservations           map[QuotaReservationID]*QuotaReservationFixture
+	maintenance            map[OperationID]RuntimeMaintenanceDecision
+	maintenanceAuthorities map[maintenanceAuthorityKey]maintenanceCallerAuthority
+}
+
+type maintenanceAuthorityKey struct {
+	executionNodeID ExecutionNodeID
+	kind            RuntimeMaintenanceAuthorityKind
 }
 
 type grantKey struct {

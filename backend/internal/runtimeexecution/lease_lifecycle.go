@@ -21,6 +21,48 @@ type RuntimeMaintenanceCommand interface {
 	maintenanceDigest() Digest
 }
 
+type RuntimeMaintenanceAuthorityKind uint8
+
+const (
+	MaintenanceAuthorityWorker RuntimeMaintenanceAuthorityKind = iota + 1
+	MaintenanceAuthorityScheduler
+	MaintenanceAuthoritySecurity
+	MaintenanceAuthorityRecovery
+	MaintenanceAuthorityCleanup
+)
+
+type maintenanceCallerAuthority struct {
+	kind       RuntimeMaintenanceAuthorityKind
+	id         AuthorityID
+	generation AuthorizationGeneration
+}
+
+type RuntimeMaintenanceAuthorityBinding struct {
+	executionNodeID ExecutionNodeID
+	caller          maintenanceCallerAuthority
+}
+
+func BindLeaseFencingAuthority(
+	executionNodeID ExecutionNodeID,
+	authority LeaseFencingAuthority,
+) RuntimeMaintenanceAuthorityBinding {
+	return RuntimeMaintenanceAuthorityBinding{executionNodeID: executionNodeID, caller: authority.caller()}
+}
+
+func BindSandboxResetAuthority(
+	executionNodeID ExecutionNodeID,
+	authority SandboxResetAuthority,
+) RuntimeMaintenanceAuthorityBinding {
+	return RuntimeMaintenanceAuthorityBinding{executionNodeID: executionNodeID, caller: authority.caller()}
+}
+
+func BindNodeAttestationAuthority(
+	executionNodeID ExecutionNodeID,
+	authority NodeAttestationAuthority,
+) RuntimeMaintenanceAuthorityBinding {
+	return RuntimeMaintenanceAuthorityBinding{executionNodeID: executionNodeID, caller: authority.caller()}
+}
+
 type LeaseRenewalAuthority struct {
 	workerAuthorityID       WorkerAuthorityID
 	workerGeneration        WorkerGeneration
@@ -37,6 +79,13 @@ func NewLeaseRenewalAuthority(
 	return LeaseRenewalAuthority{
 		workerAuthorityID: workerAuthorityID, workerGeneration: workerGeneration,
 		nodeAuthorityID: nodeAuthorityID, authorizationGeneration: authorizationGeneration,
+	}
+}
+
+func (authority LeaseRenewalAuthority) caller() maintenanceCallerAuthority {
+	return maintenanceCallerAuthority{
+		kind: MaintenanceAuthorityWorker,
+		id:   AuthorityID{value: authority.workerAuthorityID.String()}, generation: AuthorizationGeneration(authority.workerGeneration),
 	}
 }
 
@@ -93,12 +142,21 @@ type RuntimeMaintenanceDecision struct {
 }
 
 type LeaseFencingAuthority struct {
-	id         NodeAuthorityID
+	kind       RuntimeMaintenanceAuthorityKind
+	id         AuthorityID
 	generation AuthorizationGeneration
 }
 
-func NewSecurityLeaseFencingAuthority(id NodeAuthorityID, generation AuthorizationGeneration) LeaseFencingAuthority {
-	return LeaseFencingAuthority{id: id, generation: generation}
+func NewSecurityLeaseFencingAuthority(id AuthorityID, generation AuthorizationGeneration) LeaseFencingAuthority {
+	return LeaseFencingAuthority{kind: MaintenanceAuthoritySecurity, id: id, generation: generation}
+}
+
+func NewRecoveryLeaseFencingAuthority(id AuthorityID, generation AuthorizationGeneration) LeaseFencingAuthority {
+	return LeaseFencingAuthority{kind: MaintenanceAuthorityRecovery, id: id, generation: generation}
+}
+
+func (authority LeaseFencingAuthority) caller() maintenanceCallerAuthority {
+	return maintenanceCallerAuthority{kind: authority.kind, id: authority.id, generation: authority.generation}
 }
 
 type LeaseFenceReason uint8
@@ -147,12 +205,34 @@ func (command FenceSandboxLease) maintenanceOperationID() OperationID { return c
 func (command FenceSandboxLease) maintenanceDigest() Digest           { return command.CanonicalRequestDigest }
 
 type SandboxResetAuthority struct {
-	id         NodeAuthorityID
+	id         AuthorityID
 	generation AuthorizationGeneration
 }
 
-func NewSandboxResetAuthority(id NodeAuthorityID, generation AuthorizationGeneration) SandboxResetAuthority {
+func NewSandboxResetAuthority(id AuthorityID, generation AuthorizationGeneration) SandboxResetAuthority {
 	return SandboxResetAuthority{id: id, generation: generation}
+}
+
+func (authority SandboxResetAuthority) caller() maintenanceCallerAuthority {
+	return maintenanceCallerAuthority{kind: MaintenanceAuthorityCleanup, id: authority.id, generation: authority.generation}
+}
+
+type NodeAttestationAuthority struct {
+	kind       RuntimeMaintenanceAuthorityKind
+	id         AuthorityID
+	generation AuthorizationGeneration
+}
+
+func NewSchedulerNodeAttestationAuthority(id AuthorityID, generation AuthorizationGeneration) NodeAttestationAuthority {
+	return NodeAttestationAuthority{kind: MaintenanceAuthorityScheduler, id: id, generation: generation}
+}
+
+func NewRecoveryNodeAttestationAuthority(id AuthorityID, generation AuthorizationGeneration) NodeAttestationAuthority {
+	return NodeAttestationAuthority{kind: MaintenanceAuthorityRecovery, id: id, generation: generation}
+}
+
+func (authority NodeAttestationAuthority) caller() maintenanceCallerAuthority {
+	return maintenanceCallerAuthority{kind: authority.kind, id: authority.id, generation: authority.generation}
 }
 
 type ConfirmSandboxResetInput struct {
@@ -214,6 +294,7 @@ func (command ConfirmSandboxReset) maintenanceDigest() Digest           { return
 type AttestExecutionNodeInput struct {
 	SchemaVersion           SchemaVersion
 	OperationID             OperationID
+	Authority               NodeAttestationAuthority
 	ExecutionNodeID         ExecutionNodeID
 	NodeGeneration          NodeGeneration
 	AttestationID           NodeAttestationID
@@ -287,7 +368,7 @@ func canonicalFenceSandboxLease(command FenceSandboxLease) ([]byte, bool) {
 		input.ExpectedRuntimeFence == 0 || !validOpaqueID(input.SandboxLeaseID.String()) ||
 		input.LeaseGeneration == 0 || input.LeaseFence == 0 || !validOpaqueID(input.ExecutionNodeID.String()) ||
 		input.NodeGeneration == 0 || input.Reason < LeaseFenceRevoked || input.Reason > LeaseFenceNodeLost ||
-		!validOpaqueID(input.Authority.id.String()) || input.Authority.generation == 0 ||
+		!validLeaseFencingAuthority(input.Authority) ||
 		input.ReleaseSafetyEpoch == 0 || input.OccurredAt.IsZero() {
 		return nil, false
 	}
@@ -295,7 +376,7 @@ func canonicalFenceSandboxLease(command FenceSandboxLease) ([]byte, bool) {
 		"slidesmith.runtime-execution.lease-fence/v1", input.OperationID.String(), input.PersonalWorkspaceID.String(),
 		input.RuntimeRunID.String(), fmt.Sprint(input.ExpectedRuntimeFence), input.SandboxLeaseID.String(),
 		fmt.Sprint(input.LeaseGeneration), fmt.Sprint(input.LeaseFence), input.ExecutionNodeID.String(),
-		fmt.Sprint(input.NodeGeneration), fmt.Sprint(input.Reason), input.Authority.id.String(),
+		fmt.Sprint(input.NodeGeneration), fmt.Sprint(input.Reason), fmt.Sprint(input.Authority.kind), input.Authority.id.String(),
 		fmt.Sprint(input.Authority.generation), fmt.Sprint(input.ReleaseSafetyEpoch),
 		input.OccurredAt.Format(time.RFC3339Nano),
 	}, "\n")), true
@@ -308,7 +389,7 @@ func canonicalConfirmSandboxReset(command ConfirmSandboxReset) ([]byte, bool) {
 		input.ExpectedRuntimeFence == 0 || !validOpaqueID(input.SandboxLeaseID.String()) ||
 		input.LeaseGeneration == 0 || input.LeaseFence == 0 || !validOpaqueID(input.SandboxID.String()) ||
 		input.SandboxGeneration == 0 || input.SandboxFence == 0 || !validOpaqueID(input.ExecutionNodeID.String()) ||
-		input.NodeGeneration == 0 || !validOpaqueID(input.Authority.id.String()) || input.Authority.generation == 0 ||
+		input.NodeGeneration == 0 || !validSandboxResetAuthority(input.Authority) ||
 		!validOpaqueID(input.EvidenceID.String()) || input.EvidenceDigest == (Digest{}) || input.OccurredAt.IsZero() {
 		return nil, false
 	}
@@ -324,7 +405,7 @@ func canonicalConfirmSandboxReset(command ConfirmSandboxReset) ([]byte, bool) {
 		input.RuntimeRunID.String(), fmt.Sprint(input.ExpectedRuntimeFence), input.SandboxLeaseID.String(),
 		fmt.Sprint(input.LeaseGeneration), fmt.Sprint(input.LeaseFence), input.SandboxID.String(),
 		fmt.Sprint(input.SandboxGeneration), fmt.Sprint(input.SandboxFence), input.ExecutionNodeID.String(),
-		fmt.Sprint(input.NodeGeneration), input.Authority.id.String(), fmt.Sprint(input.Authority.generation),
+		fmt.Sprint(input.NodeGeneration), fmt.Sprint(MaintenanceAuthorityCleanup), input.Authority.id.String(), fmt.Sprint(input.Authority.generation),
 		input.EvidenceID.String(), input.EvidenceDigest.String(), input.OccurredAt.Format(time.RFC3339Nano),
 	}
 	for _, value := range booleans {
@@ -336,6 +417,7 @@ func canonicalConfirmSandboxReset(command ConfirmSandboxReset) ([]byte, bool) {
 func canonicalAttestExecutionNode(command AttestExecutionNode) ([]byte, bool) {
 	input := command.AttestExecutionNodeInput
 	if input.SchemaVersion.Major() != SchemaV1.Major() || !validOpaqueID(input.OperationID.String()) ||
+		!validNodeAttestationAuthority(input.Authority) ||
 		!validOpaqueID(input.ExecutionNodeID.String()) || input.NodeGeneration == 0 ||
 		!validOpaqueID(input.AttestationID.String()) || input.AttestationGeneration == 0 || input.AttestedAt.IsZero() ||
 		!input.ExpiresAt.After(input.AttestedAt) || !validOpaqueID(input.ResourceClassID.String()) ||
@@ -347,7 +429,8 @@ func canonicalAttestExecutionNode(command AttestExecutionNode) ([]byte, bool) {
 		return nil, false
 	}
 	return []byte(strings.Join([]string{
-		"slidesmith.runtime-execution.node-attestation/v1", input.OperationID.String(), input.ExecutionNodeID.String(),
+		"slidesmith.runtime-execution.node-attestation/v1", input.OperationID.String(), fmt.Sprint(input.Authority.kind),
+		input.Authority.id.String(), fmt.Sprint(input.Authority.generation), input.ExecutionNodeID.String(),
 		fmt.Sprint(input.NodeGeneration), input.AttestationID.String(), fmt.Sprint(input.AttestationGeneration),
 		input.AttestedAt.Format(time.RFC3339Nano), input.ExpiresAt.Format(time.RFC3339Nano),
 		input.ResourceClassID.String(), input.ExecutionPolicyID.String(), input.NodeAuthorityID.String(),
@@ -356,6 +439,30 @@ func canonicalAttestExecutionNode(command AttestExecutionNode) ([]byte, bool) {
 		fmt.Sprint(input.CatalogSafetyEpoch), input.ResetEvidenceID.String(), input.ResetEvidenceDigest.String(),
 		input.OccurredAt.Format(time.RFC3339Nano),
 	}, "\n")), true
+}
+
+func validMaintenanceCaller(authority maintenanceCallerAuthority) bool {
+	return authority.kind >= MaintenanceAuthorityWorker && authority.kind <= MaintenanceAuthorityCleanup &&
+		validOpaqueID(authority.id.String()) && authority.generation > 0
+}
+
+func validLeaseFencingAuthority(authority LeaseFencingAuthority) bool {
+	return (authority.kind == MaintenanceAuthoritySecurity || authority.kind == MaintenanceAuthorityRecovery) &&
+		validMaintenanceCaller(authority.caller())
+}
+
+func validSandboxResetAuthority(authority SandboxResetAuthority) bool {
+	return validMaintenanceCaller(authority.caller())
+}
+
+func validNodeAttestationAuthority(authority NodeAttestationAuthority) bool {
+	return (authority.kind == MaintenanceAuthorityScheduler || authority.kind == MaintenanceAuthorityRecovery) &&
+		validMaintenanceCaller(authority.caller())
+}
+
+func validMaintenanceAuthorityBinding(binding RuntimeMaintenanceAuthorityBinding) bool {
+	return validOpaqueID(binding.executionNodeID.String()) && validMaintenanceCaller(binding.caller) &&
+		binding.caller.kind != MaintenanceAuthorityWorker
 }
 
 func (engine *invariantEngine) Maintain(
@@ -412,6 +519,17 @@ func (engine *invariantEngine) replayMaintenanceLocked(
 	}
 	retained.Replayed = true
 	return retained, true, nil
+}
+
+func (engine *invariantEngine) authorizedMaintenanceCallerLocked(
+	executionNodeID ExecutionNodeID,
+	caller maintenanceCallerAuthority,
+) bool {
+	retained, exists := engine.store.maintenanceAuthorities[maintenanceAuthorityKey{
+		executionNodeID: executionNodeID,
+		kind:            caller.kind,
+	}]
+	return exists && retained == caller
 }
 
 func (engine *invariantEngine) renewSandboxLease(
@@ -474,23 +592,48 @@ func (engine *invariantEngine) fenceSandboxLease(
 	if retained, exists, err := engine.replayMaintenanceLocked(command.OperationID, command.CanonicalRequestDigest); exists {
 		return retained, err
 	}
+	if !engine.authorizedMaintenanceCallerLocked(command.ExecutionNodeID, command.Authority.caller()) {
+		return RuntimeMaintenanceDecision{}, newError(ErrorAuthorizationDenied)
+	}
 	record := engine.store.runtimes[command.RuntimeRunID]
 	if record == nil || record.fixture.PersonalWorkspaceID != command.PersonalWorkspaceID {
 		return RuntimeMaintenanceDecision{}, newError(ErrorAuthorizationDenied)
 	}
 	now := engine.clock.current()
 	node := engine.store.nodes[command.ExecutionNodeID]
-	lease := record.lease
-	if lease.AcquireStatus != LeaseGranted || lease.Disposition != LeaseActive ||
-		command.ExpectedRuntimeFence != record.fixture.RuntimeFence || lease.LeaseID != command.SandboxLeaseID ||
-		lease.Generation != command.LeaseGeneration || lease.Fence != command.LeaseFence ||
-		record.operation.ExecutionNodeID != command.ExecutionNodeID ||
-		NodeGeneration(record.operation.NodeCapacityGeneration) != command.NodeGeneration ||
-		command.ReleaseSafetyEpoch != record.fixture.SafetyEpoch || node == nil ||
-		node.ActiveRuntimeRunID != command.RuntimeRunID || node.ActiveLeaseID != command.SandboxLeaseID ||
-		command.OccurredAt.After(now) || command.Reason == LeaseFenceExpired && now.Before(lease.ExpiresAt) {
+	if !validLeaseFenceTransition(record, node, command, now) {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
+	decision := applyLeaseFenceTransition(record, node, command)
+	engine.store.maintenance[command.OperationID] = decision
+	return decision, nil
+}
+
+func validLeaseFenceTransition(
+	record *runtimeRecord,
+	node *ExecutionNodeFixture,
+	command FenceSandboxLease,
+	now time.Time,
+) bool {
+	if record == nil || node == nil {
+		return false
+	}
+	lease := record.lease
+	return lease.AcquireStatus == LeaseGranted && lease.Disposition == LeaseActive &&
+		command.ExpectedRuntimeFence == record.fixture.RuntimeFence && lease.LeaseID == command.SandboxLeaseID &&
+		lease.Generation == command.LeaseGeneration && lease.Fence == command.LeaseFence &&
+		record.operation.ExecutionNodeID == command.ExecutionNodeID &&
+		NodeGeneration(record.operation.NodeCapacityGeneration) == command.NodeGeneration &&
+		command.ReleaseSafetyEpoch == record.fixture.SafetyEpoch &&
+		node.ActiveRuntimeRunID == command.RuntimeRunID && node.ActiveLeaseID == command.SandboxLeaseID &&
+		!command.OccurredAt.After(now) && (command.Reason != LeaseFenceExpired || !now.Before(lease.ExpiresAt))
+}
+
+func applyLeaseFenceTransition(
+	record *runtimeRecord,
+	node *ExecutionNodeFixture,
+	command FenceSandboxLease,
+) RuntimeMaintenanceDecision {
 	record.fixture.RuntimeRevision++
 	record.fixture.RuntimeFence++
 	record.fixture.State = RuntimeStopping
@@ -510,7 +653,20 @@ func (engine *invariantEngine) fenceSandboxLease(
 		node.Readiness = NodeUnavailable
 	}
 	record.node = nodeSnapshot(*node)
-	record.capacity.Physical = PhysicalCapacityUnknownOrQuarantined
+	record.capacity = RuntimeCapacitySnapshot{
+		LogicalRelease: LogicalCapacityReleaseReady,
+		NoLease:        NoLeaseDispositionNone,
+		Physical:       PhysicalCapacityUnknownOrQuarantined,
+	}
+	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{RuntimeFencedOrTerminal: RuntimeFencedOrTerminalEvidence{
+		WorkItemID: record.operation.WorkItemID, AdmissionGrantID: record.operation.AdmissionGrantID,
+		GrantGeneration: record.operation.GrantGeneration, RuntimeRunID: record.fixture.RuntimeRunID,
+		StartOperationID: record.acceptedStart.OperationID, StartDigest: record.acceptedStartDigest,
+		TerminalDecisionID: RuntimeDecisionID{value: "runtime-fence-" + command.CanonicalRequestDigest.String()},
+		RuntimeRevision:    record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
+		SchedulerEpoch: record.operation.SchedulerEpoch, PolicyVersion: record.operation.PolicyVersion,
+		LeaseAcquireOperationID: record.lease.AcquireOperationID, LeaseAcquireDigest: record.lease.AcquireDigest,
+	}}
 	record.cleanup = RuntimeLeaseCleanupSnapshot{
 		Status: LeaseCleanupPending, OperationID: command.OperationID,
 		CanonicalRequestDigest: command.CanonicalRequestDigest, StopMainProcess: true,
@@ -522,8 +678,7 @@ func (engine *invariantEngine) fenceSandboxLease(
 		RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
 		Lease: record.lease, Node: record.node, Cleanup: record.cleanup,
 	}
-	engine.store.maintenance[command.OperationID] = decision
-	return decision, nil
+	return decision
 }
 
 func (engine *invariantEngine) confirmSandboxReset(
@@ -534,22 +689,48 @@ func (engine *invariantEngine) confirmSandboxReset(
 	if retained, exists, err := engine.replayMaintenanceLocked(command.OperationID, command.CanonicalRequestDigest); exists {
 		return retained, err
 	}
+	if !engine.authorizedMaintenanceCallerLocked(command.ExecutionNodeID, command.Authority.caller()) {
+		return RuntimeMaintenanceDecision{}, newError(ErrorAuthorizationDenied)
+	}
 	record := engine.store.runtimes[command.RuntimeRunID]
 	if record == nil || record.fixture.PersonalWorkspaceID != command.PersonalWorkspaceID {
 		return RuntimeMaintenanceDecision{}, newError(ErrorAuthorizationDenied)
 	}
 	node := engine.store.nodes[command.ExecutionNodeID]
-	lease := record.lease
-	if lease.AcquireStatus != LeaseGranted || lease.Disposition != LeaseRevoked && lease.Disposition != LeaseExpired ||
-		command.ExpectedRuntimeFence != record.fixture.RuntimeFence || lease.LeaseID != command.SandboxLeaseID ||
-		lease.Generation != command.LeaseGeneration || lease.Fence != command.LeaseFence ||
-		lease.SandboxID != command.SandboxID || lease.SandboxGeneration != command.SandboxGeneration ||
-		lease.SandboxFence != command.SandboxFence || record.operation.ExecutionNodeID != command.ExecutionNodeID ||
-		NodeGeneration(record.operation.NodeCapacityGeneration) != command.NodeGeneration || node == nil ||
-		node.ActiveRuntimeRunID != command.RuntimeRunID || node.ActiveLeaseID != command.SandboxLeaseID ||
-		command.OccurredAt.After(engine.clock.current()) || !completeResetEvidence(command.ConfirmSandboxResetInput) {
+	if !validSandboxResetTransition(record, node, command, engine.clock.current()) {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
+	decision := applySandboxResetTransition(record, node, command)
+	engine.store.maintenance[command.OperationID] = decision
+	return decision, nil
+}
+
+func validSandboxResetTransition(
+	record *runtimeRecord,
+	node *ExecutionNodeFixture,
+	command ConfirmSandboxReset,
+	now time.Time,
+) bool {
+	if record == nil || node == nil {
+		return false
+	}
+	lease := record.lease
+	return lease.AcquireStatus == LeaseGranted &&
+		(lease.Disposition == LeaseRevoked || lease.Disposition == LeaseExpired) &&
+		command.ExpectedRuntimeFence == record.fixture.RuntimeFence && lease.LeaseID == command.SandboxLeaseID &&
+		lease.Generation == command.LeaseGeneration && lease.Fence == command.LeaseFence &&
+		lease.SandboxID == command.SandboxID && lease.SandboxGeneration == command.SandboxGeneration &&
+		lease.SandboxFence == command.SandboxFence && record.operation.ExecutionNodeID == command.ExecutionNodeID &&
+		NodeGeneration(record.operation.NodeCapacityGeneration) == command.NodeGeneration &&
+		node.ActiveRuntimeRunID == command.RuntimeRunID && node.ActiveLeaseID == command.SandboxLeaseID &&
+		!command.OccurredAt.After(now) && completeResetEvidence(command.ConfirmSandboxResetInput)
+}
+
+func applySandboxResetTransition(
+	record *runtimeRecord,
+	node *ExecutionNodeFixture,
+	command ConfirmSandboxReset,
+) RuntimeMaintenanceDecision {
 	record.fixture.RuntimeRevision++
 	record.lease.Generation++
 	record.lease.Fence++
@@ -587,8 +768,7 @@ func (engine *invariantEngine) confirmSandboxReset(
 		Lease: record.lease, Node: record.node, Cleanup: record.cleanup,
 		PhysicalCapacityReleaseReady: release,
 	}
-	engine.store.maintenance[command.OperationID] = decision
-	return decision, nil
+	return decision
 }
 
 func completeResetEvidence(input ConfirmSandboxResetInput) bool {
@@ -606,6 +786,9 @@ func (engine *invariantEngine) attestExecutionNode(
 	defer engine.store.mu.Unlock()
 	if retained, exists, err := engine.replayMaintenanceLocked(command.OperationID, command.CanonicalRequestDigest); exists {
 		return retained, err
+	}
+	if !engine.authorizedMaintenanceCallerLocked(command.ExecutionNodeID, command.Authority.caller()) {
+		return RuntimeMaintenanceDecision{}, newError(ErrorAuthorizationDenied)
 	}
 	node := engine.store.nodes[command.ExecutionNodeID]
 	if node == nil || !node.Quarantined || node.Occupancy != NodeUnoccupied ||

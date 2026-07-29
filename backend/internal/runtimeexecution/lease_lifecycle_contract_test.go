@@ -3,6 +3,7 @@ package runtimeexecution
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -314,6 +315,71 @@ func TestPostLeaseCancelFencesAuthorityBeforeCleanupAndDoesNotClaimPhysicalRelea
 	}
 }
 
+func TestNodeLossFencingAuthorizesOnlyLogicalCapacityRelease(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 29, 17, 45, 0, 0, time.UTC)
+	authority := mustTaskOrchestrationAuthority(t, "node-loss-task-authority", 7)
+	start := standardStart(t, now, authority, "node-loss")
+	grant := grantFixtureForStart(start, now.Add(10*time.Minute), true)
+	grant.ExecutionNodeID = startNodeID(t, "node-loss-node")
+	grant.NodeCapacityGeneration = 2
+	node := executionNodeFixtureForStart(t, start, grant, now)
+	securityID := mustAuthorityID(t, "node-loss-security-authority")
+	fencingAuthority := NewSecurityLeaseFencingAuthority(securityID, 2)
+	harness, err := NewDeterministicHarness(HarnessConfig{
+		Now: now, IDs: DeterministicIDConfig{DecisionStart: 1, LeaseStart: 1, SandboxStart: 1},
+		Runtimes:        []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants: []AdmissionGrantFixture{grant}, Nodes: []ExecutionNodeFixture{node},
+		MaintenanceAuthorities: []RuntimeMaintenanceAuthorityBinding{
+			BindLeaseFencingAuthority(grant.ExecutionNodeID, fencingAuthority),
+		},
+		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
+			context.Context,
+			LeaseAcquisitionRequest,
+		) (LeaseAcquisitionObservation, error) {
+			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquired, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := acquired.Snapshot.Lease
+	fence, err := NewFenceSandboxLease(FenceSandboxLeaseInput{
+		SchemaVersion: SchemaV1, OperationID: mustOperationID(t, "node-loss-fence-operation"),
+		PersonalWorkspaceID: start.PersonalWorkspaceID, RuntimeRunID: start.RuntimeRunID,
+		ExpectedRuntimeFence: acquired.Snapshot.RuntimeFence, SandboxLeaseID: lease.LeaseID,
+		LeaseGeneration: lease.Generation, LeaseFence: lease.Fence,
+		ExecutionNodeID: grant.ExecutionNodeID, NodeGeneration: 2, Reason: LeaseFenceNodeLost,
+		Authority: fencingAuthority, ReleaseSafetyEpoch: start.ReleaseSafetyEpoch, OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.Maintenance.Maintain(context.Background(), fence); err != nil {
+		t.Fatal(err)
+	}
+	inspected, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, authority))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := inspected.CapacityEvidence.RuntimeFencedOrTerminal
+	if inspected.Capacity.LogicalRelease != LogicalCapacityReleaseReady ||
+		inspected.Capacity.NoLease != NoLeaseDispositionNone ||
+		inspected.Capacity.Physical != PhysicalCapacityUnknownOrQuarantined ||
+		inspected.Node.Readiness != NodeUnavailable || !inspected.Node.Quarantined ||
+		evidence.RuntimeRunID != start.RuntimeRunID || evidence.RuntimeFence != inspected.RuntimeFence ||
+		evidence.RuntimeRevision != inspected.RuntimeRevision || evidence.TerminalDecisionID.String() == "" ||
+		inspected.CapacityEvidence.NoLeasePhysicalDisposition != (NoLeasePhysicalDispositionEvidence{}) ||
+		inspected.CapacityEvidence.PhysicalCapacityReleaseReady != (PhysicalCapacityReleaseReadyEvidence{}) {
+		t.Fatalf("node loss crossed logical/physical evidence authority: %+v", inspected)
+	}
+}
+
 func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 	t.Parallel()
 
@@ -327,6 +393,12 @@ func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 	secondGrant := grantFixtureForStart(secondStart, now.Add(10*time.Minute), true)
 	secondGrant.ExecutionNodeID, secondGrant.NodeCapacityGeneration = nodeID, 5
 	node := executionNodeFixtureForStart(t, firstStart, firstGrant, now)
+	securityAuthorityID := mustAuthorityID(t, "reuse-security")
+	cleanupAuthorityID := mustAuthorityID(t, "reuse-reset-authority")
+	recoveryAuthorityID := mustAuthorityID(t, "reuse-recovery-authority")
+	fenceAuthority := NewSecurityLeaseFencingAuthority(securityAuthorityID, 3)
+	resetAuthority := NewSandboxResetAuthority(cleanupAuthorityID, 4)
+	attestationAuthority := NewRecoveryNodeAttestationAuthority(recoveryAuthorityID, 5)
 	node.ResourceClassID = secondStart.ResourceClassID
 	node.ExecutionPolicyID = secondStart.ExecutionPolicyID
 	firstStart.StartRuntimeRunInput.ResourceClassID = node.ResourceClassID
@@ -341,6 +413,11 @@ func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 			runtimeFixtureForStart(firstStart, authority), runtimeFixtureForStart(secondStart, authority),
 		},
 		AdmissionGrants: []AdmissionGrantFixture{firstGrant, secondGrant}, Nodes: []ExecutionNodeFixture{node},
+		MaintenanceAuthorities: []RuntimeMaintenanceAuthorityBinding{
+			BindLeaseFencingAuthority(nodeID, fenceAuthority),
+			BindSandboxResetAuthority(nodeID, resetAuthority),
+			BindNodeAttestationAuthority(nodeID, attestationAuthority),
+		},
 		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
 			context.Context,
 			LeaseAcquisitionRequest,
@@ -356,7 +433,28 @@ func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 		t.Fatalf("acquire first lease: %v", err)
 	}
 	lease := first.Snapshot.Lease
-	fenceAuthority := NewSecurityLeaseFencingAuthority(startNodeAuthorityID(t, "reuse-security"), 3)
+	wrongFenceAuthority := NewSecurityLeaseFencingAuthority(mustAuthorityID(t, "reuse-wrong-security"), 3)
+	staleFenceAuthority := NewSecurityLeaseFencingAuthority(securityAuthorityID, 2)
+	for _, rejectedAuthority := range []LeaseFencingAuthority{wrongFenceAuthority, staleFenceAuthority} {
+		input := FenceSandboxLeaseInput{
+			SchemaVersion: SchemaV1, OperationID: mustOperationID(t, "reuse-rejected-revoke-"+rejectedAuthority.id.String()),
+			PersonalWorkspaceID: firstStart.PersonalWorkspaceID, RuntimeRunID: firstStart.RuntimeRunID,
+			ExpectedRuntimeFence: first.Snapshot.RuntimeFence, SandboxLeaseID: lease.LeaseID,
+			LeaseGeneration: lease.Generation, LeaseFence: lease.Fence,
+			ExecutionNodeID: nodeID, NodeGeneration: 5, Reason: LeaseFenceRevoked,
+			Authority: rejectedAuthority, ReleaseSafetyEpoch: firstStart.ReleaseSafetyEpoch, OccurredAt: now,
+		}
+		rejected, constructErr := NewFenceSandboxLease(input)
+		if constructErr != nil {
+			t.Fatal(constructErr)
+		}
+		_, maintainErr := harness.Maintenance.Maintain(context.Background(), rejected)
+		assertRuntimeLifecycleErrorCode(t, maintainErr, ErrorAuthorizationDenied)
+	}
+	beforeFence, err := harness.Runtime.Inspect(context.Background(), runtimeRef(firstStart, authority))
+	if err != nil || beforeFence != first.Snapshot {
+		t.Fatalf("rejected fencing authority changed Runtime: snapshot=%+v err=%v", beforeFence, err)
+	}
 	revoke, err := NewFenceSandboxLease(FenceSandboxLeaseInput{
 		SchemaVersion: SchemaV1, OperationID: mustOperationID(t, "reuse-revoke"),
 		PersonalWorkspaceID: firstStart.PersonalWorkspaceID, RuntimeRunID: firstStart.RuntimeRunID,
@@ -395,7 +493,7 @@ func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 		LeaseGeneration: fenced.Lease.Generation, LeaseFence: fenced.Lease.Fence,
 		SandboxID: fenced.Lease.SandboxID, SandboxGeneration: fenced.Lease.SandboxGeneration,
 		SandboxFence: fenced.Lease.SandboxFence, ExecutionNodeID: nodeID, NodeGeneration: 5,
-		Authority:  NewSandboxResetAuthority(startNodeAuthorityID(t, "reuse-reset-authority"), 4),
+		Authority:  resetAuthority,
 		EvidenceID: resetEvidenceID, EvidenceDigest: digest(91), ProcessStopped: true,
 		ChildProcessesStopped: true, SecretsRevoked: true, NetworkRemoved: true,
 		ContainmentEstablished: true, ResetCompleted: true, NoUnresolvedOccupancy: true,
@@ -414,6 +512,20 @@ func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 	stillFenced, err := harness.Runtime.Inspect(context.Background(), runtimeRef(firstStart, authority))
 	if err != nil || stillFenced.Capacity.Physical != PhysicalCapacityUnknownOrQuarantined {
 		t.Fatalf("incomplete reset changed capacity: snapshot=%+v err=%v", stillFenced, err)
+	}
+	for index, rejectedAuthority := range []SandboxResetAuthority{
+		NewSandboxResetAuthority(mustAuthorityID(t, "reuse-wrong-cleanup"), 4),
+		NewSandboxResetAuthority(cleanupAuthorityID, 3),
+	} {
+		rejectedInput := resetInput
+		rejectedInput.OperationID = mustOperationID(t, fmt.Sprintf("reuse-rejected-reset-%d", index))
+		rejectedInput.Authority = rejectedAuthority
+		rejected, constructErr := NewConfirmSandboxReset(rejectedInput)
+		if constructErr != nil {
+			t.Fatal(constructErr)
+		}
+		_, maintainErr := harness.Maintenance.Maintain(context.Background(), rejected)
+		assertRuntimeLifecycleErrorCode(t, maintainErr, ErrorAuthorizationDenied)
 	}
 
 	reset, err := NewConfirmSandboxReset(resetInput)
@@ -435,6 +547,7 @@ func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 
 	attest, err := NewAttestExecutionNode(AttestExecutionNodeInput{
 		SchemaVersion: SchemaV1, OperationID: mustOperationID(t, "reuse-node-return"),
+		Authority:       attestationAuthority,
 		ExecutionNodeID: nodeID, NodeGeneration: 5,
 		AttestationID: startNodeAttestationID(t, "reuse-return-attestation"), AttestationGeneration: 2,
 		AttestedAt: now, ExpiresAt: now.Add(5 * time.Minute), ResourceClassID: node.ResourceClassID,
@@ -446,6 +559,20 @@ func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	for index, rejectedAuthority := range []NodeAttestationAuthority{
+		NewRecoveryNodeAttestationAuthority(mustAuthorityID(t, "reuse-wrong-recovery"), 5),
+		NewRecoveryNodeAttestationAuthority(recoveryAuthorityID, 4),
+	} {
+		rejectedInput := attest.AttestExecutionNodeInput
+		rejectedInput.OperationID = mustOperationID(t, fmt.Sprintf("reuse-rejected-attestation-%d", index))
+		rejectedInput.Authority = rejectedAuthority
+		rejected, constructErr := NewAttestExecutionNode(rejectedInput)
+		if constructErr != nil {
+			t.Fatal(constructErr)
+		}
+		_, maintainErr := harness.Maintenance.Maintain(context.Background(), rejected)
+		assertRuntimeLifecycleErrorCode(t, maintainErr, ErrorAuthorizationDenied)
 	}
 	returned, err := harness.Maintenance.Maintain(context.Background(), attest)
 	if err != nil || returned.Node.Readiness != NodeReady || returned.Node.Quarantined {
@@ -482,6 +609,15 @@ func runtimeRef(start StartRuntimeRun, authority RuntimeAuthority) RuntimeRunRef
 func startNodeID(t *testing.T, value string) ExecutionNodeID {
 	t.Helper()
 	id, err := NewExecutionNodeID(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func mustAuthorityID(t *testing.T, value string) AuthorityID {
+	t.Helper()
+	id, err := NewAuthorityID(value)
 	if err != nil {
 		t.Fatal(err)
 	}

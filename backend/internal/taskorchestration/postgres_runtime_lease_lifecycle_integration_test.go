@@ -350,6 +350,62 @@ func TestPostgresPostLeaseCancelFencesBeforeCleanupWithoutPhysicalRelease(t *tes
 	}
 }
 
+func TestPostgresNodeLossReleasesLogicalCountersButKeepsPhysicalOccupancyQuarantined(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 17, 45, 0, 0, time.UTC)
+	ready := runtimeexecution.LeaseAcquisitionAdapterFunc(func(
+		context.Context,
+		runtimeexecution.LeaseAcquisitionRequest,
+	) (runtimeexecution.LeaseAcquisitionObservation, error) {
+		return runtimeexecution.LeaseAcquisitionObservation{Disposition: runtimeexecution.LeaseAcquisitionReady}, nil
+	})
+	system := newPostgresRuntimeAdmissionSystem(t, now, ready, nil)
+	work := system.enqueueAndAdmitRuntime(t, "issue-76-node-loss-logical-release")
+	acquired, err := system.runtime.Execute(context.Background(), work.start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, node := acquired.Snapshot.Lease, acquired.Snapshot.Node
+	operationID, _ := runtimeexecution.NewOperationID("issue-76-node-loss-fence")
+	fence, err := runtimeexecution.NewFenceSandboxLease(runtimeexecution.FenceSandboxLeaseInput{
+		SchemaVersion: runtimeexecution.SchemaV1, OperationID: operationID,
+		PersonalWorkspaceID: work.start.PersonalWorkspaceID, RuntimeRunID: work.start.RuntimeRunID,
+		ExpectedRuntimeFence: acquired.Snapshot.RuntimeFence, SandboxLeaseID: lease.LeaseID,
+		LeaseGeneration: lease.Generation, LeaseFence: lease.Fence,
+		ExecutionNodeID: node.ExecutionNodeID, NodeGeneration: node.Generation,
+		Reason: runtimeexecution.LeaseFenceNodeLost, Authority: system.fencingAuthority,
+		ReleaseSafetyEpoch: work.start.ReleaseSafetyEpoch, OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := system.runtime.Maintain(context.Background(), fence); err != nil {
+		t.Fatal(err)
+	}
+	inspected := inspectPostgresRuntime(t, system.runtime, work.start)
+	if inspected.Capacity.LogicalRelease != runtimeexecution.LogicalCapacityReleaseReady ||
+		inspected.Capacity.Physical != runtimeexecution.PhysicalCapacityUnknownOrQuarantined ||
+		inspected.Node.Readiness != runtimeexecution.NodeUnavailable || !inspected.Node.Quarantined ||
+		inspected.CapacityEvidence.RuntimeFencedOrTerminal.RuntimeRunID != work.start.RuntimeRunID ||
+		inspected.CapacityEvidence.NoLeasePhysicalDisposition != (runtimeexecution.NoLeasePhysicalDispositionEvidence{}) ||
+		inspected.CapacityEvidence.PhysicalCapacityReleaseReady != (runtimeexecution.PhysicalCapacityReleaseReadyEvidence{}) {
+		t.Fatalf("node loss crossed Runtime capacity authorities: %+v", inspected)
+	}
+	if err := system.scheduling.ApplyRuntimeFencedOrTerminal(context.Background(),
+		inspected.CapacityEvidence.RuntimeFencedOrTerminal); err != nil {
+		t.Fatalf("Scheduler rejected exact node-loss logical evidence: %v", err)
+	}
+	workspaceID, _ := scheduler.NewPersonalWorkspaceID(work.start.PersonalWorkspaceID.String())
+	view, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
+		WorkItemID: work.canonical.WorkItemID, Scope: scheduler.NewOwnerWorkItemQueryScope(workspaceID),
+	})
+	if err != nil || view.Grant.State != scheduler.GrantLeaseAttached ||
+		view.LogicalReservation != scheduler.ReservationReleased ||
+		view.SelectedNodeReservation != scheduler.ReservationLeaseAttached ||
+		view.PhysicalOccupancy != scheduler.PhysicalOccupancyHeld {
+		t.Fatalf("node-loss evidence released physical capacity: view=%+v err=%v", view, err)
+	}
+}
+
 func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *testing.T) {
 	now := time.Date(2026, time.July, 29, 18, 0, 0, 0, time.UTC)
 	ready := runtimeexecution.LeaseAcquisitionAdapterFunc(func(
@@ -366,11 +422,44 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 		t.Fatalf("acquire first lease: %v", err)
 	}
 	lease, node := first.Snapshot.Lease, first.Snapshot.Node
-	fenceOperationID, err := runtimeexecution.NewOperationID("issue-76-revoke-first")
-	if err != nil {
-		t.Fatal(err)
+	poolCanary := newIssue76SandboxPoolCanaryAdapter(lease, node.ExecutionNodeID, firstWork.start.OperationID)
+	poolCanary.Inject(issue76SandboxResidueCanaries{
+		TaskWorkspaceBytes:     "prior-task-workspace-bytes-canary",
+		Secrets:                "prior-secret-capability-canary",
+		WritableCacheMutations: "prior-writable-cache-mutation-canary",
+		LogsAndTranscripts:     "prior-log-transcript-canary",
+		Evidence:               "prior-runtime-evidence-canary",
+		MainProcessState:       "prior-main-process-state-canary",
+		ChildProcessState:      "prior-child-process-state-canary",
+		NetworkState:           "prior-network-state-canary",
+		PriorOperationIdentity: firstWork.start.OperationID.String(),
+	})
+	securityAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-security-authority")
+	wrongSecurityAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-wrong-security-authority")
+	for index, rejectedAuthority := range []runtimeexecution.LeaseFencingAuthority{
+		runtimeexecution.NewSecurityLeaseFencingAuthority(wrongSecurityAuthorityID, 3),
+		runtimeexecution.NewSecurityLeaseFencingAuthority(securityAuthorityID, 2),
+	} {
+		operationID, _ := runtimeexecution.NewOperationID(fmt.Sprintf("issue-76-rejected-fence-%d", index))
+		rejected, constructErr := runtimeexecution.NewFenceSandboxLease(runtimeexecution.FenceSandboxLeaseInput{
+			SchemaVersion: runtimeexecution.SchemaV1, OperationID: operationID,
+			PersonalWorkspaceID: firstWork.start.PersonalWorkspaceID, RuntimeRunID: firstWork.start.RuntimeRunID,
+			ExpectedRuntimeFence: first.Snapshot.RuntimeFence, SandboxLeaseID: lease.LeaseID,
+			LeaseGeneration: lease.Generation, LeaseFence: lease.Fence,
+			ExecutionNodeID: node.ExecutionNodeID, NodeGeneration: node.Generation,
+			Reason: runtimeexecution.LeaseFenceRevoked, Authority: rejectedAuthority,
+			ReleaseSafetyEpoch: firstWork.start.ReleaseSafetyEpoch, OccurredAt: now,
+		})
+		if constructErr != nil {
+			t.Fatal(constructErr)
+		}
+		_, maintainErr := system.runtime.Maintain(context.Background(), rejected)
+		assertRuntimeExecutionErrorCode(t, maintainErr, runtimeexecution.ErrorAuthorizationDenied)
 	}
-	securityID, err := runtimeexecution.NewNodeAuthorityID("issue-76-security-authority")
+	if afterRejected := inspectPostgresRuntime(t, system.runtime, firstWork.start); afterRejected != first.Snapshot {
+		t.Fatalf("rejected fencing authority changed Runtime: got=%+v want=%+v", afterRejected, first.Snapshot)
+	}
+	fenceOperationID, err := runtimeexecution.NewOperationID("issue-76-revoke-first")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +470,7 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 		LeaseGeneration: lease.Generation, LeaseFence: lease.Fence,
 		ExecutionNodeID: node.ExecutionNodeID, NodeGeneration: node.Generation,
 		Reason:             runtimeexecution.LeaseFenceRevoked,
-		Authority:          runtimeexecution.NewSecurityLeaseFencingAuthority(securityID, 1),
+		Authority:          system.fencingAuthority,
 		ReleaseSafetyEpoch: firstWork.start.ReleaseSafetyEpoch, OccurredAt: now,
 	})
 	if err != nil {
@@ -408,10 +497,6 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	resetAuthorityID, err := runtimeexecution.NewNodeAuthorityID("issue-76-reset-authority")
-	if err != nil {
-		t.Fatal(err)
-	}
 	resetEvidenceID, err := runtimeexecution.NewEvidenceID("issue-76-reset-evidence")
 	if err != nil {
 		t.Fatal(err)
@@ -423,7 +508,7 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 		LeaseGeneration: fenced.Lease.Generation, LeaseFence: fenced.Lease.Fence,
 		SandboxID: fenced.Lease.SandboxID, SandboxGeneration: fenced.Lease.SandboxGeneration,
 		SandboxFence: fenced.Lease.SandboxFence, ExecutionNodeID: node.ExecutionNodeID,
-		NodeGeneration: node.Generation, Authority: runtimeexecution.NewSandboxResetAuthority(resetAuthorityID, 1),
+		NodeGeneration: node.Generation, Authority: system.resetAuthority,
 		EvidenceID: resetEvidenceID, EvidenceDigest: runtimeexecution.Digest{31: 76},
 		ProcessStopped: true, ChildProcessesStopped: true, SecretsRevoked: true, NetworkRemoved: true,
 		ContainmentEstablished: true, ResetCompleted: true, NoUnresolvedOccupancy: true,
@@ -455,6 +540,25 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 	}
 	_, err = system.runtime.Maintain(context.Background(), incomplete)
 	assertRuntimeExecutionErrorCode(t, err, runtimeexecution.ErrorIntegrityConflict)
+	if poolCanary.Observe() == (issue76SandboxResidueCanaries{}) {
+		t.Fatal("rejected incomplete reset cleared physical sandbox canaries")
+	}
+	cleanupAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-cleanup-authority")
+	wrongCleanupAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-wrong-cleanup-authority")
+	for index, rejectedAuthority := range []runtimeexecution.SandboxResetAuthority{
+		runtimeexecution.NewSandboxResetAuthority(wrongCleanupAuthorityID, 4),
+		runtimeexecution.NewSandboxResetAuthority(cleanupAuthorityID, 3),
+	} {
+		rejectedInput := resetInput
+		rejectedInput.OperationID, _ = runtimeexecution.NewOperationID(fmt.Sprintf("issue-76-rejected-reset-%d", index))
+		rejectedInput.Authority = rejectedAuthority
+		rejected, constructErr := runtimeexecution.NewConfirmSandboxReset(rejectedInput)
+		if constructErr != nil {
+			t.Fatal(constructErr)
+		}
+		_, maintainErr := system.runtime.Maintain(context.Background(), rejected)
+		assertRuntimeExecutionErrorCode(t, maintainErr, runtimeexecution.ErrorAuthorizationDenied)
+	}
 
 	reset, err := runtimeexecution.NewConfirmSandboxReset(resetInput)
 	if err != nil {
@@ -471,6 +575,9 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 		evidence.SandboxLeaseID != lease.LeaseID || evidence.SandboxID != lease.SandboxID ||
 		evidence.ResetEvidenceID != resetEvidenceID {
 		t.Fatalf("complete reset did not publish exact release evidence: %+v", released)
+	}
+	if err := poolCanary.ApplyPhysicalRelease(evidence); err != nil {
+		t.Fatalf("test sandbox pool rejected exact physical-release evidence: %v", err)
 	}
 	replayedReset, err := system.runtime.Maintain(context.Background(), reset)
 	if err != nil || !replayedReset.Replayed ||
@@ -516,6 +623,7 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 	}
 	attest, err := runtimeexecution.NewAttestExecutionNode(runtimeexecution.AttestExecutionNodeInput{
 		SchemaVersion: runtimeexecution.SchemaV1, OperationID: returnOperationID,
+		Authority:       system.attestationAuthority,
 		ExecutionNodeID: node.ExecutionNodeID, NodeGeneration: node.Generation,
 		AttestationID: returnAttestationID, AttestationGeneration: node.AttestationGeneration + 1,
 		AttestedAt: now, ExpiresAt: now.Add(24 * time.Hour), ResourceClassID: firstWork.start.ResourceClassID,
@@ -529,9 +637,47 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	recoveryAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-recovery-authority")
+	wrongRecoveryAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-wrong-recovery-authority")
+	for index, rejectedAuthority := range []runtimeexecution.NodeAttestationAuthority{
+		runtimeexecution.NewRecoveryNodeAttestationAuthority(wrongRecoveryAuthorityID, 5),
+		runtimeexecution.NewRecoveryNodeAttestationAuthority(recoveryAuthorityID, 4),
+	} {
+		rejectedInput := attest.AttestExecutionNodeInput
+		rejectedInput.OperationID, _ = runtimeexecution.NewOperationID(fmt.Sprintf("issue-76-rejected-attestation-%d", index))
+		rejectedInput.Authority = rejectedAuthority
+		rejected, constructErr := runtimeexecution.NewAttestExecutionNode(rejectedInput)
+		if constructErr != nil {
+			t.Fatal(constructErr)
+		}
+		_, maintainErr := system.runtime.Maintain(context.Background(), rejected)
+		assertRuntimeExecutionErrorCode(t, maintainErr, runtimeexecution.ErrorAuthorizationDenied)
+	}
 	returned, err := system.runtime.Maintain(context.Background(), attest)
 	if err != nil || returned.Node.Readiness != runtimeexecution.NodeReady || returned.Node.Quarantined {
 		t.Fatalf("fresh attestation did not restore node: decision=%+v err=%v", returned, err)
+	}
+	for _, expected := range []struct {
+		operationID string
+		kind        runtimeexecution.RuntimeMaintenanceAuthorityKind
+		authorityID string
+		generation  uint64
+	}{
+		{fenceOperationID.String(), runtimeexecution.MaintenanceAuthoritySecurity, securityAuthorityID.String(), 3},
+		{resetOperationID.String(), runtimeexecution.MaintenanceAuthorityCleanup, cleanupAuthorityID.String(), 4},
+		{returnOperationID.String(), runtimeexecution.MaintenanceAuthorityRecovery, recoveryAuthorityID.String(), 5},
+	} {
+		var kind runtimeexecution.RuntimeMaintenanceAuthorityKind
+		var authorityID string
+		var generation uint64
+		err := system.db.QueryRowContext(context.Background(), fmt.Sprintf(`SELECT authority_kind,
+			authority_id, authority_generation FROM %s.runtime_execution_maintenance_audit
+			WHERE operation_id=$1`, system.schema), expected.operationID).Scan(&kind, &authorityID, &generation)
+		if err != nil || kind != expected.kind || authorityID != expected.authorityID || generation != expected.generation {
+			t.Fatalf("maintenance audit caller for %s = (%d,%s,%d) err=%v, want (%d,%s,%d)",
+				expected.operationID, kind, authorityID, generation, err,
+				expected.kind, expected.authorityID, expected.generation)
+		}
 	}
 
 	secondWork := system.claimRuntime(t)
@@ -544,6 +690,11 @@ func TestPostgresRevokeResetPhysicalReleaseAndPoolReuseStayExactlyFenced(t *test
 		second.Snapshot.Lease.SandboxFence <= released.Lease.SandboxFence {
 		t.Fatalf("pool reuse crossed fenced identity: first=%+v released=%+v second=%+v",
 			lease, released.Lease, second.Snapshot.Lease)
+	}
+	observedCanaries, err := poolCanary.Reuse(second.Snapshot.Lease, second.Snapshot.Node.ExecutionNodeID,
+		secondWork.start.OperationID)
+	if err != nil || observedCanaries != (issue76SandboxResidueCanaries{}) {
+		t.Fatalf("sandbox pool carried residue across leases: residue=%+v err=%v", observedCanaries, err)
 	}
 }
 
@@ -766,14 +917,13 @@ func TestPostgresRenewCannotCrossConcurrentRevokeOrExpiryFence(t *testing.T) {
 			}
 			occurredAt := system.clock.Now()
 			fenceOperationID, _ := runtimeexecution.NewOperationID("issue-76-race-fence-" + issue76Slug(testCase.name))
-			fenceAuthorityID, _ := runtimeexecution.NewNodeAuthorityID("issue-76-race-fence-authority-" + issue76Slug(testCase.name))
 			fence, err := runtimeexecution.NewFenceSandboxLease(runtimeexecution.FenceSandboxLeaseInput{
 				SchemaVersion: runtimeexecution.SchemaV1, OperationID: fenceOperationID,
 				PersonalWorkspaceID: work.start.PersonalWorkspaceID, RuntimeRunID: work.start.RuntimeRunID,
 				ExpectedRuntimeFence: acquired.Snapshot.RuntimeFence, SandboxLeaseID: lease.LeaseID,
 				LeaseGeneration: lease.Generation, LeaseFence: lease.Fence,
 				ExecutionNodeID: node.ExecutionNodeID, NodeGeneration: node.Generation, Reason: testCase.reason,
-				Authority:          runtimeexecution.NewSecurityLeaseFencingAuthority(fenceAuthorityID, 1),
+				Authority:          system.fencingAuthority,
 				ReleaseSafetyEpoch: work.start.ReleaseSafetyEpoch, OccurredAt: occurredAt,
 			})
 			if err != nil {
@@ -1050,4 +1200,79 @@ func assertIssue76SchedulerCode(t *testing.T, err error, want scheduler.ErrorCod
 	if !errors.As(err, &failure) || failure.Code() != want {
 		t.Fatalf("Scheduler error = %T %v, want code %v", err, err, want)
 	}
+}
+
+type issue76SandboxResidueCanaries struct {
+	TaskWorkspaceBytes     string
+	Secrets                string
+	WritableCacheMutations string
+	LogsAndTranscripts     string
+	Evidence               string
+	MainProcessState       string
+	ChildProcessState      string
+	NetworkState           string
+	PriorOperationIdentity string
+}
+
+type issue76SandboxPoolCanaryAdapter struct {
+	leaseID           runtimeexecution.SandboxLeaseID
+	leaseGeneration   runtimeexecution.LeaseGeneration
+	leaseFence        runtimeexecution.LeaseFence
+	sandboxID         runtimeexecution.SandboxID
+	sandboxGeneration runtimeexecution.SandboxGeneration
+	sandboxFence      runtimeexecution.SandboxFence
+	nodeID            runtimeexecution.ExecutionNodeID
+	operationID       runtimeexecution.OperationID
+	residue           issue76SandboxResidueCanaries
+	released          bool
+}
+
+func newIssue76SandboxPoolCanaryAdapter(
+	lease runtimeexecution.RuntimeLeaseSnapshot,
+	nodeID runtimeexecution.ExecutionNodeID,
+	operationID runtimeexecution.OperationID,
+) *issue76SandboxPoolCanaryAdapter {
+	return &issue76SandboxPoolCanaryAdapter{
+		leaseID: lease.LeaseID, leaseGeneration: lease.Generation, leaseFence: lease.Fence,
+		sandboxID: lease.SandboxID, sandboxGeneration: lease.SandboxGeneration,
+		sandboxFence: lease.SandboxFence, nodeID: nodeID, operationID: operationID,
+	}
+}
+
+func (adapter *issue76SandboxPoolCanaryAdapter) Inject(canaries issue76SandboxResidueCanaries) {
+	adapter.residue = canaries
+}
+
+func (adapter *issue76SandboxPoolCanaryAdapter) Observe() issue76SandboxResidueCanaries {
+	return adapter.residue
+}
+
+func (adapter *issue76SandboxPoolCanaryAdapter) ApplyPhysicalRelease(
+	evidence runtimeexecution.PhysicalCapacityReleaseReadyEvidence,
+) error {
+	if adapter.released || evidence.SandboxLeaseID != adapter.leaseID ||
+		evidence.LeaseGeneration <= adapter.leaseGeneration || evidence.LeaseFence <= adapter.leaseFence ||
+		evidence.SandboxID != adapter.sandboxID || evidence.SandboxGeneration != adapter.sandboxGeneration ||
+		evidence.SandboxFence <= adapter.sandboxFence || evidence.ExecutionNodeID != adapter.nodeID ||
+		evidence.StartOperationID != adapter.operationID || evidence.ResetEvidenceID.String() == "" ||
+		evidence.ResetEvidenceDigest == (runtimeexecution.Digest{}) {
+		return errors.New("physical release evidence did not exactly fence the occupied sandbox")
+	}
+	adapter.residue = issue76SandboxResidueCanaries{}
+	adapter.released = true
+	return nil
+}
+
+func (adapter *issue76SandboxPoolCanaryAdapter) Reuse(
+	lease runtimeexecution.RuntimeLeaseSnapshot,
+	nodeID runtimeexecution.ExecutionNodeID,
+	operationID runtimeexecution.OperationID,
+) (issue76SandboxResidueCanaries, error) {
+	if !adapter.released || nodeID != adapter.nodeID || lease.LeaseID == adapter.leaseID ||
+		lease.SandboxID == adapter.sandboxID || lease.SandboxGeneration <= adapter.sandboxGeneration ||
+		lease.SandboxFence <= adapter.sandboxFence || operationID == adapter.operationID ||
+		lease.Disposition != runtimeexecution.LeaseActive {
+		return issue76SandboxResidueCanaries{}, errors.New("sandbox reuse did not establish a fresh fenced incarnation")
+	}
+	return adapter.residue, nil
 }

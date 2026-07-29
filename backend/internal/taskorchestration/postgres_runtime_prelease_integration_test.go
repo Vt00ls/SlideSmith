@@ -14,16 +14,19 @@ import (
 )
 
 type postgresRuntimeAdmissionSystem struct {
-	t            *testing.T
-	db           *sql.DB
-	schema       string
-	clock        *runtimeAdmissionClock
-	tasks        *taskorchestration.PostgresAdapter
-	scheduling   *scheduler.PostgresAuthority
-	runtime      *runtimeexecution.PostgresAuthority
-	lease        runtimeexecution.LeaseAcquisitionAdapter
-	faults       runtimeexecution.PersistenceFaultInjector
-	nodeAttested bool
+	t                    *testing.T
+	db                   *sql.DB
+	schema               string
+	clock                *runtimeAdmissionClock
+	tasks                *taskorchestration.PostgresAdapter
+	scheduling           *scheduler.PostgresAuthority
+	runtime              *runtimeexecution.PostgresAuthority
+	lease                runtimeexecution.LeaseAcquisitionAdapter
+	faults               runtimeexecution.PersistenceFaultInjector
+	nodeAttested         bool
+	fencingAuthority     runtimeexecution.LeaseFencingAuthority
+	resetAuthority       runtimeexecution.SandboxResetAuthority
+	attestationAuthority runtimeexecution.NodeAttestationAuthority
 }
 
 type admittedRuntimeWork struct {
@@ -1924,6 +1927,16 @@ func newPostgresRuntimeAdmissionSystemWithLimits(
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtimeNodeID, err := runtimeexecution.NewExecutionNodeID(nodeID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	securityAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-security-authority")
+	cleanupAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-cleanup-authority")
+	recoveryAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-recovery-authority")
+	fencingAuthority := runtimeexecution.NewSecurityLeaseFencingAuthority(securityAuthorityID, 3)
+	resetAuthority := runtimeexecution.NewSandboxResetAuthority(cleanupAuthorityID, 4)
+	attestationAuthority := runtimeexecution.NewRecoveryNodeAttestationAuthority(recoveryAuthorityID, 5)
 	scheduling, err := scheduler.NewPostgresAuthority(db, scheduler.PostgresConfig{
 		Schema:                                 schema,
 		Now:                                    clock.Now,
@@ -1961,6 +1974,11 @@ func newPostgresRuntimeAdmissionSystemWithLimits(
 		SchedulerLeaseAttachmentParticipant: scheduling.RuntimeLeaseAttachmentParticipant(),
 		SchedulerLeaseAttachmentFunction:    scheduling.RuntimeLeaseAttachmentFunction(),
 		LeaseAcquisition:                    leaseAcquisition,
+		MaintenanceAuthorities: []runtimeexecution.RuntimeMaintenanceAuthorityBinding{
+			runtimeexecution.BindLeaseFencingAuthority(runtimeNodeID, fencingAuthority),
+			runtimeexecution.BindSandboxResetAuthority(runtimeNodeID, resetAuthority),
+			runtimeexecution.BindNodeAttestationAuthority(runtimeNodeID, attestationAuthority),
+		},
 	})
 	if err != nil {
 		t.Fatalf("create Runtime Execution authority: %v", err)
@@ -1972,6 +1990,8 @@ func newPostgresRuntimeAdmissionSystemWithLimits(
 		t: t, db: db, schema: schema, clock: clock,
 		tasks: tasks, scheduling: scheduling, runtime: runtime,
 		lease: leaseAcquisition, faults: faults,
+		fencingAuthority: fencingAuthority, resetAuthority: resetAuthority,
+		attestationAuthority: attestationAuthority,
 	}
 	system.bootstrapConfiguredRuntimeNode(t, nodeID.String(), resourceClassID.String(), executionPolicyID.String())
 	return system
@@ -2004,6 +2024,7 @@ func (system *postgresRuntimeAdmissionSystem) bootstrapConfiguredRuntimeNode(
 	now := system.clock.Now()
 	attest, err := runtimeexecution.NewAttestExecutionNode(runtimeexecution.AttestExecutionNodeInput{
 		SchemaVersion: runtimeexecution.SchemaV1, OperationID: operationID, ExecutionNodeID: nodeID,
+		Authority:      system.attestationAuthority,
 		NodeGeneration: 1, AttestationID: attestationID, AttestationGeneration: 1,
 		AttestedAt: now, ExpiresAt: now.Add(24 * time.Hour), ResourceClassID: resourceClassID,
 		ExecutionPolicyID: executionPolicyID, NodeAuthorityID: nodeAuthorityID,
@@ -2171,6 +2192,7 @@ func (system *postgresRuntimeAdmissionSystem) ensureRuntimeNodeAttested(t *testi
 	now := system.clock.Now()
 	attest, err := runtimeexecution.NewAttestExecutionNode(runtimeexecution.AttestExecutionNodeInput{
 		SchemaVersion: runtimeexecution.SchemaV1, OperationID: operationID, ExecutionNodeID: nodeID,
+		Authority:      system.attestationAuthority,
 		NodeGeneration: runtimeexecution.NodeGeneration(work.canonical.Grant.NodeCapacityGeneration),
 		AttestationID:  attestationID, AttestationGeneration: 1, AttestedAt: now,
 		ExpiresAt: now.Add(24 * time.Hour), ResourceClassID: work.start.ResourceClassID,

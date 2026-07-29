@@ -53,17 +53,48 @@ type postgresMaintenanceDecisionState struct {
 }
 
 type postgresMaintenanceAuditState struct {
-	SchemaVersion          SchemaVersion   `json:"schema_version"`
-	CommandKind            int16           `json:"command_kind"`
-	OperationID            string          `json:"operation_id"`
-	CanonicalRequestDigest Digest          `json:"canonical_request_digest"`
-	RuntimeRunID           string          `json:"runtime_run_id"`
-	ExecutionNodeID        string          `json:"execution_node_id"`
-	BeforeRuntimeRevision  RuntimeRevision `json:"before_runtime_revision"`
-	AfterRuntimeRevision   RuntimeRevision `json:"after_runtime_revision"`
-	BeforeRuntimeFence     RuntimeFence    `json:"before_runtime_fence"`
-	AfterRuntimeFence      RuntimeFence    `json:"after_runtime_fence"`
-	OccurredAt             time.Time       `json:"occurred_at"`
+	SchemaVersion          SchemaVersion                   `json:"schema_version"`
+	CommandKind            int16                           `json:"command_kind"`
+	OperationID            string                          `json:"operation_id"`
+	CanonicalRequestDigest Digest                          `json:"canonical_request_digest"`
+	RuntimeRunID           string                          `json:"runtime_run_id"`
+	ExecutionNodeID        string                          `json:"execution_node_id"`
+	AuthorityKind          RuntimeMaintenanceAuthorityKind `json:"authority_kind"`
+	AuthorityID            string                          `json:"authority_id"`
+	AuthorityGeneration    AuthorizationGeneration         `json:"authority_generation"`
+	BeforeRuntimeRevision  RuntimeRevision                 `json:"before_runtime_revision"`
+	AfterRuntimeRevision   RuntimeRevision                 `json:"after_runtime_revision"`
+	BeforeRuntimeFence     RuntimeFence                    `json:"before_runtime_fence"`
+	AfterRuntimeFence      RuntimeFence                    `json:"after_runtime_fence"`
+	OccurredAt             time.Time                       `json:"occurred_at"`
+}
+
+func (authority *PostgresAuthority) installPostgresMaintenanceAuthorities(
+	ctx context.Context,
+	tx *sql.Tx,
+) error {
+	for _, binding := range authority.maintenanceAuthorities {
+		result, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s AS current_authority (
+			execution_node_id, authority_kind, authority_id, authority_generation, updated_at
+		) VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (execution_node_id, authority_kind) DO UPDATE SET
+			authority_id=EXCLUDED.authority_id,
+			authority_generation=EXCLUDED.authority_generation,
+			updated_at=EXCLUDED.updated_at
+		WHERE (current_authority.authority_id=EXCLUDED.authority_id AND
+			current_authority.authority_generation=EXCLUDED.authority_generation)
+			OR EXCLUDED.authority_generation>current_authority.authority_generation`,
+			authority.table("runtime_execution_maintenance_authorities")),
+			binding.executionNodeID.String(), binding.caller.kind, binding.caller.id.String(),
+			binding.caller.generation, postgresTimestamp(authority.now()))
+		if err != nil {
+			return normalizeRuntimePersistenceFailure(err)
+		}
+		if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+			return newPersistenceError(PersistenceIntegrityConflict)
+		}
+	}
+	return nil
 }
 
 func maintenanceLeaseState(value RuntimeLeaseSnapshot) postgresMaintenanceLeaseState {
@@ -337,6 +368,28 @@ func (authority *PostgresAuthority) replayPostgresMaintenance(
 	return decision, true, nil
 }
 
+func (authority *PostgresAuthority) validatePostgresMaintenanceCaller(
+	ctx context.Context,
+	tx *sql.Tx,
+	executionNodeID ExecutionNodeID,
+	caller maintenanceCallerAuthority,
+) error {
+	var authorityID string
+	var generation AuthorizationGeneration
+	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT authority_id, authority_generation FROM %s
+		WHERE execution_node_id=$1 AND authority_kind=$2 FOR SHARE`,
+		authority.table("runtime_execution_maintenance_authorities")),
+		executionNodeID.String(), caller.kind).Scan(&authorityID, &generation)
+	if errors.Is(err, sql.ErrNoRows) || err == nil &&
+		(authorityID != caller.id.String() || generation != caller.generation) {
+		return newError(ErrorAuthorizationDenied)
+	}
+	if err != nil {
+		return normalizeRuntimePersistenceFailure(err)
+	}
+	return nil
+}
+
 func (authority *PostgresAuthority) persistPostgresMaintenance(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -345,6 +398,7 @@ func (authority *PostgresAuthority) persistPostgresMaintenance(
 	decision RuntimeMaintenanceDecision,
 	runtimeRunID RuntimeRunID,
 	nodeID ExecutionNodeID,
+	caller maintenanceCallerAuthority,
 	beforeRevision RuntimeRevision,
 	beforeFence RuntimeFence,
 	occurredAt time.Time,
@@ -367,7 +421,8 @@ func (authority *PostgresAuthority) persistPostgresMaintenance(
 	audit := postgresMaintenanceAuditState{
 		SchemaVersion: SchemaV1, CommandKind: kind, OperationID: decision.OperationID.String(),
 		CanonicalRequestDigest: decision.CanonicalRequestDigest, RuntimeRunID: runtimeRunID.String(),
-		ExecutionNodeID: nodeID.String(), BeforeRuntimeRevision: beforeRevision,
+		ExecutionNodeID: nodeID.String(), AuthorityKind: caller.kind, AuthorityID: caller.id.String(),
+		AuthorityGeneration: caller.generation, BeforeRuntimeRevision: beforeRevision,
 		AfterRuntimeRevision: decision.RuntimeRevision, BeforeRuntimeFence: beforeFence,
 		AfterRuntimeFence: decision.RuntimeFence, OccurredAt: occurredAt.UTC(),
 	}
@@ -378,13 +433,15 @@ func (authority *PostgresAuthority) persistPostgresMaintenance(
 	auditDigest := Digest(sha256.Sum256(auditBytes))
 	auditID := "runtime-maintenance-audit-" + decision.OperationID.String()
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
-		audit_id, operation_id, command_kind, canonical_request_digest, runtime_run_id,
-		execution_node_id, before_runtime_revision, after_runtime_revision,
-		before_runtime_fence, after_runtime_fence, occurred_at, canonical_digest, audit_state
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			audit_id, operation_id, command_kind, canonical_request_digest, runtime_run_id,
+			execution_node_id, authority_kind, authority_id, authority_generation,
+			before_runtime_revision, after_runtime_revision,
+			before_runtime_fence, after_runtime_fence, occurred_at, canonical_digest, audit_state
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		authority.table("runtime_execution_maintenance_audit")), auditID, decision.OperationID.String(),
-		kind, decision.CanonicalRequestDigest[:], runtimeRunID.String(), nodeID.String(), beforeRevision,
-		decision.RuntimeRevision, beforeFence, decision.RuntimeFence, occurredAt, auditDigest[:], auditBytes); err != nil {
+		kind, decision.CanonicalRequestDigest[:], runtimeRunID.String(), nodeID.String(), caller.kind,
+		caller.id.String(), caller.generation, beforeRevision, decision.RuntimeRevision, beforeFence,
+		decision.RuntimeFence, occurredAt, auditDigest[:], auditBytes); err != nil {
 		return normalizeRuntimePersistenceFailure(err)
 	}
 	if authority.failAt(PersistenceFaultAfterMandatoryAudit) || authority.failAt(PersistenceFaultBeforeOutbox) {
@@ -526,7 +583,8 @@ func (authority *PostgresAuthority) renewPostgresSandboxLease(
 		return RuntimeMaintenanceDecision{}, err
 	}
 	if err := authority.persistPostgresMaintenance(ctx, tx, postgresMaintenanceRenew, canonical, decision,
-		command.RuntimeRunID, command.ExecutionNodeID, previousRevision, previousFence, command.OccurredAt); err != nil {
+		command.RuntimeRunID, command.ExecutionNodeID, command.Authority.caller(), previousRevision, previousFence,
+		command.OccurredAt); err != nil {
 		return RuntimeMaintenanceDecision{}, err
 	}
 	if authority.failAt(PersistenceFaultBeforeCommit) {
@@ -560,6 +618,10 @@ func (authority *PostgresAuthority) fencePostgresSandboxLease(
 		}
 		return replay, replayErr
 	}
+	if err := authority.validatePostgresMaintenanceCaller(ctx, tx, command.ExecutionNodeID,
+		command.Authority.caller()); err != nil {
+		return RuntimeMaintenanceDecision{}, err
+	}
 	record, err := authority.loadRuntimeForUpdate(ctx, tx, command.RuntimeRunID)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && record.fixture.PersonalWorkspaceID != command.PersonalWorkspaceID {
 		return RuntimeMaintenanceDecision{}, newError(ErrorAuthorizationDenied)
@@ -572,50 +634,12 @@ func (authority *PostgresAuthority) fencePostgresSandboxLease(
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
 	now := postgresTimestamp(authority.now())
-	lease := record.lease
-	if lease.AcquireStatus != LeaseGranted || lease.Disposition != LeaseActive ||
-		command.ExpectedRuntimeFence != record.fixture.RuntimeFence || lease.LeaseID != command.SandboxLeaseID ||
-		lease.Generation != command.LeaseGeneration || lease.Fence != command.LeaseFence ||
-		record.operation.ExecutionNodeID != command.ExecutionNodeID ||
-		NodeGeneration(record.operation.NodeCapacityGeneration) != command.NodeGeneration ||
-		command.ReleaseSafetyEpoch != record.fixture.SafetyEpoch ||
-		node.ActiveRuntimeRunID != command.RuntimeRunID || node.ActiveLeaseID != command.SandboxLeaseID ||
-		command.OccurredAt.After(now) || command.Reason == LeaseFenceExpired && now.Before(lease.ExpiresAt) {
+	if !validLeaseFenceTransition(record, &node.ExecutionNodeFixture, command, now) {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
 	previousRevision, previousFence, previousState := record.fixture.RuntimeRevision,
 		record.fixture.RuntimeFence, record.fixture.State
-	record.fixture.RuntimeRevision++
-	record.fixture.RuntimeFence++
-	record.fixture.State = RuntimeStopping
-	record.lease.Generation++
-	record.lease.Fence++
-	record.lease.SandboxFence++
-	if command.Reason == LeaseFenceExpired {
-		record.lease.Disposition = LeaseExpired
-	} else {
-		record.lease.Disposition = LeaseRevoked
-	}
-	node.Occupancy = NodeOccupancyUnknown
-	node.Quarantined = true
-	node.Containment = ContainmentPending
-	node.Reset = ResetRequired
-	if command.Reason == LeaseFenceExpired || command.Reason == LeaseFenceNodeLost {
-		node.Readiness = NodeUnavailable
-	}
-	record.node = nodeSnapshot(node.ExecutionNodeFixture)
-	record.capacity.Physical = PhysicalCapacityUnknownOrQuarantined
-	record.cleanup = RuntimeLeaseCleanupSnapshot{
-		Status: LeaseCleanupPending, OperationID: command.OperationID,
-		CanonicalRequestDigest: command.CanonicalRequestDigest, StopMainProcess: true,
-		StopChildProcesses: true, RevokeSecrets: true, RemoveNetwork: true,
-		FenceRuntimeView: true, ReconcileContainment: true,
-	}
-	decision := RuntimeMaintenanceDecision{
-		OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
-		RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
-		Lease: record.lease, Node: record.node, Cleanup: record.cleanup,
-	}
+	decision := applyLeaseFenceTransition(record, &node.ExecutionNodeFixture, command)
 	if err := authority.updatePostgresRuntimeAggregate(ctx, tx, record, previousRevision, previousFence,
 		previousState, now); err != nil {
 		return RuntimeMaintenanceDecision{}, err
@@ -627,7 +651,8 @@ func (authority *PostgresAuthority) fencePostgresSandboxLease(
 		return RuntimeMaintenanceDecision{}, err
 	}
 	if err := authority.persistPostgresMaintenance(ctx, tx, postgresMaintenanceFence, canonical, decision,
-		command.RuntimeRunID, command.ExecutionNodeID, previousRevision, previousFence, command.OccurredAt); err != nil {
+		command.RuntimeRunID, command.ExecutionNodeID, command.Authority.caller(), previousRevision, previousFence,
+		command.OccurredAt); err != nil {
 		return RuntimeMaintenanceDecision{}, err
 	}
 	cleanupDigest := digestBytes(append([]byte("slidesmith.runtime-execution.lease-cleanup/v1\n"), canonical...))
@@ -674,6 +699,10 @@ func (authority *PostgresAuthority) confirmPostgresSandboxReset(
 		}
 		return replay, replayErr
 	}
+	if err := authority.validatePostgresMaintenanceCaller(ctx, tx, command.ExecutionNodeID,
+		command.Authority.caller()); err != nil {
+		return RuntimeMaintenanceDecision{}, err
+	}
 	record, err := authority.loadRuntimeForUpdate(ctx, tx, command.RuntimeRunID)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && record.fixture.PersonalWorkspaceID != command.PersonalWorkspaceID {
 		return RuntimeMaintenanceDecision{}, newError(ErrorAuthorizationDenied)
@@ -685,57 +714,14 @@ func (authority *PostgresAuthority) confirmPostgresSandboxReset(
 	if err != nil {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
-	lease := record.lease
-	if lease.AcquireStatus != LeaseGranted || lease.Disposition != LeaseRevoked && lease.Disposition != LeaseExpired ||
-		command.ExpectedRuntimeFence != record.fixture.RuntimeFence || lease.LeaseID != command.SandboxLeaseID ||
-		lease.Generation != command.LeaseGeneration || lease.Fence != command.LeaseFence ||
-		lease.SandboxID != command.SandboxID || lease.SandboxGeneration != command.SandboxGeneration ||
-		lease.SandboxFence != command.SandboxFence || record.operation.ExecutionNodeID != command.ExecutionNodeID ||
-		NodeGeneration(record.operation.NodeCapacityGeneration) != command.NodeGeneration ||
-		node.ActiveRuntimeRunID != command.RuntimeRunID || node.ActiveLeaseID != command.SandboxLeaseID ||
-		command.OccurredAt.After(postgresTimestamp(authority.now())) || !completeResetEvidence(command.ConfirmSandboxResetInput) {
+	now := postgresTimestamp(authority.now())
+	if !validSandboxResetTransition(record, &node.ExecutionNodeFixture, command, now) {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
 	previousRevision, previousFence, previousState := record.fixture.RuntimeRevision,
 		record.fixture.RuntimeFence, record.fixture.State
-	record.fixture.RuntimeRevision++
-	record.lease.Generation++
-	record.lease.Fence++
-	record.lease.SandboxFence++
-	record.lease.Disposition = LeaseReleased
-	node.Occupancy = NodeUnoccupied
-	node.Containment = ContainmentEstablished
-	node.Reset = ResetCompleted
-	node.ActiveRuntimeRunID = RuntimeRunID{}
-	node.ActiveLeaseID = SandboxLeaseID{}
-	node.LastSandboxGeneration = record.lease.SandboxGeneration
-	node.LastSandboxFence = record.lease.SandboxFence
-	node.LastResetEvidenceID = command.EvidenceID
-	node.LastResetEvidenceDigest = command.EvidenceDigest
-	record.node = nodeSnapshot(node.ExecutionNodeFixture)
-	record.capacity.Physical = PhysicalCapacityReleaseReady
-	record.cleanup.Status = LeaseCleanupCompleted
-	release := PhysicalCapacityReleaseReadyEvidence{
-		WorkItemID: record.operation.WorkItemID, AdmissionGrantID: record.operation.AdmissionGrantID,
-		GrantGeneration: record.operation.GrantGeneration, RuntimeRunID: record.fixture.RuntimeRunID,
-		StartOperationID: record.acceptedStart.OperationID, StartDigest: record.acceptedStartDigest,
-		ReleaseOperationID: command.OperationID, ReleaseOperationDigest: command.CanonicalRequestDigest,
-		RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
-		SandboxLeaseID: record.lease.LeaseID, LeaseGeneration: record.lease.Generation,
-		LeaseFence: record.lease.Fence, SandboxID: record.lease.SandboxID,
-		SandboxGeneration: record.lease.SandboxGeneration, SandboxFence: record.lease.SandboxFence,
-		ExecutionNodeID:        record.operation.ExecutionNodeID,
-		NodeCapacityGeneration: record.operation.NodeCapacityGeneration,
-		ResetEvidenceID:        command.EvidenceID, ResetEvidenceDigest: command.EvidenceDigest,
-	}
-	record.capacityEvidence.PhysicalCapacityReleaseReady = release
-	decision := RuntimeMaintenanceDecision{
-		OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
-		RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
-		Lease: record.lease, Node: record.node, Cleanup: record.cleanup,
-		PhysicalCapacityReleaseReady: release,
-	}
-	now := postgresTimestamp(authority.now())
+	decision := applySandboxResetTransition(record, &node.ExecutionNodeFixture, command)
+	release := decision.PhysicalCapacityReleaseReady
 	if err := authority.updatePostgresRuntimeAggregate(ctx, tx, record, previousRevision, previousFence,
 		previousState, now); err != nil {
 		return RuntimeMaintenanceDecision{}, err
@@ -747,7 +733,8 @@ func (authority *PostgresAuthority) confirmPostgresSandboxReset(
 		return RuntimeMaintenanceDecision{}, err
 	}
 	if err := authority.persistPostgresMaintenance(ctx, tx, postgresMaintenanceReset, canonical, decision,
-		command.RuntimeRunID, command.ExecutionNodeID, previousRevision, previousFence, command.OccurredAt); err != nil {
+		command.RuntimeRunID, command.ExecutionNodeID, command.Authority.caller(), previousRevision, previousFence,
+		command.OccurredAt); err != nil {
 		return RuntimeMaintenanceDecision{}, err
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
@@ -796,6 +783,10 @@ func (authority *PostgresAuthority) attestPostgresExecutionNode(
 			}
 		}
 		return replay, replayErr
+	}
+	if err := authority.validatePostgresMaintenanceCaller(ctx, tx, command.ExecutionNodeID,
+		command.Authority.caller()); err != nil {
+		return RuntimeMaintenanceDecision{}, err
 	}
 	now := postgresTimestamp(authority.now())
 	if command.AttestedAt.After(now) || !now.Before(command.ExpiresAt) ||
@@ -872,7 +863,7 @@ func (authority *PostgresAuthority) attestPostgresExecutionNode(
 		Node: nodeSnapshot(node.ExecutionNodeFixture),
 	}
 	if err := authority.persistPostgresMaintenance(ctx, tx, postgresMaintenanceAttestNode, canonical, decision,
-		RuntimeRunID{}, command.ExecutionNodeID, 0, 0, command.OccurredAt); err != nil {
+		RuntimeRunID{}, command.ExecutionNodeID, command.Authority.caller(), 0, 0, command.OccurredAt); err != nil {
 		return RuntimeMaintenanceDecision{}, err
 	}
 	if authority.failAt(PersistenceFaultBeforeCommit) {

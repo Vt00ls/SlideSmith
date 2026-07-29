@@ -79,6 +79,7 @@ type PostgresConfig struct {
 	LeaseAcquisition                    LeaseAcquisitionAdapter
 	QuotaReservationParticipant         QuotaReservationParticipant
 	QuotaReservationFunction            string
+	MaintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
 }
 
 // PostgresAuthority owns C03 persistence behind the RuntimeExecution seam.
@@ -99,6 +100,7 @@ type PostgresAuthority struct {
 	leaseAcquisition                    LeaseAcquisitionAdapter
 	quotaReservationParticipant         QuotaReservationParticipant
 	quotaReservationFunction            string
+	maintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
 }
 
 var _ RuntimeExecution = (*PostgresAuthority)(nil)
@@ -129,6 +131,17 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 		config.QuotaReservationParticipant == nil && config.QuotaReservationFunction != "" {
 		return nil, newPersistenceError(PersistenceInvalidConfiguration)
 	}
+	seenMaintenanceAuthorities := make(map[maintenanceAuthorityKey]maintenanceCallerAuthority)
+	for _, binding := range config.MaintenanceAuthorities {
+		if !validMaintenanceAuthorityBinding(binding) {
+			return nil, newPersistenceError(PersistenceInvalidConfiguration)
+		}
+		key := maintenanceAuthorityKey{executionNodeID: binding.executionNodeID, kind: binding.caller.kind}
+		if retained, exists := seenMaintenanceAuthorities[key]; exists && retained != binding.caller {
+			return nil, newPersistenceError(PersistenceInvalidConfiguration)
+		}
+		seenMaintenanceAuthorities[key] = binding.caller
+	}
 	return &PostgresAuthority{
 		db: db, schema: schema, now: now, faults: config.Faults, projection: config.ProjectionDelivery,
 		schedulerParticipant:                config.SchedulerParticipant,
@@ -140,6 +153,7 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 		leaseAcquisition:                    config.LeaseAcquisition,
 		quotaReservationParticipant:         config.QuotaReservationParticipant,
 		quotaReservationFunction:            config.QuotaReservationFunction,
+		maintenanceAuthorities:              append([]RuntimeMaintenanceAuthorityBinding(nil), config.MaintenanceAuthorities...),
 	}, nil
 }
 
@@ -206,6 +220,9 @@ func (authority *PostgresAuthority) Migrate(ctx context.Context) error {
 			return normalizePostgresPersistenceFailure(err)
 		}
 	}
+	if err := authority.installPostgresMaintenanceAuthorities(ctx, tx); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return normalizePostgresPersistenceFailure(err)
 	}
@@ -223,6 +240,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	preLeaseLeases := authority.table("runtime_execution_prelease_leases")
 	nodes := authority.table("runtime_execution_nodes")
 	maintenance := authority.table("runtime_execution_maintenance_operations")
+	maintenanceAuthorities := authority.table("runtime_execution_maintenance_authorities")
 	maintenanceAudit := authority.table("runtime_execution_maintenance_audit")
 	maintenanceOutbox := authority.table("runtime_execution_maintenance_outbox")
 	leaseCleanup := authority.table("runtime_execution_lease_cleanup_obligations")
@@ -318,6 +336,14 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			source_clock_id text NOT NULL,
 			audit_state jsonb NOT NULL
 		)`, audit, decisions, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			execution_node_id text NOT NULL,
+			authority_kind smallint NOT NULL,
+			authority_id text NOT NULL,
+			authority_generation bigint NOT NULL CHECK (authority_generation > 0),
+			updated_at timestamptz NOT NULL,
+			PRIMARY KEY (execution_node_id, authority_kind)
+		)`, maintenanceAuthorities),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY,
 			decision_id text NOT NULL REFERENCES %s(decision_id),
@@ -462,6 +488,9 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			canonical_request_digest bytea NOT NULL CHECK (octet_length(canonical_request_digest) = 32),
 			runtime_run_id text NOT NULL DEFAULT '',
 			execution_node_id text NOT NULL,
+			authority_kind smallint NOT NULL,
+			authority_id text NOT NULL,
+			authority_generation bigint NOT NULL CHECK (authority_generation > 0),
 			before_runtime_revision bigint NOT NULL CHECK (before_runtime_revision >= 0),
 			after_runtime_revision bigint NOT NULL CHECK (after_runtime_revision >= 0),
 			before_runtime_fence bigint NOT NULL CHECK (before_runtime_fence >= 0),
@@ -470,6 +499,14 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
 			audit_state jsonb NOT NULL
 		)`, maintenanceAudit, maintenance),
+		fmt.Sprintf(`ALTER TABLE %s
+			ADD COLUMN IF NOT EXISTS authority_kind smallint,
+			ADD COLUMN IF NOT EXISTS authority_id text,
+			ADD COLUMN IF NOT EXISTS authority_generation bigint CHECK (authority_generation > 0)`, maintenanceAudit),
+		fmt.Sprintf(`ALTER TABLE %s
+			ALTER COLUMN authority_kind SET NOT NULL,
+			ALTER COLUMN authority_id SET NOT NULL,
+			ALTER COLUMN authority_generation SET NOT NULL`, maintenanceAudit),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
 			canonical_request_digest bytea NOT NULL CHECK (octet_length(canonical_request_digest) = 32),
