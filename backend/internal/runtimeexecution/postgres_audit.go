@@ -23,6 +23,8 @@ const (
 	postgresAuditStartAccepted postgresMandatoryAuditAction = iota + 1
 	postgresAuditCancelAccepted
 	postgresAuditReconciliationRequired
+	postgresAuditPreLeaseTerminal
+	postgresAuditLeaseCommitted
 )
 
 type postgresMandatoryAuditResult uint8
@@ -292,7 +294,7 @@ func validPostgresMandatoryAuditState(state postgresMandatoryAuditState) bool {
 		!validOpaqueID(state.DecisionID) || !validOpaqueID(state.RuntimeRunID) ||
 		!validOpaqueID(state.OperationID) || !validDigestText(state.RequestDigest) ||
 		!validAuthority(RuntimeAuthority{id: AuthorityID{value: state.AuthorityID}, generation: state.AuthorityGeneration, kind: state.AuthorityKind}) ||
-		state.Action < postgresAuditStartAccepted || state.Action > postgresAuditReconciliationRequired ||
+		state.Action < postgresAuditStartAccepted || state.Action > postgresAuditLeaseCommitted ||
 		state.Result != postgresAuditAccepted || state.BeforeRevision == 0 || state.AfterRevision == 0 ||
 		!knownRuntimeState(state.BeforeState) || !knownRuntimeState(state.AfterState) ||
 		state.BeforeOperationGeneration == 0 || state.AfterOperationGeneration == 0 ||
@@ -317,6 +319,14 @@ func validPostgresMandatoryAuditState(state postgresMandatoryAuditState) bool {
 		}
 	case postgresAuditReconciliationRequired:
 		if state.ReasonCode < uint8(ReconciliationTransportAmbiguous) || state.ReasonCode > uint8(ReconciliationProjectionDelivery) {
+			return false
+		}
+	case postgresAuditPreLeaseTerminal:
+		if !knownPreLeaseTerminalReason(PreLeaseTerminalReason(state.ReasonCode)) || state.ReasonCode == 0 {
+			return false
+		}
+	case postgresAuditLeaseCommitted:
+		if state.ReasonCode != 0 {
 			return false
 		}
 	}

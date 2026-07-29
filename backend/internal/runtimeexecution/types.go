@@ -388,11 +388,56 @@ func NewStartRuntimeRun(input StartRuntimeRunInput) (StartRuntimeRun, error) {
 		input.ProviderBinding = &binding
 	}
 	command := StartRuntimeRun{StartRuntimeRunInput: input}
+	if !validAdmissionGrantProof(command.AdmissionGrant) {
+		return StartRuntimeRun{}, newError(ErrorInvalidRequest)
+	}
 	digest, err := computeStartDigest(command)
 	if err != nil {
 		return StartRuntimeRun{}, err
 	}
 	command.CanonicalRequestDigest = digest
+	return command, nil
+}
+
+// NewCanonicalStartRuntimeRun constructs the immutable Task-owned C03 request
+// before Scheduler admission. AdmissionGrant is deliberately absent from the
+// canonical request and must be attached only by authenticated delivery.
+func NewCanonicalStartRuntimeRun(input StartRuntimeRunInput) (StartRuntimeRun, error) {
+	input.AdmissionGrant = AdmissionGrantProof{}
+	input.Deadline = input.Deadline.UTC()
+	input.ImmutableInputs = append([]ImmutableInputBinding(nil), input.ImmutableInputs...)
+	if input.RuntimeViewRequirement != nil {
+		requirement := *input.RuntimeViewRequirement
+		input.RuntimeViewRequirement = &requirement
+	}
+	if input.CatalogBinding != nil {
+		binding := *input.CatalogBinding
+		input.CatalogBinding = &binding
+	}
+	if input.ProviderBinding != nil {
+		binding := *input.ProviderBinding
+		input.ProviderBinding = &binding
+	}
+	command := StartRuntimeRun{StartRuntimeRunInput: input}
+	digest, err := computeStartDigest(command)
+	if err != nil {
+		return StartRuntimeRun{}, err
+	}
+	command.CanonicalRequestDigest = digest
+	return command, nil
+}
+
+// WithAdmissionGrant attaches Scheduler proof without changing the canonical
+// Task request or its digest.
+func (command StartRuntimeRun) WithAdmissionGrant(grant AdmissionGrantProof) (StartRuntimeRun, error) {
+	if !validAdmissionGrantProof(grant) {
+		return StartRuntimeRun{}, newError(ErrorInvalidRequest)
+	}
+	command.AdmissionGrant = grant
+	canonical, err := canonicalStartEncoding(command)
+	if err != nil || canonicalRequestDigest(canonical) != command.CanonicalRequestDigest {
+		return StartRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
 	return command, nil
 }
 
@@ -532,12 +577,19 @@ const (
 )
 
 type RuntimeOperationBinding struct {
-	Status           OperationBindingStatus
-	OperationID      OperationID
-	Digest           Digest
-	Generation       OperationGeneration
-	AdmissionGrantID AdmissionGrantID
-	GrantGeneration  AdmissionGrantGeneration
+	Status                 OperationBindingStatus
+	OperationID            OperationID
+	Digest                 Digest
+	Generation             OperationGeneration
+	AdmissionGrantID       AdmissionGrantID
+	WorkItemID             WorkItemID
+	GrantGeneration        AdmissionGrantGeneration
+	ExecutionNodeID        ExecutionNodeID
+	NodeCapacityGeneration uint64
+	ResourceClassID        ResourceClassID
+	ExecutionPolicyID      ExecutionPolicyID
+	SchedulerEpoch         uint64
+	PolicyVersion          uint64
 }
 
 type LeaseAcquireStatus uint8
@@ -550,10 +602,12 @@ const (
 )
 
 type RuntimeLeaseSnapshot struct {
-	AcquireStatus LeaseAcquireStatus
-	LeaseID       SandboxLeaseID
-	Generation    LeaseGeneration
-	Fence         LeaseFence
+	AcquireStatus      LeaseAcquireStatus
+	AcquireOperationID OperationID
+	AcquireDigest      Digest
+	LeaseID            SandboxLeaseID
+	Generation         LeaseGeneration
+	Fence              LeaseFence
 }
 
 type CancellationStatus uint8
@@ -613,21 +667,74 @@ type RuntimeCapacitySnapshot struct {
 	Physical       PhysicalCapacityDisposition
 }
 
+type RuntimeFencedOrTerminalEvidence struct {
+	WorkItemID              WorkItemID
+	AdmissionGrantID        AdmissionGrantID
+	GrantGeneration         AdmissionGrantGeneration
+	RuntimeRunID            RuntimeRunID
+	StartOperationID        OperationID
+	StartDigest             Digest
+	TerminalDecisionID      RuntimeDecisionID
+	RuntimeRevision         RuntimeRevision
+	RuntimeFence            RuntimeFence
+	SchedulerEpoch          uint64
+	PolicyVersion           uint64
+	LeaseAcquireOperationID OperationID
+	LeaseAcquireDigest      Digest
+}
+
+type NoLeasePhysicalDispositionEvidence struct {
+	WorkItemID              WorkItemID
+	AdmissionGrantID        AdmissionGrantID
+	GrantGeneration         AdmissionGrantGeneration
+	RuntimeRunID            RuntimeRunID
+	StartOperationID        OperationID
+	StartDigest             Digest
+	TerminalDecisionID      RuntimeDecisionID
+	RuntimeRevision         RuntimeRevision
+	RuntimeFence            RuntimeFence
+	SchedulerEpoch          uint64
+	PolicyVersion           uint64
+	LeaseAcquireOperationID OperationID
+	LeaseAcquireDigest      Digest
+	ExecutionNodeID         ExecutionNodeID
+	NodeCapacityGeneration  uint64
+}
+
+// PhysicalCapacityReleaseReadyEvidence is intentionally independent and is
+// never produced by the pre-lease implementation in this ticket.
+type PhysicalCapacityReleaseReadyEvidence struct {
+	RuntimeRunID           RuntimeRunID
+	SandboxLeaseID         SandboxLeaseID
+	LeaseGeneration        LeaseGeneration
+	LeaseFence             LeaseFence
+	ExecutionNodeID        ExecutionNodeID
+	NodeCapacityGeneration uint64
+}
+
+type RuntimeCapacityEvidenceSnapshot struct {
+	RuntimeFencedOrTerminal      RuntimeFencedOrTerminalEvidence
+	NoLeasePhysicalDisposition   NoLeasePhysicalDispositionEvidence
+	PhysicalCapacityReleaseReady PhysicalCapacityReleaseReadyEvidence
+}
+
 type RuntimeSnapshot struct {
-	SchemaVersion   SchemaVersion
-	RuntimeRunID    RuntimeRunID
-	RuntimeRevision RuntimeRevision
-	State           RuntimeState
-	Outcome         RuntimeOutcome
-	Operation       RuntimeOperationBinding
-	RuntimeFence    RuntimeFence
-	Lease           RuntimeLeaseSnapshot
-	Deadline        time.Time
-	LeaseAcquireBy  time.Time
-	Cancellation    RuntimeCancellationSnapshot
-	EvidenceRoot    EvidenceRootSnapshot
-	Capacity        RuntimeCapacitySnapshot
-	Reconciliation  ReconciliationStatus
+	SchemaVersion          SchemaVersion
+	RuntimeRunID           RuntimeRunID
+	RuntimeRevision        RuntimeRevision
+	State                  RuntimeState
+	Outcome                RuntimeOutcome
+	Operation              RuntimeOperationBinding
+	RuntimeFence           RuntimeFence
+	Lease                  RuntimeLeaseSnapshot
+	Deadline               time.Time
+	LeaseAcquireBy         time.Time
+	Cancellation           RuntimeCancellationSnapshot
+	EvidenceRoot           EvidenceRootSnapshot
+	Capacity               RuntimeCapacitySnapshot
+	CapacityEvidence       RuntimeCapacityEvidenceSnapshot
+	PreLeaseTerminalReason PreLeaseTerminalReason
+	Reconciliation         ReconciliationStatus
 }
 
 type RetryDisposition uint8

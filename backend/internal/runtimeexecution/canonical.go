@@ -1,7 +1,9 @@
 package runtimeexecution
 
 import (
+	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"sort"
 	"time"
@@ -98,7 +100,7 @@ func computeStartDigest(command StartRuntimeRun) (Digest, error) {
 }
 
 func canonicalStartEncoding(command StartRuntimeRun) ([]byte, error) {
-	if !validStart(command) {
+	if !validCanonicalStart(command) {
 		return nil, newError(ErrorInvalidRequest)
 	}
 	inputs := make([]canonicalInput, len(command.ImmutableInputs))
@@ -214,7 +216,7 @@ func canonicalCancelEncoding(command CancelRuntimeRun) ([]byte, error) {
 	return encoded, nil
 }
 
-func validStart(command StartRuntimeRun) bool {
+func validCanonicalStart(command StartRuntimeRun) bool {
 	if !validOpaqueID(command.OperationID.String()) || !validOpaqueID(command.PersonalWorkspaceID.String()) ||
 		!validOpaqueID(command.TaskID.String()) || !validOpaqueID(command.PhaseRunID.String()) ||
 		!validOpaqueID(command.RuntimeRunID.String()) || command.Attempt == 0 || command.ExpectedTaskRevision == 0 ||
@@ -228,9 +230,7 @@ func validStart(command StartRuntimeRun) bool {
 		!validOpaqueID(command.ResourceClassID.String()) || !validOpaqueID(command.ExecutionPolicyID.String()) ||
 		providerCapabilityName(command.ProviderCapability) == "" || !validProviderBinding(command.ProviderCapability, command.ProviderBinding) ||
 		!validOpaqueID(command.NetworkPolicyID.String()) || !validOpaqueID(command.SecretPolicyID.String()) ||
-		command.Deadline.IsZero() || cancellationPolicyName(command.CancellationPolicy) == "" ||
-		!validOpaqueID(command.AdmissionGrant.AdmissionGrantID.String()) || !validOpaqueID(command.AdmissionGrant.WorkItemID.String()) ||
-		command.AdmissionGrant.Generation == 0 {
+		command.Deadline.IsZero() || cancellationPolicyName(command.CancellationPolicy) == "" {
 		return false
 	}
 	if command.Effect == EffectReadOnly && command.RuntimeViewRequirement != nil ||
@@ -243,6 +243,279 @@ func validStart(command StartRuntimeRun) bool {
 		}
 	}
 	return true
+}
+
+func validStart(command StartRuntimeRun) bool {
+	return validCanonicalStart(command) && validAdmissionGrantProof(command.AdmissionGrant)
+}
+
+func validAdmissionGrantProof(grant AdmissionGrantProof) bool {
+	return validOpaqueID(grant.AdmissionGrantID.String()) && validOpaqueID(grant.WorkItemID.String()) &&
+		grant.Generation > 0
+}
+
+// CanonicalStartPayload returns a defensive copy of the exact versioned C03
+// request bytes whose digest is carried by Task Orchestration and Scheduler.
+func CanonicalStartPayload(command StartRuntimeRun) ([]byte, error) {
+	encoded, err := canonicalStartEncoding(command)
+	if err != nil {
+		return nil, err
+	}
+	if canonicalRequestDigest(encoded) != command.CanonicalRequestDigest {
+		return nil, newError(ErrorIntegrityConflict)
+	}
+	return append([]byte(nil), encoded...), nil
+}
+
+// BindCanonicalStartPayload reconstructs the exact Task-authored request and
+// attaches only the authenticated Scheduler proof. Re-encoding must reproduce
+// the supplied bytes exactly, so delivery cannot supplement or normalize the
+// authoritative payload.
+func BindCanonicalStartPayload(
+	payload []byte,
+	expectedDigest Digest,
+	grant AdmissionGrantProof,
+) (StartRuntimeRun, error) {
+	if !validAdmissionGrantProof(grant) {
+		return StartRuntimeRun{}, newError(ErrorInvalidRequest)
+	}
+	command, err := ParseCanonicalStartPayload(payload, expectedDigest)
+	if err != nil {
+		return StartRuntimeRun{}, err
+	}
+	return command.WithAdmissionGrant(grant)
+}
+
+// ParseCanonicalStartPayload verifies and reconstructs a grant-independent
+// Task-authored C03 Start request without creating an execution decision.
+func ParseCanonicalStartPayload(payload []byte, expectedDigest Digest) (StartRuntimeRun, error) {
+	if len(payload) == 0 || expectedDigest == (Digest{}) || canonicalRequestDigest(payload) != expectedDigest {
+		return StartRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
+	var wire canonicalStart
+	if err := json.Unmarshal(payload, &wire); err != nil || wire.Kind != "start_runtime_run" {
+		return StartRuntimeRun{}, newError(ErrorInvalidRequest)
+	}
+	input, err := startInputFromCanonical(wire)
+	if err != nil {
+		return StartRuntimeRun{}, err
+	}
+	command, err := NewCanonicalStartRuntimeRun(input)
+	if err != nil || command.CanonicalRequestDigest != expectedDigest {
+		return StartRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
+	encoded, err := canonicalStartEncoding(command)
+	if err != nil || !bytes.Equal(encoded, payload) {
+		return StartRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
+	return command, nil
+}
+
+// CanonicalCancelPayload returns a defensive copy of the exact versioned C03
+// cancellation bytes bound by Task Orchestration and Scheduler.
+func CanonicalCancelPayload(command CancelRuntimeRun) ([]byte, error) {
+	encoded, err := canonicalCancelEncoding(command)
+	if err != nil {
+		return nil, err
+	}
+	if canonicalRequestDigest(encoded) != command.CanonicalRequestDigest {
+		return nil, newError(ErrorIntegrityConflict)
+	}
+	return append([]byte(nil), encoded...), nil
+}
+
+// ParseCanonicalCancelPayload verifies and reconstructs the exact Task-authored
+// C03 cancellation request without supplementing its authority or identity.
+func ParseCanonicalCancelPayload(payload []byte, expectedDigest Digest) (CancelRuntimeRun, error) {
+	if len(payload) == 0 || expectedDigest == (Digest{}) || canonicalRequestDigest(payload) != expectedDigest {
+		return CancelRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
+	var wire canonicalCancel
+	if err := json.Unmarshal(payload, &wire); err != nil || wire.Kind != "cancel_runtime_run" ||
+		wire.Schema.Major == 0 || wire.Authority.Kind != "task_orchestration" {
+		return CancelRuntimeRun{}, newError(ErrorInvalidRequest)
+	}
+	reason := CancellationReason(0)
+	switch wire.Reason {
+	case "user_requested":
+		reason = CancellationUserRequested
+	case "administrator_requested":
+		reason = CancellationAdministratorRequested
+	}
+	occurredAt, err := time.Parse(canonicalTimeFormat, wire.OccurredAt)
+	if err != nil || reason == 0 {
+		return CancelRuntimeRun{}, newError(ErrorInvalidRequest)
+	}
+	command, err := NewCancelRuntimeRun(CancelRuntimeRunInput{
+		SchemaVersion:       NewSchemaVersion(wire.Schema.Major, wire.Schema.Minor),
+		OperationID:         OperationID{value: wire.OperationID},
+		PersonalWorkspaceID: PersonalWorkspaceID{value: wire.PersonalWorkspaceID},
+		TaskID:              TaskID{value: wire.TaskID}, PhaseRunID: PhaseRunID{value: wire.PhaseRunID},
+		RuntimeRunID:                RuntimeRunID{value: wire.RuntimeRunID},
+		ExpectedRuntimeRevision:     RuntimeRevision(wire.ExpectedRuntimeRevision),
+		ExpectedStartOperationID:    OperationID{value: wire.ExpectedStartOperationID},
+		ExpectedOperationGeneration: OperationGeneration(wire.ExpectedOperationGeneration),
+		ExpectedRuntimeFence:        RuntimeFence(wire.ExpectedRuntimeFence),
+		Authority: NewTaskOrchestrationAuthority(
+			AuthorityID{value: wire.Authority.ID}, AuthorizationGeneration(wire.Authority.Generation),
+		),
+		Reason: reason, SafetyEpoch: ReleaseSafetyEpoch(wire.SafetyEpoch), OccurredAt: occurredAt,
+	})
+	if err != nil || command.CanonicalRequestDigest != expectedDigest {
+		return CancelRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
+	encoded, err := canonicalCancelEncoding(command)
+	if err != nil || !bytes.Equal(encoded, payload) {
+		return CancelRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
+	return command, nil
+}
+
+func startInputFromCanonical(wire canonicalStart) (StartRuntimeRunInput, error) {
+	deadline, err := time.Parse(canonicalTimeFormat, wire.Deadline)
+	if err != nil || wire.Schema.Major == 0 || wire.Authority.Kind != "task_orchestration" {
+		return StartRuntimeRunInput{}, newError(ErrorInvalidRequest)
+	}
+	workerClass := WorkerClass(0)
+	switch wire.WorkerClass {
+	case "agent":
+		workerClass = WorkerAgent
+	case "tool":
+		workerClass = WorkerTool
+	}
+	effect := EffectClass(0)
+	switch wire.Effect {
+	case "read_only":
+		effect = EffectReadOnly
+	case "mutating":
+		effect = EffectMutating
+	}
+	providerCapability := ProviderCapability(0)
+	switch wire.ProviderCapability {
+	case "none":
+		providerCapability = ProviderCapabilityNone
+	case "required":
+		providerCapability = ProviderCapabilityRequired
+	}
+	if wire.CancellationPolicy != "fence_first" || workerClass == 0 || effect == 0 || providerCapability == 0 {
+		return StartRuntimeRunInput{}, newError(ErrorInvalidRequest)
+	}
+	runtimeBindingDigest, err := digestFromCanonicalText(wire.RuntimeBindingDigest)
+	if err != nil {
+		return StartRuntimeRunInput{}, err
+	}
+	executionLockDigest, err := digestFromCanonicalText(wire.ExecutionLockDigest)
+	if err != nil {
+		return StartRuntimeRunInput{}, err
+	}
+	capabilityDigest, err := digestFromCanonicalText(wire.CapabilityContractDigest)
+	if err != nil {
+		return StartRuntimeRunInput{}, err
+	}
+	imagesDigest, err := digestFromCanonicalText(wire.AllowedPlatformImagesDigest)
+	if err != nil {
+		return StartRuntimeRunInput{}, err
+	}
+	executorDigest, err := digestFromCanonicalText(wire.ExecutorContractDigest)
+	if err != nil {
+		return StartRuntimeRunInput{}, err
+	}
+	outputDigest, err := digestFromCanonicalText(wire.OutputContractDigest)
+	if err != nil {
+		return StartRuntimeRunInput{}, err
+	}
+	evidenceDigest, err := digestFromCanonicalText(wire.EvidenceContractDigest)
+	if err != nil {
+		return StartRuntimeRunInput{}, err
+	}
+	inputs := make([]ImmutableInputBinding, len(wire.ImmutableInputs))
+	for index, item := range wire.ImmutableInputs {
+		digest, digestErr := digestFromCanonicalText(item.Digest)
+		if digestErr != nil {
+			return StartRuntimeRunInput{}, digestErr
+		}
+		inputs[index] = ImmutableInputBinding{
+			Identity: ImmutableInputIdentity{value: item.Identity}, Digest: digest, SizeBytes: item.SizeBytes,
+		}
+	}
+	var runtimeView *RuntimeViewRequirement
+	if wire.RuntimeViewRequirement != nil {
+		if wire.RuntimeViewRequirement.ExpiryPolicy != "runtime_deadline" {
+			return StartRuntimeRunInput{}, newError(ErrorInvalidRequest)
+		}
+		openDigest, digestErr := digestFromCanonicalText(wire.RuntimeViewRequirement.OpenOperationDerivation)
+		if digestErr != nil {
+			return StartRuntimeRunInput{}, digestErr
+		}
+		runtimeView = &RuntimeViewRequirement{
+			TaskWorkspaceID:     TaskWorkspaceID{value: wire.RuntimeViewRequirement.TaskWorkspaceID},
+			MaterializationID:   TaskWorkspaceMaterializationID{value: wire.RuntimeViewRequirement.MaterializationID},
+			BaseRevisionID:      TaskWorkspaceRevisionID{value: wire.RuntimeViewRequirement.BaseRevisionID},
+			LifecycleGeneration: TaskWorkspaceLifecycleGeneration(wire.RuntimeViewRequirement.LifecycleGeneration),
+			LifecycleFence:      TaskWorkspaceLifecycleFence(wire.RuntimeViewRequirement.LifecycleFence),
+			ExpiryPolicy:        RuntimeViewExpiryAtDeadline, OpenOperationDerivation: openDigest,
+		}
+	}
+	var catalog *CatalogExecutionBinding
+	if wire.CatalogBinding != nil {
+		lockDigest, digestErr := digestFromCanonicalText(wire.CatalogBinding.TemplateLockDigest)
+		if digestErr != nil {
+			return StartRuntimeRunInput{}, digestErr
+		}
+		closureDigest, digestErr := digestFromCanonicalText(wire.CatalogBinding.ClosureRootDigest)
+		if digestErr != nil {
+			return StartRuntimeRunInput{}, digestErr
+		}
+		catalog = &CatalogExecutionBinding{
+			TemplateLockID:     TemplateLockID{value: wire.CatalogBinding.TemplateLockID},
+			TemplateLockDigest: lockDigest, ClosureRootDigest: closureDigest,
+			SafetyEpoch: CatalogSafetyEpoch(wire.CatalogBinding.SafetyEpoch),
+		}
+	}
+	var provider *ProviderExecutionBinding
+	if wire.ProviderBinding != nil {
+		mode := QuotaReservationMode(0)
+		switch wire.ProviderBinding.Mode {
+		case "observation":
+			mode = QuotaReservationObservation
+		case "enforced":
+			mode = QuotaReservationEnforced
+		}
+		provider = &ProviderExecutionBinding{
+			QuotaReservationID: QuotaReservationID{value: wire.ProviderBinding.QuotaReservationID},
+			Generation:         QuotaReservationGeneration(wire.ProviderBinding.Generation), Mode: mode,
+			GatewayRoutePolicyID: GatewayRoutePolicyID{value: wire.ProviderBinding.GatewayRoutePolicyID},
+		}
+	}
+	return StartRuntimeRunInput{
+		SchemaVersion: NewSchemaVersion(wire.Schema.Major, wire.Schema.Minor),
+		OperationID:   OperationID{value: wire.OperationID}, PersonalWorkspaceID: PersonalWorkspaceID{value: wire.PersonalWorkspaceID},
+		TaskID: TaskID{value: wire.TaskID}, PhaseRunID: PhaseRunID{value: wire.PhaseRunID},
+		RuntimeRunID: RuntimeRunID{value: wire.RuntimeRunID}, Attempt: wire.Attempt,
+		ExpectedTaskRevision: TaskRevision(wire.ExpectedTaskRevision), ExpectedRuntimeRevision: RuntimeRevision(wire.ExpectedRuntimeRevision),
+		ExpectedOperationGeneration: OperationGeneration(wire.ExpectedOperationGeneration), ExpectedRuntimeFence: RuntimeFence(wire.ExpectedRuntimeFence),
+		Authority:        NewTaskOrchestrationAuthority(AuthorityID{value: wire.Authority.ID}, AuthorizationGeneration(wire.Authority.Generation)),
+		RuntimeBindingID: RuntimeBindingID{value: wire.RuntimeBindingID}, RuntimeBindingDigest: runtimeBindingDigest,
+		ExecutionLockDigest: executionLockDigest, CapabilityContractDigest: capabilityDigest,
+		AllowedPlatformImagesDigest: imagesDigest, ExecutorContractDigest: executorDigest,
+		ReleaseSafetyEpoch: ReleaseSafetyEpoch(wire.ReleaseSafetyEpoch), CatalogBinding: catalog,
+		WorkerClass: workerClass, Effect: effect, ImmutableInputs: inputs,
+		OutputContractDigest: outputDigest, EvidenceContractDigest: evidenceDigest, RuntimeViewRequirement: runtimeView,
+		ResourceClassID: ResourceClassID{value: wire.ResourceClassID}, ExecutionPolicyID: ExecutionPolicyID{value: wire.ExecutionPolicyID},
+		ProviderCapability: providerCapability, ProviderBinding: provider,
+		NetworkPolicyID: NetworkPolicyID{value: wire.NetworkPolicyID}, SecretPolicyID: SecretPolicyID{value: wire.SecretPolicyID},
+		Deadline: deadline, CancellationPolicy: CancellationFenceFirst,
+	}, nil
+}
+
+func digestFromCanonicalText(value string) (Digest, error) {
+	decoded, err := hex.DecodeString(value)
+	if err != nil || len(decoded) != len(Digest{}) {
+		return Digest{}, newError(ErrorInvalidRequest)
+	}
+	var digest Digest
+	copy(digest[:], decoded)
+	return digest, nil
 }
 
 func validCancel(command CancelRuntimeRun) bool {

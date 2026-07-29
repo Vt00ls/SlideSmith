@@ -109,7 +109,7 @@ func TestPostgresOperationIdentityCannotCrossCommandKinds(t *testing.T) {
 	}
 }
 
-func TestPostgresRetainedStartReplayRejectsGrantRebinding(t *testing.T) {
+func TestPostgresRetainedStartReplayIgnoresNewerRedundantGrant(t *testing.T) {
 	db, schema := testpostgres.Open(t, "runtime_execution_test")
 	now := time.Date(2026, 7, 28, 10, 50, 0, 0, time.UTC)
 	owner := mustTaskOrchestrationAuthority(t, "postgres-grant-rebind-owner", 13)
@@ -127,11 +127,11 @@ func TestPostgresRetainedStartReplayRejectsGrantRebinding(t *testing.T) {
 	if rebound.CanonicalRequestDigest != start.CanonicalRequestDigest {
 		t.Fatal("replaceable delivery grant unexpectedly changed the canonical Start digest")
 	}
-	_, err := store.Execute(context.Background(), rebound)
-	var safeError *Error
-	if !errors.As(err, &safeError) || safeError.Code() != ErrorIntegrityConflict ||
-		safeError.RetryDisposition() != RetryNever {
-		t.Fatalf("accepted Start grant rebinding error = %T %v, want non-retryable integrity conflict", err, err)
+	replayed, err := store.Execute(context.Background(), rebound)
+	if err != nil || replayed.Fact != fact ||
+		replayed.Snapshot.Operation.AdmissionGrantID != start.AdmissionGrant.AdmissionGrantID ||
+		replayed.Snapshot.Operation.GrantGeneration != start.AdmissionGrant.Generation {
+		t.Fatalf("newer redundant grant did not replay retained Start: replay=%+v err=%v", replayed, err)
 	}
 }
 

@@ -29,6 +29,7 @@ type postgresTaskState struct {
 	LatestRevisionID         string
 	LatestCheckpointID       string
 	CancellationState        CancellationState
+	CancellationReason       CancelReason
 	Enactments               []postgresEnactmentState
 	Reconciler               postgresAuthorityState
 	ReconciliationFences     []postgresReconciliationFenceState
@@ -168,6 +169,8 @@ type postgresRuntimeOperationState struct {
 	Fence              RuntimeFence
 	SafetyEpoch        SafetyEpoch
 	ActivityGeneration ActivityGeneration
+	CanonicalPayload   []byte
+	PayloadDigest      EnactmentPayloadDigest
 	Terminal           bool
 }
 
@@ -312,9 +315,11 @@ type postgresPhaseRunState struct {
 }
 
 type postgresRuntimeRunState struct {
-	ID          string
-	OperationID string
-	Outcome     RuntimeRunOutcome
+	ID               string
+	OperationID      string
+	Outcome          RuntimeRunOutcome
+	CanonicalPayload []byte
+	PayloadDigest    EnactmentPayloadDigest
 }
 
 func encodePostgresTaskState(record taskRecord) ([]byte, error) {
@@ -339,7 +344,9 @@ func validPostgresTaskRecord(record taskRecord) bool {
 		!validPersistedDecision(record.latestDecision) ||
 		!validOptionalOpaqueID(record.latestRevisionID.value) ||
 		!validOptionalOpaqueID(record.latestCheckpointID.value) ||
-		record.cancellationState > CancellationCancelled {
+		record.cancellationState > CancellationCancelled ||
+		(record.cancellationState == CancellationNotRequested) != (record.cancellationReason == 0) ||
+		(record.cancellationReason != 0 && cancelReasonName(record.cancellationReason) == "") {
 		return false
 	}
 	if record.evidenceDiagnosticCount > 0 &&
@@ -358,7 +365,8 @@ func validPostgresTaskRecord(record taskRecord) bool {
 		if !validOpaqueID(id.value) || !validOpaqueID(operation.phaseRunID.value) ||
 			!validOpaqueID(operation.runtimeRunID.value) || operation.generation == 0 ||
 			operation.fence == 0 || operation.safetyEpoch == 0 ||
-			operation.activityGeneration == 0 || !validOptionalAuthority(operation.authority) {
+			operation.activityGeneration == 0 || !validOptionalAuthority(operation.authority) ||
+			(len(operation.canonicalPayload) > 0 && operation.payloadDigest == (EnactmentPayloadDigest{})) {
 			return false
 		}
 	}
@@ -453,7 +461,8 @@ func validPostgresAggregate(aggregate taskAggregate) bool {
 			return false
 		}
 		for _, runtimeRun := range run.runtimeRuns {
-			if !validOpaqueID(runtimeRun.id.value) || !validOpaqueID(runtimeRun.operationID.value) {
+			if !validOpaqueID(runtimeRun.id.value) || !validOpaqueID(runtimeRun.operationID.value) ||
+				len(runtimeRun.canonicalPayload) == 0 || runtimeRun.payloadDigest == (EnactmentPayloadDigest{}) {
 				return false
 			}
 		}
@@ -521,6 +530,7 @@ func postgresTaskStateFromRecord(record taskRecord) postgresTaskState {
 		LatestRevisionID:         record.latestRevisionID.value,
 		LatestCheckpointID:       record.latestCheckpointID.value,
 		CancellationState:        record.cancellationState,
+		CancellationReason:       record.cancellationReason,
 		Reconciler:               postgresAuthorityStateFromAuthority(record.reconciler),
 	}
 	for id, binding := range record.phaseRuns {
@@ -535,7 +545,9 @@ func postgresTaskStateFromRecord(record taskRecord) postgresTaskState {
 			Authority:    postgresAuthorityStateFromAuthority(operation.authority),
 			Generation:   operation.generation, Fence: operation.fence,
 			SafetyEpoch: operation.safetyEpoch, ActivityGeneration: operation.activityGeneration,
-			Terminal: operation.terminal,
+			CanonicalPayload: append([]byte(nil), operation.canonicalPayload...),
+			PayloadDigest:    operation.payloadDigest,
+			Terminal:         operation.terminal,
 		})
 	}
 	for id, binding := range record.validationBindings {
@@ -612,6 +624,7 @@ func (state postgresTaskState) taskRecord() taskRecord {
 		latestRevisionID:         TaskWorkspaceRevisionID{state.LatestRevisionID},
 		latestCheckpointID:       CheckpointID{state.LatestCheckpointID},
 		cancellationState:        state.CancellationState,
+		cancellationReason:       state.CancellationReason,
 		enactments:               make(map[OperationID]EnactmentRef, len(state.Enactments)),
 		reconciler:               state.Reconciler.authority(),
 		reconciliationFences:     make(map[OperationID]ReconciliationFence, len(state.ReconciliationFences)),
@@ -627,7 +640,9 @@ func (state postgresTaskState) taskRecord() taskRecord {
 			phaseRunID: PhaseRunID{item.PhaseRunID}, runtimeRunID: RuntimeRunID{item.RuntimeRunID},
 			authority: item.Authority.authority(), generation: item.Generation, fence: item.Fence,
 			safetyEpoch: item.SafetyEpoch, activityGeneration: item.ActivityGeneration,
-			terminal: item.Terminal,
+			canonicalPayload: append([]byte(nil), item.CanonicalPayload...),
+			payloadDigest:    item.PayloadDigest,
+			terminal:         item.Terminal,
 		}
 	}
 	for _, item := range state.ValidationBindings {
@@ -920,6 +935,8 @@ func postgresAggregateStateFromAggregate(aggregate taskAggregate) *postgresAggre
 		for _, runtimeRun := range run.runtimeRuns {
 			item.RuntimeRuns = append(item.RuntimeRuns, postgresRuntimeRunState{
 				ID: runtimeRun.id.value, OperationID: runtimeRun.operationID.value, Outcome: runtimeRun.outcome,
+				CanonicalPayload: append([]byte(nil), runtimeRun.canonicalPayload...),
+				PayloadDigest:    runtimeRun.payloadDigest,
 			})
 		}
 		state.PhaseRuns = append(state.PhaseRuns, item)
@@ -956,7 +973,8 @@ func (state postgresAggregateState) aggregate() *taskAggregate {
 		for _, runtimeRun := range item.RuntimeRuns {
 			run.runtimeRuns = append(run.runtimeRuns, runtimeRunRecord{
 				id: RuntimeRunID{runtimeRun.ID}, operationID: OperationID{runtimeRun.OperationID},
-				outcome: runtimeRun.Outcome,
+				outcome: runtimeRun.Outcome, canonicalPayload: append([]byte(nil), runtimeRun.CanonicalPayload...),
+				payloadDigest: runtimeRun.PayloadDigest,
 			})
 		}
 		aggregate.phaseRuns = append(aggregate.phaseRuns, run)
