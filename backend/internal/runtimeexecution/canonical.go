@@ -186,8 +186,16 @@ type canonicalCancel struct {
 }
 
 func computeCancelDigest(command CancelRuntimeRun) (Digest, error) {
+	encoded, err := canonicalCancelEncoding(command)
+	if err != nil {
+		return Digest{}, err
+	}
+	return Digest(sha256.Sum256(append([]byte(canonicalRequestDomain), encoded...))), nil
+}
+
+func canonicalCancelEncoding(command CancelRuntimeRun) ([]byte, error) {
 	if !validCancel(command) {
-		return Digest{}, newError(ErrorInvalidRequest)
+		return nil, newError(ErrorInvalidRequest)
 	}
 	encoded, err := json.Marshal(canonicalCancel{
 		Schema: canonicalSchema{Major: command.SchemaVersion.Major(), Minor: command.SchemaVersion.Minor()},
@@ -201,9 +209,9 @@ func computeCancelDigest(command CancelRuntimeRun) (Digest, error) {
 		OccurredAt: command.OccurredAt.UTC().Format(canonicalTimeFormat),
 	})
 	if err != nil {
-		return Digest{}, newError(ErrorInvalidRequest)
+		return nil, newError(ErrorInvalidRequest)
 	}
-	return Digest(sha256.Sum256(append([]byte(canonicalRequestDomain), encoded...))), nil
+	return encoded, nil
 }
 
 func validStart(command StartRuntimeRun) bool {
