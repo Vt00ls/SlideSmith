@@ -21,6 +21,10 @@ const (
 	PersistenceFaultBeforeCommit
 	PersistenceFaultAfterCommit
 	PersistenceFaultBeforeResponse
+	PersistenceFaultBeforeLeaseCommit
+	PersistenceFaultAfterLeaseCommit
+	PersistenceFaultBeforeNoLeaseCommit
+	PersistenceFaultAfterNoLeaseCommit
 )
 
 func (point PersistenceFaultPoint) String() string {
@@ -41,6 +45,14 @@ func (point PersistenceFaultPoint) String() string {
 		return "after_commit"
 	case PersistenceFaultBeforeResponse:
 		return "before_response"
+	case PersistenceFaultBeforeLeaseCommit:
+		return "before_lease_commit"
+	case PersistenceFaultAfterLeaseCommit:
+		return "after_lease_commit"
+	case PersistenceFaultBeforeNoLeaseCommit:
+		return "before_no_lease_commit"
+	case PersistenceFaultAfterNoLeaseCommit:
+		return "after_no_lease_commit"
 	default:
 		return "unknown"
 	}
@@ -58,7 +70,7 @@ type PersistenceFaultController struct {
 }
 
 func (controller *PersistenceFaultController) FailNextAt(point PersistenceFaultPoint) error {
-	if point < PersistenceFaultBeforeRuntimeWrite || point > PersistenceFaultBeforeResponse {
+	if point < PersistenceFaultBeforeRuntimeWrite || point > PersistenceFaultAfterNoLeaseCommit {
 		return newPersistenceError(PersistenceInvalidConfiguration)
 	}
 	controller.mu.Lock()
@@ -87,7 +99,11 @@ const (
 	ReconciliationProjectionDelivery
 )
 
-const postgresReconciliationCommandKind int16 = 100
+const (
+	postgresReconciliationCommandKind   int16 = 100
+	postgresPreLeaseTerminalCommandKind int16 = 101
+	postgresLeaseCommitCommandKind      int16 = 102
+)
 
 type reconciliationFoundationIntent struct {
 	PersonalWorkspaceID         PersonalWorkspaceID
@@ -195,6 +211,7 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 	beforeSafetyEpoch := record.fixture.SafetyEpoch
 	record.fixture.RuntimeRevision++
 	record.fixture.State = RuntimeReconciling
+	record.lease.AcquireStatus = LeaseAcquireReconciliationRequired
 	record.reconciliation = ReconciliationRequiredStatus
 	fixture := fixtureFromRuntimeRecord(record)
 	aggregateState, err := encodePostgresRuntimeFixture(fixture)
@@ -425,6 +442,8 @@ func fixtureFromRuntimeRecord(record *runtimeRecord) RuntimeFixture {
 	fixture.Cancellation = record.cancellation
 	fixture.EvidenceRoot = record.evidenceRoot
 	fixture.Capacity = record.capacity
+	fixture.CapacityEvidence = record.capacityEvidence
+	fixture.PreLeaseTerminalReason = record.preLeaseTerminalReason
 	fixture.Reconciliation = record.reconciliation
 	return fixture
 }

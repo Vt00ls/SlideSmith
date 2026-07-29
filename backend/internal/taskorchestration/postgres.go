@@ -108,6 +108,7 @@ type SchedulerEnqueueFact struct {
 	TaskRevision       TaskRevision
 	Kind               EnactmentKind
 	PayloadDigest      EnactmentPayloadDigest
+	CanonicalPayload   []byte
 	ActivityGeneration ActivityGeneration
 	FenceKind          EnactmentFenceKind
 	Fence              uint64
@@ -387,6 +388,7 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 			runtime_run_id text NOT NULL DEFAULT '',
 			kind smallint NOT NULL,
 			payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
+			canonical_payload bytea NOT NULL DEFAULT ''::bytea,
 			activity_generation bigint NOT NULL,
 			safety_epoch bigint NOT NULL CHECK (safety_epoch > 0),
 			fence_kind smallint NOT NULL,
@@ -395,6 +397,7 @@ func (adapter *PostgresAdapter) migrationStatements() []string {
 			prerequisite_bindings jsonb NOT NULL,
 			committed_at timestamptz NOT NULL
 		)`, outbox, decisions),
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS canonical_payload bytea NOT NULL DEFAULT ''::bytea", outbox),
 		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS safety_epoch bigint NOT NULL DEFAULT 1 CHECK (safety_epoch > 0)", outbox),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
@@ -808,6 +811,15 @@ func (adapter *PostgresAdapter) insertOutbox(
 	enactment EnactmentRef,
 ) (bool, SchedulerEnqueueFact, error) {
 	phaseRunID, runtimeRunID := enactmentScope(record, enactment.OperationID)
+	canonicalPayload := []byte{}
+	if enactment.Kind == EnactmentRuntimeExecution {
+		operation, exists := record.runtimeOperations[enactment.OperationID]
+		if !exists || len(operation.canonicalPayload) == 0 ||
+			operation.payloadDigest != enactment.PayloadDigest {
+			return false, SchedulerEnqueueFact{}, newError(ErrorIntegrityConflict)
+		}
+		canonicalPayload = append([]byte(nil), operation.canonicalPayload...)
+	}
 	fenceKind, fence := postgresFenceValue(enactment.Fence)
 	prerequisites, err := json.Marshal(map[string]any{
 		"decision_id":           decision.DecisionID.value,
@@ -819,13 +831,13 @@ func (adapter *PostgresAdapter) insertOutbox(
 	}
 	result, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
 		operation_id, decision_id, task_id, phase_run_id, runtime_run_id, kind,
-		payload_digest, activity_generation, fence_kind, fence, causation_id,
+		payload_digest, canonical_payload, activity_generation, fence_kind, fence, causation_id,
 		safety_epoch, prerequisite_bindings, committed_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14)
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15)
 	ON CONFLICT (operation_id) DO NOTHING`, adapter.table("task_orchestration_outbox")),
 		enactment.OperationID.value, decision.DecisionID.value, decision.TaskProjection.TaskID.value,
 		phaseRunID.value, runtimeRunID.value, enactment.Kind, enactment.PayloadDigest[:],
-		enactment.ActivityGeneration, fenceKind, fence, enactment.CausationID.value,
+		canonicalPayload, enactment.ActivityGeneration, fenceKind, fence, enactment.CausationID.value,
 		decision.TaskProjection.SafetyEpoch, prerequisites, decision.CommittedAt,
 	)
 	if err != nil {
@@ -839,8 +851,9 @@ func (adapter *PostgresAdapter) insertOutbox(
 		OperationID: enactment.OperationID, TaskID: decision.TaskProjection.TaskID,
 		PhaseRunID: phaseRunID, RuntimeRunID: runtimeRunID, DecisionID: decision.DecisionID,
 		TaskRevision: decision.AcceptedTaskRevision, Kind: enactment.Kind,
-		PayloadDigest: enactment.PayloadDigest, ActivityGeneration: enactment.ActivityGeneration,
-		FenceKind: fenceKind, Fence: fence, CausationID: enactment.CausationID,
+		PayloadDigest: enactment.PayloadDigest, CanonicalPayload: append([]byte{}, canonicalPayload...),
+		ActivityGeneration: enactment.ActivityGeneration,
+		FenceKind:          fenceKind, Fence: fence, CausationID: enactment.CausationID,
 	}, nil
 }
 
@@ -852,21 +865,21 @@ func (adapter *PostgresAdapter) validateExistingOutboxBinding(
 ) error {
 	var decisionID, taskID, phaseRunID, runtimeRunID, causationID string
 	var kind EnactmentKind
-	var payloadDigest, prerequisites, decisionState []byte
+	var payloadDigest, canonicalPayload, prerequisites, decisionState []byte
 	var activityGeneration ActivityGeneration
 	var safetyEpoch SafetyEpoch
 	var fenceKind EnactmentFenceKind
 	var fence uint64
 	var committedAt time.Time
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT outbox.decision_id, outbox.task_id,
-		outbox.phase_run_id, outbox.runtime_run_id, outbox.kind, outbox.payload_digest,
+		outbox.phase_run_id, outbox.runtime_run_id, outbox.kind, outbox.payload_digest, outbox.canonical_payload,
 		outbox.activity_generation, outbox.fence_kind, outbox.fence, outbox.causation_id,
 		outbox.safety_epoch, outbox.prerequisite_bindings, outbox.committed_at, decision.decision_state
 		FROM %s AS outbox
 		JOIN %s AS decision ON decision.decision_id=outbox.decision_id
 		WHERE outbox.operation_id=$1`, adapter.table("task_orchestration_outbox"),
 		adapter.table("task_orchestration_decisions")), enactment.OperationID.value,
-	).Scan(&decisionID, &taskID, &phaseRunID, &runtimeRunID, &kind, &payloadDigest,
+	).Scan(&decisionID, &taskID, &phaseRunID, &runtimeRunID, &kind, &payloadDigest, &canonicalPayload,
 		&activityGeneration, &fenceKind, &fence, &causationID, &safetyEpoch,
 		&prerequisites, &committedAt, &decisionState)
 	if err != nil {
@@ -876,11 +889,20 @@ func (adapter *PostgresAdapter) validateExistingOutboxBinding(
 		return newError(ErrorDependencyUnavailable)
 	}
 	expectedPhaseRunID, expectedRuntimeRunID := enactmentScope(record, enactment.OperationID)
+	expectedCanonicalPayload := []byte{}
+	if enactment.Kind == EnactmentRuntimeExecution {
+		operation, exists := record.runtimeOperations[enactment.OperationID]
+		if !exists || len(operation.canonicalPayload) == 0 || operation.payloadDigest != enactment.PayloadDigest {
+			return newPersistenceError(PersistenceStateCorrupt)
+		}
+		expectedCanonicalPayload = operation.canonicalPayload
+	}
 	expectedFenceKind, expectedFence := postgresFenceValue(enactment.Fence)
 	if taskID != record.latestDecision.TaskProjection.TaskID.value ||
 		phaseRunID != expectedPhaseRunID.value || runtimeRunID != expectedRuntimeRunID.value ||
 		kind != enactment.Kind || len(payloadDigest) != len(enactment.PayloadDigest) ||
 		!bytes.Equal(payloadDigest, enactment.PayloadDigest[:]) ||
+		!bytes.Equal(canonicalPayload, expectedCanonicalPayload) ||
 		activityGeneration != enactment.ActivityGeneration || fenceKind != expectedFenceKind ||
 		fence != expectedFence || causationID != enactment.CausationID.value {
 		return newPersistenceError(PersistenceStateCorrupt)
@@ -957,10 +979,10 @@ func (transaction *postgresSchedulerTransaction) Enqueue(ctx context.Context) er
 	}
 	fact := transaction.fact
 	if _, err := transaction.tx.ExecContext(ctx, "SELECT "+transaction.enqueueFunction+`(
-		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		fact.OperationID.value, fact.TaskID.value, fact.PhaseRunID.value,
 		fact.RuntimeRunID.value, fact.DecisionID.value, fact.TaskRevision, fact.Kind,
-		fact.PayloadDigest[:], fact.ActivityGeneration, fact.FenceKind, fact.Fence,
+		fact.PayloadDigest[:], fact.CanonicalPayload, fact.ActivityGeneration, fact.FenceKind, fact.Fence,
 		fact.CausationID.value,
 	); err != nil {
 		return newPersistenceError(PersistenceUnavailable)

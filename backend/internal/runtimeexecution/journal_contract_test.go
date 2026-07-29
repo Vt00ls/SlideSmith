@@ -19,6 +19,28 @@ func TestNilRuntimeCommandIsInvalidRequest(t *testing.T) {
 	assertErrorCode(t, executeError(harness, nil), ErrorInvalidRequest)
 }
 
+func TestExecuteRejectsCanonicalStartUntilSchedulerGrantIsAttached(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 28, 9, 30, 0, 0, time.UTC)
+	authority := mustTaskOrchestrationAuthority(t, "grant-free-owner", 4)
+	input := standardStart(t, now, authority, "grant-free").StartRuntimeRunInput
+	start, err := NewCanonicalStartRuntimeRun(input)
+	if err != nil {
+		t.Fatalf("construct grant-free canonical request: %v", err)
+	}
+	harness, err := NewDeterministicHarness(HarnessConfig{
+		Now:      now,
+		Runtimes: []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+	})
+	if err != nil {
+		t.Fatalf("new harness: %v", err)
+	}
+
+	assertErrorCode(t, executeError(harness, start), ErrorInvalidRequest)
+	assertNoBusinessEffect(t, harness, start, start.ExpectedRuntimeRevision)
+}
+
 func TestDecision97HostileIngressPersistsSanitizedObservations(t *testing.T) {
 	t.Parallel()
 

@@ -3,6 +3,7 @@ package taskorchestration_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/slidesmith/slidesmith/backend/internal/runtimeexecution"
+	"github.com/slidesmith/slidesmith/backend/internal/scheduler"
 	"github.com/slidesmith/slidesmith/backend/internal/taskorchestration"
 )
 
@@ -612,6 +615,302 @@ func TestPostgresSchedulerParticipantFailureRollsBackTaskAndWorkItem(t *testing.
 	}
 	if _, err := good.Decide(context.Background(), workIntent); err != nil {
 		t.Fatalf("commit request after Scheduler participant recovery: %v", err)
+	}
+}
+
+func TestPostgresRuntimeWorkItemBindsCompleteCanonicalC03RequestInTaskTransaction(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 9, 0, 0, 0, time.UTC)
+	db, schema := isolatedPostgresSchema(t)
+	var captured taskorchestration.SchedulerEnqueueFact
+	adapter := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
+		Now: func() time.Time { return now },
+		SchedulerParticipant: taskorchestration.SchedulerTransactionalParticipantFunc(func(
+			ctx context.Context,
+			transaction taskorchestration.SchedulerTransaction,
+			fact taskorchestration.SchedulerEnqueueFact,
+		) error {
+			captured = fact
+			return transaction.Enqueue(ctx)
+		}),
+	})
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "postgres-c03-binding-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "postgres-c03-binding-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "postgres-c03-binding-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	started, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
+		intentHeader(t, "postgres-c03-binding-start", "postgres-c03-binding-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start Task: %v", err)
+	}
+	header := intentHeader(t, "postgres-c03-binding-work", "postgres-c03-binding-task", now.Add(time.Second))
+	header.ExpectedTaskRevision = started.AcceptedTaskRevision
+	decision, err := adapter.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		header, worker, operationID(t, "postgres-c03-binding-availability"),
+	))
+	if err != nil {
+		t.Fatalf("make Runtime work available: %v", err)
+	}
+	if captured.Kind != taskorchestration.EnactmentRuntimeExecution ||
+		captured.OperationID != decision.EnactmentRefs[0].OperationID || len(captured.CanonicalPayload) == 0 {
+		t.Fatalf("restricted Scheduler fact lacks exact C03 request: %+v", captured)
+	}
+	var request struct {
+		Kind         string `json:"kind"`
+		OperationID  string `json:"operation_id"`
+		TaskID       string `json:"task_id"`
+		PhaseRunID   string `json:"phase_run_id"`
+		RuntimeRunID string `json:"runtime_run_id"`
+	}
+	if err := json.Unmarshal(captured.CanonicalPayload, &request); err != nil {
+		t.Fatalf("decode canonical C03 request: %v", err)
+	}
+	if request.Kind != "start_runtime_run" || request.OperationID != captured.OperationID.String() ||
+		request.TaskID != captured.TaskID.String() || request.PhaseRunID != captured.PhaseRunID.String() ||
+		request.RuntimeRunID != captured.RuntimeRunID.String() {
+		t.Fatalf("canonical C03 binding = %+v, Scheduler fact = %+v", request, captured)
+	}
+	wantDigest := sha256.Sum256(append(
+		[]byte("slidesmith.runtime-execution.request/v1\n"), captured.CanonicalPayload...,
+	))
+	if !bytes.Equal(captured.PayloadDigest[:], wantDigest[:]) {
+		t.Fatalf("Work Item digest %x != canonical C03 digest %x", captured.PayloadDigest, wantDigest)
+	}
+	var persisted []byte
+	if err := db.QueryRowContext(context.Background(), `SELECT canonical_payload FROM `+schema+
+		`.task_orchestration_outbox WHERE operation_id=$1`, captured.OperationID.String()).Scan(&persisted); err != nil {
+		t.Fatalf("read Task-owned canonical payload: %v", err)
+	}
+	if !bytes.Equal(persisted, captured.CanonicalPayload) {
+		t.Fatal("Task outbox and Scheduler participant observed different C03 payloads")
+	}
+}
+
+func TestPostgresSchedulerClaimAndAdmitIsTheUniqueGenerationAuthority(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 9, 30, 0, 0, time.UTC)
+	db, schema := isolatedPostgresSchema(t)
+	nodeID, err := scheduler.NewExecutionNodeID("issue-75-node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceClassID, err := scheduler.NewResourceClassID("resource-class-runtime-release-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionPolicyID, err := scheduler.NewExecutionPolicyID("execution-policy-runtime-release-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheduling, err := scheduler.NewPostgresAuthority(db, scheduler.PostgresConfig{
+		Schema: schema,
+		Now:    func() time.Time { return now },
+		Admission: scheduler.LocalAdmissionConfig{
+			SchedulerEpoch: 1,
+			PolicyVersion:  1,
+			GrantTTL:       time.Minute,
+			Node: scheduler.ExecutionNodeConfig{
+				ExecutionNodeID:       nodeID,
+				CapacityGeneration:    1,
+				ResourceClassID:       resourceClassID,
+				ExecutionPolicyID:     executionPolicyID,
+				AvailableRuntimeSlots: 1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create Scheduler authority: %v", err)
+	}
+	if err := scheduling.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate Scheduler authority: %v", err)
+	}
+	adapter := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
+		Now:                      func() time.Time { return now },
+		SchedulerParticipant:     scheduling.TaskEnqueueParticipant(),
+		SchedulerEnqueueFunction: scheduling.TaskEnqueueFunction(),
+	})
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "postgres-scheduler-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "postgres-scheduler-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "postgres-scheduler-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract: taskorchestration.PhaseValidationAllRuntimeRunsSucceeded, RequiredRuntimeRuns: 1,
+	}})
+	started, err := adapter.Decide(context.Background(), verifiedPinnedStartIntent(t,
+		intentHeader(t, "postgres-scheduler-start", "postgres-scheduler-task", now), owner, pinned,
+	))
+	if err != nil {
+		t.Fatalf("start Task: %v", err)
+	}
+	header := intentHeader(t, "postgres-scheduler-work", "postgres-scheduler-task", now.Add(time.Second))
+	header.ExpectedTaskRevision = started.AcceptedTaskRevision
+	if _, err := adapter.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		header, worker, operationID(t, "postgres-scheduler-availability"),
+	)); err != nil {
+		t.Fatalf("make Runtime work available: %v", err)
+	}
+
+	first, err := scheduling.ClaimAndAdmit(context.Background())
+	if err != nil {
+		t.Fatalf("claim and admit: %v", err)
+	}
+	replayed, err := scheduling.ClaimAndAdmit(context.Background())
+	if err != nil {
+		t.Fatalf("replay claim and admit: %v", err)
+	}
+	if replayed.WorkItemID != first.WorkItemID || replayed.Grant != first.Grant ||
+		replayed.OperationID != first.OperationID || !bytes.Equal(replayed.CanonicalPayload, first.CanonicalPayload) {
+		t.Fatalf("exact delivery replay allocated new authority:\nfirst=%+v\nreplay=%+v", first, replayed)
+	}
+
+	now = first.Grant.ExpiresAt.Add(time.Nanosecond)
+	rotated, err := scheduling.ClaimAndAdmit(context.Background())
+	if err != nil {
+		t.Fatalf("rotate expired unbound grant: %v", err)
+	}
+	if rotated.WorkItemID != first.WorkItemID || rotated.OperationID != first.OperationID ||
+		rotated.PayloadDigest != first.PayloadDigest || !bytes.Equal(rotated.CanonicalPayload, first.CanonicalPayload) ||
+		rotated.Grant.Generation != first.Grant.Generation+1 || rotated.Grant.AdmissionGrantID == first.Grant.AdmissionGrantID {
+		t.Fatalf("grant rotation changed Task authority or failed to advance generation:\nfirst=%+v\nrotated=%+v", first, rotated)
+	}
+	view, err := scheduling.Inspect(context.Background(), scheduler.WorkItemRef{WorkItemID: first.WorkItemID})
+	if err != nil {
+		t.Fatalf("inspect admitted Work Item: %v", err)
+	}
+	if view.State != scheduler.WorkItemDelivering || view.Grant.State != scheduler.GrantReservedUnbound ||
+		view.Grant.Generation != rotated.Grant.Generation {
+		t.Fatalf("Scheduler inspection lost current unbound generation: %+v", view)
+	}
+	grantID, err := runtimeexecution.NewAdmissionGrantID(rotated.Grant.AdmissionGrantID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	workItemID, err := runtimeexecution.NewWorkItemID(rotated.WorkItemID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, err := runtimeexecution.BindCanonicalStartPayload(
+		rotated.CanonicalPayload,
+		runtimeexecution.Digest(rotated.PayloadDigest),
+		runtimeexecution.AdmissionGrantProof{
+			AdmissionGrantID: grantID,
+			WorkItemID:       workItemID,
+			Generation:       runtimeexecution.AdmissionGrantGeneration(rotated.Grant.Generation),
+		},
+	)
+	if err != nil {
+		t.Fatalf("bind authenticated grant to canonical Task request: %v", err)
+	}
+	runtime, err := runtimeexecution.NewPostgresAuthority(db, runtimeexecution.PostgresConfig{
+		Schema:                      schema,
+		Now:                         func() time.Time { return now },
+		SchedulerParticipant:        scheduling.RuntimeAcceptanceParticipant(),
+		SchedulerAcceptanceFunction: scheduling.RuntimeAcceptanceFunction(),
+	})
+	if err != nil {
+		t.Fatalf("create Runtime Execution authority: %v", err)
+	}
+	if err := runtime.Migrate(context.Background()); err != nil {
+		t.Fatalf("migrate Runtime Execution authority: %v", err)
+	}
+	accepted, err := runtime.Execute(context.Background(), start)
+	if err != nil {
+		t.Fatalf("execute fresh C03 Start: %v", err)
+	}
+	inspected, err := runtime.Inspect(context.Background(), runtimeexecution.RuntimeRunRef{
+		SchemaVersion: runtimeexecution.SchemaV1, ProjectionVersion: runtimeexecution.SnapshotSchemaCurrent,
+		PersonalWorkspaceID: start.PersonalWorkspaceID, RuntimeRunID: start.RuntimeRunID, Authority: start.Authority,
+	})
+	if err != nil {
+		t.Fatalf("inspect accepted C03 Start: %v", err)
+	}
+	if inspected != accepted.Snapshot || inspected.State != runtimeexecution.RuntimeWaitingForLease ||
+		inspected.RuntimeFence != start.ExpectedRuntimeFence+1 ||
+		inspected.Operation.OperationID != start.OperationID ||
+		inspected.Operation.Digest != start.CanonicalRequestDigest ||
+		inspected.Operation.AdmissionGrantID != start.AdmissionGrant.AdmissionGrantID ||
+		inspected.Operation.GrantGeneration != start.AdmissionGrant.Generation ||
+		inspected.Lease.AcquireOperationID.String() == "" || inspected.Lease.AcquireDigest == (runtimeexecution.Digest{}) ||
+		!inspected.LeaseAcquireBy.Equal(rotated.Grant.ExpiresAt) {
+		t.Fatalf("fresh C03 Start lost atomic binding: %+v", inspected)
+	}
+	view, err = scheduling.Inspect(context.Background(), scheduler.WorkItemRef{WorkItemID: first.WorkItemID})
+	if err != nil {
+		t.Fatalf("inspect accepted Scheduler Work Item: %v", err)
+	}
+	if view.State != scheduler.WorkItemAccepted || view.Grant.State != scheduler.GrantBound ||
+		view.Grant.Generation != rotated.Grant.Generation {
+		t.Fatalf("C03 acceptance did not atomically bind exact Scheduler generation: %+v", view)
+	}
+	replayedStart, err := runtime.Execute(context.Background(), start)
+	if err != nil || replayedStart.Fact != accepted.Fact || replayedStart.Snapshot != accepted.Snapshot {
+		t.Fatalf("exact C03 replay changed accepted authority: replay=%+v err=%v", replayedStart, err)
+	}
+	cancelOperationID, err := runtimeexecution.NewOperationID("cancel-" + start.OperationID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel, err := runtimeexecution.NewCancelRuntimeRun(runtimeexecution.CancelRuntimeRunInput{
+		SchemaVersion: runtimeexecution.SchemaV1, OperationID: cancelOperationID,
+		PersonalWorkspaceID: start.PersonalWorkspaceID, TaskID: start.TaskID,
+		PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID,
+		ExpectedRuntimeRevision: inspected.RuntimeRevision, ExpectedStartOperationID: start.OperationID,
+		ExpectedOperationGeneration: inspected.Operation.Generation, ExpectedRuntimeFence: inspected.RuntimeFence,
+		Authority: start.Authority, Reason: runtimeexecution.CancellationUserRequested,
+		SafetyEpoch: start.ReleaseSafetyEpoch, OccurredAt: now.Add(time.Second),
+	})
+	if err != nil {
+		t.Fatalf("construct canonical C03 Cancel: %v", err)
+	}
+	cancelled, err := runtime.Execute(context.Background(), cancel)
+	if err != nil {
+		t.Fatalf("execute pre-lease C03 Cancel: %v", err)
+	}
+	if cancelled.Snapshot.State != runtimeexecution.RuntimeTerminal ||
+		cancelled.Snapshot.Outcome != runtimeexecution.RuntimeCancelled ||
+		cancelled.Snapshot.RuntimeFence != inspected.RuntimeFence+1 ||
+		cancelled.Snapshot.Capacity.LogicalRelease != runtimeexecution.LogicalCapacityReleaseReady ||
+		cancelled.Snapshot.Capacity.NoLease != runtimeexecution.NoLeaseDispositionRecorded ||
+		cancelled.Snapshot.Capacity.Physical != runtimeexecution.PhysicalCapacityNotApplicable ||
+		cancelled.Snapshot.CapacityEvidence.RuntimeFencedOrTerminal == (runtimeexecution.RuntimeFencedOrTerminalEvidence{}) ||
+		cancelled.Snapshot.CapacityEvidence.NoLeasePhysicalDisposition == (runtimeexecution.NoLeasePhysicalDispositionEvidence{}) ||
+		cancelled.Snapshot.CapacityEvidence.PhysicalCapacityReleaseReady != (runtimeexecution.PhysicalCapacityReleaseReadyEvidence{}) {
+		t.Fatalf("pre-lease Cancel produced incomplete or fabricated evidence: %+v", cancelled.Snapshot)
+	}
+	if err := scheduling.ApplyRuntimeFencedOrTerminal(
+		context.Background(), cancelled.Snapshot.CapacityEvidence.RuntimeFencedOrTerminal,
+	); err != nil {
+		t.Fatalf("apply logical release evidence: %v", err)
+	}
+	view, err = scheduling.Inspect(context.Background(), scheduler.WorkItemRef{WorkItemID: first.WorkItemID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.LogicalReservation != scheduler.ReservationReleased ||
+		view.SelectedNodeReservation != scheduler.ReservationBound || view.Grant.State != scheduler.GrantBound {
+		t.Fatalf("logical evidence crossed into selected-node capacity: %+v", view)
+	}
+	if err := scheduling.ApplyNoLeasePhysicalDisposition(
+		context.Background(), cancelled.Snapshot.CapacityEvidence.NoLeasePhysicalDisposition,
+	); err != nil {
+		t.Fatalf("apply exact no-lease selected-node disposition: %v", err)
+	}
+	view, err = scheduling.Inspect(context.Background(), scheduler.WorkItemRef{WorkItemID: first.WorkItemID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.LogicalReservation != scheduler.ReservationReleased ||
+		view.SelectedNodeReservation != scheduler.ReservationReleased || view.Grant.State != scheduler.GrantReleased {
+		t.Fatalf("separate capacity dispositions did not converge exactly: %+v", view)
 	}
 }
 
@@ -1358,6 +1657,7 @@ func ensureSchedulerTestTable(t *testing.T, db *sql.DB, schema string) {
 		task_revision bigint NOT NULL,
 		kind smallint NOT NULL,
 		payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
+		canonical_payload bytea NOT NULL,
 		activity_generation bigint NOT NULL,
 		fence_kind smallint NOT NULL,
 		fence bigint NOT NULL,
@@ -1378,6 +1678,7 @@ func ensureSchedulerTestTable(t *testing.T, db *sql.DB, schema string) {
 		p_task_revision bigint,
 		p_kind smallint,
 		p_payload_digest bytea,
+		p_canonical_payload bytea,
 		p_activity_generation bigint,
 		p_fence_kind smallint,
 		p_fence bigint,
@@ -1385,11 +1686,11 @@ func ensureSchedulerTestTable(t *testing.T, db *sql.DB, schema string) {
 	) RETURNS void LANGUAGE SQL AS $scheduler_function$
 		INSERT INTO `+schema+`.scheduler_test_owned_work_items (
 			work_item_id, operation_id, task_id, phase_run_id, runtime_run_id, decision_id,
-			task_revision, kind, payload_digest, activity_generation, fence_kind, fence,
+			task_revision, kind, payload_digest, canonical_payload, activity_generation, fence_kind, fence,
 			causation_id, priority_class, state, enqueued_at
 		) VALUES (
 			'scheduler-test-' || p_operation_id, p_operation_id, p_task_id, p_phase_run_id,
-			p_runtime_run_id, p_decision_id, p_task_revision, p_kind, p_payload_digest,
+			p_runtime_run_id, p_decision_id, p_task_revision, p_kind, p_payload_digest, p_canonical_payload,
 			p_activity_generation, p_fence_kind, p_fence, p_causation_id,
 			'standard', 'offered', CURRENT_TIMESTAMP
 		)

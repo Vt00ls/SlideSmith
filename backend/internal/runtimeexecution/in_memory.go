@@ -2,6 +2,7 @@ package runtimeexecution
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -9,6 +10,7 @@ import (
 type DeterministicIDConfig struct {
 	DecisionStart    uint64
 	ObservationStart uint64
+	LeaseStart       uint64
 }
 
 type IngressObservationKind uint8
@@ -34,6 +36,10 @@ const (
 	FaultBeforeCommit
 	FaultAfterCommit
 	FaultBeforeResponse
+	FaultBeforeLeaseCommit
+	FaultAfterLeaseCommit
+	FaultBeforeNoLeaseCommit
+	FaultAfterNoLeaseCommit
 )
 
 type CrashBoundary uint8
@@ -41,56 +47,68 @@ type CrashBoundary uint8
 const (
 	CrashBeforeCommit CrashBoundary = iota + 1
 	CrashAfterCommit
+	CrashBeforeLeaseCommit
+	CrashAfterLeaseCommit
+	CrashBeforeNoLeaseCommit
+	CrashAfterNoLeaseCommit
 )
 
 type RuntimeFixture struct {
-	PersonalWorkspaceID PersonalWorkspaceID
-	TaskID              TaskID
-	PhaseRunID          PhaseRunID
-	RuntimeRunID        RuntimeRunID
-	Owner               RuntimeAuthority
-	TaskRevision        TaskRevision
-	RuntimeRevision     RuntimeRevision
-	OperationGeneration OperationGeneration
-	RuntimeFence        RuntimeFence
-	SafetyEpoch         ReleaseSafetyEpoch
-	State               RuntimeState
-	Outcome             RuntimeOutcome
-	TerminalEvidenceID  EvidenceID
-	Operation           RuntimeOperationBinding
-	Lease               RuntimeLeaseSnapshot
-	Deadline            time.Time
-	LeaseAcquireBy      time.Time
-	Cancellation        RuntimeCancellationSnapshot
-	EvidenceRoot        EvidenceRootSnapshot
-	Capacity            RuntimeCapacitySnapshot
-	Reconciliation      ReconciliationStatus
+	PersonalWorkspaceID    PersonalWorkspaceID
+	TaskID                 TaskID
+	PhaseRunID             PhaseRunID
+	RuntimeRunID           RuntimeRunID
+	Owner                  RuntimeAuthority
+	TaskRevision           TaskRevision
+	RuntimeRevision        RuntimeRevision
+	OperationGeneration    OperationGeneration
+	RuntimeFence           RuntimeFence
+	SafetyEpoch            ReleaseSafetyEpoch
+	State                  RuntimeState
+	Outcome                RuntimeOutcome
+	TerminalEvidenceID     EvidenceID
+	Operation              RuntimeOperationBinding
+	Lease                  RuntimeLeaseSnapshot
+	Deadline               time.Time
+	LeaseAcquireBy         time.Time
+	Cancellation           RuntimeCancellationSnapshot
+	EvidenceRoot           EvidenceRootSnapshot
+	Capacity               RuntimeCapacitySnapshot
+	CapacityEvidence       RuntimeCapacityEvidenceSnapshot
+	PreLeaseTerminalReason PreLeaseTerminalReason
+	Reconciliation         ReconciliationStatus
 }
 
 type AdmissionGrantFixture struct {
-	AdmissionGrantID     AdmissionGrantID
-	WorkItemID           WorkItemID
-	Generation           AdmissionGrantGeneration
-	PersonalWorkspaceID  PersonalWorkspaceID
-	RuntimeRunID         RuntimeRunID
-	OperationID          OperationID
-	CanonicalStartDigest Digest
-	ExpiresAt            time.Time
-	Current              bool
+	AdmissionGrantID       AdmissionGrantID
+	WorkItemID             WorkItemID
+	Generation             AdmissionGrantGeneration
+	PersonalWorkspaceID    PersonalWorkspaceID
+	RuntimeRunID           RuntimeRunID
+	OperationID            OperationID
+	CanonicalStartDigest   Digest
+	ExpiresAt              time.Time
+	Current                bool
+	ExecutionNodeID        ExecutionNodeID
+	NodeCapacityGeneration uint64
+	SchedulerEpoch         uint64
+	PolicyVersion          uint64
 }
 
 type HarnessConfig struct {
-	Now             time.Time
-	IDs             DeterministicIDConfig
-	Runtimes        []RuntimeFixture
-	AdmissionGrants []AdmissionGrantFixture
+	Now              time.Time
+	IDs              DeterministicIDConfig
+	Runtimes         []RuntimeFixture
+	AdmissionGrants  []AdmissionGrantFixture
+	LeaseAcquisition LeaseAcquisitionAdapter
 }
 
 type DeterministicHarness struct {
-	Runtime  RuntimeExecution
-	store    *memoryStore
-	clock    *controlledClock
-	controls *harnessControls
+	Runtime          RuntimeExecution
+	store            *memoryStore
+	clock            *controlledClock
+	controls         *harnessControls
+	leaseAcquisition LeaseAcquisitionAdapter
 }
 
 func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error) {
@@ -102,12 +120,16 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		grants:          make(map[grantKey]AdmissionGrantFixture),
 		nextDecision:    config.IDs.DecisionStart,
 		nextObservation: config.IDs.ObservationStart,
+		nextLease:       config.IDs.LeaseStart,
 	}
 	if store.nextDecision == 0 {
 		store.nextDecision = 1
 	}
 	if store.nextObservation == 0 {
 		store.nextObservation = 1
+	}
+	if store.nextLease == 0 {
+		store.nextLease = 1
 	}
 	for _, fixture := range config.Runtimes {
 		if !validRuntimeFixture(fixture) || store.runtimes[fixture.RuntimeRunID] != nil {
@@ -131,10 +153,23 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 			operation: fixture.Operation, lease: fixture.Lease,
 			deadline: fixture.Deadline.UTC(), leaseAcquireBy: fixture.LeaseAcquireBy.UTC(),
 			cancellation: fixture.Cancellation, evidenceRoot: fixture.EvidenceRoot,
-			capacity: capacity, reconciliation: reconciliation,
+			capacity: capacity, capacityEvidence: fixture.CapacityEvidence,
+			preLeaseTerminalReason: fixture.PreLeaseTerminalReason, reconciliation: reconciliation,
 		}
 	}
 	for _, grant := range config.AdmissionGrants {
+		if grant.ExecutionNodeID == (ExecutionNodeID{}) {
+			grant.ExecutionNodeID = ExecutionNodeID{value: "execution-node-" + grant.AdmissionGrantID.String()}
+		}
+		if grant.NodeCapacityGeneration == 0 {
+			grant.NodeCapacityGeneration = 1
+		}
+		if grant.SchedulerEpoch == 0 {
+			grant.SchedulerEpoch = 1
+		}
+		if grant.PolicyVersion == 0 {
+			grant.PolicyVersion = 1
+		}
 		if !validAdmissionGrantFixture(grant) {
 			return nil, newError(ErrorInvalidRequest)
 		}
@@ -146,13 +181,15 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		store.grants[key] = grant
 	}
 	clock := &controlledClock{now: config.Now.UTC()}
-	return newHarness(store, clock), nil
+	return newHarness(store, clock, config.LeaseAcquisition), nil
 }
 
-func newHarness(store *memoryStore, clock *controlledClock) *DeterministicHarness {
+func newHarness(store *memoryStore, clock *controlledClock, leaseAcquisition LeaseAcquisitionAdapter) *DeterministicHarness {
 	controls := &harnessControls{}
-	engine := &invariantEngine{store: store, clock: clock, controls: controls}
-	return &DeterministicHarness{Runtime: engine, store: store, clock: clock, controls: controls}
+	engine := &invariantEngine{store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition}
+	return &DeterministicHarness{
+		Runtime: engine, store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition,
+	}
 }
 
 func (harness *DeterministicHarness) AdvanceClock(elapsed time.Duration) error {
@@ -166,7 +203,7 @@ func (harness *DeterministicHarness) AdvanceClock(elapsed time.Duration) error {
 }
 
 func (harness *DeterministicHarness) FailNextAt(point FaultPoint) error {
-	if point < FaultBeforeValidation || point > FaultBeforeResponse {
+	if point < FaultBeforeValidation || point > FaultAfterNoLeaseCommit {
 		return newError(ErrorInvalidRequest)
 	}
 	harness.controls.mu.Lock()
@@ -176,7 +213,7 @@ func (harness *DeterministicHarness) FailNextAt(point FaultPoint) error {
 }
 
 func (harness *DeterministicHarness) CrashNextAt(boundary CrashBoundary) error {
-	if boundary != CrashBeforeCommit && boundary != CrashAfterCommit {
+	if boundary < CrashBeforeCommit || boundary > CrashAfterNoLeaseCommit {
 		return newError(ErrorInvalidRequest)
 	}
 	harness.controls.mu.Lock()
@@ -195,7 +232,7 @@ func (harness *DeterministicHarness) Restart() *DeterministicHarness {
 	harness.controls.mu.Lock()
 	harness.controls.crashed = true
 	harness.controls.mu.Unlock()
-	return newHarness(harness.store, harness.clock)
+	return newHarness(harness.store, harness.clock, harness.leaseAcquisition)
 }
 
 func (harness *DeterministicHarness) IngressObservations() []IngressObservation {
@@ -265,6 +302,7 @@ type memoryStore struct {
 	observations    []IngressObservation
 	nextDecision    uint64
 	nextObservation uint64
+	nextLease       uint64
 }
 
 type grantKey struct {
@@ -280,25 +318,28 @@ type decisionAttemptKey struct {
 }
 
 type runtimeRecord struct {
-	fixture             RuntimeFixture
-	bindings            map[OperationID]Digest
-	decisions           map[decisionAttemptKey]RuntimeDecisionFact
-	acceptedStart       RuntimeDecisionFact
-	acceptedStartDigest Digest
-	operation           RuntimeOperationBinding
-	deadline            time.Time
-	leaseAcquireBy      time.Time
-	lease               RuntimeLeaseSnapshot
-	cancellation        RuntimeCancellationSnapshot
-	evidenceRoot        EvidenceRootSnapshot
-	capacity            RuntimeCapacitySnapshot
-	reconciliation      ReconciliationStatus
+	fixture                RuntimeFixture
+	bindings               map[OperationID]Digest
+	decisions              map[decisionAttemptKey]RuntimeDecisionFact
+	acceptedStart          RuntimeDecisionFact
+	acceptedStartDigest    Digest
+	operation              RuntimeOperationBinding
+	deadline               time.Time
+	leaseAcquireBy         time.Time
+	lease                  RuntimeLeaseSnapshot
+	cancellation           RuntimeCancellationSnapshot
+	evidenceRoot           EvidenceRootSnapshot
+	capacity               RuntimeCapacitySnapshot
+	capacityEvidence       RuntimeCapacityEvidenceSnapshot
+	preLeaseTerminalReason PreLeaseTerminalReason
+	reconciliation         ReconciliationStatus
 }
 
 type invariantEngine struct {
-	store    *memoryStore
-	clock    *controlledClock
-	controls *harnessControls
+	store            *memoryStore
+	clock            *controlledClock
+	controls         *harnessControls
+	leaseAcquisition LeaseAcquisitionAdapter
 }
 
 func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeCommand) (RuntimeDecision, error) {
@@ -314,7 +355,11 @@ func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeComma
 	}
 	switch typed := command.(type) {
 	case StartRuntimeRun:
-		return engine.executeStart(typed)
+		decision, err := engine.executeStart(typed)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		return engine.advancePreLease(ctx, typed, decision)
 	case CancelRuntimeRun:
 		return engine.executeCancel(typed)
 	default:
@@ -377,6 +422,8 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 		return engine.reject(record, attempt, command.OperationID, digest, CommandRejectionPolicy)
 	}
 	previous := record.fixture.RuntimeRevision
+	startBinding := record.operation
+	leaseBinding := record.lease
 	record.fixture.RuntimeRevision++
 	record.fixture.OperationGeneration++
 	record.fixture.RuntimeFence++
@@ -385,7 +432,11 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 	record.operation = RuntimeOperationBinding{
 		Status: OperationBound, OperationID: command.OperationID, Digest: digest,
 		Generation:       record.fixture.OperationGeneration,
-		AdmissionGrantID: record.operation.AdmissionGrantID, GrantGeneration: record.operation.GrantGeneration,
+		AdmissionGrantID: startBinding.AdmissionGrantID, WorkItemID: startBinding.WorkItemID,
+		GrantGeneration: startBinding.GrantGeneration, ExecutionNodeID: startBinding.ExecutionNodeID,
+		NodeCapacityGeneration: startBinding.NodeCapacityGeneration,
+		ResourceClassID:        startBinding.ResourceClassID, ExecutionPolicyID: startBinding.ExecutionPolicyID,
+		SchedulerEpoch: startBinding.SchedulerEpoch, PolicyVersion: startBinding.PolicyVersion,
 	}
 	record.lease.AcquireStatus = LeaseNotRequested
 	record.cancellation = RuntimeCancellationSnapshot{
@@ -405,8 +456,221 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 		StateAtDecision: record.fixture.State, OutcomeAtDecision: record.fixture.Outcome,
 		Retry: RetryNever, Reconciliation: ReconciliationNotRequired,
 	}
+	baseEvidence := RuntimeFencedOrTerminalEvidence{
+		WorkItemID: startBinding.WorkItemID, AdmissionGrantID: startBinding.AdmissionGrantID,
+		GrantGeneration: startBinding.GrantGeneration, RuntimeRunID: command.RuntimeRunID,
+		StartOperationID: command.ExpectedStartOperationID, StartDigest: startBinding.Digest,
+		TerminalDecisionID: fact.DecisionID, RuntimeFence: record.fixture.RuntimeFence,
+		LeaseAcquireOperationID: leaseBinding.AcquireOperationID, LeaseAcquireDigest: leaseBinding.AcquireDigest,
+	}
+	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{
+		RuntimeFencedOrTerminal: baseEvidence,
+		NoLeasePhysicalDisposition: NoLeasePhysicalDispositionEvidence{
+			WorkItemID: baseEvidence.WorkItemID, AdmissionGrantID: baseEvidence.AdmissionGrantID,
+			GrantGeneration: baseEvidence.GrantGeneration, RuntimeRunID: baseEvidence.RuntimeRunID,
+			StartOperationID: baseEvidence.StartOperationID, StartDigest: baseEvidence.StartDigest,
+			TerminalDecisionID: baseEvidence.TerminalDecisionID, RuntimeFence: baseEvidence.RuntimeFence,
+			LeaseAcquireOperationID: baseEvidence.LeaseAcquireOperationID,
+			LeaseAcquireDigest:      baseEvidence.LeaseAcquireDigest,
+			ExecutionNodeID:         startBinding.ExecutionNodeID,
+			NodeCapacityGeneration:  startBinding.NodeCapacityGeneration,
+		},
+	}
 	record.decisions[attempt] = fact
 	return engine.respond(RuntimeDecision{Fact: fact, Snapshot: snapshot(record, SnapshotSchemaCurrent)})
+}
+
+func (engine *invariantEngine) advancePreLease(
+	ctx context.Context,
+	start StartRuntimeRun,
+	startDecision RuntimeDecision,
+) (RuntimeDecision, error) {
+	if startDecision.Fact.Disposition != DecisionAccepted {
+		return startDecision, nil
+	}
+	now := engine.clock.current()
+	engine.store.mu.Lock()
+	record := engine.store.runtimes[start.RuntimeRunID]
+	if record == nil {
+		engine.store.mu.Unlock()
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	if record.fixture.State == RuntimeTerminal || record.lease.AcquireStatus == LeaseGranted ||
+		record.fixture.State != RuntimeWaitingForLease && record.fixture.State != RuntimeReconciling {
+		startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+		engine.store.mu.Unlock()
+		return startDecision, nil
+	}
+	if !now.Before(record.deadline) {
+		return engine.finishInMemoryNoLeaseLocked(
+			record, startDecision, RuntimeTimedOut, PreLeaseTerminalRuntimeDeadline, now,
+		)
+	}
+	if !now.Before(record.leaseAcquireBy) {
+		return engine.finishInMemoryNoLeaseLocked(
+			record, startDecision, RuntimeRejected, PreLeaseTerminalAdmissionAuthorityExpired, now,
+		)
+	}
+	request := leaseAcquisitionRequest(record)
+	if engine.leaseAcquisition == nil {
+		startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+		engine.store.mu.Unlock()
+		return startDecision, nil
+	}
+	if !validLeaseAcquisitionRequest(request) {
+		engine.store.mu.Unlock()
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	engine.store.mu.Unlock()
+
+	observation, err := engine.leaseAcquisition.ObserveLeaseAcquisition(ctx, request)
+	if err != nil {
+		observation = LeaseAcquisitionObservation{Disposition: LeaseAcquisitionAmbiguousPrerequisite}
+	}
+	if !validLeaseAcquisitionObservation(observation) {
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+
+	engine.store.mu.Lock()
+	record = engine.store.runtimes[start.RuntimeRunID]
+	if record == nil || record.lease.AcquireOperationID != request.OperationID ||
+		record.lease.AcquireDigest != request.Digest {
+		engine.store.mu.Unlock()
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	if record.fixture.State == RuntimeTerminal || record.lease.AcquireStatus == LeaseGranted {
+		startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+		engine.store.mu.Unlock()
+		return startDecision, nil
+	}
+	now = engine.clock.current()
+	if !now.Before(record.deadline) {
+		return engine.finishInMemoryNoLeaseLocked(
+			record, startDecision, RuntimeTimedOut, PreLeaseTerminalRuntimeDeadline, now,
+		)
+	}
+	if !now.Before(record.leaseAcquireBy) {
+		return engine.finishInMemoryNoLeaseLocked(
+			record, startDecision, RuntimeRejected, PreLeaseTerminalAdmissionAuthorityExpired, now,
+		)
+	}
+
+	switch observation.Disposition {
+	case LeaseAcquisitionTemporaryUnavailable:
+		startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+		engine.store.mu.Unlock()
+		return startDecision, nil
+	case LeaseAcquisitionRetryablePrerequisite, LeaseAcquisitionAmbiguousPrerequisite:
+		if record.fixture.State != RuntimeReconciling {
+			record.fixture.RuntimeRevision++
+			record.fixture.State = RuntimeReconciling
+			record.lease.AcquireStatus = LeaseAcquireReconciliationRequired
+			record.reconciliation = ReconciliationRequiredStatus
+		}
+		startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+		engine.store.mu.Unlock()
+		return startDecision, nil
+	case LeaseAcquisitionPermanentFailure:
+		return engine.finishInMemoryNoLeaseLocked(
+			record, startDecision, RuntimeRejected,
+			terminalReasonForPermanentFailure(observation.PermanentFailure), now,
+		)
+	case LeaseAcquisitionReady:
+		if engine.controls.crashAt(CrashBeforeLeaseCommit) || engine.controls.faultAt(FaultBeforeLeaseCommit) {
+			engine.store.mu.Unlock()
+			return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+		}
+		record.fixture.RuntimeRevision++
+		record.fixture.State = RuntimePreparingPrerequisites
+		record.lease.AcquireStatus = LeaseGranted
+		record.lease.LeaseID = SandboxLeaseID{value: fmt.Sprintf("sandbox-lease-%06d", engine.store.nextLease)}
+		engine.store.nextLease++
+		record.lease.Generation = 1
+		record.lease.Fence = 1
+		record.capacity.Physical = PhysicalCapacityOccupied
+		record.reconciliation = ReconciliationStable
+		startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+		engine.store.mu.Unlock()
+		if engine.controls.crashAt(CrashAfterLeaseCommit) || engine.controls.faultAt(FaultAfterLeaseCommit) {
+			return RuntimeDecision{}, newError(ErrorReconciliationRequired)
+		}
+		return startDecision, nil
+	default:
+		engine.store.mu.Unlock()
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+}
+
+func (engine *invariantEngine) finishInMemoryNoLeaseLocked(
+	record *runtimeRecord,
+	startDecision RuntimeDecision,
+	outcome RuntimeOutcome,
+	reason PreLeaseTerminalReason,
+	occurredAt time.Time,
+) (RuntimeDecision, error) {
+	if reason == PreLeaseTerminalNone || outcome != RuntimeRejected && outcome != RuntimeTimedOut {
+		engine.store.mu.Unlock()
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	if engine.controls.crashAt(CrashBeforeNoLeaseCommit) || engine.controls.faultAt(FaultBeforeNoLeaseCommit) {
+		engine.store.mu.Unlock()
+		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+	}
+	startBinding := record.operation
+	leaseBinding := record.lease
+	previousRevision := record.fixture.RuntimeRevision
+	record.fixture.RuntimeRevision++
+	record.fixture.OperationGeneration++
+	record.fixture.RuntimeFence++
+	record.fixture.State = RuntimeTerminal
+	record.fixture.Outcome = outcome
+	terminalOperationID, terminalDigest := stablePreLeaseTerminalBinding(leaseBinding, outcome, reason)
+	record.operation = startBinding
+	record.operation.OperationID = terminalOperationID
+	record.operation.Digest = terminalDigest
+	record.operation.Generation = record.fixture.OperationGeneration
+	record.lease.AcquireStatus = LeaseNotRequested
+	record.preLeaseTerminalReason = reason
+	record.capacity = RuntimeCapacitySnapshot{
+		LogicalRelease: LogicalCapacityReleaseReady,
+		NoLease:        NoLeaseDispositionRecorded,
+		Physical:       PhysicalCapacityNotApplicable,
+	}
+	record.reconciliation = ReconciliationStable
+	terminalFact := RuntimeDecisionFact{
+		DecisionID: engine.nextDecisionID(), Disposition: DecisionAccepted,
+		OperationID: terminalOperationID, CanonicalRequestDigest: terminalDigest,
+		PreviousRuntimeRevision: previousRevision, ResultingRuntimeRevision: record.fixture.RuntimeRevision,
+		StateAtDecision: RuntimeTerminal, OutcomeAtDecision: outcome,
+		Retry: RetryNever, Reconciliation: ReconciliationNotRequired,
+	}
+	baseEvidence := RuntimeFencedOrTerminalEvidence{
+		WorkItemID: startBinding.WorkItemID, AdmissionGrantID: startBinding.AdmissionGrantID,
+		GrantGeneration: startBinding.GrantGeneration, RuntimeRunID: record.fixture.RuntimeRunID,
+		StartOperationID: record.acceptedStart.OperationID, StartDigest: record.acceptedStartDigest,
+		TerminalDecisionID: terminalFact.DecisionID, RuntimeFence: record.fixture.RuntimeFence,
+		LeaseAcquireOperationID: leaseBinding.AcquireOperationID, LeaseAcquireDigest: leaseBinding.AcquireDigest,
+	}
+	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{
+		RuntimeFencedOrTerminal: baseEvidence,
+		NoLeasePhysicalDisposition: NoLeasePhysicalDispositionEvidence{
+			WorkItemID: baseEvidence.WorkItemID, AdmissionGrantID: baseEvidence.AdmissionGrantID,
+			GrantGeneration: baseEvidence.GrantGeneration, RuntimeRunID: baseEvidence.RuntimeRunID,
+			StartOperationID: baseEvidence.StartOperationID, StartDigest: baseEvidence.StartDigest,
+			TerminalDecisionID: baseEvidence.TerminalDecisionID, RuntimeFence: baseEvidence.RuntimeFence,
+			LeaseAcquireOperationID: baseEvidence.LeaseAcquireOperationID,
+			LeaseAcquireDigest:      baseEvidence.LeaseAcquireDigest,
+			ExecutionNodeID:         startBinding.ExecutionNodeID,
+			NodeCapacityGeneration:  startBinding.NodeCapacityGeneration,
+		},
+	}
+	_ = occurredAt
+	startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+	engine.store.mu.Unlock()
+	if engine.controls.crashAt(CrashAfterNoLeaseCommit) || engine.controls.faultAt(FaultAfterNoLeaseCommit) {
+		return RuntimeDecision{}, newError(ErrorReconciliationRequired)
+	}
+	return startDecision, nil
 }
 
 func (engine *invariantEngine) respond(decision RuntimeDecision) (RuntimeDecision, error) {
@@ -428,6 +692,10 @@ func (engine *invariantEngine) executeStart(command StartRuntimeRun) (RuntimeDec
 	if command.SchemaVersion.Major() != SchemaV1.Major() {
 		engine.observeIngress(IngressUnsupportedSchema)
 		return RuntimeDecision{}, newError(ErrorUnsupportedSchema)
+	}
+	if !validStart(command) {
+		engine.observeIngress(IngressMalformed)
+		return RuntimeDecision{}, newError(ErrorInvalidRequest)
 	}
 	digest, err := computeStartDigest(command)
 	if err != nil {
@@ -505,11 +773,15 @@ func (engine *invariantEngine) executeStart(command StartRuntimeRun) (RuntimeDec
 	record.operation = RuntimeOperationBinding{
 		Status: OperationBound, OperationID: command.OperationID, Digest: digest,
 		Generation: record.fixture.OperationGeneration, AdmissionGrantID: command.AdmissionGrant.AdmissionGrantID,
-		GrantGeneration: command.AdmissionGrant.Generation,
+		WorkItemID: command.AdmissionGrant.WorkItemID, GrantGeneration: command.AdmissionGrant.Generation,
+		ExecutionNodeID: grant.ExecutionNodeID, NodeCapacityGeneration: grant.NodeCapacityGeneration,
+		ResourceClassID: command.ResourceClassID, ExecutionPolicyID: command.ExecutionPolicyID,
+		SchedulerEpoch: grant.SchedulerEpoch, PolicyVersion: grant.PolicyVersion,
 	}
 	record.deadline = command.Deadline.UTC()
 	record.leaseAcquireBy = earlier(command.Deadline, grant.ExpiresAt)
 	record.lease.AcquireStatus = LeaseAcquirePending
+	record.lease.AcquireOperationID, record.lease.AcquireDigest = stableLeaseAcquireBinding(command)
 	record.capacity = RuntimeCapacitySnapshot{
 		LogicalRelease: LogicalCapacityHeld, NoLease: NoLeaseDispositionNone, Physical: PhysicalCapacityNotApplicable,
 	}
@@ -649,7 +921,9 @@ func buildSnapshot(record *runtimeRecord, version SchemaVersion) RuntimeSnapshot
 		RuntimeRevision: record.fixture.RuntimeRevision, State: record.fixture.State, Outcome: record.fixture.Outcome,
 		Operation: record.operation, RuntimeFence: record.fixture.RuntimeFence, Lease: record.lease,
 		Deadline: record.deadline, LeaseAcquireBy: record.leaseAcquireBy, Cancellation: record.cancellation,
-		EvidenceRoot: record.evidenceRoot, Capacity: record.capacity, Reconciliation: record.reconciliation,
+		EvidenceRoot: record.evidenceRoot, Capacity: record.capacity, CapacityEvidence: record.capacityEvidence,
+		PreLeaseTerminalReason: record.preLeaseTerminalReason,
+		Reconciliation:         record.reconciliation,
 	}
 }
 
@@ -666,6 +940,7 @@ func snapshotVariantsKnown(record *runtimeRecord) bool {
 	if record == nil || !knownRuntimeState(record.fixture.State) || !knownRuntimeOutcome(record.fixture.Outcome) ||
 		!knownOperationStatus(record.operation.Status) || !knownLeaseStatus(record.lease.AcquireStatus) ||
 		!knownCancellationStatus(record.cancellation.Status) || !knownCapacity(record.capacity) ||
+		!knownPreLeaseTerminalReason(record.preLeaseTerminalReason) ||
 		!knownReconciliation(record.reconciliation) || !knownEvidenceRoot(record.evidenceRoot) {
 		return false
 	}

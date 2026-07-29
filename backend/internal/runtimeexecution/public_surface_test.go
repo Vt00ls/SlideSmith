@@ -18,6 +18,11 @@ func TestPublicSurfaceHasOnlyExecuteAndInspect(t *testing.T) {
 	if !reflect.DeepEqual(methods, []string{"Execute", "Inspect"}) {
 		t.Fatalf("public Runtime methods = %v", methods)
 	}
+	for _, forbidden := range []string{"AcquireLease", "GrantLease", "ReleaseLease", "SetLease", "MutateLease"} {
+		if _, found := interfaceType.MethodByName(forbidden); found {
+			t.Fatalf("RuntimeExecution exposes caller-controlled lease mutation %q", forbidden)
+		}
+	}
 
 	commandType := reflect.TypeOf((*RuntimeCommand)(nil)).Elem()
 	if commandType.NumMethod() != 2 {

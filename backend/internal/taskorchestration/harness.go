@@ -469,6 +469,7 @@ type taskRecord struct {
 	latestRevisionID         TaskWorkspaceRevisionID
 	latestCheckpointID       CheckpointID
 	cancellationState        CancellationState
+	cancellationReason       CancelReason
 	enactments               map[OperationID]EnactmentRef
 	reconciler               authorityValue
 	reconciliationFences     map[OperationID]ReconciliationFence
@@ -519,9 +520,11 @@ type phaseRunRecord struct {
 }
 
 type runtimeRunRecord struct {
-	id          RuntimeRunID
-	operationID OperationID
-	outcome     RuntimeRunOutcome
+	id               RuntimeRunID
+	operationID      OperationID
+	outcome          RuntimeRunOutcome
+	canonicalPayload []byte
+	payloadDigest    EnactmentPayloadDigest
 }
 
 type phaseRunBinding struct {
@@ -538,6 +541,8 @@ type runtimeOperationBinding struct {
 	fence              RuntimeFence
 	safetyEpoch        SafetyEpoch
 	activityGeneration ActivityGeneration
+	canonicalPayload   []byte
+	payloadDigest      EnactmentPayloadDigest
 	terminal           bool
 }
 
@@ -948,6 +953,7 @@ func (engine *decisionEngine) Decide(
 			return TransitionDecision{}, newError(ErrorTerminalConflict)
 		}
 		updatedRecord.cancellationState = CancellationCancelling
+		updatedRecord.cancellationReason = intent.(intentValue).payload.(cancelPayload).reason
 		activePhaseRunID, hasActivePhaseRun := updatedRecord.activePhaseRun()
 		if hadActivePhaseRunAtCancellation {
 			activePhaseRunID = cancellationPhaseRunID
@@ -960,7 +966,8 @@ func (engine *decisionEngine) Decide(
 			cancel := intent.(intentValue).payload.(cancelPayload)
 			cancellationEnactments, cancellationErr := engine.buildCancellationEnactments(
 				&updatedRecord, header.TaskID, activePhaseRunID, acceptedActivityGeneration,
-				engine.effectiveSafetyEpoch(updatedRecord), &ids, cancel.lifecycleFence,
+				engine.effectiveSafetyEpoch(updatedRecord), &ids, cancel.reason, header.OccurredAt,
+				cancel.lifecycleFence,
 			)
 			if cancellationErr != nil {
 				return TransitionDecision{}, cancellationErr
@@ -1005,6 +1012,7 @@ func (engine *decisionEngine) Decide(
 				cancellationEnactments, cancellationErr := engine.buildCancellationEnactments(
 					&updatedRecord, header.TaskID, activePhaseRunID, acceptedActivityGeneration,
 					effectiveSafetyEpoch(updatedRecord, updatedRecovery), &ids,
+					updatedRecord.cancellationReason, header.OccurredAt,
 					binding.LifecycleFence,
 				)
 				if cancellationErr != nil {
@@ -1129,6 +1137,10 @@ func cloneTaskRecord(record taskRecord) taskRecord {
 	}
 	if record.runtimeOperations != nil {
 		record.runtimeOperations = cloneMap(record.runtimeOperations)
+		for id, operation := range record.runtimeOperations {
+			operation.canonicalPayload = append([]byte(nil), operation.canonicalPayload...)
+			record.runtimeOperations[id] = operation
+		}
 	}
 	if record.validationBindings != nil {
 		record.validationBindings = cloneMap(record.validationBindings)
@@ -1155,6 +1167,11 @@ func cloneTaskRecord(record taskRecord) taskRecord {
 		for index, run := range record.aggregate.phaseRuns {
 			aggregate.phaseRuns[index] = run
 			aggregate.phaseRuns[index].runtimeRuns = append([]runtimeRunRecord(nil), run.runtimeRuns...)
+			for runtimeIndex := range aggregate.phaseRuns[index].runtimeRuns {
+				aggregate.phaseRuns[index].runtimeRuns[runtimeIndex].canonicalPayload = append(
+					[]byte(nil), aggregate.phaseRuns[index].runtimeRuns[runtimeIndex].canonicalPayload...,
+				)
+			}
 		}
 		record.aggregate = &aggregate
 	}
@@ -1240,6 +1257,8 @@ func (engine *decisionEngine) syncAggregateCoordination(
 					fence:              RuntimeFence(run.fence),
 					safetyEpoch:        safetyEpoch,
 					activityGeneration: activityGeneration,
+					canonicalPayload:   append([]byte(nil), runtimeRun.canonicalPayload...),
+					payloadDigest:      runtimeRun.payloadDigest,
 				}
 			}
 			record.bindAggregateSchedulingOperation(
@@ -1510,15 +1529,16 @@ func beginAggregatePhase(
 	aggregate.status = TaskRunning
 	enactments := make([]EnactmentRef, 0, phase.RequiredRuntimeRuns)
 	for runtimeIndex := uint32(0); runtimeIndex < phase.RequiredRuntimeRuns; runtimeIndex++ {
-		runtimeRun := runtimeRunRecord{id: ids.nextRuntimeRunID(), outcome: RuntimeRunPending}
+		runtimeRunID := ids.nextRuntimeRunID()
 		operationID := ids.nextOperationID()
-		runtimeRun.operationID = operationID
+		runtimeRun, enactment, err := canonicalRuntimeStartEnactment(
+			record, phase, run, runtimeRunID, operationID, intent.Header(), decisionID,
+		)
+		if err != nil {
+			return record, nil, nil, err
+		}
 		run.runtimeRuns = append(run.runtimeRuns, runtimeRun)
-		enactments = append(enactments, harnessEnactment(
-			operationID, EnactmentRuntimeExecution, RuntimeFence(run.fence),
-			intent.Header().ActivityGeneration, decisionID, run.id, runtimeRun.id,
-			run.taskWorkspaceID, run.inputArtifactVersionID,
-		))
+		enactments = append(enactments, enactment)
 	}
 	if phase.Kind == PhaseConfirmationGate {
 		operationID := ids.nextOperationID()
@@ -1601,14 +1621,15 @@ func retryAggregateRuntimeRun(
 	if !failed {
 		return record, nil, nil, newError(ErrorTerminalConflict)
 	}
-	runtimeRun := runtimeRunRecord{id: ids.nextRuntimeRunID(), outcome: RuntimeRunPending}
-	runtimeRun.operationID = ids.nextOperationID()
-	run.runtimeRuns = append(run.runtimeRuns, runtimeRun)
-	enactment := harnessEnactment(
-		runtimeRun.operationID, EnactmentRuntimeExecution, RuntimeFence(run.fence),
-		intent.header.ActivityGeneration, decisionID, run.id, runtimeRun.id,
-		run.taskWorkspaceID, run.inputArtifactVersionID,
+	runtimeRunID := ids.nextRuntimeRunID()
+	operationID := ids.nextOperationID()
+	runtimeRun, enactment, err := canonicalRuntimeStartEnactment(
+		record, phase, *run, runtimeRunID, operationID, intent.header, decisionID,
 	)
+	if err != nil {
+		return record, nil, nil, err
+	}
+	run.runtimeRuns = append(run.runtimeRuns, runtimeRun)
 	return record, []PhaseRunID{run.id}, []EnactmentRef{enactment}, nil
 }
 
@@ -2061,6 +2082,8 @@ func (engine *decisionEngine) buildCancellationEnactments(
 	activityGeneration ActivityGeneration,
 	safetyEpoch SafetyEpoch,
 	ids *deterministicIDAllocator,
+	reason CancelReason,
+	occurredAt time.Time,
 	lifecycleFenceRequest TaskWorkspaceLifecycleFenceRequestBinding,
 ) ([]EnactmentRef, error) {
 	refs := make([]EnactmentRef, 0, 2)
@@ -2068,19 +2091,24 @@ func (engine *decisionEngine) buildCancellationEnactments(
 	if record.aggregate != nil {
 		schedulerAuthority = record.aggregate.pinned.Authorities.Scheduler.value
 	}
-	runtimeOperationByRun := make(map[RuntimeRunID]runtimeOperationBinding)
-	for _, operation := range record.runtimeOperations {
-		if operation.phaseRunID != phaseRunID {
-			continue
-		}
-		selected, exists := runtimeOperationByRun[operation.runtimeRunID]
-		if !exists || operation.fence > selected.fence ||
-			operation.fence == selected.fence && operation.generation > selected.generation {
-			runtimeOperationByRun[operation.runtimeRunID] = operation
+	var aggregateRun *phaseRunRecord
+	if record.aggregate != nil {
+		for index := range record.aggregate.phaseRuns {
+			if record.aggregate.phaseRuns[index].id == phaseRunID {
+				aggregateRun = &record.aggregate.phaseRuns[index]
+				break
+			}
 		}
 	}
-	runtimeOperations := make([]runtimeOperationBinding, 0, len(runtimeOperationByRun))
-	for _, operation := range runtimeOperationByRun {
+	if aggregateRun == nil {
+		return nil, newError(ErrorIntegrityConflict)
+	}
+	runtimeOperations := make([]runtimeOperationBinding, 0, len(aggregateRun.runtimeRuns))
+	for _, runtimeRun := range aggregateRun.runtimeRuns {
+		operation, exists := record.runtimeOperations[runtimeRun.operationID]
+		if !exists || operation.runtimeRunID != runtimeRun.id || operation.phaseRunID != phaseRunID {
+			return nil, newError(ErrorIntegrityConflict)
+		}
 		runtimeOperations = append(runtimeOperations, operation)
 	}
 	sort.Slice(runtimeOperations, func(left, right int) bool {
@@ -2089,15 +2117,16 @@ func (engine *decisionEngine) buildCancellationEnactments(
 	for _, operation := range runtimeOperations {
 		operationID := nextUniqueOperationID(record, ids)
 		fence := operation.fence + 1
+		canonicalPayload, payloadDigest, canonicalErr := canonicalRuntimeCancelEnactment(
+			operation, taskID, operationID, reason, occurredAt,
+		)
+		if canonicalErr != nil {
+			return nil, canonicalErr
+		}
 		ref := EnactmentRef{
-			OperationID: operationID,
-			Kind:        EnactmentRuntimeExecution,
-			PayloadDigest: computeEnactmentPayloadDigest(map[string]any{
-				"activity_generation": uint64(activityGeneration),
-				"phase_run_id":        phaseRunID.value,
-				"purpose":             "cancel",
-				"runtime_run_id":      operation.runtimeRunID.value,
-			}),
+			OperationID:        operationID,
+			Kind:               EnactmentRuntimeExecution,
+			PayloadDigest:      payloadDigest,
 			ActivityGeneration: activityGeneration,
 			Fence:              fence,
 			CausationID:        ids.nextCausationID(),
@@ -2110,6 +2139,8 @@ func (engine *decisionEngine) buildCancellationEnactments(
 			fence:              fence,
 			safetyEpoch:        safetyEpoch,
 			activityGeneration: activityGeneration,
+			canonicalPayload:   canonicalPayload,
+			payloadDigest:      payloadDigest,
 		}
 		record.schedulingOperations[operationID] = schedulingOperationBinding{
 			phaseRunID: phaseRunID,

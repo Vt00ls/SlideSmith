@@ -66,21 +66,27 @@ func newPersistenceError(code PersistenceErrorCode) *PersistenceError {
 }
 
 type PostgresConfig struct {
-	Schema             string
-	Now                func() time.Time
-	Faults             PersistenceFaultInjector
-	ProjectionDelivery ProjectionDelivery
+	Schema                      string
+	Now                         func() time.Time
+	Faults                      PersistenceFaultInjector
+	ProjectionDelivery          ProjectionDelivery
+	SchedulerParticipant        SchedulerAcceptanceParticipant
+	SchedulerAcceptanceFunction string
+	LeaseAcquisition            LeaseAcquisitionAdapter
 }
 
 // PostgresAuthority owns C03 persistence behind the RuntimeExecution seam.
 // Its implementation does not expose SQL, a general repository, or a
 // caller-controlled transaction handle.
 type PostgresAuthority struct {
-	db         *sql.DB
-	schema     string
-	now        func() time.Time
-	faults     PersistenceFaultInjector
-	projection ProjectionDelivery
+	db                          *sql.DB
+	schema                      string
+	now                         func() time.Time
+	faults                      PersistenceFaultInjector
+	projection                  ProjectionDelivery
+	schedulerParticipant        SchedulerAcceptanceParticipant
+	schedulerAcceptanceFunction string
+	leaseAcquisition            LeaseAcquisitionAdapter
 }
 
 var _ RuntimeExecution = (*PostgresAuthority)(nil)
@@ -100,8 +106,15 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 	if now == nil {
 		now = time.Now
 	}
+	if config.SchedulerParticipant != nil && !validPostgresQualifiedIdentifier(config.SchedulerAcceptanceFunction) ||
+		config.SchedulerParticipant == nil && config.SchedulerAcceptanceFunction != "" {
+		return nil, newPersistenceError(PersistenceInvalidConfiguration)
+	}
 	return &PostgresAuthority{
 		db: db, schema: schema, now: now, faults: config.Faults, projection: config.ProjectionDelivery,
+		schedulerParticipant:        config.SchedulerParticipant,
+		schedulerAcceptanceFunction: config.SchedulerAcceptanceFunction,
+		leaseAcquisition:            config.LeaseAcquisition,
 	}, nil
 }
 
@@ -117,6 +130,14 @@ func validPostgresIdentifier(value string) bool {
 		return false
 	}
 	return true
+}
+
+func validPostgresQualifiedIdentifier(value string) bool {
+	parts := strings.Split(value, ".")
+	if len(parts) != 2 {
+		return false
+	}
+	return validPostgresIdentifier(parts[0]) && validPostgresIdentifier(parts[1])
 }
 
 func (authority *PostgresAuthority) table(name string) string {
@@ -162,6 +183,8 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	revisions := authority.table("runtime_execution_revisions")
 	audit := authority.table("runtime_execution_mandatory_audit")
 	outbox := authority.table("runtime_execution_outbox")
+	capacityOutbox := authority.table("runtime_execution_capacity_outbox")
+	preLeaseLeases := authority.table("runtime_execution_prelease_leases")
 	delivery := authority.table("runtime_execution_outbox_delivery")
 	reconciliation := authority.table("runtime_execution_reconciliation_obligations")
 	projection := authority.table("runtime_execution_projection_backlog")
@@ -178,6 +201,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	cleanupRebindingFunction := authority.table("runtime_execution_reject_cleanup_rebinding")
 	return []string{
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_decision_sequence")),
+		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_sandbox_lease_sequence")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			runtime_run_id text PRIMARY KEY,
 			personal_workspace_id text NOT NULL,
@@ -270,6 +294,38 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			last_attempt_at timestamptz,
 			acknowledged_at timestamptz
 		)`, delivery, outbox),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			terminal_decision_id text PRIMARY KEY REFERENCES %s(decision_id),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			work_item_id text NOT NULL,
+			admission_grant_id text NOT NULL,
+			grant_generation bigint NOT NULL CHECK (grant_generation > 0),
+			runtime_fenced_or_terminal jsonb NOT NULL,
+			no_lease_physical_disposition jsonb NOT NULL,
+			physical_capacity_release_ready jsonb,
+			committed_at timestamptz NOT NULL
+			)`, capacityOutbox, decisions, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			lease_acquire_operation_id text PRIMARY KEY,
+			lease_acquire_digest bytea NOT NULL CHECK (octet_length(lease_acquire_digest) = 32),
+			runtime_run_id text NOT NULL UNIQUE REFERENCES %s(runtime_run_id),
+			start_operation_id text NOT NULL,
+			start_digest bytea NOT NULL CHECK (octet_length(start_digest) = 32),
+			work_item_id text NOT NULL,
+			admission_grant_id text NOT NULL,
+			grant_generation bigint NOT NULL CHECK (grant_generation > 0),
+			execution_node_id text NOT NULL,
+			node_capacity_generation bigint NOT NULL CHECK (node_capacity_generation > 0),
+			resource_class_id text NOT NULL,
+			execution_policy_id text NOT NULL,
+			scheduler_epoch bigint NOT NULL CHECK (scheduler_epoch > 0),
+			policy_version bigint NOT NULL CHECK (policy_version > 0),
+			safety_epoch bigint NOT NULL CHECK (safety_epoch > 0),
+			sandbox_lease_id text NOT NULL UNIQUE,
+			lease_generation bigint NOT NULL CHECK (lease_generation > 0),
+			lease_fence bigint NOT NULL CHECK (lease_fence > 0),
+			committed_at timestamptz NOT NULL
+		)`, preLeaseLeases, runtimes),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY,
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
@@ -542,6 +598,16 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 	if err != nil {
 		return RuntimeDecision{}, err
 	}
+	if start, ok := command.(StartRuntimeRun); ok {
+		decision, executeErr := authority.executePostgresStart(ctx, start, binding)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		return authority.advancePostgresPreLease(ctx, start, decision)
+	}
+	if cancel, ok := command.(CancelRuntimeRun); ok {
+		return authority.executePostgresCancel(ctx, cancel, binding)
+	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
@@ -621,6 +687,9 @@ func retainedCommandBinding(command RuntimeCommand) (retainedCommandBindingValue
 		}
 		if typed.SchemaVersion.Major() != SchemaV1.Major() {
 			return retainedCommandBindingValue{}, newError(ErrorUnsupportedSchema)
+		}
+		if !validStart(typed) {
+			return retainedCommandBindingValue{}, newError(ErrorInvalidRequest)
 		}
 		canonical, err := canonicalStartEncoding(typed)
 		if err != nil {
