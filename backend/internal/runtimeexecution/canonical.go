@@ -324,6 +324,53 @@ func CanonicalCancelPayload(command CancelRuntimeRun) ([]byte, error) {
 	return append([]byte(nil), encoded...), nil
 }
 
+// ParseCanonicalCancelPayload verifies and reconstructs the exact Task-authored
+// C03 cancellation request without supplementing its authority or identity.
+func ParseCanonicalCancelPayload(payload []byte, expectedDigest Digest) (CancelRuntimeRun, error) {
+	if len(payload) == 0 || expectedDigest == (Digest{}) || canonicalRequestDigest(payload) != expectedDigest {
+		return CancelRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
+	var wire canonicalCancel
+	if err := json.Unmarshal(payload, &wire); err != nil || wire.Kind != "cancel_runtime_run" ||
+		wire.Schema.Major == 0 || wire.Authority.Kind != "task_orchestration" {
+		return CancelRuntimeRun{}, newError(ErrorInvalidRequest)
+	}
+	reason := CancellationReason(0)
+	switch wire.Reason {
+	case "user_requested":
+		reason = CancellationUserRequested
+	case "administrator_requested":
+		reason = CancellationAdministratorRequested
+	}
+	occurredAt, err := time.Parse(canonicalTimeFormat, wire.OccurredAt)
+	if err != nil || reason == 0 {
+		return CancelRuntimeRun{}, newError(ErrorInvalidRequest)
+	}
+	command, err := NewCancelRuntimeRun(CancelRuntimeRunInput{
+		SchemaVersion:       NewSchemaVersion(wire.Schema.Major, wire.Schema.Minor),
+		OperationID:         OperationID{value: wire.OperationID},
+		PersonalWorkspaceID: PersonalWorkspaceID{value: wire.PersonalWorkspaceID},
+		TaskID:              TaskID{value: wire.TaskID}, PhaseRunID: PhaseRunID{value: wire.PhaseRunID},
+		RuntimeRunID:                RuntimeRunID{value: wire.RuntimeRunID},
+		ExpectedRuntimeRevision:     RuntimeRevision(wire.ExpectedRuntimeRevision),
+		ExpectedStartOperationID:    OperationID{value: wire.ExpectedStartOperationID},
+		ExpectedOperationGeneration: OperationGeneration(wire.ExpectedOperationGeneration),
+		ExpectedRuntimeFence:        RuntimeFence(wire.ExpectedRuntimeFence),
+		Authority: NewTaskOrchestrationAuthority(
+			AuthorityID{value: wire.Authority.ID}, AuthorizationGeneration(wire.Authority.Generation),
+		),
+		Reason: reason, SafetyEpoch: ReleaseSafetyEpoch(wire.SafetyEpoch), OccurredAt: occurredAt,
+	})
+	if err != nil || command.CanonicalRequestDigest != expectedDigest {
+		return CancelRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
+	encoded, err := canonicalCancelEncoding(command)
+	if err != nil || !bytes.Equal(encoded, payload) {
+		return CancelRuntimeRun{}, newError(ErrorIntegrityConflict)
+	}
+	return command, nil
+}
+
 func startInputFromCanonical(wire canonicalStart) (StartRuntimeRunInput, error) {
 	deadline, err := time.Parse(canonicalTimeFormat, wire.Deadline)
 	if err != nil || wire.Schema.Major == 0 || wire.Authority.Kind != "task_orchestration" {

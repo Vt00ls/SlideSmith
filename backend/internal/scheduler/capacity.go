@@ -66,7 +66,9 @@ func (authority *PostgresAuthority) ApplyNoLeasePhysicalDisposition(
 		WorkItemID: evidence.WorkItemID, AdmissionGrantID: evidence.AdmissionGrantID,
 		GrantGeneration: evidence.GrantGeneration, RuntimeRunID: evidence.RuntimeRunID,
 		StartOperationID: evidence.StartOperationID, StartDigest: evidence.StartDigest,
-		TerminalDecisionID: evidence.TerminalDecisionID, RuntimeFence: evidence.RuntimeFence,
+		TerminalDecisionID: evidence.TerminalDecisionID, RuntimeRevision: evidence.RuntimeRevision,
+		RuntimeFence: evidence.RuntimeFence, SchedulerEpoch: evidence.SchedulerEpoch,
+		PolicyVersion:           evidence.PolicyVersion,
 		LeaseAcquireOperationID: evidence.LeaseAcquireOperationID, LeaseAcquireDigest: evidence.LeaseAcquireDigest,
 	}
 	if !validRuntimeFencedEvidence(base) || evidence.ExecutionNodeID.String() == "" ||
@@ -134,7 +136,8 @@ func validRuntimeFencedEvidence(evidence runtimeexecution.RuntimeFencedOrTermina
 	return evidence.WorkItemID.String() != "" && evidence.AdmissionGrantID.String() != "" &&
 		evidence.GrantGeneration > 0 && evidence.RuntimeRunID.String() != "" &&
 		evidence.StartOperationID.String() != "" && evidence.StartDigest != (runtimeexecution.Digest{}) &&
-		evidence.TerminalDecisionID.String() != "" && evidence.RuntimeFence > 0 &&
+		evidence.TerminalDecisionID.String() != "" && evidence.RuntimeRevision > 0 && evidence.RuntimeFence > 0 &&
+		evidence.SchedulerEpoch > 0 && evidence.PolicyVersion > 0 &&
 		evidence.LeaseAcquireOperationID.String() != "" && evidence.LeaseAcquireDigest != (runtimeexecution.Digest{})
 }
 
@@ -145,20 +148,47 @@ func (authority *PostgresAuthority) lockAndValidateTerminalEvidence(
 ) (GrantState, error) {
 	var state GrantState
 	var operationID, runtimeRunID, boundDecisionID, leaseOperationID string
+	var terminalDecisionID string
 	var digest, leaseDigest []byte
-	var boundFence runtimeexecution.RuntimeFence
+	var boundRevision, terminalRevision runtimeexecution.RuntimeRevision
+	var boundFence, terminalFence runtimeexecution.RuntimeFence
+	var schedulerEpoch, policyVersion, terminalSchedulerEpoch, terminalPolicyVersion uint64
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT state, operation_id, payload_digest,
-		runtime_run_id, bound_decision_id, bound_runtime_fence,
-		lease_acquire_operation_id, lease_acquire_digest FROM %s
+		runtime_run_id, bound_decision_id, bound_runtime_revision, bound_runtime_fence,
+		scheduler_epoch, policy_version, lease_acquire_operation_id, lease_acquire_digest,
+		terminal_decision_id, terminal_runtime_revision, terminal_runtime_fence,
+		terminal_scheduler_epoch, terminal_policy_version FROM %s
 		WHERE admission_grant_id=$1 AND work_item_id=$2 AND generation=$3 FOR UPDATE`,
 		authority.table("scheduler_admission_grants")), evidence.AdmissionGrantID.String(),
 		evidence.WorkItemID.String(), evidence.GrantGeneration).Scan(&state, &operationID, &digest,
-		&runtimeRunID, &boundDecisionID, &boundFence, &leaseOperationID, &leaseDigest)
+		&runtimeRunID, &boundDecisionID, &boundRevision, &boundFence, &schedulerEpoch, &policyVersion,
+		&leaseOperationID, &leaseDigest, &terminalDecisionID, &terminalRevision, &terminalFence,
+		&terminalSchedulerEpoch, &terminalPolicyVersion)
 	if err != nil || operationID != evidence.StartOperationID.String() ||
 		!bytes.Equal(digest, evidence.StartDigest[:]) || runtimeRunID != evidence.RuntimeRunID.String() ||
-		boundDecisionID == "" || evidence.RuntimeFence <= boundFence ||
+		boundDecisionID == "" || evidence.RuntimeRevision <= boundRevision || evidence.RuntimeFence != boundFence+1 ||
+		evidence.SchedulerEpoch != schedulerEpoch || evidence.PolicyVersion != policyVersion ||
 		leaseOperationID != evidence.LeaseAcquireOperationID.String() ||
 		!bytes.Equal(leaseDigest, evidence.LeaseAcquireDigest[:]) {
+		return 0, newError(ErrorIntegrityConflict)
+	}
+	if terminalDecisionID == "" {
+		result, updateErr := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET
+			terminal_decision_id=$1, terminal_runtime_revision=$2, terminal_runtime_fence=$3,
+			terminal_scheduler_epoch=$4, terminal_policy_version=$5, updated_at=CURRENT_TIMESTAMP
+			WHERE admission_grant_id=$6 AND generation=$7 AND terminal_decision_id=''`,
+			authority.table("scheduler_admission_grants")), evidence.TerminalDecisionID.String(),
+			evidence.RuntimeRevision, evidence.RuntimeFence, evidence.SchedulerEpoch, evidence.PolicyVersion,
+			evidence.AdmissionGrantID.String(), evidence.GrantGeneration)
+		if updateErr != nil {
+			return 0, newError(ErrorDependencyUnavailable)
+		}
+		if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+			return 0, newError(ErrorIntegrityConflict)
+		}
+	} else if terminalDecisionID != evidence.TerminalDecisionID.String() ||
+		terminalRevision != evidence.RuntimeRevision || terminalFence != evidence.RuntimeFence ||
+		terminalSchedulerEpoch != evidence.SchedulerEpoch || terminalPolicyVersion != evidence.PolicyVersion {
 		return 0, newError(ErrorIntegrityConflict)
 	}
 	return state, nil

@@ -71,6 +71,9 @@ func (authority *PostgresAuthority) executePostgresStart(
 			record.fixture.TaskID != command.TaskID || record.fixture.PhaseRunID != command.PhaseRunID {
 			return RuntimeDecision{}, newError(ErrorAuthorizationDenied)
 		}
+		if authority.failAt(PersistenceFaultBeforeRequestLookup) {
+			return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
+		}
 		if replay, found, replayErr := authority.lookupPostgresCommandReplay(ctx, tx, record, binding); replayErr != nil {
 			return RuntimeDecision{}, replayErr
 		} else if found {
@@ -351,11 +354,15 @@ func (authority *PostgresAuthority) lookupPostgresCommandReplay(
 	if err != nil {
 		return RuntimeDecision{}, false, normalizeRuntimePersistenceFailure(err)
 	}
-	if retainedWorkspaceID != binding.workspaceID.String() || retainedKind != binding.kind ||
-		!bytes.Equal(retainedDigest, binding.digest[:]) || !bytes.Equal(retainedCanonical, binding.canonical) ||
-		retainedGrantID != binding.admissionGrantID.String() ||
-		retainedWorkItemID != binding.admissionWorkItemID.String() ||
-		retainedGrantGeneration != binding.admissionGrantGeneration {
+	coreMatches := retainedWorkspaceID == binding.workspaceID.String() && retainedKind == binding.kind &&
+		bytes.Equal(retainedDigest, binding.digest[:]) && bytes.Equal(retainedCanonical, binding.canonical)
+	exactGrant := retainedGrantID == binding.admissionGrantID.String() &&
+		retainedWorkItemID == binding.admissionWorkItemID.String() &&
+		retainedGrantGeneration == binding.admissionGrantGeneration
+	newerRedundantGrant := retainedKind == int16(CommandStartRuntimeRun) &&
+		retainedWorkItemID == binding.admissionWorkItemID.String() &&
+		binding.admissionGrantGeneration > retainedGrantGeneration
+	if !coreMatches || !exactGrant && !newerRedundantGrant {
 		if err := authority.recordIntegrityIncident(ctx, tx, binding, retainedKind, retainedDigest,
 			retainedGrantID, retainedWorkItemID, retainedGrantGeneration); err != nil {
 			return RuntimeDecision{}, false, err

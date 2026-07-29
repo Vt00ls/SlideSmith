@@ -156,7 +156,9 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		WorkItemID: startBinding.WorkItemID, AdmissionGrantID: startBinding.AdmissionGrantID,
 		GrantGeneration: startBinding.GrantGeneration, RuntimeRunID: command.RuntimeRunID,
 		StartOperationID: command.ExpectedStartOperationID, StartDigest: startBinding.Digest,
-		TerminalDecisionID: decisionID, RuntimeFence: record.fixture.RuntimeFence,
+		TerminalDecisionID: decisionID, RuntimeRevision: record.fixture.RuntimeRevision,
+		RuntimeFence: record.fixture.RuntimeFence, SchedulerEpoch: startBinding.SchedulerEpoch,
+		PolicyVersion:           startBinding.PolicyVersion,
 		LeaseAcquireOperationID: leaseBinding.AcquireOperationID, LeaseAcquireDigest: leaseBinding.AcquireDigest,
 	}
 	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{
@@ -165,7 +167,9 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 			WorkItemID: baseEvidence.WorkItemID, AdmissionGrantID: baseEvidence.AdmissionGrantID,
 			GrantGeneration: baseEvidence.GrantGeneration, RuntimeRunID: baseEvidence.RuntimeRunID,
 			StartOperationID: baseEvidence.StartOperationID, StartDigest: baseEvidence.StartDigest,
-			TerminalDecisionID: baseEvidence.TerminalDecisionID, RuntimeFence: baseEvidence.RuntimeFence,
+			TerminalDecisionID: baseEvidence.TerminalDecisionID, RuntimeRevision: baseEvidence.RuntimeRevision,
+			RuntimeFence: baseEvidence.RuntimeFence, SchedulerEpoch: baseEvidence.SchedulerEpoch,
+			PolicyVersion:           baseEvidence.PolicyVersion,
 			LeaseAcquireOperationID: baseEvidence.LeaseAcquireOperationID,
 			LeaseAcquireDigest:      baseEvidence.LeaseAcquireDigest,
 			ExecutionNodeID:         startBinding.ExecutionNodeID,
@@ -314,6 +318,22 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		decisionID.String(), auditID, auditDigest[:], record.fixture.RuntimeRevision,
 		SchemaV1, ProjectionPending); err != nil {
 		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
+	}
+	if command.Outcome == RuntimeCancelled && authority.schedulerCancellationParticipant != nil {
+		cancellationFact := SchedulerCancellationFact{
+			OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
+			RuntimeRunID: command.RuntimeRunID, DecisionID: decisionID,
+			RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
+			AcceptedAt: committedAt,
+		}
+		cancellationTransaction := &postgresSchedulerCancellationTransaction{
+			tx: tx, function: authority.schedulerCancellationFunction, fact: cancellationFact,
+		}
+		if err := authority.schedulerCancellationParticipant.ParticipateCancellation(
+			ctx, cancellationTransaction, cancellationFact,
+		); err != nil || !cancellationTransaction.called {
+			return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+		}
 	}
 	if authority.failAt(PersistenceFaultBeforeCommit) || authority.failAt(PersistenceFaultBeforeNoLeaseCommit) {
 		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)

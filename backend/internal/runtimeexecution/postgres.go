@@ -66,27 +66,31 @@ func newPersistenceError(code PersistenceErrorCode) *PersistenceError {
 }
 
 type PostgresConfig struct {
-	Schema                      string
-	Now                         func() time.Time
-	Faults                      PersistenceFaultInjector
-	ProjectionDelivery          ProjectionDelivery
-	SchedulerParticipant        SchedulerAcceptanceParticipant
-	SchedulerAcceptanceFunction string
-	LeaseAcquisition            LeaseAcquisitionAdapter
+	Schema                           string
+	Now                              func() time.Time
+	Faults                           PersistenceFaultInjector
+	ProjectionDelivery               ProjectionDelivery
+	SchedulerParticipant             SchedulerAcceptanceParticipant
+	SchedulerAcceptanceFunction      string
+	SchedulerCancellationParticipant SchedulerCancellationParticipant
+	SchedulerCancellationFunction    string
+	LeaseAcquisition                 LeaseAcquisitionAdapter
 }
 
 // PostgresAuthority owns C03 persistence behind the RuntimeExecution seam.
 // Its implementation does not expose SQL, a general repository, or a
 // caller-controlled transaction handle.
 type PostgresAuthority struct {
-	db                          *sql.DB
-	schema                      string
-	now                         func() time.Time
-	faults                      PersistenceFaultInjector
-	projection                  ProjectionDelivery
-	schedulerParticipant        SchedulerAcceptanceParticipant
-	schedulerAcceptanceFunction string
-	leaseAcquisition            LeaseAcquisitionAdapter
+	db                               *sql.DB
+	schema                           string
+	now                              func() time.Time
+	faults                           PersistenceFaultInjector
+	projection                       ProjectionDelivery
+	schedulerParticipant             SchedulerAcceptanceParticipant
+	schedulerAcceptanceFunction      string
+	schedulerCancellationParticipant SchedulerCancellationParticipant
+	schedulerCancellationFunction    string
+	leaseAcquisition                 LeaseAcquisitionAdapter
 }
 
 var _ RuntimeExecution = (*PostgresAuthority)(nil)
@@ -107,14 +111,18 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 		now = time.Now
 	}
 	if config.SchedulerParticipant != nil && !validPostgresQualifiedIdentifier(config.SchedulerAcceptanceFunction) ||
-		config.SchedulerParticipant == nil && config.SchedulerAcceptanceFunction != "" {
+		config.SchedulerParticipant == nil && config.SchedulerAcceptanceFunction != "" ||
+		config.SchedulerCancellationParticipant != nil && !validPostgresQualifiedIdentifier(config.SchedulerCancellationFunction) ||
+		config.SchedulerCancellationParticipant == nil && config.SchedulerCancellationFunction != "" {
 		return nil, newPersistenceError(PersistenceInvalidConfiguration)
 	}
 	return &PostgresAuthority{
 		db: db, schema: schema, now: now, faults: config.Faults, projection: config.ProjectionDelivery,
-		schedulerParticipant:        config.SchedulerParticipant,
-		schedulerAcceptanceFunction: config.SchedulerAcceptanceFunction,
-		leaseAcquisition:            config.LeaseAcquisition,
+		schedulerParticipant:             config.SchedulerParticipant,
+		schedulerAcceptanceFunction:      config.SchedulerAcceptanceFunction,
+		schedulerCancellationParticipant: config.SchedulerCancellationParticipant,
+		schedulerCancellationFunction:    config.SchedulerCancellationFunction,
+		leaseAcquisition:                 config.LeaseAcquisition,
 	}, nil
 }
 

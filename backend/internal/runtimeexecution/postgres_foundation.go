@@ -13,7 +13,8 @@ import (
 type PersistenceFaultPoint uint8
 
 const (
-	PersistenceFaultBeforeRuntimeWrite PersistenceFaultPoint = iota + 1
+	PersistenceFaultBeforeRequestLookup PersistenceFaultPoint = iota + 1
+	PersistenceFaultBeforeRuntimeWrite
 	PersistenceFaultBeforeDecision
 	PersistenceFaultBeforeMandatoryAudit
 	PersistenceFaultAfterMandatoryAudit
@@ -29,6 +30,8 @@ const (
 
 func (point PersistenceFaultPoint) String() string {
 	switch point {
+	case PersistenceFaultBeforeRequestLookup:
+		return "before_request_lookup"
 	case PersistenceFaultBeforeRuntimeWrite:
 		return "before_runtime_write"
 	case PersistenceFaultBeforeDecision:
@@ -70,7 +73,7 @@ type PersistenceFaultController struct {
 }
 
 func (controller *PersistenceFaultController) FailNextAt(point PersistenceFaultPoint) error {
-	if point < PersistenceFaultBeforeRuntimeWrite || point > PersistenceFaultAfterNoLeaseCommit {
+	if point < PersistenceFaultBeforeRequestLookup || point > PersistenceFaultAfterNoLeaseCommit {
 		return newPersistenceError(PersistenceInvalidConfiguration)
 	}
 	controller.mu.Lock()

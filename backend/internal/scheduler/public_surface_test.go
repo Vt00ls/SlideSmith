@@ -21,6 +21,7 @@ func TestSchedulingSurfaceHasNoGeneralCapacityReleaseOrNodeReadinessMutation(t *
 		"ApplyNoLeasePhysicalDisposition",
 		"ApplyRuntimeFencedOrTerminal",
 		"ClaimAndAdmit",
+		"ClaimCancellation",
 		"Inspect",
 	}
 	if !reflect.DeepEqual(methods, want) {

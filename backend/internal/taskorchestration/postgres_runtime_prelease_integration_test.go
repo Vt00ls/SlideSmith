@@ -130,6 +130,282 @@ func (clock *runtimeAdmissionClock) Set(now time.Time) {
 	clock.now = now.UTC()
 }
 
+func TestPostgresRuntimeAdmissionUsesOwnerPersonalWorkspaceAcrossTasks(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 11, 55, 0, 0, time.UTC)
+	permanent := runtimeexecution.LeaseAcquisitionAdapterFunc(func(
+		context.Context,
+		runtimeexecution.LeaseAcquisitionRequest,
+	) (runtimeexecution.LeaseAcquisitionObservation, error) {
+		return runtimeexecution.LeaseAcquisitionObservation{
+			Disposition:      runtimeexecution.LeaseAcquisitionPermanentFailure,
+			PermanentFailure: runtimeexecution.PreLeasePermanentImmutableBinding,
+		}, nil
+	})
+	system := newPostgresRuntimeAdmissionSystem(t, now, permanent, nil)
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "shared-personal-workspace-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	first := system.enqueueAndAdmitRuntimeForOwner(t, "owner-workspace-first", owner)
+	firstTerminal, err := system.runtime.Execute(context.Background(), first.start)
+	if err != nil {
+		t.Fatalf("terminalize first Runtime: %v", err)
+	}
+	assertAndConsumePostgresNoLeaseEvidence(t, system, first, firstTerminal.Snapshot)
+
+	second := system.enqueueAndAdmitRuntimeForOwner(t, "owner-workspace-second", owner)
+	if first.taskID == second.taskID || first.start.TaskID == second.start.TaskID {
+		t.Fatalf("test requires distinct Tasks: first=%+v second=%+v", first, second)
+	}
+	if first.start.PersonalWorkspaceID != second.start.PersonalWorkspaceID {
+		t.Fatalf("same User received Task-derived Personal Workspaces: first=%s second=%s",
+			first.start.PersonalWorkspaceID.String(), second.start.PersonalWorkspaceID.String())
+	}
+}
+
+func TestPostgresSchedulerInspectRequiresOwnerOrAdministratorScopeWithoutDisclosure(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 11, 57, 0, 0, time.UTC)
+	system := newPostgresRuntimeAdmissionSystem(t, now, nil, nil)
+	work := system.enqueueAndAdmitRuntime(t, "scheduler-inspect-scope")
+	workspaceID, err := scheduler.NewPersonalWorkspaceID(work.start.PersonalWorkspaceID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerRef := scheduler.WorkItemRef{
+		WorkItemID: work.canonical.WorkItemID,
+		Scope:      scheduler.NewOwnerWorkItemQueryScope(workspaceID),
+	}
+	ownerView, err := system.scheduling.Inspect(context.Background(), ownerRef)
+	if err != nil || ownerView.WorkItemID != work.canonical.WorkItemID {
+		t.Fatalf("owner scope could not inspect Work Item: view=%+v err=%v", ownerView, err)
+	}
+	administratorRef := ownerRef
+	administratorRef.Scope = scheduler.NewAdministratorWorkItemQueryScope()
+	administratorView, err := system.scheduling.Inspect(context.Background(), administratorRef)
+	if err != nil || administratorView != ownerView {
+		t.Fatalf("administrator scope could not inspect operational Work Item: view=%+v err=%v",
+			administratorView, err)
+	}
+
+	foreignWorkspaceID, err := scheduler.NewPersonalWorkspaceID("personal-workspace-foreign-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignRef := ownerRef
+	foreignRef.Scope = scheduler.NewOwnerWorkItemQueryScope(foreignWorkspaceID)
+	foreignView, err := system.scheduling.Inspect(context.Background(), foreignRef)
+	assertSchedulerErrorCode(t, err, scheduler.ErrorAuthorizationDenied)
+	if foreignView != (scheduler.WorkItemView{}) {
+		t.Fatalf("foreign scope disclosed Work Item fields: %+v", foreignView)
+	}
+}
+
+func TestPostgresSchedulerEnforcesEveryLogicalAdmissionLimitAgainstBoundReservations(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 11, 58, 0, 0, time.UTC)
+	temporary := runtimeexecution.LeaseAcquisitionAdapterFunc(func(
+		context.Context,
+		runtimeexecution.LeaseAcquisitionRequest,
+	) (runtimeexecution.LeaseAcquisitionObservation, error) {
+		return runtimeexecution.LeaseAcquisitionObservation{
+			Disposition: runtimeexecution.LeaseAcquisitionTemporaryUnavailable,
+		}, nil
+	})
+	for _, testCase := range []struct {
+		name string
+		slug string
+	}{
+		{name: "global", slug: "global"},
+		{name: "Personal Workspace", slug: "personal-workspace"},
+		{name: "worker class", slug: "worker-class"},
+		{name: "Resource Class", slug: "resource-class"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			limits := scheduler.AdmissionLimits{
+				Global: 4, PersonalWorkspace: 4, WorkerClass: 4, ResourceClass: 4,
+			}
+			switch testCase.name {
+			case "global":
+				limits.Global = 1
+			case "Personal Workspace":
+				limits.PersonalWorkspace = 1
+			case "worker class":
+				limits.WorkerClass = 1
+			case "Resource Class":
+				limits.ResourceClass = 1
+			}
+			system := newPostgresRuntimeAdmissionSystemWithLimits(
+				t, now, 10*time.Minute, limits, 4, temporary, nil,
+			)
+			firstOwner := taskorchestration.NewUserAuthority(
+				authorityID(t, "limit-first-owner-"+testCase.slug), taskorchestration.AuthorizationGeneration(1),
+			)
+			first := system.enqueueAndAdmitRuntimeForOwner(t, "limit-first-"+testCase.slug, firstOwner)
+			accepted, err := system.runtime.Execute(context.Background(), first.start)
+			if err != nil || accepted.Snapshot.State != runtimeexecution.RuntimeWaitingForLease {
+				t.Fatalf("bind first logical reservation: decision=%+v err=%v", accepted, err)
+			}
+			secondOwner := taskorchestration.NewUserAuthority(
+				authorityID(t, "limit-second-owner-"+testCase.slug), taskorchestration.AuthorizationGeneration(1),
+			)
+			if testCase.name == "Personal Workspace" {
+				secondOwner = firstOwner
+			}
+			system.enqueueRuntimeForOwner(t, "limit-second-"+testCase.slug, secondOwner)
+			_, err = system.scheduling.ClaimAndAdmit(context.Background())
+			assertSchedulerErrorCode(t, err, scheduler.ErrorNoEligibleWork)
+			view, inspectErr := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, first))
+			if inspectErr != nil || view.Grant.State != scheduler.GrantBound ||
+				view.LogicalReservation != scheduler.ReservationBound {
+				t.Fatalf("oversubscription rejection changed first reservation: view=%+v err=%v", view, inspectErr)
+			}
+		})
+	}
+}
+
+func TestPostgresSchedulerAlternatesEqualWeightPersonalWorkspaces(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 11, 59, 0, 0, time.UTC)
+	temporary := runtimeexecution.LeaseAcquisitionAdapterFunc(func(
+		context.Context,
+		runtimeexecution.LeaseAcquisitionRequest,
+	) (runtimeexecution.LeaseAcquisitionObservation, error) {
+		return runtimeexecution.LeaseAcquisitionObservation{
+			Disposition: runtimeexecution.LeaseAcquisitionTemporaryUnavailable,
+		}, nil
+	})
+	system := newPostgresRuntimeAdmissionSystemWithLimits(
+		t, now, 10*time.Minute,
+		scheduler.AdmissionLimits{Global: 4, PersonalWorkspace: 4, WorkerClass: 4, ResourceClass: 4},
+		4, temporary, nil,
+	)
+	ownerA := taskorchestration.NewUserAuthority(
+		authorityID(t, "fairness-owner-a"), taskorchestration.AuthorizationGeneration(1),
+	)
+	ownerB := taskorchestration.NewUserAuthority(
+		authorityID(t, "fairness-owner-b"), taskorchestration.AuthorizationGeneration(1),
+	)
+	for _, queued := range []struct {
+		suffix string
+		owner  taskorchestration.UserAuthority
+	}{
+		{suffix: "fairness-a1", owner: ownerA},
+		{suffix: "fairness-a2", owner: ownerA},
+		{suffix: "fairness-b1", owner: ownerB},
+		{suffix: "fairness-b2", owner: ownerB},
+	} {
+		system.enqueueRuntimeForOwner(t, queued.suffix, queued.owner)
+	}
+
+	wantTasks := []string{
+		"postgres-prelease-fairness-a1",
+		"postgres-prelease-fairness-b1",
+		"postgres-prelease-fairness-a2",
+		"postgres-prelease-fairness-b2",
+	}
+	var admitted []string
+	for range wantTasks {
+		work := system.claimRuntime(t)
+		admitted = append(admitted, work.start.TaskID.String())
+		accepted, err := system.runtime.Execute(context.Background(), work.start)
+		if err != nil || accepted.Snapshot.State != runtimeexecution.RuntimeWaitingForLease {
+			t.Fatalf("bind fair admission %s: decision=%+v err=%v", work.start.TaskID.String(), accepted, err)
+		}
+	}
+	if len(admitted) != len(wantTasks) {
+		t.Fatalf("admission count=%d want=%d", len(admitted), len(wantTasks))
+	}
+	for index := range wantTasks {
+		if admitted[index] != wantTasks[index] {
+			t.Fatalf("Workspace fairness order=%v want=%v", admitted, wantTasks)
+		}
+	}
+}
+
+func TestPostgresCanonicalCancellationUsesControlLaneWithoutPoisoningStartAdmission(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 12, 0, 0, 0, time.UTC)
+	temporary := runtimeexecution.LeaseAcquisitionAdapterFunc(func(
+		context.Context,
+		runtimeexecution.LeaseAcquisitionRequest,
+	) (runtimeexecution.LeaseAcquisitionObservation, error) {
+		return runtimeexecution.LeaseAcquisitionObservation{
+			Disposition: runtimeexecution.LeaseAcquisitionTemporaryUnavailable,
+		}, nil
+	})
+	system := newPostgresRuntimeAdmissionSystemWithLimits(
+		t, now, 10*time.Minute,
+		scheduler.AdmissionLimits{Global: 2, PersonalWorkspace: 2, WorkerClass: 2, ResourceClass: 2},
+		2, temporary, nil,
+	)
+	system.enableRuntimeCancellationParticipant(t)
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "canonical-cancel-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	running := system.enqueueAndAdmitRuntimeForOwner(t, "canonical-cancel-running", owner)
+	accepted, err := system.runtime.Execute(context.Background(), running.start)
+	if err != nil || accepted.Snapshot.State != runtimeexecution.RuntimeWaitingForLease {
+		t.Fatalf("accept Runtime before canonical cancellation: decision=%+v err=%v", accepted, err)
+	}
+	beforeCancel, err := system.tasks.Query(context.Background(), taskorchestration.TaskQuery{
+		TaskID: running.taskID, Authority: taskorchestration.NewUserQueryAuthority(owner),
+	})
+	if err != nil {
+		t.Fatalf("query Task before cancellation: %v", err)
+	}
+	cancelHeader := intentHeader(
+		t, "canonical-cancel-request", running.taskID.String(), now.Add(2*time.Second),
+	)
+	cancelHeader.ExpectedTaskRevision = beforeCancel.TaskRevision
+	cancelDecision, err := system.tasks.Decide(context.Background(), taskorchestration.NewCancelTaskByUserIntent(
+		cancelHeader, owner, taskorchestration.CancelReasonUserRequested,
+	))
+	if err != nil || len(cancelDecision.EnactmentRefs) == 0 {
+		t.Fatalf("Task cancellation did not enqueue canonical control work: decision=%+v err=%v", cancelDecision, err)
+	}
+	afterCancel, err := system.tasks.Query(context.Background(), taskorchestration.TaskQuery{
+		TaskID: running.taskID, Authority: taskorchestration.NewUserQueryAuthority(owner),
+	})
+	if err != nil || afterCancel.TaskRevision != cancelDecision.AcceptedTaskRevision {
+		t.Fatalf("Task Query lost accepted cancellation decision: view=%+v err=%v", afterCancel, err)
+	}
+
+	otherOwner := taskorchestration.NewUserAuthority(
+		authorityID(t, "canonical-cancel-other-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	system.enqueueRuntimeForOwner(t, "canonical-cancel-other-start", otherOwner)
+	otherStart := system.claimRuntime(t)
+	if otherStart.start.TaskID.String() != "postgres-prelease-canonical-cancel-other-start" {
+		t.Fatalf("cancellation poisoned Start admission: admitted=%s", otherStart.start.TaskID.String())
+	}
+
+	cancellation, err := system.scheduling.ClaimCancellation(context.Background())
+	if err != nil {
+		t.Fatalf("claim canonical cancellation control work: %v", err)
+	}
+	cancel, err := runtimeexecution.ParseCanonicalCancelPayload(
+		cancellation.CanonicalPayload, runtimeexecution.Digest(cancellation.PayloadDigest),
+	)
+	if err != nil || cancel.RuntimeRunID != running.start.RuntimeRunID ||
+		cancel.PersonalWorkspaceID != running.start.PersonalWorkspaceID {
+		t.Fatalf("Scheduler changed canonical cancellation: cancel=%+v err=%v", cancel, err)
+	}
+	cancelled, err := system.runtime.Execute(context.Background(), cancel)
+	if err != nil || cancelled.Snapshot.Outcome != runtimeexecution.RuntimeCancelled {
+		t.Fatalf("execute canonical cancellation: decision=%+v err=%v", cancelled, err)
+	}
+	inspected := inspectPostgresRuntime(t, system.runtime, running.start)
+	if inspected != cancelled.Snapshot {
+		t.Fatalf("C03 Inspect lost canonical cancellation: got=%+v want=%+v", inspected, cancelled.Snapshot)
+	}
+	cancelRef := scheduler.WorkItemRef{
+		WorkItemID: cancellation.WorkItemID,
+		Scope:      scheduler.NewOwnerWorkItemQueryScope(cancellation.PersonalWorkspaceID),
+	}
+	cancelView, err := system.scheduling.Inspect(context.Background(), cancelRef)
+	if err != nil || cancelView.State != scheduler.WorkItemAccepted ||
+		cancelView.Grant != (scheduler.GrantView{}) || cancelView.LogicalReservation != 0 ||
+		cancelView.SelectedNodeReservation != 0 {
+		t.Fatalf("Scheduler did not atomically consume cancellation Work Item: view=%+v err=%v", cancelView, err)
+	}
+}
+
 func TestPostgresBoundSelectedNodeReservationBlocksAnotherAdmission(t *testing.T) {
 	now := time.Date(2026, time.July, 29, 12, 0, 0, 0, time.UTC)
 	system := newPostgresRuntimeAdmissionSystem(t, now,
@@ -150,9 +426,7 @@ func TestPostgresBoundSelectedNodeReservationBlocksAnotherAdmission(t *testing.T
 	if accepted.Snapshot.State != runtimeexecution.RuntimeWaitingForLease {
 		t.Fatalf("first Runtime did not retain its bound reservation: %+v", accepted.Snapshot)
 	}
-	firstView, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: first.canonical.WorkItemID,
-	})
+	firstView, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, first))
 	if err != nil {
 		t.Fatalf("inspect first bound Work Item: %v", err)
 	}
@@ -195,9 +469,7 @@ func TestPostgresStartAcceptedBoundFaultMatrixIsAtomic(t *testing.T) {
 			}
 			system := newPostgresRuntimeAdmissionSystem(t, now, adapter, faults)
 			work := system.enqueueAndAdmitRuntime(t, "start-atomic-fault")
-			before, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-				WorkItemID: work.canonical.WorkItemID,
-			})
+			before, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 			if err != nil || before.State != scheduler.WorkItemDelivering ||
 				before.Grant.State != scheduler.GrantReservedUnbound ||
 				before.LogicalReservation != scheduler.ReservationReservedUnbound ||
@@ -210,9 +482,7 @@ func TestPostgresStartAcceptedBoundFaultMatrixIsAtomic(t *testing.T) {
 			_, err = system.runtime.Execute(context.Background(), work.start)
 			assertRuntimeExecutionErrorCode(t, err, testCase.wantCode)
 
-			after, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-				WorkItemID: work.canonical.WorkItemID,
-			})
+			after, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 			if err != nil {
 				t.Fatalf("inspect Scheduler after Start fault: %v", err)
 			}
@@ -261,6 +531,39 @@ func TestPostgresStartAcceptedBoundFaultMatrixIsAtomic(t *testing.T) {
 	}
 }
 
+func TestPostgresStartRequestLookupFaultPreservesOriginalDecision(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 12, 40, 0, 0, time.UTC)
+	faults := &runtimeexecution.PersistenceFaultController{}
+	adapter := &controlledLeaseAcquisitionAdapter{
+		observation: runtimeexecution.LeaseAcquisitionObservation{
+			Disposition: runtimeexecution.LeaseAcquisitionTemporaryUnavailable,
+		},
+	}
+	system := newPostgresRuntimeAdmissionSystem(t, now, adapter, faults)
+	work := system.enqueueAndAdmitRuntime(t, "start-request-lookup-fault")
+	accepted, err := system.runtime.Execute(context.Background(), work.start)
+	if err != nil {
+		t.Fatalf("accept Start before request lookup fault: %v", err)
+	}
+	callsBeforeFault := adapter.CallCount()
+	if err := faults.FailNextAt(runtimeexecution.PersistenceFaultBeforeRequestLookup); err != nil {
+		t.Fatal(err)
+	}
+	_, err = system.runtime.Execute(context.Background(), work.start)
+	assertRuntimeExecutionErrorCode(t, err, runtimeexecution.ErrorDependencyUnavailable)
+	if after := inspectPostgresRuntime(t, system.runtime, work.start); after != accepted.Snapshot ||
+		adapter.CallCount() != callsBeforeFault {
+		t.Fatalf("request lookup fault changed accepted authority or reached adapter: snapshot=%+v calls=%d/%d",
+			after, adapter.CallCount(), callsBeforeFault)
+	}
+	restarted := system.restartRuntime(t)
+	replayed, err := restarted.Execute(context.Background(), work.start)
+	if err != nil || replayed.Fact != accepted.Fact || replayed.Snapshot != accepted.Snapshot {
+		t.Fatalf("restart did not replay original Decision after request lookup fault: replay=%+v err=%v",
+			replayed, err)
+	}
+}
+
 func TestPostgresAcceptedBoundGrantCannotRotateRequeueOrRebind(t *testing.T) {
 	now := time.Date(2026, time.July, 29, 12, 45, 0, 0, time.UTC)
 	adapter := &controlledLeaseAcquisitionAdapter{
@@ -306,9 +609,7 @@ func TestPostgresAcceptedBoundGrantCannotRotateRequeueOrRebind(t *testing.T) {
 		t.Fatalf("accept rotated grant: %v", err)
 	}
 	assertPostgresStartAcceptedAndBound(t, system, work, accepted.Snapshot)
-	acceptedView, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: rotated.WorkItemID,
-	})
+	acceptedView, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,6 +627,17 @@ func TestPostgresAcceptedBoundGrantCannotRotateRequeueOrRebind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	higherStart := start
+	higherStart.AdmissionGrant = runtimeexecution.AdmissionGrantProof{
+		AdmissionGrantID: conflictingGrantID,
+		WorkItemID:       start.AdmissionGrant.WorkItemID,
+		Generation:       start.AdmissionGrant.Generation + 1,
+	}
+	higherReplay, err := system.runtime.Execute(context.Background(), higherStart)
+	if err != nil || higherReplay.Fact != accepted.Fact || higherReplay.Snapshot != accepted.Snapshot {
+		t.Fatalf("newer redundant grant did not return the original Decision: replay=%+v err=%v",
+			higherReplay, err)
+	}
 	for _, conflict := range []struct {
 		name  string
 		proof runtimeexecution.AdmissionGrantProof
@@ -336,14 +648,6 @@ func TestPostgresAcceptedBoundGrantCannotRotateRequeueOrRebind(t *testing.T) {
 				AdmissionGrantID: start.AdmissionGrant.AdmissionGrantID,
 				WorkItemID:       start.AdmissionGrant.WorkItemID,
 				Generation:       start.AdmissionGrant.Generation - 1,
-			},
-		},
-		{
-			name: "higher generation",
-			proof: runtimeexecution.AdmissionGrantProof{
-				AdmissionGrantID: start.AdmissionGrant.AdmissionGrantID,
-				WorkItemID:       start.AdmissionGrant.WorkItemID,
-				Generation:       start.AdmissionGrant.Generation + 1,
 			},
 		},
 		{
@@ -369,9 +673,7 @@ func TestPostgresAcceptedBoundGrantCannotRotateRequeueOrRebind(t *testing.T) {
 			_, err := system.runtime.Execute(context.Background(), conflictingStart)
 			assertRuntimeExecutionErrorCode(t, err, runtimeexecution.ErrorIntegrityConflict)
 			afterRuntime := inspectPostgresRuntime(t, system.runtime, start)
-			afterView, inspectErr := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-				WorkItemID: rotated.WorkItemID,
-			})
+			afterView, inspectErr := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 			if inspectErr != nil || afterRuntime != accepted.Snapshot || afterView != acceptedView {
 				t.Fatalf("grant conflict changed original Accepted/Bound authority: runtime=%+v scheduler=%+v err=%v",
 					afterRuntime, afterView, inspectErr)
@@ -386,9 +688,7 @@ func TestPostgresAcceptedBoundGrantCannotRotateRequeueOrRebind(t *testing.T) {
 		t.Fatalf("Accepted Work Item was eligible for requeue/re-admission after expiry: %T %v", err, err)
 	}
 	afterExpiryRuntime := inspectPostgresRuntime(t, system.runtime, start)
-	afterExpiryView, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: rotated.WorkItemID,
-	})
+	afterExpiryView, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 	if err != nil || afterExpiryRuntime != accepted.Snapshot || afterExpiryView != acceptedView ||
 		afterExpiryView.State != scheduler.WorkItemAccepted || afterExpiryView.Grant.State != scheduler.GrantBound {
 		t.Fatalf("accepted grant expiry unbound, requeued, rebound, or re-admitted work: runtime=%+v scheduler=%+v err=%v",
@@ -795,6 +1095,57 @@ func TestPostgresLeaseCancelAndDeadlineRacesCommitZeroOrOneLease(t *testing.T) {
 		assertPostgresStartAcceptedAndBound(t, system, work, deadline.Snapshot)
 		assertAndConsumePostgresNoLeaseEvidence(t, system, work, deadline.Snapshot)
 	})
+
+	for _, testCase := range []struct {
+		name        string
+		advanceTo   func(runtimeexecution.RuntimeSnapshot) time.Time
+		wantOutcome runtimeexecution.RuntimeOutcome
+		wantReason  runtimeexecution.PreLeaseTerminalReason
+	}{
+		{
+			name: "lease observation crosses admission authority expiry",
+			advanceTo: func(snapshot runtimeexecution.RuntimeSnapshot) time.Time {
+				return snapshot.LeaseAcquireBy
+			},
+			wantOutcome: runtimeexecution.RuntimeRejected,
+			wantReason:  runtimeexecution.PreLeaseTerminalAdmissionAuthorityExpired,
+		},
+		{
+			name: "lease observation crosses Runtime deadline",
+			advanceTo: func(snapshot runtimeexecution.RuntimeSnapshot) time.Time {
+				return snapshot.Deadline
+			},
+			wantOutcome: runtimeexecution.RuntimeTimedOut,
+			wantReason:  runtimeexecution.PreLeaseTerminalRuntimeDeadline,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			barrier := &secondCallLeaseBarrier{entered: make(chan struct{}), release: make(chan struct{})}
+			system := newPostgresRuntimeAdmissionSystem(t, now, barrier, nil)
+			work := system.enqueueAndAdmitRuntime(t, "lease-clock-linearization")
+			accepted, err := system.runtime.Execute(context.Background(), work.start)
+			if err != nil || accepted.Snapshot.State != runtimeexecution.RuntimeWaitingForLease {
+				t.Fatalf("accept Runtime before clock crossing: decision=%+v err=%v", accepted, err)
+			}
+			leaseResult := make(chan executeResult, 1)
+			go func() {
+				decision, err := system.runtime.Execute(context.Background(), work.start)
+				leaseResult <- executeResult{decision: decision, err: err}
+			}()
+			<-barrier.entered
+			system.clock.Set(testCase.advanceTo(accepted.Snapshot))
+			close(barrier.release)
+			result := <-leaseResult
+			if result.err != nil || result.decision.Fact != accepted.Fact ||
+				result.decision.Snapshot.Outcome != testCase.wantOutcome ||
+				result.decision.Snapshot.PreLeaseTerminalReason != testCase.wantReason ||
+				result.decision.Snapshot.Lease.AcquireStatus != runtimeexecution.LeaseNotRequested {
+				t.Fatalf("lease linearized after its clock authority: result=%+v", result)
+			}
+			assertPostgresStartAcceptedAndBound(t, system, work, result.decision.Snapshot)
+			assertAndConsumePostgresNoLeaseEvidence(t, system, work, result.decision.Snapshot)
+		})
+	}
 }
 
 func TestPostgresSchedulerCapacityEvidenceBridgeRejectsConflictsAndSeparatesAuthority(t *testing.T) {
@@ -816,9 +1167,7 @@ func TestPostgresSchedulerCapacityEvidenceBridgeRejectsConflictsAndSeparatesAuth
 	}
 	fenced := terminal.Snapshot.CapacityEvidence.RuntimeFencedOrTerminal
 	noLease := terminal.Snapshot.CapacityEvidence.NoLeasePhysicalDisposition
-	before, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: work.canonical.WorkItemID,
-	})
+	before, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 	if err != nil || before.LogicalReservation != scheduler.ReservationBound ||
 		before.SelectedNodeReservation != scheduler.ReservationBound || before.Grant.State != scheduler.GrantBound {
 		t.Fatalf("terminal evidence precondition lost bound capacity: view=%+v err=%v", before, err)
@@ -858,9 +1207,7 @@ func TestPostgresSchedulerCapacityEvidenceBridgeRejectsConflictsAndSeparatesAuth
 		t.Run("reject mismatched "+conflict.name, func(t *testing.T) {
 			err := system.scheduling.ApplyRuntimeFencedOrTerminal(context.Background(), conflict.evidence)
 			assertSchedulerErrorCode(t, err, scheduler.ErrorIntegrityConflict)
-			after, inspectErr := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-				WorkItemID: work.canonical.WorkItemID,
-			})
+			after, inspectErr := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 			if inspectErr != nil || after != before {
 				t.Fatalf("conflicting logical evidence changed capacity: before=%+v after=%+v err=%v",
 					before, after, inspectErr)
@@ -876,9 +1223,7 @@ func TestPostgresSchedulerCapacityEvidenceBridgeRejectsConflictsAndSeparatesAuth
 	wrongNode.ExecutionNodeID = wrongNodeID
 	err = system.scheduling.ApplyNoLeasePhysicalDisposition(context.Background(), wrongNode)
 	assertSchedulerErrorCode(t, err, scheduler.ErrorIntegrityConflict)
-	afterWrongNode, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: work.canonical.WorkItemID,
-	})
+	afterWrongNode, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 	if err != nil || afterWrongNode != before {
 		t.Fatalf("mismatched node evidence changed capacity: before=%+v after=%+v err=%v",
 			before, afterWrongNode, err)
@@ -890,9 +1235,7 @@ func TestPostgresSchedulerCapacityEvidenceBridgeRejectsConflictsAndSeparatesAuth
 	if err := system.scheduling.ApplyNoLeasePhysicalDisposition(context.Background(), noLease); err != nil {
 		t.Fatalf("replay exact no-lease disposition: %v", err)
 	}
-	physicalOnly, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: work.canonical.WorkItemID,
-	})
+	physicalOnly, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 	if err != nil || physicalOnly.LogicalReservation != scheduler.ReservationBound ||
 		physicalOnly.SelectedNodeReservation != scheduler.ReservationReleased ||
 		physicalOnly.Grant.State != scheduler.GrantTerminalNoLease {
@@ -904,13 +1247,106 @@ func TestPostgresSchedulerCapacityEvidenceBridgeRejectsConflictsAndSeparatesAuth
 	if err := system.scheduling.ApplyRuntimeFencedOrTerminal(context.Background(), fenced); err != nil {
 		t.Fatalf("replay exact logical disposition: %v", err)
 	}
-	fullyReleased, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: work.canonical.WorkItemID,
-	})
+	fullyReleased, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 	if err != nil || fullyReleased.LogicalReservation != scheduler.ReservationReleased ||
 		fullyReleased.SelectedNodeReservation != scheduler.ReservationReleased ||
 		fullyReleased.Grant.State != scheduler.GrantReleased {
 		t.Fatalf("separate evidence did not converge idempotently: view=%+v err=%v", fullyReleased, err)
+	}
+}
+
+func TestPostgresSchedulerCapacityEvidenceRetainsExactTerminalIdentityAcrossEvidenceClasses(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 14, 57, 0, 0, time.UTC)
+	permanent := runtimeexecution.LeaseAcquisitionAdapterFunc(func(
+		context.Context,
+		runtimeexecution.LeaseAcquisitionRequest,
+	) (runtimeexecution.LeaseAcquisitionObservation, error) {
+		return runtimeexecution.LeaseAcquisitionObservation{
+			Disposition:      runtimeexecution.LeaseAcquisitionPermanentFailure,
+			PermanentFailure: runtimeexecution.PreLeasePermanentImmutableBinding,
+		}, nil
+	})
+	system := newPostgresRuntimeAdmissionSystem(t, now, permanent, nil)
+	work := system.enqueueAndAdmitRuntime(t, "scheduler-retained-terminal-identity")
+	terminal, err := system.runtime.Execute(context.Background(), work.start)
+	if err != nil || terminal.Snapshot.Outcome != runtimeexecution.RuntimeRejected {
+		t.Fatalf("create first proven no-lease Runtime: decision=%+v err=%v", terminal, err)
+	}
+
+	noLease := terminal.Snapshot.CapacityEvidence.NoLeasePhysicalDisposition
+	if err := system.scheduling.ApplyNoLeasePhysicalDisposition(context.Background(), noLease); err != nil {
+		t.Fatalf("retain exact no-lease terminal identity: %v", err)
+	}
+	if err := system.scheduling.ApplyRuntimeFencedOrTerminal(
+		context.Background(), terminal.Snapshot.CapacityEvidence.RuntimeFencedOrTerminal,
+	); err != nil {
+		t.Fatalf("release first exact logical terminal identity: %v", err)
+	}
+	foreignWork := system.enqueueAndAdmitRuntime(t, "scheduler-foreign-terminal-identity")
+	foreignTerminal, err := system.runtime.Execute(context.Background(), foreignWork.start)
+	if err != nil || foreignTerminal.Snapshot.Outcome != runtimeexecution.RuntimeRejected {
+		t.Fatalf("create foreign proven no-lease Runtime: decision=%+v err=%v", foreignTerminal, err)
+	}
+
+	baseFenced := terminal.Snapshot.CapacityEvidence.RuntimeFencedOrTerminal
+	alteredDecision := baseFenced
+	alteredDecision.TerminalDecisionID = foreignTerminal.Snapshot.CapacityEvidence.RuntimeFencedOrTerminal.TerminalDecisionID
+	alteredRevision := baseFenced
+	alteredRevision.RuntimeRevision++
+	alteredFence := baseFenced
+	alteredFence.RuntimeFence++
+	alteredEpoch := baseFenced
+	alteredEpoch.SchedulerEpoch++
+	alteredPolicy := baseFenced
+	alteredPolicy.PolicyVersion++
+	for _, testCase := range []struct {
+		name     string
+		evidence runtimeexecution.RuntimeFencedOrTerminalEvidence
+	}{
+		{name: "terminal Decision", evidence: alteredDecision},
+		{name: "Runtime revision", evidence: alteredRevision},
+		{name: "Runtime fence", evidence: alteredFence},
+		{name: "Scheduler epoch", evidence: alteredEpoch},
+		{name: "policy version", evidence: alteredPolicy},
+	} {
+		t.Run("logical rejects altered "+testCase.name, func(t *testing.T) {
+			err := system.scheduling.ApplyRuntimeFencedOrTerminal(context.Background(), testCase.evidence)
+			assertSchedulerErrorCode(t, err, scheduler.ErrorIntegrityConflict)
+		})
+	}
+
+	baseNoLease := terminal.Snapshot.CapacityEvidence.NoLeasePhysicalDisposition
+	alteredNoLeaseDecision := baseNoLease
+	alteredNoLeaseDecision.TerminalDecisionID = foreignTerminal.Snapshot.CapacityEvidence.RuntimeFencedOrTerminal.TerminalDecisionID
+	alteredNoLeaseRevision := baseNoLease
+	alteredNoLeaseRevision.RuntimeRevision++
+	alteredNoLeaseFence := baseNoLease
+	alteredNoLeaseFence.RuntimeFence++
+	alteredNoLeaseEpoch := baseNoLease
+	alteredNoLeaseEpoch.SchedulerEpoch++
+	alteredNoLeasePolicy := baseNoLease
+	alteredNoLeasePolicy.PolicyVersion++
+	for _, testCase := range []struct {
+		name     string
+		evidence runtimeexecution.NoLeasePhysicalDispositionEvidence
+	}{
+		{name: "terminal Decision", evidence: alteredNoLeaseDecision},
+		{name: "Runtime revision", evidence: alteredNoLeaseRevision},
+		{name: "Runtime fence", evidence: alteredNoLeaseFence},
+		{name: "Scheduler epoch", evidence: alteredNoLeaseEpoch},
+		{name: "policy version", evidence: alteredNoLeasePolicy},
+	} {
+		t.Run("no-lease rejects altered "+testCase.name, func(t *testing.T) {
+			err := system.scheduling.ApplyNoLeasePhysicalDisposition(context.Background(), testCase.evidence)
+			assertSchedulerErrorCode(t, err, scheduler.ErrorIntegrityConflict)
+		})
+	}
+
+	view, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
+	if err != nil || view.LogicalReservation != scheduler.ReservationReleased ||
+		view.SelectedNodeReservation != scheduler.ReservationReleased ||
+		view.Grant.State != scheduler.GrantReleased {
+		t.Fatalf("altered terminal identity changed retained capacity: view=%+v err=%v", view, err)
 	}
 }
 
@@ -982,13 +1418,17 @@ func TestPostgresRuntimeCodecRoundTripsAdmissionTerminalAndCapacityEvidence(t *t
 		fenced.RuntimeRunID != work.start.RuntimeRunID ||
 		fenced.StartOperationID != work.start.OperationID ||
 		fenced.StartDigest != work.start.CanonicalRequestDigest ||
-		fenced.TerminalDecisionID.String() == "" || fenced.RuntimeFence != snapshot.RuntimeFence ||
+		fenced.TerminalDecisionID.String() == "" || fenced.RuntimeRevision != snapshot.RuntimeRevision ||
+		fenced.RuntimeFence != snapshot.RuntimeFence || fenced.SchedulerEpoch != waiting.Operation.SchedulerEpoch ||
+		fenced.PolicyVersion != waiting.Operation.PolicyVersion ||
 		fenced.LeaseAcquireOperationID != waiting.Lease.AcquireOperationID ||
 		fenced.LeaseAcquireDigest != waiting.Lease.AcquireDigest ||
 		noLease.WorkItemID != fenced.WorkItemID || noLease.AdmissionGrantID != fenced.AdmissionGrantID ||
 		noLease.GrantGeneration != fenced.GrantGeneration || noLease.RuntimeRunID != fenced.RuntimeRunID ||
 		noLease.StartOperationID != fenced.StartOperationID || noLease.StartDigest != fenced.StartDigest ||
-		noLease.TerminalDecisionID != fenced.TerminalDecisionID || noLease.RuntimeFence != fenced.RuntimeFence ||
+		noLease.TerminalDecisionID != fenced.TerminalDecisionID || noLease.RuntimeRevision != fenced.RuntimeRevision ||
+		noLease.RuntimeFence != fenced.RuntimeFence || noLease.SchedulerEpoch != fenced.SchedulerEpoch ||
+		noLease.PolicyVersion != fenced.PolicyVersion ||
 		noLease.LeaseAcquireOperationID != fenced.LeaseAcquireOperationID ||
 		noLease.LeaseAcquireDigest != fenced.LeaseAcquireDigest ||
 		noLease.ExecutionNodeID != waiting.Operation.ExecutionNodeID ||
@@ -1173,6 +1613,22 @@ func (system *postgresRuntimeAdmissionSystem) replaceRuntimeSchedulerParticipant
 	system.runtime = restarted
 }
 
+func (system *postgresRuntimeAdmissionSystem) enableRuntimeCancellationParticipant(t *testing.T) {
+	t.Helper()
+	restarted, err := runtimeexecution.NewPostgresAuthority(system.db, runtimeexecution.PostgresConfig{
+		Schema: system.schema, Now: system.clock.Now, Faults: system.faults,
+		SchedulerParticipant:             system.scheduling.RuntimeAcceptanceParticipant(),
+		SchedulerAcceptanceFunction:      system.scheduling.RuntimeAcceptanceFunction(),
+		SchedulerCancellationParticipant: system.scheduling.RuntimeCancellationParticipant(),
+		SchedulerCancellationFunction:    system.scheduling.RuntimeCancellationFunction(),
+		LeaseAcquisition:                 system.lease,
+	})
+	if err != nil {
+		t.Fatalf("enable Runtime cancellation participant: %v", err)
+	}
+	system.runtime = restarted
+}
+
 func newPostgresPreLeaseCancel(
 	t *testing.T,
 	start runtimeexecution.StartRuntimeRun,
@@ -1221,6 +1677,18 @@ func assertSchedulerErrorCode(t *testing.T, err error, want scheduler.ErrorCode)
 	var schedulingError *scheduler.Error
 	if !errors.As(err, &schedulingError) || schedulingError.Code() != want {
 		t.Fatalf("Scheduler error = %T %v, want code %v", err, err, want)
+	}
+}
+
+func schedulerOwnerWorkItemRef(t *testing.T, work admittedRuntimeWork) scheduler.WorkItemRef {
+	t.Helper()
+	personalWorkspaceID, err := scheduler.NewPersonalWorkspaceID(work.start.PersonalWorkspaceID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return scheduler.WorkItemRef{
+		WorkItemID: work.canonical.WorkItemID,
+		Scope:      scheduler.NewOwnerWorkItemQueryScope(personalWorkspaceID),
 	}
 }
 
@@ -1290,9 +1758,7 @@ func assertPostgresStartAcceptedAndBound(
 	snapshot runtimeexecution.RuntimeSnapshot,
 ) {
 	t.Helper()
-	view, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: work.canonical.WorkItemID,
-	})
+	view, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 	if err != nil {
 		t.Fatalf("inspect Scheduler Work Item: %v", err)
 	}
@@ -1347,9 +1813,7 @@ func assertAndConsumePostgresNoLeaseEvidence(
 	if err := system.scheduling.ApplyRuntimeFencedOrTerminal(context.Background(), fenced); err != nil {
 		t.Fatalf("replay logical disposition: %v", err)
 	}
-	view, err := system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: work.canonical.WorkItemID,
-	})
+	view, err := system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1364,9 +1828,7 @@ func assertAndConsumePostgresNoLeaseEvidence(
 	if err := system.scheduling.ApplyNoLeasePhysicalDisposition(context.Background(), noLease); err != nil {
 		t.Fatalf("replay no-lease disposition: %v", err)
 	}
-	view, err = system.scheduling.Inspect(context.Background(), scheduler.WorkItemRef{
-		WorkItemID: work.canonical.WorkItemID,
-	})
+	view, err = system.scheduling.Inspect(context.Background(), schedulerOwnerWorkItemRef(t, work))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1416,6 +1878,23 @@ func newPostgresRuntimeAdmissionSystemWithGrantTTL(
 	faults runtimeexecution.PersistenceFaultInjector,
 ) *postgresRuntimeAdmissionSystem {
 	t.Helper()
+	return newPostgresRuntimeAdmissionSystemWithLimits(
+		t, now, grantTTL,
+		scheduler.AdmissionLimits{Global: 1, PersonalWorkspace: 1, WorkerClass: 1, ResourceClass: 1},
+		1, leaseAcquisition, faults,
+	)
+}
+
+func newPostgresRuntimeAdmissionSystemWithLimits(
+	t *testing.T,
+	now time.Time,
+	grantTTL time.Duration,
+	limits scheduler.AdmissionLimits,
+	availableRuntimeSlots uint64,
+	leaseAcquisition runtimeexecution.LeaseAcquisitionAdapter,
+	faults runtimeexecution.PersistenceFaultInjector,
+) *postgresRuntimeAdmissionSystem {
+	t.Helper()
 	db, schema := isolatedPostgresSchema(t)
 	clock := &runtimeAdmissionClock{now: now.UTC()}
 	nodeID, err := scheduler.NewExecutionNodeID("issue-75-node")
@@ -1437,12 +1916,13 @@ func newPostgresRuntimeAdmissionSystemWithGrantTTL(
 			SchedulerEpoch: 1,
 			PolicyVersion:  1,
 			GrantTTL:       grantTTL,
+			Limits:         limits,
 			Node: scheduler.ExecutionNodeConfig{
 				ExecutionNodeID:       nodeID,
 				CapacityGeneration:    1,
 				ResourceClassID:       resourceClassID,
 				ExecutionPolicyID:     executionPolicyID,
-				AvailableRuntimeSlots: 1,
+				AvailableRuntimeSlots: availableRuntimeSlots,
 			},
 		},
 	})
@@ -1478,11 +1958,21 @@ func newPostgresRuntimeAdmissionSystemWithGrantTTL(
 
 func (system *postgresRuntimeAdmissionSystem) enqueueRuntime(t *testing.T, suffix string) taskorchestration.UserAuthority {
 	t.Helper()
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "postgres-prelease-"+suffix+"-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	system.enqueueRuntimeForOwner(t, suffix, owner)
+	return owner
+}
+
+func (system *postgresRuntimeAdmissionSystem) enqueueRuntimeForOwner(
+	t *testing.T,
+	suffix string,
+	owner taskorchestration.UserAuthority,
+) {
+	t.Helper()
 	now := system.clock.Now()
 	taskValue := "postgres-prelease-" + suffix
-	owner := taskorchestration.NewUserAuthority(
-		authorityID(t, taskValue+"-owner"), taskorchestration.AuthorizationGeneration(1),
-	)
 	worker := taskorchestration.NewWorkerAuthority(
 		authorityID(t, taskValue+"-worker"), taskorchestration.AuthorizationGeneration(1),
 	)
@@ -1514,15 +2004,44 @@ func (system *postgresRuntimeAdmissionSystem) enqueueRuntime(t *testing.T, suffi
 	if len(view.PhaseRuns) != 1 || len(view.PhaseRuns[0].RuntimeRuns) != 1 {
 		t.Fatalf("Task %s did not expose one pre-created Runtime Run: %+v", suffix, view)
 	}
-	return owner
 }
 
 func (system *postgresRuntimeAdmissionSystem) enqueueAndAdmitRuntime(t *testing.T, suffix string) admittedRuntimeWork {
 	t.Helper()
 	owner := system.enqueueRuntime(t, suffix)
+	return system.admitRuntime(t, suffix, owner)
+}
+
+func (system *postgresRuntimeAdmissionSystem) enqueueAndAdmitRuntimeForOwner(
+	t *testing.T,
+	suffix string,
+	owner taskorchestration.UserAuthority,
+) admittedRuntimeWork {
+	t.Helper()
+	system.enqueueRuntimeForOwner(t, suffix, owner)
+	return system.admitRuntime(t, suffix, owner)
+}
+
+func (system *postgresRuntimeAdmissionSystem) admitRuntime(
+	t *testing.T,
+	suffix string,
+	owner taskorchestration.UserAuthority,
+) admittedRuntimeWork {
+	t.Helper()
+	work := system.claimRuntime(t)
+	wantTaskID := taskID(t, "postgres-prelease-"+suffix)
+	if work.taskID != wantTaskID {
+		t.Fatalf("claim and admit Runtime %s selected Task %s", suffix, work.start.TaskID.String())
+	}
+	work.owner = owner
+	return work
+}
+
+func (system *postgresRuntimeAdmissionSystem) claimRuntime(t *testing.T) admittedRuntimeWork {
+	t.Helper()
 	decision, err := system.scheduling.ClaimAndAdmit(context.Background())
 	if err != nil {
-		t.Fatalf("claim and admit Runtime %s: %v", suffix, err)
+		t.Fatalf("claim and admit Runtime: %v", err)
 	}
 	grantID, err := runtimeexecution.NewAdmissionGrantID(decision.Grant.AdmissionGrantID.String())
 	if err != nil {
@@ -1542,10 +2061,10 @@ func (system *postgresRuntimeAdmissionSystem) enqueueAndAdmitRuntime(t *testing.
 		},
 	)
 	if err != nil {
-		t.Fatalf("bind canonical Runtime Start for %s: %v", suffix, err)
+		t.Fatalf("bind canonical Runtime Start: %v", err)
 	}
 	return admittedRuntimeWork{
-		owner: owner, taskID: taskID(t, "postgres-prelease-"+suffix),
+		taskID:    taskID(t, decision.TaskID),
 		canonical: decision, start: start,
 	}
 }

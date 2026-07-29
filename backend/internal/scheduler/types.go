@@ -19,6 +19,7 @@ type (
 )
 
 type WorkItemID struct{ value string }
+type PersonalWorkspaceID = runtimeexecution.PersonalWorkspaceID
 type AdmissionGrantID struct{ value string }
 type DeliveryClaimID struct{ value string }
 type ExecutionNodeID struct{ value string }
@@ -30,6 +31,10 @@ func NewExecutionNodeID(value string) (ExecutionNodeID, error) {
 		return ExecutionNodeID{}, newError(ErrorInvalidRequest)
 	}
 	return ExecutionNodeID{value: value}, nil
+}
+
+func NewPersonalWorkspaceID(value string) (PersonalWorkspaceID, error) {
+	return runtimeexecution.NewPersonalWorkspaceID(value)
 }
 
 func NewResourceClassID(value string) (ResourceClassID, error) {
@@ -88,18 +93,51 @@ type AdmissionGrant struct {
 }
 
 type AdmissionDecision struct {
-	WorkItemID       WorkItemID
-	OperationID      string
-	TaskID           string
-	PhaseRunID       string
-	RuntimeRunID     string
-	PayloadDigest    Digest
-	CanonicalPayload []byte
-	Grant            AdmissionGrant
+	WorkItemID          WorkItemID
+	PersonalWorkspaceID PersonalWorkspaceID
+	OperationID         string
+	TaskID              string
+	PhaseRunID          string
+	RuntimeRunID        string
+	PayloadDigest       Digest
+	CanonicalPayload    []byte
+	Grant               AdmissionGrant
+}
+
+type CancellationDecision struct {
+	WorkItemID          WorkItemID
+	PersonalWorkspaceID PersonalWorkspaceID
+	OperationID         string
+	TaskID              string
+	PhaseRunID          string
+	RuntimeRunID        string
+	PayloadDigest       Digest
+	CanonicalPayload    []byte
+}
+
+type WorkItemQueryScopeKind uint8
+
+const (
+	WorkItemQueryOwner WorkItemQueryScopeKind = iota + 1
+	WorkItemQueryAdministrator
+)
+
+type WorkItemQueryScope struct {
+	kind                WorkItemQueryScopeKind
+	personalWorkspaceID PersonalWorkspaceID
+}
+
+func NewOwnerWorkItemQueryScope(personalWorkspaceID PersonalWorkspaceID) WorkItemQueryScope {
+	return WorkItemQueryScope{kind: WorkItemQueryOwner, personalWorkspaceID: personalWorkspaceID}
+}
+
+func NewAdministratorWorkItemQueryScope() WorkItemQueryScope {
+	return WorkItemQueryScope{kind: WorkItemQueryAdministrator}
 }
 
 type WorkItemRef struct {
 	WorkItemID WorkItemID
+	Scope      WorkItemQueryScope
 }
 
 type GrantView struct {
@@ -130,6 +168,7 @@ const (
 
 type Scheduling interface {
 	ClaimAndAdmit(context.Context) (AdmissionDecision, error)
+	ClaimCancellation(context.Context) (CancellationDecision, error)
 	Inspect(context.Context, WorkItemRef) (WorkItemView, error)
 	ApplyRuntimeFencedOrTerminal(context.Context, runtimeexecution.RuntimeFencedOrTerminalEvidence) error
 	ApplyNoLeasePhysicalDisposition(context.Context, runtimeexecution.NoLeasePhysicalDispositionEvidence) error
@@ -142,6 +181,7 @@ const (
 	ErrorNoEligibleWork
 	ErrorIntegrityConflict
 	ErrorDependencyUnavailable
+	ErrorAuthorizationDenied
 )
 
 type Error struct{ code ErrorCode }
@@ -157,6 +197,8 @@ func (failure *Error) Error() string {
 		return "scheduler authority binding conflicts with retained state"
 	case ErrorDependencyUnavailable:
 		return "scheduler dependency is unavailable"
+	case ErrorAuthorizationDenied:
+		return "scheduler Work Item is not available to this query scope"
 	default:
 		return "scheduler request is invalid"
 	}
@@ -170,6 +212,15 @@ func (failure *Error) Code() ErrorCode {
 }
 
 func newError(code ErrorCode) *Error { return &Error{code: code} }
+
+func (scope WorkItemQueryScope) valid() bool {
+	return scope.kind == WorkItemQueryAdministrator ||
+		scope.kind == WorkItemQueryOwner && validOpaqueID(scope.personalWorkspaceID.String())
+}
+
+func (scope WorkItemQueryScope) administrator() bool {
+	return scope.kind == WorkItemQueryAdministrator
+}
 
 func validOpaqueID(value string) bool {
 	if len(value) == 0 || len(value) > 255 {

@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/slidesmith/slidesmith/backend/internal/runtimeexecution"
 )
 
 const postgresIdentityBlockSize uint64 = 1_000_000
@@ -99,20 +101,30 @@ func (controller *PersistenceFaultController) FailAt(point PersistenceFaultPoint
 	return true
 }
 
+type SchedulerRuntimeRequestKind uint8
+
+const (
+	SchedulerRuntimeRequestNone SchedulerRuntimeRequestKind = iota
+	SchedulerRuntimeRequestStart
+	SchedulerRuntimeRequestCancel
+)
+
 type SchedulerEnqueueFact struct {
-	OperationID        OperationID
-	TaskID             TaskID
-	PhaseRunID         PhaseRunID
-	RuntimeRunID       RuntimeRunID
-	DecisionID         DecisionID
-	TaskRevision       TaskRevision
-	Kind               EnactmentKind
-	PayloadDigest      EnactmentPayloadDigest
-	CanonicalPayload   []byte
-	ActivityGeneration ActivityGeneration
-	FenceKind          EnactmentFenceKind
-	Fence              uint64
-	CausationID        CausationID
+	OperationID         OperationID
+	PersonalWorkspaceID runtimeexecution.PersonalWorkspaceID
+	TaskID              TaskID
+	PhaseRunID          PhaseRunID
+	RuntimeRunID        RuntimeRunID
+	DecisionID          DecisionID
+	TaskRevision        TaskRevision
+	Kind                EnactmentKind
+	PayloadDigest       EnactmentPayloadDigest
+	CanonicalPayload    []byte
+	RuntimeRequestKind  SchedulerRuntimeRequestKind
+	ActivityGeneration  ActivityGeneration
+	FenceKind           EnactmentFenceKind
+	Fence               uint64
+	CausationID         CausationID
 }
 
 // SchedulerTransaction exposes one call to a configured Scheduler-owned
@@ -811,7 +823,12 @@ func (adapter *PostgresAdapter) insertOutbox(
 	enactment EnactmentRef,
 ) (bool, SchedulerEnqueueFact, error) {
 	phaseRunID, runtimeRunID := enactmentScope(record, enactment.OperationID)
+	personalWorkspaceID, err := canonicalPersonalWorkspaceID(record.owner)
+	if err != nil {
+		return false, SchedulerEnqueueFact{}, newError(ErrorIntegrityConflict)
+	}
 	canonicalPayload := []byte{}
+	runtimeRequestKind := SchedulerRuntimeRequestNone
 	if enactment.Kind == EnactmentRuntimeExecution {
 		operation, exists := record.runtimeOperations[enactment.OperationID]
 		if !exists || len(operation.canonicalPayload) == 0 ||
@@ -819,6 +836,17 @@ func (adapter *PostgresAdapter) insertOutbox(
 			return false, SchedulerEnqueueFact{}, newError(ErrorIntegrityConflict)
 		}
 		canonicalPayload = append([]byte(nil), operation.canonicalPayload...)
+		if _, parseErr := runtimeexecution.ParseCanonicalStartPayload(
+			canonicalPayload, runtimeexecution.Digest(enactment.PayloadDigest),
+		); parseErr == nil {
+			runtimeRequestKind = SchedulerRuntimeRequestStart
+		} else if _, parseErr := runtimeexecution.ParseCanonicalCancelPayload(
+			canonicalPayload, runtimeexecution.Digest(enactment.PayloadDigest),
+		); parseErr == nil {
+			runtimeRequestKind = SchedulerRuntimeRequestCancel
+		} else {
+			return false, SchedulerEnqueueFact{}, newError(ErrorIntegrityConflict)
+		}
 	}
 	fenceKind, fence := postgresFenceValue(enactment.Fence)
 	prerequisites, err := json.Marshal(map[string]any{
@@ -848,10 +876,12 @@ func (adapter *PostgresAdapter) insertOutbox(
 		return false, SchedulerEnqueueFact{}, newError(ErrorDependencyUnavailable)
 	}
 	return rows == 1, SchedulerEnqueueFact{
-		OperationID: enactment.OperationID, TaskID: decision.TaskProjection.TaskID,
+		OperationID: enactment.OperationID, PersonalWorkspaceID: personalWorkspaceID,
+		TaskID:     decision.TaskProjection.TaskID,
 		PhaseRunID: phaseRunID, RuntimeRunID: runtimeRunID, DecisionID: decision.DecisionID,
 		TaskRevision: decision.AcceptedTaskRevision, Kind: enactment.Kind,
 		PayloadDigest: enactment.PayloadDigest, CanonicalPayload: append([]byte{}, canonicalPayload...),
+		RuntimeRequestKind: runtimeRequestKind,
 		ActivityGeneration: enactment.ActivityGeneration,
 		FenceKind:          fenceKind, Fence: fence, CausationID: enactment.CausationID,
 	}, nil
@@ -979,10 +1009,11 @@ func (transaction *postgresSchedulerTransaction) Enqueue(ctx context.Context) er
 	}
 	fact := transaction.fact
 	if _, err := transaction.tx.ExecContext(ctx, "SELECT "+transaction.enqueueFunction+`(
-		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
-		fact.OperationID.value, fact.TaskID.value, fact.PhaseRunID.value,
+		$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		fact.OperationID.value, fact.PersonalWorkspaceID.String(), fact.TaskID.value, fact.PhaseRunID.value,
 		fact.RuntimeRunID.value, fact.DecisionID.value, fact.TaskRevision, fact.Kind,
-		fact.PayloadDigest[:], fact.CanonicalPayload, fact.ActivityGeneration, fact.FenceKind, fact.Fence,
+		fact.PayloadDigest[:], fact.CanonicalPayload, fact.RuntimeRequestKind,
+		fact.ActivityGeneration, fact.FenceKind, fact.Fence,
 		fact.CausationID.value,
 	); err != nil {
 		return newPersistenceError(PersistenceUnavailable)

@@ -675,7 +675,10 @@ type RuntimeFencedOrTerminalEvidence struct {
 	StartOperationID        OperationID
 	StartDigest             Digest
 	TerminalDecisionID      RuntimeDecisionID
+	RuntimeRevision         RuntimeRevision
 	RuntimeFence            RuntimeFence
+	SchedulerEpoch          uint64
+	PolicyVersion           uint64
 	LeaseAcquireOperationID OperationID
 	LeaseAcquireDigest      Digest
 }
@@ -688,7 +691,10 @@ type NoLeasePhysicalDispositionEvidence struct {
 	StartOperationID        OperationID
 	StartDigest             Digest
 	TerminalDecisionID      RuntimeDecisionID
+	RuntimeRevision         RuntimeRevision
 	RuntimeFence            RuntimeFence
+	SchedulerEpoch          uint64
+	PolicyVersion           uint64
 	LeaseAcquireOperationID OperationID
 	LeaseAcquireDigest      Digest
 	ExecutionNodeID         ExecutionNodeID

@@ -65,6 +65,38 @@ func (function SchedulerAcceptanceParticipantFunc) Participate(
 	return function(ctx, transaction, fact)
 }
 
+type SchedulerCancellationFact struct {
+	OperationID            OperationID
+	CanonicalRequestDigest Digest
+	RuntimeRunID           RuntimeRunID
+	DecisionID             RuntimeDecisionID
+	RuntimeRevision        RuntimeRevision
+	RuntimeFence           RuntimeFence
+	AcceptedAt             time.Time
+}
+
+type SchedulerCancellationTransaction interface {
+	AcceptCancellation(context.Context) error
+}
+
+type SchedulerCancellationParticipant interface {
+	ParticipateCancellation(context.Context, SchedulerCancellationTransaction, SchedulerCancellationFact) error
+}
+
+type SchedulerCancellationParticipantFunc func(
+	context.Context,
+	SchedulerCancellationTransaction,
+	SchedulerCancellationFact,
+) error
+
+func (function SchedulerCancellationParticipantFunc) ParticipateCancellation(
+	ctx context.Context,
+	transaction SchedulerCancellationTransaction,
+	fact SchedulerCancellationFact,
+) error {
+	return function(ctx, transaction, fact)
+}
+
 func stableLeaseAcquireBinding(command StartRuntimeRun) (OperationID, Digest) {
 	identity := sha256.Sum256([]byte(strings.Join([]string{
 		"slidesmith.runtime-execution.lease-acquire-operation/v1",

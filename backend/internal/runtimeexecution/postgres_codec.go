@@ -53,7 +53,10 @@ type postgresRuntimeFencedEvidenceState struct {
 	StartOperationID        string                   `json:"start_operation_id"`
 	StartDigest             Digest                   `json:"start_digest"`
 	TerminalDecisionID      string                   `json:"terminal_decision_id"`
+	RuntimeRevision         RuntimeRevision          `json:"runtime_revision"`
 	RuntimeFence            RuntimeFence             `json:"runtime_fence"`
+	SchedulerEpoch          uint64                   `json:"scheduler_epoch"`
+	PolicyVersion           uint64                   `json:"policy_version"`
 	LeaseAcquireOperationID string                   `json:"lease_acquire_operation_id"`
 	LeaseAcquireDigest      Digest                   `json:"lease_acquire_digest"`
 }
@@ -164,7 +167,8 @@ func postgresFencedEvidenceFromRuntime(value RuntimeFencedOrTerminalEvidence) po
 		WorkItemID: value.WorkItemID.String(), AdmissionGrantID: value.AdmissionGrantID.String(),
 		GrantGeneration: value.GrantGeneration, RuntimeRunID: value.RuntimeRunID.String(),
 		StartOperationID: value.StartOperationID.String(), StartDigest: value.StartDigest,
-		TerminalDecisionID: value.TerminalDecisionID.String(), RuntimeFence: value.RuntimeFence,
+		TerminalDecisionID: value.TerminalDecisionID.String(), RuntimeRevision: value.RuntimeRevision,
+		RuntimeFence: value.RuntimeFence, SchedulerEpoch: value.SchedulerEpoch, PolicyVersion: value.PolicyVersion,
 		LeaseAcquireOperationID: value.LeaseAcquireOperationID.String(), LeaseAcquireDigest: value.LeaseAcquireDigest,
 	}
 }
@@ -181,7 +185,10 @@ func postgresCapacityEvidenceFromSnapshot(value RuntimeCapacityEvidenceSnapshot)
 				StartOperationID:        value.NoLeasePhysicalDisposition.StartOperationID,
 				StartDigest:             value.NoLeasePhysicalDisposition.StartDigest,
 				TerminalDecisionID:      value.NoLeasePhysicalDisposition.TerminalDecisionID,
+				RuntimeRevision:         value.NoLeasePhysicalDisposition.RuntimeRevision,
 				RuntimeFence:            value.NoLeasePhysicalDisposition.RuntimeFence,
+				SchedulerEpoch:          value.NoLeasePhysicalDisposition.SchedulerEpoch,
+				PolicyVersion:           value.NoLeasePhysicalDisposition.PolicyVersion,
 				LeaseAcquireOperationID: value.NoLeasePhysicalDisposition.LeaseAcquireOperationID,
 				LeaseAcquireDigest:      value.NoLeasePhysicalDisposition.LeaseAcquireDigest,
 			}),
@@ -204,7 +211,8 @@ func runtimeFencedEvidenceFromPostgres(value postgresRuntimeFencedEvidenceState)
 		WorkItemID: WorkItemID{value: value.WorkItemID}, AdmissionGrantID: AdmissionGrantID{value: value.AdmissionGrantID},
 		GrantGeneration: value.GrantGeneration, RuntimeRunID: RuntimeRunID{value: value.RuntimeRunID},
 		StartOperationID: OperationID{value: value.StartOperationID}, StartDigest: value.StartDigest,
-		TerminalDecisionID: RuntimeDecisionID{value: value.TerminalDecisionID}, RuntimeFence: value.RuntimeFence,
+		TerminalDecisionID: RuntimeDecisionID{value: value.TerminalDecisionID}, RuntimeRevision: value.RuntimeRevision,
+		RuntimeFence: value.RuntimeFence, SchedulerEpoch: value.SchedulerEpoch, PolicyVersion: value.PolicyVersion,
 		LeaseAcquireOperationID: OperationID{value: value.LeaseAcquireOperationID}, LeaseAcquireDigest: value.LeaseAcquireDigest,
 	}
 }
@@ -217,7 +225,9 @@ func capacityEvidenceSnapshotFromPostgres(value postgresCapacityEvidenceState) R
 			WorkItemID: noLeaseBase.WorkItemID, AdmissionGrantID: noLeaseBase.AdmissionGrantID,
 			GrantGeneration: noLeaseBase.GrantGeneration, RuntimeRunID: noLeaseBase.RuntimeRunID,
 			StartOperationID: noLeaseBase.StartOperationID, StartDigest: noLeaseBase.StartDigest,
-			TerminalDecisionID: noLeaseBase.TerminalDecisionID, RuntimeFence: noLeaseBase.RuntimeFence,
+			TerminalDecisionID: noLeaseBase.TerminalDecisionID, RuntimeRevision: noLeaseBase.RuntimeRevision,
+			RuntimeFence: noLeaseBase.RuntimeFence, SchedulerEpoch: noLeaseBase.SchedulerEpoch,
+			PolicyVersion:           noLeaseBase.PolicyVersion,
 			LeaseAcquireOperationID: noLeaseBase.LeaseAcquireOperationID,
 			LeaseAcquireDigest:      noLeaseBase.LeaseAcquireDigest,
 			ExecutionNodeID:         ExecutionNodeID{value: value.NoLeasePhysicalDisposition.ExecutionNodeID},

@@ -715,6 +715,9 @@ func TestPostgresSchedulerClaimAndAdmitIsTheUniqueGenerationAuthority(t *testing
 			SchedulerEpoch: 1,
 			PolicyVersion:  1,
 			GrantTTL:       time.Minute,
+			Limits: scheduler.AdmissionLimits{
+				Global: 1, PersonalWorkspace: 1, WorkerClass: 1, ResourceClass: 1,
+			},
 			Node: scheduler.ExecutionNodeConfig{
 				ExecutionNodeID:       nodeID,
 				CapacityGeneration:    1,
@@ -782,7 +785,11 @@ func TestPostgresSchedulerClaimAndAdmitIsTheUniqueGenerationAuthority(t *testing
 		rotated.Grant.Generation != first.Grant.Generation+1 || rotated.Grant.AdmissionGrantID == first.Grant.AdmissionGrantID {
 		t.Fatalf("grant rotation changed Task authority or failed to advance generation:\nfirst=%+v\nrotated=%+v", first, rotated)
 	}
-	view, err := scheduling.Inspect(context.Background(), scheduler.WorkItemRef{WorkItemID: first.WorkItemID})
+	workItemRef := scheduler.WorkItemRef{
+		WorkItemID: first.WorkItemID,
+		Scope:      scheduler.NewOwnerWorkItemQueryScope(first.PersonalWorkspaceID),
+	}
+	view, err := scheduling.Inspect(context.Background(), workItemRef)
 	if err != nil {
 		t.Fatalf("inspect admitted Work Item: %v", err)
 	}
@@ -843,7 +850,7 @@ func TestPostgresSchedulerClaimAndAdmitIsTheUniqueGenerationAuthority(t *testing
 		!inspected.LeaseAcquireBy.Equal(rotated.Grant.ExpiresAt) {
 		t.Fatalf("fresh C03 Start lost atomic binding: %+v", inspected)
 	}
-	view, err = scheduling.Inspect(context.Background(), scheduler.WorkItemRef{WorkItemID: first.WorkItemID})
+	view, err = scheduling.Inspect(context.Background(), workItemRef)
 	if err != nil {
 		t.Fatalf("inspect accepted Scheduler Work Item: %v", err)
 	}
@@ -891,7 +898,7 @@ func TestPostgresSchedulerClaimAndAdmitIsTheUniqueGenerationAuthority(t *testing
 	); err != nil {
 		t.Fatalf("apply logical release evidence: %v", err)
 	}
-	view, err = scheduling.Inspect(context.Background(), scheduler.WorkItemRef{WorkItemID: first.WorkItemID})
+	view, err = scheduling.Inspect(context.Background(), workItemRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -904,7 +911,7 @@ func TestPostgresSchedulerClaimAndAdmitIsTheUniqueGenerationAuthority(t *testing
 	); err != nil {
 		t.Fatalf("apply exact no-lease selected-node disposition: %v", err)
 	}
-	view, err = scheduling.Inspect(context.Background(), scheduler.WorkItemRef{WorkItemID: first.WorkItemID})
+	view, err = scheduling.Inspect(context.Background(), workItemRef)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1650,12 +1657,14 @@ func ensureSchedulerTestTable(t *testing.T, db *sql.DB, schema string) {
 	_, err := db.ExecContext(context.Background(), `CREATE TABLE IF NOT EXISTS `+schema+`.scheduler_test_owned_work_items (
 		work_item_id text PRIMARY KEY,
 		operation_id text NOT NULL UNIQUE,
+		personal_workspace_id text NOT NULL,
 		task_id text NOT NULL,
 		phase_run_id text NOT NULL,
 		runtime_run_id text NOT NULL,
 		decision_id text NOT NULL,
 		task_revision bigint NOT NULL,
 		kind smallint NOT NULL,
+		runtime_request_kind smallint NOT NULL,
 		payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
 		canonical_payload bytea NOT NULL,
 		activity_generation bigint NOT NULL,
@@ -1671,6 +1680,7 @@ func ensureSchedulerTestTable(t *testing.T, db *sql.DB, schema string) {
 	}
 	_, err = db.ExecContext(context.Background(), `CREATE OR REPLACE FUNCTION `+schema+`.scheduler_test_offer_work(
 		p_operation_id text,
+		p_personal_workspace_id text,
 		p_task_id text,
 		p_phase_run_id text,
 		p_runtime_run_id text,
@@ -1679,18 +1689,20 @@ func ensureSchedulerTestTable(t *testing.T, db *sql.DB, schema string) {
 		p_kind smallint,
 		p_payload_digest bytea,
 		p_canonical_payload bytea,
+		p_runtime_request_kind smallint,
 		p_activity_generation bigint,
 		p_fence_kind smallint,
 		p_fence bigint,
 		p_causation_id text
 	) RETURNS void LANGUAGE SQL AS $scheduler_function$
 		INSERT INTO `+schema+`.scheduler_test_owned_work_items (
-			work_item_id, operation_id, task_id, phase_run_id, runtime_run_id, decision_id,
-			task_revision, kind, payload_digest, canonical_payload, activity_generation, fence_kind, fence,
+			work_item_id, operation_id, personal_workspace_id, task_id, phase_run_id, runtime_run_id, decision_id,
+			task_revision, kind, runtime_request_kind, payload_digest, canonical_payload, activity_generation, fence_kind, fence,
 			causation_id, priority_class, state, enqueued_at
 		) VALUES (
-			'scheduler-test-' || p_operation_id, p_operation_id, p_task_id, p_phase_run_id,
-			p_runtime_run_id, p_decision_id, p_task_revision, p_kind, p_payload_digest, p_canonical_payload,
+			'scheduler-test-' || p_operation_id, p_operation_id, p_personal_workspace_id, p_task_id, p_phase_run_id,
+			p_runtime_run_id, p_decision_id, p_task_revision, p_kind, p_runtime_request_kind,
+			p_payload_digest, p_canonical_payload,
 			p_activity_generation, p_fence_kind, p_fence, p_causation_id,
 			'standard', 'offered', CURRENT_TIMESTAMP
 		)

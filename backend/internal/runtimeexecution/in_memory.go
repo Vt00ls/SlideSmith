@@ -460,7 +460,9 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 		WorkItemID: startBinding.WorkItemID, AdmissionGrantID: startBinding.AdmissionGrantID,
 		GrantGeneration: startBinding.GrantGeneration, RuntimeRunID: command.RuntimeRunID,
 		StartOperationID: command.ExpectedStartOperationID, StartDigest: startBinding.Digest,
-		TerminalDecisionID: fact.DecisionID, RuntimeFence: record.fixture.RuntimeFence,
+		TerminalDecisionID: fact.DecisionID, RuntimeRevision: record.fixture.RuntimeRevision,
+		RuntimeFence: record.fixture.RuntimeFence, SchedulerEpoch: startBinding.SchedulerEpoch,
+		PolicyVersion:           startBinding.PolicyVersion,
 		LeaseAcquireOperationID: leaseBinding.AcquireOperationID, LeaseAcquireDigest: leaseBinding.AcquireDigest,
 	}
 	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{
@@ -469,7 +471,9 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 			WorkItemID: baseEvidence.WorkItemID, AdmissionGrantID: baseEvidence.AdmissionGrantID,
 			GrantGeneration: baseEvidence.GrantGeneration, RuntimeRunID: baseEvidence.RuntimeRunID,
 			StartOperationID: baseEvidence.StartOperationID, StartDigest: baseEvidence.StartDigest,
-			TerminalDecisionID: baseEvidence.TerminalDecisionID, RuntimeFence: baseEvidence.RuntimeFence,
+			TerminalDecisionID: baseEvidence.TerminalDecisionID, RuntimeRevision: baseEvidence.RuntimeRevision,
+			RuntimeFence: baseEvidence.RuntimeFence, SchedulerEpoch: baseEvidence.SchedulerEpoch,
+			PolicyVersion:           baseEvidence.PolicyVersion,
 			LeaseAcquireOperationID: baseEvidence.LeaseAcquireOperationID,
 			LeaseAcquireDigest:      baseEvidence.LeaseAcquireDigest,
 			ExecutionNodeID:         startBinding.ExecutionNodeID,
@@ -648,7 +652,9 @@ func (engine *invariantEngine) finishInMemoryNoLeaseLocked(
 		WorkItemID: startBinding.WorkItemID, AdmissionGrantID: startBinding.AdmissionGrantID,
 		GrantGeneration: startBinding.GrantGeneration, RuntimeRunID: record.fixture.RuntimeRunID,
 		StartOperationID: record.acceptedStart.OperationID, StartDigest: record.acceptedStartDigest,
-		TerminalDecisionID: terminalFact.DecisionID, RuntimeFence: record.fixture.RuntimeFence,
+		TerminalDecisionID: terminalFact.DecisionID, RuntimeRevision: record.fixture.RuntimeRevision,
+		RuntimeFence: record.fixture.RuntimeFence, SchedulerEpoch: startBinding.SchedulerEpoch,
+		PolicyVersion:           startBinding.PolicyVersion,
 		LeaseAcquireOperationID: leaseBinding.AcquireOperationID, LeaseAcquireDigest: leaseBinding.AcquireDigest,
 	}
 	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{
@@ -657,7 +663,9 @@ func (engine *invariantEngine) finishInMemoryNoLeaseLocked(
 			WorkItemID: baseEvidence.WorkItemID, AdmissionGrantID: baseEvidence.AdmissionGrantID,
 			GrantGeneration: baseEvidence.GrantGeneration, RuntimeRunID: baseEvidence.RuntimeRunID,
 			StartOperationID: baseEvidence.StartOperationID, StartDigest: baseEvidence.StartDigest,
-			TerminalDecisionID: baseEvidence.TerminalDecisionID, RuntimeFence: baseEvidence.RuntimeFence,
+			TerminalDecisionID: baseEvidence.TerminalDecisionID, RuntimeRevision: baseEvidence.RuntimeRevision,
+			RuntimeFence: baseEvidence.RuntimeFence, SchedulerEpoch: baseEvidence.SchedulerEpoch,
+			PolicyVersion:           baseEvidence.PolicyVersion,
 			LeaseAcquireOperationID: baseEvidence.LeaseAcquireOperationID,
 			LeaseAcquireDigest:      baseEvidence.LeaseAcquireDigest,
 			ExecutionNodeID:         startBinding.ExecutionNodeID,

@@ -24,10 +24,18 @@ type ExecutionNodeConfig struct {
 	AvailableRuntimeSlots uint64
 }
 
+type AdmissionLimits struct {
+	Global            uint64
+	PersonalWorkspace uint64
+	WorkerClass       uint64
+	ResourceClass     uint64
+}
+
 type LocalAdmissionConfig struct {
 	SchedulerEpoch SchedulerEpoch
 	PolicyVersion  PolicyVersion
 	GrantTTL       time.Duration
+	Limits         AdmissionLimits
 	Node           ExecutionNodeConfig
 }
 
@@ -59,6 +67,8 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 
 func validAdmissionConfig(config LocalAdmissionConfig) bool {
 	return config.SchedulerEpoch > 0 && config.PolicyVersion > 0 && config.GrantTTL > 0 &&
+		config.Limits.Global > 0 && config.Limits.PersonalWorkspace > 0 &&
+		config.Limits.WorkerClass > 0 && config.Limits.ResourceClass > 0 &&
 		validOpaqueID(config.Node.ExecutionNodeID.value) && config.Node.CapacityGeneration > 0 &&
 		validOpaqueID(config.Node.ResourceClassID.value) && validOpaqueID(config.Node.ExecutionPolicyID.value) &&
 		config.Node.AvailableRuntimeSlots > 0
@@ -111,6 +121,20 @@ func (authority *PostgresAuthority) RuntimeAcceptanceFunction() string {
 	return authority.table("scheduler_accept_runtime_start")
 }
 
+func (authority *PostgresAuthority) RuntimeCancellationParticipant() runtimeexecution.SchedulerCancellationParticipant {
+	return runtimeexecution.SchedulerCancellationParticipantFunc(func(
+		ctx context.Context,
+		transaction runtimeexecution.SchedulerCancellationTransaction,
+		_ runtimeexecution.SchedulerCancellationFact,
+	) error {
+		return transaction.AcceptCancellation(ctx)
+	})
+}
+
+func (authority *PostgresAuthority) RuntimeCancellationFunction() string {
+	return authority.table("scheduler_accept_runtime_cancel")
+}
+
 func (authority *PostgresAuthority) Migrate(ctx context.Context) error {
 	if ctx == nil || ctx.Err() != nil {
 		return newError(ErrorDependencyUnavailable)
@@ -140,6 +164,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	claims := authority.table("scheduler_delivery_claims")
 	logical := authority.table("scheduler_logical_reservations")
 	node := authority.table("scheduler_node_reservations")
+	fairness := authority.table("scheduler_fairness_state")
 	return []string{
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("scheduler_grant_sequence")),
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("scheduler_claim_sequence")),
@@ -147,12 +172,14 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			work_item_id text PRIMARY KEY,
 			work_item_generation bigint NOT NULL CHECK (work_item_generation > 0),
 			operation_id text NOT NULL UNIQUE,
+			personal_workspace_id text NOT NULL,
 			task_id text NOT NULL,
 			phase_run_id text NOT NULL,
 			runtime_run_id text NOT NULL,
 			decision_id text NOT NULL,
 			task_revision bigint NOT NULL CHECK (task_revision > 0),
 			kind smallint NOT NULL,
+			runtime_request_kind smallint NOT NULL CHECK (runtime_request_kind BETWEEN 0 AND 2),
 			payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
 			canonical_payload bytea NOT NULL,
 			activity_generation bigint NOT NULL CHECK (activity_generation > 0),
@@ -163,6 +190,9 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			state smallint NOT NULL,
 			current_grant_generation bigint NOT NULL DEFAULT 0 CHECK (current_grant_generation >= 0),
 			last_grant_generation bigint NOT NULL DEFAULT 0 CHECK (last_grant_generation >= 0),
+			accepted_decision_id text NOT NULL DEFAULT '',
+			accepted_runtime_revision bigint NOT NULL DEFAULT 0 CHECK (accepted_runtime_revision >= 0),
+			accepted_runtime_fence bigint NOT NULL DEFAULT 0 CHECK (accepted_runtime_fence >= 0),
 			enqueued_at timestamptz NOT NULL,
 			updated_at timestamptz NOT NULL
 		)`, workItems),
@@ -187,6 +217,11 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			bound_decision_id text NOT NULL DEFAULT '',
 			bound_runtime_revision bigint NOT NULL DEFAULT 0 CHECK (bound_runtime_revision >= 0),
 			bound_runtime_fence bigint NOT NULL DEFAULT 0 CHECK (bound_runtime_fence >= 0),
+			terminal_decision_id text NOT NULL DEFAULT '',
+			terminal_runtime_revision bigint NOT NULL DEFAULT 0 CHECK (terminal_runtime_revision >= 0),
+			terminal_runtime_fence bigint NOT NULL DEFAULT 0 CHECK (terminal_runtime_fence >= 0),
+			terminal_scheduler_epoch bigint NOT NULL DEFAULT 0 CHECK (terminal_scheduler_epoch >= 0),
+			terminal_policy_version bigint NOT NULL DEFAULT 0 CHECK (terminal_policy_version >= 0),
 			lease_acquire_operation_id text NOT NULL DEFAULT '',
 			lease_acquire_digest bytea CHECK (lease_acquire_digest IS NULL OR octet_length(lease_acquire_digest) = 32),
 			lease_acquire_by timestamptz,
@@ -221,10 +256,19 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			state smallint NOT NULL,
 			updated_at timestamptz NOT NULL
 		)`, node, grants),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			singleton boolean PRIMARY KEY CHECK (singleton),
+			last_personal_workspace_id text NOT NULL,
+			updated_at timestamptz NOT NULL
+		)`, fairness),
+		fmt.Sprintf(`INSERT INTO %s (singleton, last_personal_workspace_id, updated_at)
+			VALUES (TRUE, '', CURRENT_TIMESTAMP) ON CONFLICT (singleton) DO NOTHING`, fairness),
 		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s(
-			p_operation_id text, p_task_id text, p_phase_run_id text, p_runtime_run_id text,
+			p_operation_id text, p_personal_workspace_id text, p_task_id text,
+			p_phase_run_id text, p_runtime_run_id text,
 			p_decision_id text, p_task_revision bigint, p_kind smallint, p_payload_digest bytea,
-			p_canonical_payload bytea, p_activity_generation bigint, p_fence_kind smallint,
+			p_canonical_payload bytea, p_runtime_request_kind smallint,
+			p_activity_generation bigint, p_fence_kind smallint,
 			p_fence bigint, p_causation_id text
 		) RETURNS void LANGUAGE plpgsql AS $scheduler_enqueue$
 		DECLARE
@@ -232,21 +276,26 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			candidate_id text := 'scheduler-work-item-' || p_operation_id;
 		BEGIN
 			INSERT INTO %s (
-				work_item_id, work_item_generation, operation_id, task_id, phase_run_id,
-				runtime_run_id, decision_id, task_revision, kind, payload_digest,
+				work_item_id, work_item_generation, operation_id, personal_workspace_id,
+				task_id, phase_run_id,
+				runtime_run_id, decision_id, task_revision, kind, runtime_request_kind, payload_digest,
 				canonical_payload, activity_generation, fence_kind, fence, causation_id,
 				priority_class, state, enqueued_at, updated_at
 			) VALUES (
-				candidate_id, 1, p_operation_id, p_task_id, p_phase_run_id, p_runtime_run_id,
-				p_decision_id, p_task_revision, p_kind, p_payload_digest, p_canonical_payload,
+				candidate_id, 1, p_operation_id, p_personal_workspace_id,
+				p_task_id, p_phase_run_id, p_runtime_run_id,
+				p_decision_id, p_task_revision, p_kind, p_runtime_request_kind,
+				p_payload_digest, p_canonical_payload,
 				p_activity_generation, p_fence_kind, p_fence, p_causation_id, 2, 1,
 				CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
 			) ON CONFLICT (operation_id) DO NOTHING;
 			SELECT * INTO retained FROM %s WHERE operation_id = p_operation_id;
 			IF retained.work_item_id IS NULL OR retained.work_item_id <> candidate_id OR
+				retained.personal_workspace_id <> p_personal_workspace_id OR
 				retained.task_id <> p_task_id OR retained.phase_run_id <> p_phase_run_id OR
 				retained.runtime_run_id <> p_runtime_run_id OR retained.decision_id <> p_decision_id OR
 				retained.task_revision <> p_task_revision OR retained.kind <> p_kind OR
+				retained.runtime_request_kind <> p_runtime_request_kind OR
 				retained.payload_digest <> p_payload_digest OR retained.canonical_payload <> p_canonical_payload OR
 				retained.activity_generation <> p_activity_generation OR retained.fence_kind <> p_fence_kind OR
 				retained.fence <> p_fence OR retained.causation_id <> p_causation_id THEN
@@ -295,7 +344,9 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 				lease_acquire_by=fixed_lease_acquire_by, accepted_at=p_accepted_at,
 				updated_at=p_accepted_at
 				WHERE admission_grant_id=p_admission_grant_id AND generation=p_grant_generation AND state=1;
-			UPDATE %s SET state=3, updated_at=p_accepted_at
+			UPDATE %s SET state=3, accepted_decision_id=p_decision_id,
+				accepted_runtime_revision=p_runtime_revision, accepted_runtime_fence=p_runtime_fence,
+				updated_at=p_accepted_at
 				WHERE work_item_id=p_work_item_id AND state=2 AND current_grant_generation=p_grant_generation;
 			UPDATE %s SET state=2, updated_at=p_accepted_at
 				WHERE admission_grant_id=p_admission_grant_id AND grant_generation=p_grant_generation AND state=1;
@@ -308,6 +359,29 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		END
 		$scheduler_accept$`, authority.RuntimeAcceptanceFunction(), grants, workItems,
 			workItems, grants, grants, workItems, logical, node),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s(
+			p_operation_id text, p_payload_digest bytea, p_runtime_run_id text,
+			p_decision_id text, p_runtime_revision bigint, p_runtime_fence bigint,
+			p_accepted_at timestamptz
+		) RETURNS void LANGUAGE plpgsql AS $scheduler_cancel$
+		DECLARE
+			affected integer;
+		BEGIN
+			IF p_runtime_revision <= 0 OR p_runtime_fence <= 0 OR p_decision_id = '' THEN
+				RAISE EXCEPTION 'scheduler cancellation binding conflict' USING ERRCODE = '23000';
+			END IF;
+			UPDATE %s SET state=3, accepted_decision_id=p_decision_id,
+				accepted_runtime_revision=p_runtime_revision, accepted_runtime_fence=p_runtime_fence,
+				updated_at=p_accepted_at
+				WHERE operation_id=p_operation_id AND payload_digest=p_payload_digest
+				AND runtime_run_id=p_runtime_run_id AND runtime_request_kind=2 AND state=1
+				AND current_grant_generation=0;
+			GET DIAGNOSTICS affected = ROW_COUNT;
+			IF affected <> 1 THEN
+				RAISE EXCEPTION 'scheduler cancellation binding conflict' USING ERRCODE = '23000';
+			END IF;
+		END
+		$scheduler_cancel$`, authority.RuntimeCancellationFunction(), workItems),
 	}
 }
 
@@ -325,17 +399,18 @@ type canonicalStartEnvelope struct {
 }
 
 type lockedWorkItem struct {
-	id                WorkItemID
-	generation        uint64
-	operationID       string
-	taskID            string
-	phaseRunID        string
-	runtimeRunID      string
-	payloadDigest     Digest
-	canonicalPayload  []byte
-	state             WorkItemState
-	currentGeneration GrantGeneration
-	lastGeneration    GrantGeneration
+	id                  WorkItemID
+	generation          uint64
+	operationID         string
+	personalWorkspaceID string
+	taskID              string
+	phaseRunID          string
+	runtimeRunID        string
+	payloadDigest       Digest
+	canonicalPayload    []byte
+	state               WorkItemState
+	currentGeneration   GrantGeneration
+	lastGeneration      GrantGeneration
 }
 
 func (authority *PostgresAuthority) ClaimAndAdmit(ctx context.Context) (AdmissionDecision, error) {
@@ -381,6 +456,24 @@ func (authority *PostgresAuthority) ClaimAndAdmit(ctx context.Context) (Admissio
 	if !envelope.Deadline.After(now) {
 		return AdmissionDecision{}, newError(ErrorNoEligibleWork)
 	}
+	for _, limit := range []struct {
+		kind  uint8
+		key   string
+		limit uint64
+	}{
+		{kind: 1, key: "site", limit: authority.admission.Limits.Global},
+		{kind: 2, key: envelope.PersonalWorkspaceID, limit: authority.admission.Limits.PersonalWorkspace},
+		{kind: 3, key: envelope.WorkerClass, limit: authority.admission.Limits.WorkerClass},
+		{kind: 4, key: envelope.ResourceClassID, limit: authority.admission.Limits.ResourceClass},
+	} {
+		occupied, countErr := authority.logicalReservationOccupancy(ctx, tx, limit.kind, limit.key)
+		if countErr != nil {
+			return AdmissionDecision{}, countErr
+		}
+		if occupied >= limit.limit {
+			return AdmissionDecision{}, newError(ErrorNoEligibleWork)
+		}
+	}
 	var occupied uint64
 	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s
 		WHERE execution_node_id=$1 AND node_capacity_generation=$2 AND state IN ($3,$4)`,
@@ -402,19 +495,95 @@ func (authority *PostgresAuthority) ClaimAndAdmit(ctx context.Context) (Admissio
 	return decision, nil
 }
 
+func (authority *PostgresAuthority) ClaimCancellation(
+	ctx context.Context,
+) (CancellationDecision, error) {
+	if ctx == nil || ctx.Err() != nil {
+		return CancellationDecision{}, newError(ErrorDependencyUnavailable)
+	}
+	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return CancellationDecision{}, newError(ErrorDependencyUnavailable)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var decision CancellationDecision
+	var personalWorkspaceID string
+	var digest []byte
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT work_item_id, personal_workspace_id,
+		operation_id, task_id, phase_run_id, runtime_run_id, payload_digest, canonical_payload
+		FROM %s WHERE state=$1 AND runtime_request_kind=2
+		ORDER BY enqueued_at, work_item_id LIMIT 1 FOR UPDATE`,
+		authority.table("scheduler_work_items")), WorkItemQueued).Scan(
+		&decision.WorkItemID.value, &personalWorkspaceID, &decision.OperationID,
+		&decision.TaskID, &decision.PhaseRunID, &decision.RuntimeRunID, &digest, &decision.CanonicalPayload,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return CancellationDecision{}, newError(ErrorNoEligibleWork)
+	}
+	if err != nil || len(digest) != sha256.Size {
+		return CancellationDecision{}, newError(ErrorDependencyUnavailable)
+	}
+	copy(decision.PayloadDigest[:], digest)
+	decision.PersonalWorkspaceID, err = NewPersonalWorkspaceID(personalWorkspaceID)
+	if err != nil {
+		return CancellationDecision{}, newError(ErrorIntegrityConflict)
+	}
+	cancel, err := runtimeexecution.ParseCanonicalCancelPayload(
+		decision.CanonicalPayload, runtimeexecution.Digest(decision.PayloadDigest),
+	)
+	if err != nil || cancel.OperationID.String() != decision.OperationID ||
+		cancel.PersonalWorkspaceID.String() != personalWorkspaceID || cancel.TaskID.String() != decision.TaskID ||
+		cancel.PhaseRunID.String() != decision.PhaseRunID || cancel.RuntimeRunID.String() != decision.RuntimeRunID {
+		return CancellationDecision{}, newError(ErrorIntegrityConflict)
+	}
+	decision.CanonicalPayload = append([]byte(nil), decision.CanonicalPayload...)
+	if err := tx.Commit(); err != nil {
+		return CancellationDecision{}, newError(ErrorDependencyUnavailable)
+	}
+	return decision, nil
+}
+
 func (authority *PostgresAuthority) lockAdmissionCandidate(ctx context.Context, tx *sql.Tx) (lockedWorkItem, error) {
+	var lastPersonalWorkspaceID string
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT last_personal_workspace_id FROM %s
+		WHERE singleton=TRUE FOR UPDATE`, authority.table("scheduler_fairness_state"))).Scan(
+		&lastPersonalWorkspaceID,
+	); err != nil {
+		return lockedWorkItem{}, newError(ErrorDependencyUnavailable)
+	}
 	var work lockedWorkItem
 	var digest []byte
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT work_item_id, work_item_generation,
-		operation_id, task_id, phase_run_id, runtime_run_id, payload_digest, canonical_payload,
-		state, current_grant_generation, last_grant_generation
-		FROM %s WHERE state IN ($1,$2) AND octet_length(canonical_payload) > 0
-		ORDER BY CASE state WHEN $2 THEN 0 ELSE 1 END, enqueued_at, work_item_id
-		LIMIT 1 FOR UPDATE`, authority.table("scheduler_work_items")), WorkItemQueued, WorkItemDelivering).Scan(
-		&work.id.value, &work.generation, &work.operationID, &work.taskID, &work.phaseRunID,
+		operation_id, personal_workspace_id, task_id, phase_run_id, runtime_run_id, payload_digest, canonical_payload,
+		state, current_grant_generation, last_grant_generation FROM %s
+		WHERE state=$1 AND runtime_request_kind=1 AND octet_length(canonical_payload) > 0
+		ORDER BY enqueued_at, work_item_id LIMIT 1 FOR UPDATE`,
+		authority.table("scheduler_work_items")), WorkItemDelivering).Scan(
+		&work.id.value, &work.generation, &work.operationID, &work.personalWorkspaceID, &work.taskID, &work.phaseRunID,
 		&work.runtimeRunID, &digest, &work.canonicalPayload, &work.state,
 		&work.currentGeneration, &work.lastGeneration,
 	)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT work_item_id, work_item_generation,
+			operation_id, personal_workspace_id, task_id, phase_run_id, runtime_run_id, payload_digest, canonical_payload,
+			state, current_grant_generation, last_grant_generation FROM %s AS work
+			WHERE work.state=$1 AND work.runtime_request_kind=1 AND octet_length(canonical_payload) > 0 AND (
+				SELECT count(*) FROM %s AS reservation
+				WHERE reservation.counter_kind=2
+				AND reservation.counter_key=work.personal_workspace_id
+				AND reservation.state IN ($2,$3)
+			) < $4
+			ORDER BY CASE WHEN personal_workspace_id > $5 THEN 0 ELSE 1 END,
+				personal_workspace_id, enqueued_at, work_item_id
+			LIMIT 1 FOR UPDATE`, authority.table("scheduler_work_items"),
+			authority.table("scheduler_logical_reservations")), WorkItemQueued,
+			ReservationReservedUnbound, ReservationBound, authority.admission.Limits.PersonalWorkspace,
+			lastPersonalWorkspaceID).Scan(
+			&work.id.value, &work.generation, &work.operationID, &work.personalWorkspaceID, &work.taskID, &work.phaseRunID,
+			&work.runtimeRunID, &digest, &work.canonicalPayload, &work.state,
+			&work.currentGeneration, &work.lastGeneration,
+		)
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return lockedWorkItem{}, newError(ErrorNoEligibleWork)
 	}
@@ -423,6 +592,22 @@ func (authority *PostgresAuthority) lockAdmissionCandidate(ctx context.Context, 
 	}
 	copy(work.payloadDigest[:], digest)
 	return work, nil
+}
+
+func (authority *PostgresAuthority) logicalReservationOccupancy(
+	ctx context.Context,
+	tx *sql.Tx,
+	kind uint8,
+	key string,
+) (uint64, error) {
+	var occupied uint64
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s
+		WHERE counter_kind=$1 AND counter_key=$2 AND state IN ($3,$4)`,
+		authority.table("scheduler_logical_reservations")), kind, key,
+		ReservationReservedUnbound, ReservationBound).Scan(&occupied); err != nil {
+		return 0, newError(ErrorDependencyUnavailable)
+	}
+	return occupied, nil
 }
 
 func (authority *PostgresAuthority) validateCanonicalWork(work lockedWorkItem) (canonicalStartEnvelope, error) {
@@ -435,6 +620,7 @@ func (authority *PostgresAuthority) validateCanonicalWork(work lockedWorkItem) (
 		envelope.Kind != "start_runtime_run" || envelope.OperationID != work.operationID ||
 		envelope.TaskID != work.taskID || envelope.PhaseRunID != work.phaseRunID ||
 		envelope.RuntimeRunID != work.runtimeRunID || !validOpaqueID(envelope.PersonalWorkspaceID) ||
+		envelope.PersonalWorkspaceID != work.personalWorkspaceID ||
 		envelope.ResourceClassID != authority.admission.Node.ResourceClassID.value ||
 		envelope.ExecutionPolicyID != authority.admission.Node.ExecutionPolicyID.value ||
 		!validOpaqueID(envelope.WorkerClass) || envelope.Deadline.IsZero() {
@@ -522,6 +708,15 @@ func (authority *PostgresAuthority) reserveAdmission(
 	if err != nil || rows != 1 {
 		return AdmissionGrant{}, newError(ErrorIntegrityConflict)
 	}
+	result, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET
+		last_personal_workspace_id=$1, updated_at=$2 WHERE singleton=TRUE`,
+		authority.table("scheduler_fairness_state")), work.personalWorkspaceID, now)
+	if err != nil {
+		return AdmissionGrant{}, newError(ErrorDependencyUnavailable)
+	}
+	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
+		return AdmissionGrant{}, newError(ErrorIntegrityConflict)
+	}
 	return grant, nil
 }
 
@@ -589,25 +784,29 @@ func (authority *PostgresAuthority) loadGrant(
 }
 
 func admissionDecision(work lockedWorkItem, grant AdmissionGrant) AdmissionDecision {
+	personalWorkspaceID, _ := NewPersonalWorkspaceID(work.personalWorkspaceID)
 	return AdmissionDecision{
-		WorkItemID: work.id, OperationID: work.operationID, TaskID: work.taskID,
+		WorkItemID: work.id, PersonalWorkspaceID: personalWorkspaceID,
+		OperationID: work.operationID, TaskID: work.taskID,
 		PhaseRunID: work.phaseRunID, RuntimeRunID: work.runtimeRunID,
 		PayloadDigest: work.payloadDigest, CanonicalPayload: append([]byte(nil), work.canonicalPayload...), Grant: grant,
 	}
 }
 
 func (authority *PostgresAuthority) Inspect(ctx context.Context, ref WorkItemRef) (WorkItemView, error) {
-	if ctx == nil || ctx.Err() != nil || !validOpaqueID(ref.WorkItemID.value) {
+	if ctx == nil || ctx.Err() != nil || !validOpaqueID(ref.WorkItemID.value) || !ref.Scope.valid() {
 		return WorkItemView{}, newError(ErrorInvalidRequest)
 	}
 	var view WorkItemView
 	var digest []byte
 	err := authority.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT work_item_id, operation_id,
-		task_id, phase_run_id, runtime_run_id, payload_digest, state FROM %s WHERE work_item_id=$1`,
-		authority.table("scheduler_work_items")), ref.WorkItemID.value).Scan(&view.WorkItemID.value,
+		task_id, phase_run_id, runtime_run_id, payload_digest, state FROM %s
+		WHERE work_item_id=$1 AND ($2 OR personal_workspace_id=$3)`,
+		authority.table("scheduler_work_items")), ref.WorkItemID.value, ref.Scope.administrator(),
+		ref.Scope.personalWorkspaceID.String()).Scan(&view.WorkItemID.value,
 		&view.OperationID, &view.TaskID, &view.PhaseRunID, &view.RuntimeRunID, &digest, &view.State)
 	if errors.Is(err, sql.ErrNoRows) {
-		return WorkItemView{}, newError(ErrorInvalidRequest)
+		return WorkItemView{}, newError(ErrorAuthorizationDenied)
 	}
 	if err != nil || len(digest) != sha256.Size {
 		return WorkItemView{}, newError(ErrorDependencyUnavailable)
@@ -623,7 +822,9 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref WorkItemRef
 			return WorkItemView{}, loadErr
 		}
 		view.Grant = GrantView{AdmissionGrant: grant, State: state}
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	} else if errors.Is(err, sql.ErrNoRows) {
+		return view, nil
+	} else {
 		return WorkItemView{}, newError(ErrorDependencyUnavailable)
 	}
 	var logicalMin, logicalMax, nodeState ReservationState

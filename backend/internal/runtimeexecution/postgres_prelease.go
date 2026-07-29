@@ -7,7 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
+)
+
+var (
+	errPostgresLeaseRuntimeDeadlineExpired = errors.New("runtime deadline expired before lease commit")
+	errPostgresLeaseAuthorityExpired       = errors.New("admission authority expired before lease commit")
 )
 
 func (authority *PostgresAuthority) advancePostgresPreLease(
@@ -89,7 +93,24 @@ func (authority *PostgresAuthority) advancePostgresPreLease(
 		startDecision.Snapshot = terminal.Snapshot
 		return startDecision, nil
 	case LeaseAcquisitionReady:
-		committed, err := authority.commitPostgresPreLease(ctx, start, request, now)
+		committed, err := authority.commitPostgresPreLease(ctx, start, request)
+		if errors.Is(err, errPostgresLeaseRuntimeDeadlineExpired) ||
+			errors.Is(err, errPostgresLeaseAuthorityExpired) {
+			outcome := RuntimeRejected
+			reason := PreLeaseTerminalAdmissionAuthorityExpired
+			if errors.Is(err, errPostgresLeaseRuntimeDeadlineExpired) {
+				outcome = RuntimeTimedOut
+				reason = PreLeaseTerminalRuntimeDeadline
+			}
+			terminal, terminalErr := authority.executePostgresPreLeaseTerminal(
+				ctx, start, outcome, reason, postgresTimestamp(authority.now()),
+			)
+			if terminalErr != nil {
+				return RuntimeDecision{}, terminalErr
+			}
+			startDecision.Snapshot = terminal.Snapshot
+			return startDecision, nil
+		}
 		if err != nil {
 			return RuntimeDecision{}, err
 		}
@@ -177,7 +198,6 @@ func (authority *PostgresAuthority) commitPostgresPreLease(
 	ctx context.Context,
 	start StartRuntimeRun,
 	request LeaseAcquisitionRequest,
-	committedAt time.Time,
 ) (RuntimeSnapshot, error) {
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -205,6 +225,13 @@ func (authority *PostgresAuthority) commitPostgresPreLease(
 			return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
 		}
 		return snapshot(record, SnapshotSchemaCurrent), nil
+	}
+	committedAt := postgresTimestamp(authority.now())
+	if !committedAt.Before(record.deadline) {
+		return RuntimeSnapshot{}, errPostgresLeaseRuntimeDeadlineExpired
+	}
+	if !committedAt.Before(record.leaseAcquireBy) {
+		return RuntimeSnapshot{}, errPostgresLeaseAuthorityExpired
 	}
 	if record.fixture.State != RuntimeWaitingForLease && record.fixture.State != RuntimeReconciling ||
 		record.fixture.Outcome != RuntimeOutcomeNone || !validAcceptedStartBinding(record.operation, record.lease) ||

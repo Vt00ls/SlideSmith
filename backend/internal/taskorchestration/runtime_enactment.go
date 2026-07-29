@@ -23,7 +23,7 @@ func canonicalRuntimeStartEnactment(
 	if !validOpaqueID(taskID.value) {
 		taskID = header.TaskID
 	}
-	workspaceID, err := runtimeexecution.NewPersonalWorkspaceID("personal-workspace-" + taskID.value)
+	workspaceID, err := canonicalPersonalWorkspaceID(record.owner)
 	if err != nil {
 		return runtimeRunRecord{}, EnactmentRef{}, invalidIntentError()
 	}
@@ -139,6 +139,10 @@ func canonicalRuntimeStartEnactment(
 		ActivityGeneration: header.ActivityGeneration, Fence: RuntimeFence(run.fence),
 		CausationID: CausationID{value: "causation-" + decisionID.value},
 	}, nil
+}
+
+func canonicalPersonalWorkspaceID(owner userOwnershipBinding) (runtimeexecution.PersonalWorkspaceID, error) {
+	return runtimeexecution.NewPersonalWorkspaceID("personal-workspace-" + owner.authorityID.value)
 }
 
 func runtimeEnactmentDigest(domain string, values ...string) runtimeexecution.Digest {
