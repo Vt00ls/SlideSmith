@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 )
 
 var (
@@ -242,26 +243,75 @@ func (authority *PostgresAuthority) commitPostgresPreLease(
 		}) || record.capacityEvidence != (RuntimeCapacityEvidenceSnapshot{}) {
 		return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
 	}
+	if authority.schedulerLeaseAttachmentParticipant == nil {
+		return RuntimeSnapshot{}, newError(ErrorDependencyUnavailable)
+	}
+	node, err := authority.loadPostgresNodeForUpdate(ctx, tx, record.operation.ExecutionNodeID)
+	if err != nil || !postgresNodeEligibleForLease(node, record, committedAt) {
+		return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
+	}
+	if start.ProviderCapability == ProviderCapabilityRequired {
+		if start.ProviderBinding == nil || authority.quotaReservationParticipant == nil {
+			return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
+		}
+		reservationFact := QuotaReservationValidationFact{
+			QuotaReservationID: start.ProviderBinding.QuotaReservationID,
+			Generation:         start.ProviderBinding.Generation, Mode: start.ProviderBinding.Mode,
+			PersonalWorkspaceID: start.PersonalWorkspaceID, PhaseRunID: start.PhaseRunID,
+			Capability: start.ProviderCapability, ValidAt: committedAt,
+		}
+		reservationTransaction := &postgresQuotaReservationTransaction{
+			tx: tx, function: authority.quotaReservationFunction, fact: reservationFact,
+		}
+		if err := authority.quotaReservationParticipant.ParticipateQuotaReservation(
+			ctx, reservationTransaction, reservationFact,
+		); err != nil || !reservationTransaction.called {
+			return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
+		}
+	} else if start.ProviderCapability != ProviderCapabilityNone {
+		return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
+	}
 	if authority.failAt(PersistenceFaultBeforeLeaseCommit) {
 		return RuntimeSnapshot{}, newError(ErrorDependencyUnavailable)
 	}
 	previousRevision := record.fixture.RuntimeRevision
 	beforeState := record.fixture.State
-	var decisionSequence, leaseSequence uint64
+	var decisionSequence, leaseSequence, sandboxSequence uint64
 	if err := tx.QueryRowContext(ctx, "SELECT nextval('"+authority.table("runtime_execution_decision_sequence")+"')").Scan(&decisionSequence); err != nil {
 		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
 	}
 	if err := tx.QueryRowContext(ctx, "SELECT nextval('"+authority.table("runtime_execution_sandbox_lease_sequence")+"')").Scan(&leaseSequence); err != nil {
 		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
 	}
+	if err := tx.QueryRowContext(ctx, "SELECT nextval('"+authority.table("runtime_execution_sandbox_sequence")+"')").Scan(&sandboxSequence); err != nil {
+		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
+	}
 	decisionID := RuntimeDecisionID{value: fmt.Sprintf("runtime-decision-postgres-%020d", decisionSequence)}
 	leaseID := SandboxLeaseID{value: fmt.Sprintf("sandbox-lease-postgres-%020d", leaseSequence)}
+	sandboxID := SandboxID{value: fmt.Sprintf("sandbox-instance-postgres-%020d", sandboxSequence)}
 	record.fixture.RuntimeRevision++
 	record.fixture.State = RuntimePreparingPrerequisites
 	record.lease.AcquireStatus = LeaseGranted
 	record.lease.LeaseID = leaseID
 	record.lease.Generation = 1
 	record.lease.Fence = 1
+	record.lease.Disposition = LeaseActive
+	record.lease.ExpiresAt = earliestTime(committedAt.Add(90*time.Second), record.deadline,
+		record.leaseAcquireBy, node.ExpiresAt, node.AuthorizationExpiresAt)
+	record.lease.SandboxID = sandboxID
+	record.lease.SandboxGeneration = node.LastSandboxGeneration + 1
+	record.lease.SandboxFence = node.LastSandboxFence + 1
+	record.lease.WorkerAuthorityID = node.WorkerAuthorityID
+	record.lease.WorkerGeneration = node.WorkerGeneration
+	record.lease.NodeAuthorityID = node.NodeAuthorityID
+	record.lease.AuthorizationGeneration = node.AuthorizationGeneration
+	record.lease.AuthorizationExpiresAt = node.AuthorizationExpiresAt
+	node.Occupancy = NodeOccupied
+	node.Containment = ContainmentPending
+	node.Reset = ResetRequired
+	node.ActiveRuntimeRunID = record.fixture.RuntimeRunID
+	node.ActiveLeaseID = leaseID
+	record.node = nodeSnapshot(node.ExecutionNodeFixture)
 	record.capacity.Physical = PhysicalCapacityOccupied
 	record.reconciliation = ReconciliationStable
 	fact := RuntimeDecisionFact{
@@ -270,6 +320,27 @@ func (authority *PostgresAuthority) commitPostgresPreLease(
 		PreviousRuntimeRevision: previousRevision, ResultingRuntimeRevision: record.fixture.RuntimeRevision,
 		StateAtDecision: RuntimePreparingPrerequisites, OutcomeAtDecision: RuntimeOutcomeNone,
 		Retry: RetryNever, Reconciliation: ReconciliationNotRequired,
+	}
+	attachmentFact := SchedulerLeaseAttachmentFact{
+		WorkItemID: request.WorkItemID, AdmissionGrantID: request.AdmissionGrantID,
+		GrantGeneration: request.GrantGeneration, RuntimeRunID: request.RuntimeRunID,
+		StartOperationID: request.StartOperationID, StartDigest: request.StartDigest,
+		RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
+		LeaseAcquireOperationID: request.OperationID, LeaseAcquireDigest: request.Digest,
+		SandboxLeaseID: leaseID, LeaseGeneration: record.lease.Generation, LeaseFence: record.lease.Fence,
+		SandboxID: record.lease.SandboxID, SandboxGeneration: record.lease.SandboxGeneration,
+		SandboxFence:    record.lease.SandboxFence,
+		ExecutionNodeID: request.ExecutionNodeID, NodeCapacityGeneration: request.NodeCapacityGeneration,
+		ResourceClassID: request.ResourceClassID, ExecutionPolicyID: request.ExecutionPolicyID,
+		SchedulerEpoch: request.SchedulerEpoch, PolicyVersion: request.PolicyVersion, AttachedAt: committedAt,
+	}
+	attachmentTransaction := &postgresSchedulerLeaseAttachmentTransaction{
+		tx: tx, function: authority.schedulerLeaseAttachmentFunction, fact: attachmentFact,
+	}
+	if err := authority.schedulerLeaseAttachmentParticipant.ParticipateLeaseAttachment(
+		ctx, attachmentTransaction, attachmentFact,
+	); err != nil || !attachmentTransaction.called {
+		return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
 	}
 	canonical, err := encodePostgresLeaseCommit(request)
 	if err != nil {
@@ -291,19 +362,31 @@ func (authority *PostgresAuthority) commitPostgresPreLease(
 	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
 		return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
 	}
+	if err := authority.updatePostgresNode(ctx, tx, node, committedAt); err != nil {
+		return RuntimeSnapshot{}, err
+	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
 		lease_acquire_operation_id, lease_acquire_digest, runtime_run_id,
 		start_operation_id, start_digest, work_item_id, admission_grant_id,
 		grant_generation, execution_node_id, node_capacity_generation,
 		resource_class_id, execution_policy_id, scheduler_epoch, policy_version,
-		safety_epoch, sandbox_lease_id, lease_generation, lease_fence, committed_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+		safety_epoch, sandbox_lease_id, lease_generation, lease_fence,
+		lease_disposition, lease_expires_at, sandbox_id, sandbox_generation, sandbox_fence,
+		worker_authority_id, worker_generation, node_authority_id,
+		authorization_generation, authorization_expires_at, catalog_safety_epoch, committed_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+		$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)`,
 		authority.table("runtime_execution_prelease_leases")), request.OperationID.String(), request.Digest[:],
 		request.RuntimeRunID.String(), request.StartOperationID.String(), request.StartDigest[:],
 		request.WorkItemID.String(), request.AdmissionGrantID.String(), request.GrantGeneration,
 		request.ExecutionNodeID.String(), request.NodeCapacityGeneration, request.ResourceClassID.String(),
 		request.ExecutionPolicyID.String(), request.SchedulerEpoch, request.PolicyVersion,
-		request.SafetyEpoch, leaseID.String(), record.lease.Generation, record.lease.Fence, committedAt); err != nil {
+		request.SafetyEpoch, leaseID.String(), record.lease.Generation, record.lease.Fence,
+		record.lease.Disposition, record.lease.ExpiresAt, record.lease.SandboxID.String(),
+		record.lease.SandboxGeneration, record.lease.SandboxFence, record.lease.WorkerAuthorityID.String(),
+		record.lease.WorkerGeneration, record.lease.NodeAuthorityID.String(),
+		record.lease.AuthorizationGeneration, record.lease.AuthorizationExpiresAt,
+		record.catalogSafetyEpoch, committedAt); err != nil {
 		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
 	}
 	decisionState, err := encodePostgresDecisionFact(fact)
@@ -435,6 +518,23 @@ func postgresLeaseRequestMatchesRecord(
 		request.LeaseAcquireBy.Equal(record.leaseAcquireBy)
 }
 
+func postgresNodeEligibleForLease(
+	node *postgresExecutionNodeRecord,
+	record *runtimeRecord,
+	now time.Time,
+) bool {
+	return node != nil && node.Generation == NodeGeneration(record.operation.NodeCapacityGeneration) &&
+		node.Readiness == NodeReady && !node.Quarantined && node.Occupancy == NodeUnoccupied &&
+		node.Containment == ContainmentEstablished && node.Reset == ResetCompleted &&
+		!node.AttestedAt.After(now) && now.Before(node.ExpiresAt) && now.Before(node.AuthorizationExpiresAt) &&
+		node.ResourceClassID == record.operation.ResourceClassID &&
+		node.ExecutionPolicyID == record.operation.ExecutionPolicyID &&
+		node.ReleaseSafetyEpoch == record.fixture.SafetyEpoch &&
+		node.CatalogSafetyEpoch == record.catalogSafetyEpoch && validOpaqueID(node.WorkerAuthorityID.String()) &&
+		node.WorkerGeneration > 0 && validOpaqueID(node.NodeAuthorityID.String()) &&
+		node.AuthorizationGeneration > 0
+}
+
 func (authority *PostgresAuthority) validateRetainedPostgresLease(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -442,22 +542,36 @@ func (authority *PostgresAuthority) validateRetainedPostgresLease(
 	request LeaseAcquisitionRequest,
 ) error {
 	var operationID, runtimeRunID, startOperationID, workItemID, grantID, nodeID string
-	var resourceClassID, executionPolicyID, leaseID string
+	var resourceClassID, executionPolicyID, leaseID, sandboxID string
+	var workerAuthorityID, nodeAuthorityID string
 	var acquireDigest, startDigest []byte
 	var grantGeneration AdmissionGrantGeneration
 	var nodeGeneration, schedulerEpoch, policyVersion uint64
 	var safetyEpoch ReleaseSafetyEpoch
 	var leaseGeneration LeaseGeneration
 	var leaseFence LeaseFence
+	var disposition LeaseDisposition
+	var leaseExpiresAt, authorizationExpiresAt time.Time
+	var sandboxGeneration SandboxGeneration
+	var sandboxFence SandboxFence
+	var workerGeneration WorkerGeneration
+	var authorizationGeneration AuthorizationGeneration
+	var catalogSafetyEpoch CatalogSafetyEpoch
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT lease_acquire_operation_id,
 		lease_acquire_digest, runtime_run_id, start_operation_id, start_digest, work_item_id,
 		admission_grant_id, grant_generation, execution_node_id, node_capacity_generation,
 		resource_class_id, execution_policy_id, scheduler_epoch, policy_version, safety_epoch,
-		sandbox_lease_id, lease_generation, lease_fence FROM %s WHERE runtime_run_id=$1`,
+		sandbox_lease_id, lease_generation, lease_fence, lease_disposition, lease_expires_at,
+		sandbox_id, sandbox_generation, sandbox_fence, worker_authority_id, worker_generation,
+		node_authority_id, authorization_generation, authorization_expires_at, catalog_safety_epoch
+		FROM %s WHERE runtime_run_id=$1`,
 		authority.table("runtime_execution_prelease_leases")), request.RuntimeRunID.String()).Scan(
 		&operationID, &acquireDigest, &runtimeRunID, &startOperationID, &startDigest, &workItemID,
 		&grantID, &grantGeneration, &nodeID, &nodeGeneration, &resourceClassID, &executionPolicyID,
-		&schedulerEpoch, &policyVersion, &safetyEpoch, &leaseID, &leaseGeneration, &leaseFence)
+		&schedulerEpoch, &policyVersion, &safetyEpoch, &leaseID, &leaseGeneration, &leaseFence,
+		&disposition, &leaseExpiresAt, &sandboxID, &sandboxGeneration, &sandboxFence,
+		&workerAuthorityID, &workerGeneration, &nodeAuthorityID, &authorizationGeneration,
+		&authorizationExpiresAt, &catalogSafetyEpoch)
 	if err != nil || operationID != request.OperationID.String() || !bytes.Equal(acquireDigest, request.Digest[:]) ||
 		runtimeRunID != request.RuntimeRunID.String() || startOperationID != request.StartOperationID.String() ||
 		!bytes.Equal(startDigest, request.StartDigest[:]) || workItemID != request.WorkItemID.String() ||
@@ -465,7 +579,15 @@ func (authority *PostgresAuthority) validateRetainedPostgresLease(
 		nodeID != request.ExecutionNodeID.String() || nodeGeneration != request.NodeCapacityGeneration ||
 		resourceClassID != request.ResourceClassID.String() || executionPolicyID != request.ExecutionPolicyID.String() ||
 		schedulerEpoch != request.SchedulerEpoch || policyVersion != request.PolicyVersion || safetyEpoch != request.SafetyEpoch ||
-		leaseID != record.lease.LeaseID.String() || leaseGeneration != record.lease.Generation || leaseFence != record.lease.Fence {
+		leaseID != record.lease.LeaseID.String() || leaseGeneration != record.lease.Generation ||
+		leaseFence != record.lease.Fence || disposition != record.lease.Disposition ||
+		!leaseExpiresAt.Equal(record.lease.ExpiresAt) || sandboxID != record.lease.SandboxID.String() ||
+		sandboxGeneration != record.lease.SandboxGeneration || sandboxFence != record.lease.SandboxFence ||
+		workerAuthorityID != record.lease.WorkerAuthorityID.String() || workerGeneration != record.lease.WorkerGeneration ||
+		nodeAuthorityID != record.lease.NodeAuthorityID.String() ||
+		authorizationGeneration != record.lease.AuthorizationGeneration ||
+		!authorizationExpiresAt.Equal(record.lease.AuthorizationExpiresAt) ||
+		catalogSafetyEpoch != record.catalogSafetyEpoch {
 		return newError(ErrorIntegrityConflict)
 	}
 	return nil

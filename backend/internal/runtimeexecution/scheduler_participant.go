@@ -65,6 +65,91 @@ func (function SchedulerAcceptanceParticipantFunc) Participate(
 	return function(ctx, transaction, fact)
 }
 
+// SchedulerLeaseAttachmentFact is the exact C03 lease commit that Scheduler
+// must bind to its already-Bound Admission Grant and selected-node reservation
+// in the caller's PostgreSQL transaction.
+type SchedulerLeaseAttachmentFact struct {
+	WorkItemID              WorkItemID
+	AdmissionGrantID        AdmissionGrantID
+	GrantGeneration         AdmissionGrantGeneration
+	RuntimeRunID            RuntimeRunID
+	StartOperationID        OperationID
+	StartDigest             Digest
+	RuntimeRevision         RuntimeRevision
+	RuntimeFence            RuntimeFence
+	LeaseAcquireOperationID OperationID
+	LeaseAcquireDigest      Digest
+	SandboxLeaseID          SandboxLeaseID
+	LeaseGeneration         LeaseGeneration
+	LeaseFence              LeaseFence
+	SandboxID               SandboxID
+	SandboxGeneration       SandboxGeneration
+	SandboxFence            SandboxFence
+	ExecutionNodeID         ExecutionNodeID
+	NodeCapacityGeneration  uint64
+	ResourceClassID         ResourceClassID
+	ExecutionPolicyID       ExecutionPolicyID
+	SchedulerEpoch          uint64
+	PolicyVersion           uint64
+	AttachedAt              time.Time
+}
+
+// SchedulerLeaseAttachmentTransaction exposes only the restricted exact
+// attachment function, never SQL or caller-controlled capacity mutation.
+type SchedulerLeaseAttachmentTransaction interface {
+	AttachLease(context.Context) error
+}
+
+type SchedulerLeaseAttachmentParticipant interface {
+	ParticipateLeaseAttachment(context.Context, SchedulerLeaseAttachmentTransaction, SchedulerLeaseAttachmentFact) error
+}
+
+type SchedulerLeaseAttachmentParticipantFunc func(
+	context.Context,
+	SchedulerLeaseAttachmentTransaction,
+	SchedulerLeaseAttachmentFact,
+) error
+
+func (function SchedulerLeaseAttachmentParticipantFunc) ParticipateLeaseAttachment(
+	ctx context.Context,
+	transaction SchedulerLeaseAttachmentTransaction,
+	fact SchedulerLeaseAttachmentFact,
+) error {
+	return function(ctx, transaction, fact)
+}
+
+type QuotaReservationValidationFact struct {
+	QuotaReservationID  QuotaReservationID
+	Generation          QuotaReservationGeneration
+	Mode                QuotaReservationMode
+	PersonalWorkspaceID PersonalWorkspaceID
+	PhaseRunID          PhaseRunID
+	Capability          ProviderCapability
+	ValidAt             time.Time
+}
+
+type QuotaReservationValidationTransaction interface {
+	ValidateQuotaReservation(context.Context) error
+}
+
+type QuotaReservationParticipant interface {
+	ParticipateQuotaReservation(context.Context, QuotaReservationValidationTransaction, QuotaReservationValidationFact) error
+}
+
+type QuotaReservationParticipantFunc func(
+	context.Context,
+	QuotaReservationValidationTransaction,
+	QuotaReservationValidationFact,
+) error
+
+func (function QuotaReservationParticipantFunc) ParticipateQuotaReservation(
+	ctx context.Context,
+	transaction QuotaReservationValidationTransaction,
+	fact QuotaReservationValidationFact,
+) error {
+	return function(ctx, transaction, fact)
+}
+
 type SchedulerCancellationFact struct {
 	OperationID            OperationID
 	CanonicalRequestDigest Digest

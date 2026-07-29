@@ -169,6 +169,9 @@ func (authority *PostgresAuthority) executePostgresStart(
 		AcquireStatus: LeaseAcquirePending, AcquireOperationID: leaseOperationID, AcquireDigest: leaseDigest,
 	}
 	record.deadline = command.Deadline.UTC()
+	if command.CatalogBinding != nil {
+		record.catalogSafetyEpoch = command.CatalogBinding.SafetyEpoch
+	}
 	record.leaseAcquireBy = schedulerBinding.LeaseAcquireBy
 	record.capacity = RuntimeCapacitySnapshot{
 		LogicalRelease: LogicalCapacityHeld, NoLease: NoLeaseDispositionNone, Physical: PhysicalCapacityNotApplicable,

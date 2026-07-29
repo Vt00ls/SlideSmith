@@ -66,34 +66,45 @@ func newPersistenceError(code PersistenceErrorCode) *PersistenceError {
 }
 
 type PostgresConfig struct {
-	Schema                           string
-	Now                              func() time.Time
-	Faults                           PersistenceFaultInjector
-	ProjectionDelivery               ProjectionDelivery
-	SchedulerParticipant             SchedulerAcceptanceParticipant
-	SchedulerAcceptanceFunction      string
-	SchedulerCancellationParticipant SchedulerCancellationParticipant
-	SchedulerCancellationFunction    string
-	LeaseAcquisition                 LeaseAcquisitionAdapter
+	Schema                              string
+	Now                                 func() time.Time
+	Faults                              PersistenceFaultInjector
+	ProjectionDelivery                  ProjectionDelivery
+	SchedulerParticipant                SchedulerAcceptanceParticipant
+	SchedulerAcceptanceFunction         string
+	SchedulerLeaseAttachmentParticipant SchedulerLeaseAttachmentParticipant
+	SchedulerLeaseAttachmentFunction    string
+	SchedulerCancellationParticipant    SchedulerCancellationParticipant
+	SchedulerCancellationFunction       string
+	LeaseAcquisition                    LeaseAcquisitionAdapter
+	QuotaReservationParticipant         QuotaReservationParticipant
+	QuotaReservationFunction            string
+	MaintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
 }
 
 // PostgresAuthority owns C03 persistence behind the RuntimeExecution seam.
 // Its implementation does not expose SQL, a general repository, or a
 // caller-controlled transaction handle.
 type PostgresAuthority struct {
-	db                               *sql.DB
-	schema                           string
-	now                              func() time.Time
-	faults                           PersistenceFaultInjector
-	projection                       ProjectionDelivery
-	schedulerParticipant             SchedulerAcceptanceParticipant
-	schedulerAcceptanceFunction      string
-	schedulerCancellationParticipant SchedulerCancellationParticipant
-	schedulerCancellationFunction    string
-	leaseAcquisition                 LeaseAcquisitionAdapter
+	db                                  *sql.DB
+	schema                              string
+	now                                 func() time.Time
+	faults                              PersistenceFaultInjector
+	projection                          ProjectionDelivery
+	schedulerParticipant                SchedulerAcceptanceParticipant
+	schedulerAcceptanceFunction         string
+	schedulerLeaseAttachmentParticipant SchedulerLeaseAttachmentParticipant
+	schedulerLeaseAttachmentFunction    string
+	schedulerCancellationParticipant    SchedulerCancellationParticipant
+	schedulerCancellationFunction       string
+	leaseAcquisition                    LeaseAcquisitionAdapter
+	quotaReservationParticipant         QuotaReservationParticipant
+	quotaReservationFunction            string
+	maintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
 }
 
 var _ RuntimeExecution = (*PostgresAuthority)(nil)
+var _ RuntimeMaintenance = (*PostgresAuthority)(nil)
 
 func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority, error) {
 	if db == nil {
@@ -112,17 +123,37 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 	}
 	if config.SchedulerParticipant != nil && !validPostgresQualifiedIdentifier(config.SchedulerAcceptanceFunction) ||
 		config.SchedulerParticipant == nil && config.SchedulerAcceptanceFunction != "" ||
+		config.SchedulerLeaseAttachmentParticipant != nil && !validPostgresQualifiedIdentifier(config.SchedulerLeaseAttachmentFunction) ||
+		config.SchedulerLeaseAttachmentParticipant == nil && config.SchedulerLeaseAttachmentFunction != "" ||
 		config.SchedulerCancellationParticipant != nil && !validPostgresQualifiedIdentifier(config.SchedulerCancellationFunction) ||
-		config.SchedulerCancellationParticipant == nil && config.SchedulerCancellationFunction != "" {
+		config.SchedulerCancellationParticipant == nil && config.SchedulerCancellationFunction != "" ||
+		config.QuotaReservationParticipant != nil && !validPostgresQualifiedIdentifier(config.QuotaReservationFunction) ||
+		config.QuotaReservationParticipant == nil && config.QuotaReservationFunction != "" {
 		return nil, newPersistenceError(PersistenceInvalidConfiguration)
+	}
+	seenMaintenanceAuthorities := make(map[maintenanceAuthorityKey]maintenanceCallerAuthority)
+	for _, binding := range config.MaintenanceAuthorities {
+		if !validMaintenanceAuthorityBinding(binding) {
+			return nil, newPersistenceError(PersistenceInvalidConfiguration)
+		}
+		key := maintenanceAuthorityKey{executionNodeID: binding.executionNodeID, kind: binding.caller.kind}
+		if retained, exists := seenMaintenanceAuthorities[key]; exists && retained != binding.caller {
+			return nil, newPersistenceError(PersistenceInvalidConfiguration)
+		}
+		seenMaintenanceAuthorities[key] = binding.caller
 	}
 	return &PostgresAuthority{
 		db: db, schema: schema, now: now, faults: config.Faults, projection: config.ProjectionDelivery,
-		schedulerParticipant:             config.SchedulerParticipant,
-		schedulerAcceptanceFunction:      config.SchedulerAcceptanceFunction,
-		schedulerCancellationParticipant: config.SchedulerCancellationParticipant,
-		schedulerCancellationFunction:    config.SchedulerCancellationFunction,
-		leaseAcquisition:                 config.LeaseAcquisition,
+		schedulerParticipant:                config.SchedulerParticipant,
+		schedulerAcceptanceFunction:         config.SchedulerAcceptanceFunction,
+		schedulerLeaseAttachmentParticipant: config.SchedulerLeaseAttachmentParticipant,
+		schedulerLeaseAttachmentFunction:    config.SchedulerLeaseAttachmentFunction,
+		schedulerCancellationParticipant:    config.SchedulerCancellationParticipant,
+		schedulerCancellationFunction:       config.SchedulerCancellationFunction,
+		leaseAcquisition:                    config.LeaseAcquisition,
+		quotaReservationParticipant:         config.QuotaReservationParticipant,
+		quotaReservationFunction:            config.QuotaReservationFunction,
+		maintenanceAuthorities:              append([]RuntimeMaintenanceAuthorityBinding(nil), config.MaintenanceAuthorities...),
 	}, nil
 }
 
@@ -152,6 +183,17 @@ func (authority *PostgresAuthority) table(name string) string {
 	return authority.schema + "." + name
 }
 
+// SchedulerNodeFactFunction names the read-only C03-owned projection that
+// Scheduler may consume during admission. It cannot mutate readiness,
+// quarantine, occupancy, containment, or reset authority.
+func (authority *PostgresAuthority) SchedulerNodeFactFunction() string {
+	return authority.table("runtime_execution_read_scheduler_node_fact")
+}
+
+func (authority *PostgresAuthority) SchedulerPhysicalReleaseEvidenceFunction() string {
+	return authority.table("runtime_execution_validate_physical_release")
+}
+
 // Migrate installs the owned persistence foundation in an already selected
 // schema. Production rollout and cutover remain outside this module.
 func (authority *PostgresAuthority) Migrate(ctx context.Context) error {
@@ -178,6 +220,9 @@ func (authority *PostgresAuthority) Migrate(ctx context.Context) error {
 			return normalizePostgresPersistenceFailure(err)
 		}
 	}
+	if err := authority.installPostgresMaintenanceAuthorities(ctx, tx); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return normalizePostgresPersistenceFailure(err)
 	}
@@ -193,6 +238,13 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	outbox := authority.table("runtime_execution_outbox")
 	capacityOutbox := authority.table("runtime_execution_capacity_outbox")
 	preLeaseLeases := authority.table("runtime_execution_prelease_leases")
+	nodes := authority.table("runtime_execution_nodes")
+	maintenance := authority.table("runtime_execution_maintenance_operations")
+	maintenanceAuthorities := authority.table("runtime_execution_maintenance_authorities")
+	maintenanceAudit := authority.table("runtime_execution_maintenance_audit")
+	maintenanceOutbox := authority.table("runtime_execution_maintenance_outbox")
+	leaseCleanup := authority.table("runtime_execution_lease_cleanup_obligations")
+	physicalReleaseEvidence := authority.table("runtime_execution_physical_release_evidence")
 	delivery := authority.table("runtime_execution_outbox_delivery")
 	reconciliation := authority.table("runtime_execution_reconciliation_obligations")
 	projection := authority.table("runtime_execution_projection_backlog")
@@ -210,6 +262,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	return []string{
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_decision_sequence")),
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_sandbox_lease_sequence")),
+		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_sandbox_sequence")),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			runtime_run_id text PRIMARY KEY,
 			personal_workspace_id text NOT NULL,
@@ -284,6 +337,14 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			audit_state jsonb NOT NULL
 		)`, audit, decisions, runtimes),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			execution_node_id text NOT NULL,
+			authority_kind smallint NOT NULL,
+			authority_id text NOT NULL,
+			authority_generation bigint NOT NULL CHECK (authority_generation > 0),
+			updated_at timestamptz NOT NULL,
+			PRIMARY KEY (execution_node_id, authority_kind)
+		)`, maintenanceAuthorities),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY,
 			decision_id text NOT NULL REFERENCES %s(decision_id),
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
@@ -313,6 +374,47 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			physical_capacity_release_ready jsonb,
 			committed_at timestamptz NOT NULL
 			)`, capacityOutbox, decisions, runtimes),
+		fmt.Sprintf(`ALTER TABLE %s
+			ADD COLUMN IF NOT EXISTS physical_capacity_release_ready jsonb`, capacityOutbox),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			execution_node_id text PRIMARY KEY,
+			node_generation bigint NOT NULL CHECK (node_generation > 0),
+			readiness smallint NOT NULL,
+			attestation_id text NOT NULL,
+			attestation_generation bigint NOT NULL CHECK (attestation_generation > 0),
+			attested_at timestamptz NOT NULL,
+			expires_at timestamptz NOT NULL,
+			resource_class_id text NOT NULL,
+			execution_policy_id text NOT NULL,
+			node_authority_id text NOT NULL,
+			worker_authority_id text NOT NULL,
+			worker_generation bigint NOT NULL CHECK (worker_generation > 0),
+			authorization_generation bigint NOT NULL CHECK (authorization_generation > 0),
+			authorization_expires_at timestamptz NOT NULL,
+			release_safety_epoch bigint NOT NULL CHECK (release_safety_epoch > 0),
+			catalog_safety_epoch bigint NOT NULL CHECK (catalog_safety_epoch >= 0),
+			occupancy smallint NOT NULL,
+			quarantined boolean NOT NULL,
+			containment smallint NOT NULL,
+			reset_status smallint NOT NULL,
+			active_runtime_run_id text NOT NULL DEFAULT '',
+			active_lease_id text NOT NULL DEFAULT '',
+			last_sandbox_generation bigint NOT NULL DEFAULT 0 CHECK (last_sandbox_generation >= 0),
+			last_sandbox_fence bigint NOT NULL DEFAULT 0 CHECK (last_sandbox_fence >= 0),
+			last_reset_evidence_id text NOT NULL DEFAULT '',
+			last_reset_evidence_digest bytea CHECK (last_reset_evidence_digest IS NULL OR octet_length(last_reset_evidence_digest) = 32),
+			updated_at timestamptz NOT NULL
+		)`, nodes),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s(p_execution_node_id text)
+		RETURNS TABLE (
+			node_generation bigint, readiness smallint, quarantined boolean,
+			occupancy smallint, containment smallint, reset_status smallint,
+			attestation_expires_at timestamptz, authorization_expires_at timestamptz
+		) LANGUAGE sql STABLE AS $node_fact$
+			SELECT node_generation, readiness, quarantined, occupancy, containment,
+				reset_status, expires_at, authorization_expires_at
+			FROM %s WHERE execution_node_id=p_execution_node_id
+		$node_fact$`, authority.SchedulerNodeFactFunction(), nodes),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			lease_acquire_operation_id text PRIMARY KEY,
 			lease_acquire_digest bytea NOT NULL CHECK (octet_length(lease_acquire_digest) = 32),
@@ -332,8 +434,157 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			sandbox_lease_id text NOT NULL UNIQUE,
 			lease_generation bigint NOT NULL CHECK (lease_generation > 0),
 			lease_fence bigint NOT NULL CHECK (lease_fence > 0),
+			lease_disposition smallint NOT NULL,
+			lease_expires_at timestamptz NOT NULL,
+			sandbox_id text NOT NULL UNIQUE,
+			sandbox_generation bigint NOT NULL CHECK (sandbox_generation > 0),
+			sandbox_fence bigint NOT NULL CHECK (sandbox_fence > 0),
+			worker_authority_id text NOT NULL,
+			worker_generation bigint NOT NULL CHECK (worker_generation > 0),
+			node_authority_id text NOT NULL,
+			authorization_generation bigint NOT NULL CHECK (authorization_generation > 0),
+			authorization_expires_at timestamptz NOT NULL,
+			catalog_safety_epoch bigint NOT NULL CHECK (catalog_safety_epoch >= 0),
 			committed_at timestamptz NOT NULL
 		)`, preLeaseLeases, runtimes),
+		fmt.Sprintf(`ALTER TABLE %s
+			ADD COLUMN IF NOT EXISTS lease_disposition smallint,
+			ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz,
+			ADD COLUMN IF NOT EXISTS sandbox_id text UNIQUE,
+			ADD COLUMN IF NOT EXISTS sandbox_generation bigint CHECK (sandbox_generation > 0),
+			ADD COLUMN IF NOT EXISTS sandbox_fence bigint CHECK (sandbox_fence > 0),
+			ADD COLUMN IF NOT EXISTS worker_authority_id text,
+			ADD COLUMN IF NOT EXISTS worker_generation bigint CHECK (worker_generation > 0),
+			ADD COLUMN IF NOT EXISTS node_authority_id text,
+			ADD COLUMN IF NOT EXISTS authorization_generation bigint CHECK (authorization_generation > 0),
+			ADD COLUMN IF NOT EXISTS authorization_expires_at timestamptz,
+			ADD COLUMN IF NOT EXISTS catalog_safety_epoch bigint CHECK (catalog_safety_epoch >= 0)`, preLeaseLeases),
+		fmt.Sprintf(`ALTER TABLE %s
+			ALTER COLUMN lease_disposition SET NOT NULL,
+			ALTER COLUMN lease_expires_at SET NOT NULL,
+			ALTER COLUMN sandbox_id SET NOT NULL,
+			ALTER COLUMN sandbox_generation SET NOT NULL,
+			ALTER COLUMN sandbox_fence SET NOT NULL,
+			ALTER COLUMN worker_authority_id SET NOT NULL,
+			ALTER COLUMN worker_generation SET NOT NULL,
+			ALTER COLUMN node_authority_id SET NOT NULL,
+			ALTER COLUMN authorization_generation SET NOT NULL,
+			ALTER COLUMN authorization_expires_at SET NOT NULL,
+			ALTER COLUMN catalog_safety_epoch SET NOT NULL`, preLeaseLeases),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY,
+			command_kind smallint NOT NULL,
+			canonical_request_digest bytea NOT NULL CHECK (octet_length(canonical_request_digest) = 32),
+			runtime_run_id text NOT NULL DEFAULT '',
+			execution_node_id text NOT NULL,
+			canonical_request bytea NOT NULL,
+			decision_state jsonb NOT NULL,
+			committed_at timestamptz NOT NULL
+		)`, maintenance),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			audit_id text PRIMARY KEY,
+			operation_id text NOT NULL UNIQUE REFERENCES %s(operation_id),
+			command_kind smallint NOT NULL,
+			canonical_request_digest bytea NOT NULL CHECK (octet_length(canonical_request_digest) = 32),
+			runtime_run_id text NOT NULL DEFAULT '',
+			execution_node_id text NOT NULL,
+			authority_kind smallint NOT NULL,
+			authority_id text NOT NULL,
+			authority_generation bigint NOT NULL CHECK (authority_generation > 0),
+			before_runtime_revision bigint NOT NULL CHECK (before_runtime_revision >= 0),
+			after_runtime_revision bigint NOT NULL CHECK (after_runtime_revision >= 0),
+			before_runtime_fence bigint NOT NULL CHECK (before_runtime_fence >= 0),
+			after_runtime_fence bigint NOT NULL CHECK (after_runtime_fence >= 0),
+			occurred_at timestamptz NOT NULL,
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			audit_state jsonb NOT NULL
+		)`, maintenanceAudit, maintenance),
+		fmt.Sprintf(`ALTER TABLE %s
+			ADD COLUMN IF NOT EXISTS authority_kind smallint,
+			ADD COLUMN IF NOT EXISTS authority_id text,
+			ADD COLUMN IF NOT EXISTS authority_generation bigint CHECK (authority_generation > 0)`, maintenanceAudit),
+		fmt.Sprintf(`ALTER TABLE %s
+			ALTER COLUMN authority_kind SET NOT NULL,
+			ALTER COLUMN authority_id SET NOT NULL,
+			ALTER COLUMN authority_generation SET NOT NULL`, maintenanceAudit),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			canonical_request_digest bytea NOT NULL CHECK (octet_length(canonical_request_digest) = 32),
+			runtime_run_id text NOT NULL DEFAULT '',
+			execution_node_id text NOT NULL,
+			payload bytea NOT NULL,
+			payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
+			committed_at timestamptz NOT NULL
+		)`, maintenanceOutbox, maintenance),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			sandbox_lease_id text NOT NULL,
+			lease_generation bigint NOT NULL CHECK (lease_generation > 0),
+			lease_fence bigint NOT NULL CHECK (lease_fence > 0),
+			sandbox_id text NOT NULL,
+			sandbox_generation bigint NOT NULL CHECK (sandbox_generation > 0),
+			sandbox_fence bigint NOT NULL CHECK (sandbox_fence > 0),
+			stop_main_process boolean NOT NULL,
+			stop_child_processes boolean NOT NULL,
+			revoke_secrets boolean NOT NULL,
+			remove_network boolean NOT NULL,
+			fence_runtime_view boolean NOT NULL,
+			reconcile_containment boolean NOT NULL,
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			created_at timestamptz NOT NULL
+		)`, leaseCleanup, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			release_operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			release_operation_digest bytea NOT NULL CHECK (octet_length(release_operation_digest) = 32),
+			work_item_id text NOT NULL,
+			admission_grant_id text NOT NULL,
+			grant_generation bigint NOT NULL CHECK (grant_generation > 0),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			start_operation_id text NOT NULL,
+			start_digest bytea NOT NULL CHECK (octet_length(start_digest) = 32),
+			runtime_revision bigint NOT NULL CHECK (runtime_revision > 0),
+			runtime_fence bigint NOT NULL CHECK (runtime_fence > 0),
+			sandbox_lease_id text NOT NULL,
+			lease_generation bigint NOT NULL CHECK (lease_generation > 0),
+			lease_fence bigint NOT NULL CHECK (lease_fence > 0),
+			sandbox_id text NOT NULL,
+			sandbox_generation bigint NOT NULL CHECK (sandbox_generation > 0),
+			sandbox_fence bigint NOT NULL CHECK (sandbox_fence > 0),
+			execution_node_id text NOT NULL,
+			node_capacity_generation bigint NOT NULL CHECK (node_capacity_generation > 0),
+			reset_evidence_id text NOT NULL,
+			reset_evidence_digest bytea NOT NULL CHECK (octet_length(reset_evidence_digest) = 32),
+			committed_at timestamptz NOT NULL
+		)`, physicalReleaseEvidence, maintenance, runtimes),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s(
+			p_work_item_id text, p_admission_grant_id text, p_grant_generation bigint,
+			p_runtime_run_id text, p_start_operation_id text, p_start_digest bytea,
+			p_release_operation_id text, p_release_operation_digest bytea,
+			p_runtime_revision bigint, p_runtime_fence bigint, p_sandbox_lease_id text,
+			p_lease_generation bigint, p_lease_fence bigint, p_sandbox_id text,
+			p_sandbox_generation bigint, p_sandbox_fence bigint, p_execution_node_id text,
+			p_node_capacity_generation bigint, p_reset_evidence_id text, p_reset_evidence_digest bytea
+		) RETURNS void LANGUAGE plpgsql STABLE AS $physical_release$
+		DECLARE retained %s%%ROWTYPE;
+		BEGIN
+			SELECT * INTO retained FROM %s WHERE release_operation_id=p_release_operation_id;
+			IF retained.release_operation_id IS NULL OR retained.work_item_id <> p_work_item_id OR
+				retained.admission_grant_id <> p_admission_grant_id OR retained.grant_generation <> p_grant_generation OR
+				retained.runtime_run_id <> p_runtime_run_id OR retained.start_operation_id <> p_start_operation_id OR
+				retained.start_digest <> p_start_digest OR retained.release_operation_digest <> p_release_operation_digest OR
+				retained.runtime_revision <> p_runtime_revision OR retained.runtime_fence <> p_runtime_fence OR
+				retained.sandbox_lease_id <> p_sandbox_lease_id OR retained.lease_generation <> p_lease_generation OR
+				retained.lease_fence <> p_lease_fence OR retained.sandbox_id <> p_sandbox_id OR
+				retained.sandbox_generation <> p_sandbox_generation OR retained.sandbox_fence <> p_sandbox_fence OR
+				retained.execution_node_id <> p_execution_node_id OR
+				retained.node_capacity_generation <> p_node_capacity_generation OR
+				retained.reset_evidence_id <> p_reset_evidence_id OR
+				retained.reset_evidence_digest <> p_reset_evidence_digest THEN
+				RAISE EXCEPTION 'physical release evidence conflict' USING ERRCODE = '23000';
+			END IF;
+		END $physical_release$`, authority.SchedulerPhysicalReleaseEvidenceFunction(),
+			physicalReleaseEvidence, physicalReleaseEvidence),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY,
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
@@ -571,6 +822,16 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanupResolutionProofs, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", cleanupResolutionAudit),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanupResolutionAudit, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", maintenance),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", maintenance, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", maintenanceAudit),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", maintenanceAudit, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", maintenanceOutbox),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", maintenanceOutbox, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", leaseCleanup),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", leaseCleanup, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", physicalReleaseEvidence),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", physicalReleaseEvidence, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_cleanup_rebinding ON %s", cleanup),
 		fmt.Sprintf("CREATE TRIGGER reject_cleanup_rebinding BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanup, cleanupRebindingFunction),
 	}

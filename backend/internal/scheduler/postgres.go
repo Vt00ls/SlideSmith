@@ -40,29 +40,38 @@ type LocalAdmissionConfig struct {
 }
 
 type PostgresConfig struct {
-	Schema    string
-	Now       func() time.Time
-	Admission LocalAdmissionConfig
+	Schema                                 string
+	Now                                    func() time.Time
+	Admission                              LocalAdmissionConfig
+	RuntimeNodeFactFunction                string
+	RuntimePhysicalReleaseEvidenceFunction string
 }
 
 type PostgresAuthority struct {
-	db        *sql.DB
-	schema    string
-	now       func() time.Time
-	admission LocalAdmissionConfig
+	db                                     *sql.DB
+	schema                                 string
+	now                                    func() time.Time
+	admission                              LocalAdmissionConfig
+	runtimeNodeFactFunction                string
+	runtimePhysicalReleaseEvidenceFunction string
 }
 
 var _ Scheduling = (*PostgresAuthority)(nil)
 
 func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority, error) {
-	if db == nil || !validPostgresIdentifier(config.Schema) || !validAdmissionConfig(config.Admission) {
+	if db == nil || !validPostgresIdentifier(config.Schema) || !validAdmissionConfig(config.Admission) ||
+		config.RuntimeNodeFactFunction != "" && !validPostgresQualifiedIdentifier(config.RuntimeNodeFactFunction) ||
+		config.RuntimePhysicalReleaseEvidenceFunction != "" &&
+			!validPostgresQualifiedIdentifier(config.RuntimePhysicalReleaseEvidenceFunction) {
 		return nil, newError(ErrorInvalidRequest)
 	}
 	now := config.Now
 	if now == nil {
 		now = time.Now
 	}
-	return &PostgresAuthority{db: db, schema: config.Schema, now: now, admission: config.Admission}, nil
+	return &PostgresAuthority{db: db, schema: config.Schema, now: now, admission: config.Admission,
+		runtimeNodeFactFunction:                config.RuntimeNodeFactFunction,
+		runtimePhysicalReleaseEvidenceFunction: config.RuntimePhysicalReleaseEvidenceFunction}, nil
 }
 
 func validAdmissionConfig(config LocalAdmissionConfig) bool {
@@ -86,6 +95,12 @@ func validPostgresIdentifier(value string) bool {
 		return false
 	}
 	return true
+}
+
+func validPostgresQualifiedIdentifier(value string) bool {
+	parts := bytes.Split([]byte(value), []byte("."))
+	return len(parts) == 2 && validPostgresIdentifier(string(parts[0])) &&
+		validPostgresIdentifier(string(parts[1]))
 }
 
 func (authority *PostgresAuthority) table(name string) string { return authority.schema + "." + name }
@@ -119,6 +134,20 @@ func (authority *PostgresAuthority) RuntimeAcceptanceParticipant() runtimeexecut
 
 func (authority *PostgresAuthority) RuntimeAcceptanceFunction() string {
 	return authority.table("scheduler_accept_runtime_start")
+}
+
+func (authority *PostgresAuthority) RuntimeLeaseAttachmentParticipant() runtimeexecution.SchedulerLeaseAttachmentParticipant {
+	return runtimeexecution.SchedulerLeaseAttachmentParticipantFunc(func(
+		ctx context.Context,
+		transaction runtimeexecution.SchedulerLeaseAttachmentTransaction,
+		_ runtimeexecution.SchedulerLeaseAttachmentFact,
+	) error {
+		return transaction.AttachLease(ctx)
+	})
+}
+
+func (authority *PostgresAuthority) RuntimeLeaseAttachmentFunction() string {
+	return authority.table("scheduler_attach_runtime_lease")
 }
 
 func (authority *PostgresAuthority) RuntimeCancellationParticipant() runtimeexecution.SchedulerCancellationParticipant {
@@ -164,6 +193,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	claims := authority.table("scheduler_delivery_claims")
 	logical := authority.table("scheduler_logical_reservations")
 	node := authority.table("scheduler_node_reservations")
+	physical := authority.table("scheduler_physical_occupancy")
 	fairness := authority.table("scheduler_fairness_state")
 	return []string{
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("scheduler_grant_sequence")),
@@ -225,11 +255,20 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			lease_acquire_operation_id text NOT NULL DEFAULT '',
 			lease_acquire_digest bytea CHECK (lease_acquire_digest IS NULL OR octet_length(lease_acquire_digest) = 32),
 			lease_acquire_by timestamptz,
+			sandbox_lease_id text NOT NULL DEFAULT '',
+			lease_generation bigint NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
+			lease_fence bigint NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+			lease_attached_at timestamptz,
 			accepted_at timestamptz,
 			created_at timestamptz NOT NULL,
 			updated_at timestamptz NOT NULL,
 			UNIQUE (work_item_id, generation)
 		)`, grants, workItems),
+		fmt.Sprintf(`ALTER TABLE %s
+			ADD COLUMN IF NOT EXISTS sandbox_lease_id text NOT NULL DEFAULT '',
+			ADD COLUMN IF NOT EXISTS lease_generation bigint NOT NULL DEFAULT 0 CHECK (lease_generation >= 0),
+			ADD COLUMN IF NOT EXISTS lease_fence bigint NOT NULL DEFAULT 0 CHECK (lease_fence >= 0),
+			ADD COLUMN IF NOT EXISTS lease_attached_at timestamptz`, grants),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			delivery_claim_id text PRIMARY KEY,
 			work_item_id text NOT NULL REFERENCES %s(work_item_id),
@@ -256,6 +295,35 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			state smallint NOT NULL,
 			updated_at timestamptz NOT NULL
 		)`, node, grants),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			sandbox_lease_id text PRIMARY KEY,
+			admission_grant_id text NOT NULL UNIQUE REFERENCES %s(admission_grant_id),
+			work_item_id text NOT NULL,
+			grant_generation bigint NOT NULL CHECK (grant_generation > 0),
+			runtime_run_id text NOT NULL,
+			start_operation_id text NOT NULL,
+			start_digest bytea NOT NULL CHECK (octet_length(start_digest) = 32),
+			lease_acquire_operation_id text NOT NULL,
+			lease_acquire_digest bytea NOT NULL CHECK (octet_length(lease_acquire_digest) = 32),
+			lease_generation bigint NOT NULL CHECK (lease_generation > 0),
+			lease_fence bigint NOT NULL CHECK (lease_fence > 0),
+			sandbox_id text NOT NULL,
+			sandbox_generation bigint NOT NULL CHECK (sandbox_generation > 0),
+			sandbox_fence bigint NOT NULL CHECK (sandbox_fence > 0),
+			execution_node_id text NOT NULL,
+			node_capacity_generation bigint NOT NULL CHECK (node_capacity_generation > 0),
+			resource_class_id text NOT NULL,
+			execution_policy_id text NOT NULL,
+			scheduler_epoch bigint NOT NULL CHECK (scheduler_epoch > 0),
+			policy_version bigint NOT NULL CHECK (policy_version > 0),
+			state smallint NOT NULL,
+			release_operation_id text NOT NULL DEFAULT '',
+			release_operation_digest bytea CHECK (release_operation_digest IS NULL OR octet_length(release_operation_digest) = 32),
+			reset_evidence_id text NOT NULL DEFAULT '',
+			reset_evidence_digest bytea CHECK (reset_evidence_digest IS NULL OR octet_length(reset_evidence_digest) = 32),
+			attached_at timestamptz NOT NULL,
+			released_at timestamptz
+		)`, physical, grants),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			singleton boolean PRIMARY KEY CHECK (singleton),
 			last_personal_workspace_id text NOT NULL,
@@ -360,6 +428,80 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		$scheduler_accept$`, authority.RuntimeAcceptanceFunction(), grants, workItems,
 			workItems, grants, grants, workItems, logical, node),
 		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s(
+			p_work_item_id text, p_admission_grant_id text, p_grant_generation bigint,
+			p_runtime_run_id text, p_start_operation_id text, p_start_digest bytea,
+			p_runtime_revision bigint, p_runtime_fence bigint,
+			p_lease_acquire_operation_id text, p_lease_acquire_digest bytea,
+			p_sandbox_lease_id text, p_lease_generation bigint, p_lease_fence bigint,
+			p_sandbox_id text, p_sandbox_generation bigint, p_sandbox_fence bigint,
+			p_execution_node_id text, p_node_capacity_generation bigint,
+			p_resource_class_id text, p_execution_policy_id text,
+			p_scheduler_epoch bigint, p_policy_version bigint, p_attached_at timestamptz
+		) RETURNS void LANGUAGE plpgsql AS $scheduler_attach$
+		DECLARE
+			retained_grant %s%%ROWTYPE;
+			retained_occupancy %s%%ROWTYPE;
+			affected integer;
+		BEGIN
+			SELECT * INTO retained_grant FROM %s
+				WHERE admission_grant_id=p_admission_grant_id AND work_item_id=p_work_item_id
+				AND generation=p_grant_generation FOR UPDATE;
+			IF retained_grant.admission_grant_id IS NULL OR retained_grant.state NOT IN (%d,%d) OR
+				retained_grant.runtime_run_id <> p_runtime_run_id OR
+				retained_grant.operation_id <> p_start_operation_id OR retained_grant.payload_digest <> p_start_digest OR
+				retained_grant.bound_runtime_revision >= p_runtime_revision OR
+				retained_grant.bound_runtime_fence <> p_runtime_fence OR
+				retained_grant.lease_acquire_operation_id <> p_lease_acquire_operation_id OR
+				retained_grant.lease_acquire_digest <> p_lease_acquire_digest OR
+				retained_grant.execution_node_id <> p_execution_node_id OR
+				retained_grant.node_capacity_generation <> p_node_capacity_generation OR
+				retained_grant.resource_class_id <> p_resource_class_id OR
+				retained_grant.execution_policy_id <> p_execution_policy_id OR
+				retained_grant.scheduler_epoch <> p_scheduler_epoch OR retained_grant.policy_version <> p_policy_version OR
+				retained_grant.lease_acquire_by <= p_attached_at THEN
+				RAISE EXCEPTION 'scheduler lease attachment binding conflict' USING ERRCODE = '23000';
+			END IF;
+			IF retained_grant.state = %d THEN
+				SELECT * INTO retained_occupancy FROM %s WHERE admission_grant_id=p_admission_grant_id;
+				IF retained_grant.sandbox_lease_id <> p_sandbox_lease_id OR
+					retained_grant.lease_generation <> p_lease_generation OR retained_grant.lease_fence <> p_lease_fence OR
+					retained_occupancy.sandbox_lease_id <> p_sandbox_lease_id OR
+					retained_occupancy.sandbox_id <> p_sandbox_id OR
+					retained_occupancy.sandbox_generation <> p_sandbox_generation OR
+					retained_occupancy.sandbox_fence <> p_sandbox_fence OR retained_occupancy.state <> 1 THEN
+					RAISE EXCEPTION 'scheduler lease attachment replay conflict' USING ERRCODE = '23000';
+				END IF;
+				RETURN;
+			END IF;
+			UPDATE %s SET state=%d, sandbox_lease_id=p_sandbox_lease_id,
+				lease_generation=p_lease_generation, lease_fence=p_lease_fence,
+				lease_attached_at=p_attached_at, updated_at=p_attached_at
+				WHERE admission_grant_id=p_admission_grant_id AND generation=p_grant_generation AND state=2;
+			GET DIAGNOSTICS affected = ROW_COUNT;
+			IF affected <> 1 THEN RAISE EXCEPTION 'scheduler lease attachment conflict' USING ERRCODE = '23000'; END IF;
+			UPDATE %s SET state=%d, updated_at=p_attached_at
+				WHERE admission_grant_id=p_admission_grant_id AND grant_generation=p_grant_generation
+				AND execution_node_id=p_execution_node_id AND node_capacity_generation=p_node_capacity_generation AND state=2;
+			GET DIAGNOSTICS affected = ROW_COUNT;
+			IF affected <> 1 THEN RAISE EXCEPTION 'scheduler node attachment conflict' USING ERRCODE = '23000'; END IF;
+			INSERT INTO %s (
+				sandbox_lease_id, admission_grant_id, work_item_id, grant_generation,
+				runtime_run_id, start_operation_id, start_digest, lease_acquire_operation_id,
+				lease_acquire_digest, lease_generation, lease_fence, sandbox_id,
+				sandbox_generation, sandbox_fence, execution_node_id,
+				node_capacity_generation, resource_class_id, execution_policy_id,
+				scheduler_epoch, policy_version, state, attached_at
+			) VALUES (p_sandbox_lease_id,p_admission_grant_id,p_work_item_id,p_grant_generation,
+				p_runtime_run_id,p_start_operation_id,p_start_digest,p_lease_acquire_operation_id,
+				p_lease_acquire_digest,p_lease_generation,p_lease_fence,p_sandbox_id,
+				p_sandbox_generation,p_sandbox_fence,p_execution_node_id,
+				p_node_capacity_generation,p_resource_class_id,p_execution_policy_id,
+				p_scheduler_epoch,p_policy_version,%d,p_attached_at);
+		END
+		$scheduler_attach$`, authority.RuntimeLeaseAttachmentFunction(), grants, physical,
+			grants, GrantBound, GrantLeaseAttached, GrantLeaseAttached, physical,
+			grants, GrantLeaseAttached, node, ReservationLeaseAttached, physical, PhysicalOccupancyHeld),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s(
 			p_operation_id text, p_payload_digest bytea, p_runtime_run_id text,
 			p_decision_id text, p_runtime_revision bigint, p_runtime_fence bigint,
 			p_accepted_at timestamptz
@@ -432,6 +574,28 @@ func (authority *PostgresAuthority) ClaimAndAdmit(ctx context.Context) (Admissio
 		return AdmissionDecision{}, err
 	}
 	now := authority.now().UTC().Truncate(time.Microsecond)
+	if authority.runtimeNodeFactFunction != "" {
+		var generation NodeCapacityGeneration
+		var readiness runtimeexecution.NodeReadiness
+		var quarantined bool
+		var occupancy runtimeexecution.NodeOccupancy
+		var containment runtimeexecution.ContainmentStatus
+		var reset runtimeexecution.ResetStatus
+		var attestationExpiresAt, authorizationExpiresAt time.Time
+		err := tx.QueryRowContext(ctx, "SELECT * FROM "+authority.runtimeNodeFactFunction+"($1)",
+			authority.admission.Node.ExecutionNodeID.String()).Scan(&generation, &readiness, &quarantined,
+			&occupancy, &containment, &reset, &attestationExpiresAt, &authorizationExpiresAt)
+		if errors.Is(err, sql.ErrNoRows) || err == nil && (generation != authority.admission.Node.CapacityGeneration ||
+			readiness != runtimeexecution.NodeReady || quarantined ||
+			occupancy != runtimeexecution.NodeUnoccupied || containment != runtimeexecution.ContainmentEstablished ||
+			reset != runtimeexecution.ResetCompleted || !now.Before(attestationExpiresAt) ||
+			!now.Before(authorizationExpiresAt)) {
+			return AdmissionDecision{}, newError(ErrorNoEligibleWork)
+		}
+		if err != nil {
+			return AdmissionDecision{}, newError(ErrorDependencyUnavailable)
+		}
+	}
 	if work.currentGeneration > 0 {
 		grant, state, loadErr := authority.loadGrant(ctx, tx, work.id, work.currentGeneration)
 		if loadErr != nil {
@@ -475,10 +639,12 @@ func (authority *PostgresAuthority) ClaimAndAdmit(ctx context.Context) (Admissio
 		}
 	}
 	var occupied uint64
-	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT count(*) FROM %s
-		WHERE execution_node_id=$1 AND node_capacity_generation=$2 AND state IN ($3,$4)`,
-		authority.table("scheduler_node_reservations")), authority.admission.Node.ExecutionNodeID.value,
-		authority.admission.Node.CapacityGeneration, ReservationReservedUnbound, ReservationBound).Scan(&occupied); err != nil {
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT
+		(SELECT count(*) FROM %s WHERE execution_node_id=$1 AND node_capacity_generation=$2 AND state IN ($3,$4)) +
+		(SELECT count(*) FROM %s WHERE execution_node_id=$1 AND node_capacity_generation=$2 AND state=$5)`,
+		authority.table("scheduler_node_reservations"), authority.table("scheduler_physical_occupancy")),
+		authority.admission.Node.ExecutionNodeID.value, authority.admission.Node.CapacityGeneration,
+		ReservationReservedUnbound, ReservationBound, PhysicalOccupancyHeld).Scan(&occupied); err != nil {
 		return AdmissionDecision{}, newError(ErrorDependencyUnavailable)
 	}
 	if occupied >= authority.admission.Node.AvailableRuntimeSlots {
@@ -843,6 +1009,17 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref WorkItemRef
 	}
 	view.LogicalReservation = logicalMin
 	view.SelectedNodeReservation = nodeState
+	if view.Grant.State == GrantLeaseAttached || view.Grant.State == GrantReleased {
+		var physicalState PhysicalOccupancyState
+		err := authority.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT state FROM %s
+			WHERE admission_grant_id=$1`, authority.table("scheduler_physical_occupancy")),
+			view.Grant.AdmissionGrantID.value).Scan(&physicalState)
+		if err == nil {
+			view.PhysicalOccupancy = physicalState
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return WorkItemView{}, newError(ErrorDependencyUnavailable)
+		}
+	}
 	return view, nil
 }
 

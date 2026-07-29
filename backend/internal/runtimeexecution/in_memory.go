@@ -11,6 +11,7 @@ type DeterministicIDConfig struct {
 	DecisionStart    uint64
 	ObservationStart uint64
 	LeaseStart       uint64
+	SandboxStart     uint64
 }
 
 type IngressObservationKind uint8
@@ -75,6 +76,9 @@ type RuntimeFixture struct {
 	EvidenceRoot           EvidenceRootSnapshot
 	Capacity               RuntimeCapacitySnapshot
 	CapacityEvidence       RuntimeCapacityEvidenceSnapshot
+	Node                   RuntimeNodeSnapshot
+	Cleanup                RuntimeLeaseCleanupSnapshot
+	CatalogSafetyEpoch     CatalogSafetyEpoch
 	PreLeaseTerminalReason PreLeaseTerminalReason
 	Reconciliation         ReconciliationStatus
 }
@@ -95,16 +99,68 @@ type AdmissionGrantFixture struct {
 	PolicyVersion          uint64
 }
 
+type ExecutionNodeFixture struct {
+	ExecutionNodeID         ExecutionNodeID
+	Generation              NodeGeneration
+	Readiness               NodeReadiness
+	AttestationID           NodeAttestationID
+	AttestationGeneration   NodeAttestationGeneration
+	AttestedAt              time.Time
+	ExpiresAt               time.Time
+	ResourceClassID         ResourceClassID
+	ExecutionPolicyID       ExecutionPolicyID
+	NodeAuthorityID         NodeAuthorityID
+	WorkerAuthorityID       WorkerAuthorityID
+	WorkerGeneration        WorkerGeneration
+	AuthorizationGeneration AuthorizationGeneration
+	AuthorizationExpiresAt  time.Time
+	ReleaseSafetyEpoch      ReleaseSafetyEpoch
+	CatalogSafetyEpoch      CatalogSafetyEpoch
+	Occupancy               NodeOccupancy
+	Quarantined             bool
+	Containment             ContainmentStatus
+	Reset                   ResetStatus
+	ActiveRuntimeRunID      RuntimeRunID
+	ActiveLeaseID           SandboxLeaseID
+	LastSandboxGeneration   SandboxGeneration
+	LastSandboxFence        SandboxFence
+	LastResetEvidenceID     EvidenceID
+	LastResetEvidenceDigest Digest
+}
+
+type QuotaReservationState uint8
+
+const (
+	QuotaReservationActive QuotaReservationState = iota + 1
+	QuotaReservationInactive
+)
+
+type QuotaReservationFixture struct {
+	QuotaReservationID  QuotaReservationID
+	Generation          QuotaReservationGeneration
+	Mode                QuotaReservationMode
+	State               QuotaReservationState
+	PersonalWorkspaceID PersonalWorkspaceID
+	PhaseRunID          PhaseRunID
+	Capability          ProviderCapability
+	ValidFrom           time.Time
+	ExpiresAt           time.Time
+}
+
 type HarnessConfig struct {
-	Now              time.Time
-	IDs              DeterministicIDConfig
-	Runtimes         []RuntimeFixture
-	AdmissionGrants  []AdmissionGrantFixture
-	LeaseAcquisition LeaseAcquisitionAdapter
+	Now                    time.Time
+	IDs                    DeterministicIDConfig
+	Runtimes               []RuntimeFixture
+	AdmissionGrants        []AdmissionGrantFixture
+	Nodes                  []ExecutionNodeFixture
+	QuotaReservations      []QuotaReservationFixture
+	MaintenanceAuthorities []RuntimeMaintenanceAuthorityBinding
+	LeaseAcquisition       LeaseAcquisitionAdapter
 }
 
 type DeterministicHarness struct {
 	Runtime          RuntimeExecution
+	Maintenance      RuntimeMaintenance
 	store            *memoryStore
 	clock            *controlledClock
 	controls         *harnessControls
@@ -116,11 +172,16 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		return nil, newError(ErrorInvalidRequest)
 	}
 	store := &memoryStore{
-		runtimes:        make(map[RuntimeRunID]*runtimeRecord),
-		grants:          make(map[grantKey]AdmissionGrantFixture),
-		nextDecision:    config.IDs.DecisionStart,
-		nextObservation: config.IDs.ObservationStart,
-		nextLease:       config.IDs.LeaseStart,
+		runtimes:               make(map[RuntimeRunID]*runtimeRecord),
+		grants:                 make(map[grantKey]AdmissionGrantFixture),
+		nextDecision:           config.IDs.DecisionStart,
+		nextObservation:        config.IDs.ObservationStart,
+		nextLease:              config.IDs.LeaseStart,
+		nextSandbox:            config.IDs.SandboxStart,
+		nodes:                  make(map[ExecutionNodeID]*ExecutionNodeFixture),
+		reservations:           make(map[QuotaReservationID]*QuotaReservationFixture),
+		maintenance:            make(map[OperationID]RuntimeMaintenanceDecision),
+		maintenanceAuthorities: make(map[maintenanceAuthorityKey]maintenanceCallerAuthority),
 	}
 	if store.nextDecision == 0 {
 		store.nextDecision = 1
@@ -130,6 +191,9 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 	}
 	if store.nextLease == 0 {
 		store.nextLease = 1
+	}
+	if store.nextSandbox == 0 {
+		store.nextSandbox = 1
 	}
 	for _, fixture := range config.Runtimes {
 		if !validRuntimeFixture(fixture) || store.runtimes[fixture.RuntimeRunID] != nil {
@@ -153,7 +217,8 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 			operation: fixture.Operation, lease: fixture.Lease,
 			deadline: fixture.Deadline.UTC(), leaseAcquireBy: fixture.LeaseAcquireBy.UTC(),
 			cancellation: fixture.Cancellation, evidenceRoot: fixture.EvidenceRoot,
-			capacity: capacity, capacityEvidence: fixture.CapacityEvidence,
+			capacity: capacity, capacityEvidence: fixture.CapacityEvidence, node: fixture.Node,
+			cleanup: fixture.Cleanup, catalogSafetyEpoch: fixture.CatalogSafetyEpoch,
 			preLeaseTerminalReason: fixture.PreLeaseTerminalReason, reconciliation: reconciliation,
 		}
 	}
@@ -180,6 +245,40 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		grant.ExpiresAt = grant.ExpiresAt.UTC()
 		store.grants[key] = grant
 	}
+	for index := range config.Nodes {
+		node := config.Nodes[index]
+		if node.Occupancy == 0 {
+			node.Occupancy = NodeUnoccupied
+		}
+		if !validExecutionNodeFixture(node) || store.nodes[node.ExecutionNodeID] != nil {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		node.AttestedAt = node.AttestedAt.UTC()
+		node.ExpiresAt = node.ExpiresAt.UTC()
+		node.AuthorizationExpiresAt = node.AuthorizationExpiresAt.UTC()
+		copyNode := node
+		store.nodes[node.ExecutionNodeID] = &copyNode
+	}
+	for index := range config.QuotaReservations {
+		reservation := config.QuotaReservations[index]
+		if !validQuotaReservationFixture(reservation) || store.reservations[reservation.QuotaReservationID] != nil {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		reservation.ValidFrom = reservation.ValidFrom.UTC()
+		reservation.ExpiresAt = reservation.ExpiresAt.UTC()
+		copyReservation := reservation
+		store.reservations[reservation.QuotaReservationID] = &copyReservation
+	}
+	for _, binding := range config.MaintenanceAuthorities {
+		if !validMaintenanceAuthorityBinding(binding) {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		key := maintenanceAuthorityKey{executionNodeID: binding.executionNodeID, kind: binding.caller.kind}
+		if retained, exists := store.maintenanceAuthorities[key]; exists && retained != binding.caller {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		store.maintenanceAuthorities[key] = binding.caller
+	}
 	clock := &controlledClock{now: config.Now.UTC()}
 	return newHarness(store, clock, config.LeaseAcquisition), nil
 }
@@ -188,7 +287,7 @@ func newHarness(store *memoryStore, clock *controlledClock, leaseAcquisition Lea
 	controls := &harnessControls{}
 	engine := &invariantEngine{store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition}
 	return &DeterministicHarness{
-		Runtime: engine, store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition,
+		Runtime: engine, Maintenance: engine, store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition,
 	}
 }
 
@@ -296,13 +395,23 @@ func (clock *controlledClock) current() time.Time {
 }
 
 type memoryStore struct {
-	mu              sync.Mutex
-	runtimes        map[RuntimeRunID]*runtimeRecord
-	grants          map[grantKey]AdmissionGrantFixture
-	observations    []IngressObservation
-	nextDecision    uint64
-	nextObservation uint64
-	nextLease       uint64
+	mu                     sync.Mutex
+	runtimes               map[RuntimeRunID]*runtimeRecord
+	grants                 map[grantKey]AdmissionGrantFixture
+	observations           []IngressObservation
+	nextDecision           uint64
+	nextObservation        uint64
+	nextLease              uint64
+	nextSandbox            uint64
+	nodes                  map[ExecutionNodeID]*ExecutionNodeFixture
+	reservations           map[QuotaReservationID]*QuotaReservationFixture
+	maintenance            map[OperationID]RuntimeMaintenanceDecision
+	maintenanceAuthorities map[maintenanceAuthorityKey]maintenanceCallerAuthority
+}
+
+type maintenanceAuthorityKey struct {
+	executionNodeID ExecutionNodeID
+	kind            RuntimeMaintenanceAuthorityKind
 }
 
 type grantKey struct {
@@ -333,6 +442,9 @@ type runtimeRecord struct {
 	capacityEvidence       RuntimeCapacityEvidenceSnapshot
 	preLeaseTerminalReason PreLeaseTerminalReason
 	reconciliation         ReconciliationStatus
+	node                   RuntimeNodeSnapshot
+	catalogSafetyEpoch     CatalogSafetyEpoch
+	cleanup                RuntimeLeaseCleanupSnapshot
 }
 
 type invariantEngine struct {
@@ -424,6 +536,15 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 	previous := record.fixture.RuntimeRevision
 	startBinding := record.operation
 	leaseBinding := record.lease
+	leased := leaseBinding.AcquireStatus == LeaseGranted && leaseBinding.Disposition == LeaseActive
+	var leasedNode *ExecutionNodeFixture
+	if leased {
+		leasedNode = engine.store.nodes[startBinding.ExecutionNodeID]
+		if leasedNode == nil || leasedNode.ActiveRuntimeRunID != command.RuntimeRunID ||
+			leasedNode.ActiveLeaseID != leaseBinding.LeaseID {
+			return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+		}
+	}
 	record.fixture.RuntimeRevision++
 	record.fixture.OperationGeneration++
 	record.fixture.RuntimeFence++
@@ -438,15 +559,37 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 		ResourceClassID:        startBinding.ResourceClassID, ExecutionPolicyID: startBinding.ExecutionPolicyID,
 		SchedulerEpoch: startBinding.SchedulerEpoch, PolicyVersion: startBinding.PolicyVersion,
 	}
-	record.lease.AcquireStatus = LeaseNotRequested
 	record.cancellation = RuntimeCancellationSnapshot{
 		Status: CancellationAccepted, OperationID: command.OperationID, Reason: command.Reason,
 		AcceptedAt: command.OccurredAt.UTC(),
 	}
-	record.capacity = RuntimeCapacitySnapshot{
-		LogicalRelease: LogicalCapacityReleaseReady,
-		NoLease:        NoLeaseDispositionRecorded,
-		Physical:       PhysicalCapacityNotApplicable,
+	if leased {
+		record.lease.Generation++
+		record.lease.Fence++
+		record.lease.SandboxFence++
+		record.lease.Disposition = LeaseRevoked
+		leasedNode.Occupancy = NodeOccupancyUnknown
+		leasedNode.Quarantined = true
+		leasedNode.Containment = ContainmentPending
+		leasedNode.Reset = ResetRequired
+		record.node = nodeSnapshot(*leasedNode)
+		record.cleanup = RuntimeLeaseCleanupSnapshot{
+			Status: LeaseCleanupPending, OperationID: command.OperationID,
+			CanonicalRequestDigest: digest, StopMainProcess: true, StopChildProcesses: true,
+			RevokeSecrets: true, RemoveNetwork: true, FenceRuntimeView: true,
+			ReconcileContainment: true,
+		}
+		record.capacity = RuntimeCapacitySnapshot{
+			LogicalRelease: LogicalCapacityReleaseReady, NoLease: NoLeaseDispositionNone,
+			Physical: PhysicalCapacityUnknownOrQuarantined,
+		}
+	} else {
+		record.lease.AcquireStatus = LeaseNotRequested
+		record.capacity = RuntimeCapacitySnapshot{
+			LogicalRelease: LogicalCapacityReleaseReady,
+			NoLease:        NoLeaseDispositionRecorded,
+			Physical:       PhysicalCapacityNotApplicable,
+		}
 	}
 	record.reconciliation = ReconciliationStable
 	fact := RuntimeDecisionFact{
@@ -465,9 +608,9 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 		PolicyVersion:           startBinding.PolicyVersion,
 		LeaseAcquireOperationID: leaseBinding.AcquireOperationID, LeaseAcquireDigest: leaseBinding.AcquireDigest,
 	}
-	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{
-		RuntimeFencedOrTerminal: baseEvidence,
-		NoLeasePhysicalDisposition: NoLeasePhysicalDispositionEvidence{
+	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{RuntimeFencedOrTerminal: baseEvidence}
+	if !leased {
+		record.capacityEvidence.NoLeasePhysicalDisposition = NoLeasePhysicalDispositionEvidence{
 			WorkItemID: baseEvidence.WorkItemID, AdmissionGrantID: baseEvidence.AdmissionGrantID,
 			GrantGeneration: baseEvidence.GrantGeneration, RuntimeRunID: baseEvidence.RuntimeRunID,
 			StartOperationID: baseEvidence.StartOperationID, StartDigest: baseEvidence.StartDigest,
@@ -478,7 +621,7 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 			LeaseAcquireDigest:      baseEvidence.LeaseAcquireDigest,
 			ExecutionNodeID:         startBinding.ExecutionNodeID,
 			NodeCapacityGeneration:  startBinding.NodeCapacityGeneration,
-		},
+		}
 	}
 	record.decisions[attempt] = fact
 	return engine.respond(RuntimeDecision{Fact: fact, Snapshot: snapshot(record, SnapshotSchemaCurrent)})
@@ -584,6 +727,17 @@ func (engine *invariantEngine) advancePreLease(
 			engine.store.mu.Unlock()
 			return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
 		}
+		node := engine.store.nodes[record.operation.ExecutionNodeID]
+		if !reservationEligibleForLease(engine.store.reservations, start, now) {
+			return engine.finishInMemoryNoLeaseLocked(
+				record, startDecision, RuntimeRejected, PreLeaseTerminalReservation, now,
+			)
+		}
+		if !nodeEligibleForLease(node, record, now) {
+			return engine.finishInMemoryNoLeaseLocked(
+				record, startDecision, RuntimeRejected, PreLeaseTerminalNodeIneligible, now,
+			)
+		}
 		record.fixture.RuntimeRevision++
 		record.fixture.State = RuntimePreparingPrerequisites
 		record.lease.AcquireStatus = LeaseGranted
@@ -591,6 +745,24 @@ func (engine *invariantEngine) advancePreLease(
 		engine.store.nextLease++
 		record.lease.Generation = 1
 		record.lease.Fence = 1
+		record.lease.Disposition = LeaseActive
+		record.lease.ExpiresAt = earliestTime(now.Add(90*time.Second), record.deadline, record.leaseAcquireBy,
+			node.ExpiresAt, node.AuthorizationExpiresAt)
+		record.lease.SandboxID = SandboxID{value: fmt.Sprintf("sandbox-instance-%06d", engine.store.nextSandbox)}
+		engine.store.nextSandbox++
+		record.lease.SandboxGeneration = node.LastSandboxGeneration + 1
+		record.lease.SandboxFence = node.LastSandboxFence + 1
+		record.lease.WorkerAuthorityID = node.WorkerAuthorityID
+		record.lease.WorkerGeneration = node.WorkerGeneration
+		record.lease.NodeAuthorityID = node.NodeAuthorityID
+		record.lease.AuthorizationGeneration = node.AuthorizationGeneration
+		record.lease.AuthorizationExpiresAt = node.AuthorizationExpiresAt
+		node.Occupancy = NodeOccupied
+		node.Containment = ContainmentPending
+		node.Reset = ResetRequired
+		node.ActiveRuntimeRunID = record.fixture.RuntimeRunID
+		node.ActiveLeaseID = record.lease.LeaseID
+		record.node = nodeSnapshot(*node)
 		record.capacity.Physical = PhysicalCapacityOccupied
 		record.reconciliation = ReconciliationStable
 		startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
@@ -787,6 +959,9 @@ func (engine *invariantEngine) executeStart(command StartRuntimeRun) (RuntimeDec
 		SchedulerEpoch: grant.SchedulerEpoch, PolicyVersion: grant.PolicyVersion,
 	}
 	record.deadline = command.Deadline.UTC()
+	if command.CatalogBinding != nil {
+		record.catalogSafetyEpoch = command.CatalogBinding.SafetyEpoch
+	}
 	record.leaseAcquireBy = earlier(command.Deadline, grant.ExpiresAt)
 	record.lease.AcquireStatus = LeaseAcquirePending
 	record.lease.AcquireOperationID, record.lease.AcquireDigest = stableLeaseAcquireBinding(command)
@@ -917,7 +1092,9 @@ func renderSnapshotCurrent(record *runtimeRecord) (RuntimeSnapshot, bool) {
 
 func renderSnapshotV1(record *runtimeRecord) (RuntimeSnapshot, bool) {
 	if !snapshotVariantsKnown(record) || record.capacity.Physical == PhysicalCapacityUnknownOrQuarantined ||
-		record.reconciliation == ReconciliationRequiredStatus {
+		record.reconciliation == ReconciliationRequiredStatus || record.lease.Disposition != LeaseDispositionNone ||
+		record.node != (RuntimeNodeSnapshot{}) || record.cleanup != (RuntimeLeaseCleanupSnapshot{}) ||
+		record.capacityEvidence.PhysicalCapacityReleaseReady != (PhysicalCapacityReleaseReadyEvidence{}) {
 		return RuntimeSnapshot{}, false
 	}
 	return buildSnapshot(record, SnapshotSchemaV1), true
@@ -927,7 +1104,8 @@ func buildSnapshot(record *runtimeRecord, version SchemaVersion) RuntimeSnapshot
 	return RuntimeSnapshot{
 		SchemaVersion: version, RuntimeRunID: record.fixture.RuntimeRunID,
 		RuntimeRevision: record.fixture.RuntimeRevision, State: record.fixture.State, Outcome: record.fixture.Outcome,
-		Operation: record.operation, RuntimeFence: record.fixture.RuntimeFence, Lease: record.lease,
+		Operation: record.operation, RuntimeFence: record.fixture.RuntimeFence, Lease: record.lease, Node: record.node,
+		Cleanup:  record.cleanup,
 		Deadline: record.deadline, LeaseAcquireBy: record.leaseAcquireBy, Cancellation: record.cancellation,
 		EvidenceRoot: record.evidenceRoot, Capacity: record.capacity, CapacityEvidence: record.capacityEvidence,
 		PreLeaseTerminalReason: record.preLeaseTerminalReason,
@@ -948,11 +1126,80 @@ func snapshotVariantsKnown(record *runtimeRecord) bool {
 	if record == nil || !knownRuntimeState(record.fixture.State) || !knownRuntimeOutcome(record.fixture.Outcome) ||
 		!knownOperationStatus(record.operation.Status) || !knownLeaseStatus(record.lease.AcquireStatus) ||
 		!knownCancellationStatus(record.cancellation.Status) || !knownCapacity(record.capacity) ||
+		!knownLeaseLifecycleSnapshot(record.lease) || !knownNodeSnapshot(record.node) ||
+		!knownLeaseNodeBinding(record) ||
+		!knownLeaseCleanupSnapshot(record.cleanup) ||
+		!knownPhysicalReleaseEvidence(record.capacityEvidence.PhysicalCapacityReleaseReady) ||
 		!knownPreLeaseTerminalReason(record.preLeaseTerminalReason) ||
 		!knownReconciliation(record.reconciliation) || !knownEvidenceRoot(record.evidenceRoot) {
 		return false
 	}
 	return true
+}
+
+func knownLeaseLifecycleSnapshot(lease RuntimeLeaseSnapshot) bool {
+	if lease.Disposition == LeaseDispositionNone {
+		return lease.AcquireStatus != LeaseGranted && lease.LeaseID == (SandboxLeaseID{}) &&
+			lease.Generation == 0 && lease.Fence == 0 && lease.ExpiresAt.IsZero() &&
+			lease.SandboxID == (SandboxID{}) && lease.SandboxGeneration == 0 && lease.SandboxFence == 0 &&
+			lease.WorkerAuthorityID == (WorkerAuthorityID{}) && lease.WorkerGeneration == 0 &&
+			lease.NodeAuthorityID == (NodeAuthorityID{}) && lease.AuthorizationGeneration == 0 &&
+			lease.AuthorizationExpiresAt.IsZero()
+	}
+	return lease.Disposition >= LeaseActive && lease.Disposition <= LeaseReleased &&
+		lease.AcquireStatus == LeaseGranted && validOpaqueID(lease.LeaseID.String()) &&
+		lease.Generation > 0 && lease.Fence > 0 && !lease.ExpiresAt.IsZero() &&
+		validOpaqueID(lease.SandboxID.String()) && lease.SandboxGeneration > 0 && lease.SandboxFence > 0 &&
+		validOpaqueID(lease.WorkerAuthorityID.String()) && lease.WorkerGeneration > 0 &&
+		validOpaqueID(lease.NodeAuthorityID.String()) && lease.AuthorizationGeneration > 0 &&
+		!lease.AuthorizationExpiresAt.IsZero()
+}
+
+func knownLeaseNodeBinding(record *runtimeRecord) bool {
+	if record.lease.Disposition == LeaseDispositionNone {
+		return record.node == (RuntimeNodeSnapshot{})
+	}
+	return record.operation.Status == OperationBound && record.node != (RuntimeNodeSnapshot{}) &&
+		record.node.ExecutionNodeID == record.operation.ExecutionNodeID &&
+		uint64(record.node.Generation) == record.operation.NodeCapacityGeneration
+}
+
+func knownNodeSnapshot(node RuntimeNodeSnapshot) bool {
+	if node == (RuntimeNodeSnapshot{}) {
+		return true
+	}
+	return validOpaqueID(node.ExecutionNodeID.String()) && node.Generation > 0 &&
+		node.Readiness >= NodeReadinessUnknown && node.Readiness <= NodeUnavailable &&
+		validOpaqueID(node.AttestationID.String()) && node.AttestationGeneration > 0 &&
+		!node.AttestedAt.IsZero() && node.ExpiresAt.After(node.AttestedAt) &&
+		node.Occupancy >= NodeUnoccupied && node.Occupancy <= NodeOccupancyUnknown &&
+		node.Containment >= ContainmentPending && node.Containment <= ContainmentEstablished &&
+		node.Reset >= ResetRequired && node.Reset <= ResetCompleted
+}
+
+func knownLeaseCleanupSnapshot(cleanup RuntimeLeaseCleanupSnapshot) bool {
+	if cleanup.Status == LeaseCleanupNone {
+		return cleanup == (RuntimeLeaseCleanupSnapshot{})
+	}
+	return cleanup.Status >= LeaseCleanupPending && cleanup.Status <= LeaseCleanupCompleted &&
+		validOpaqueID(cleanup.OperationID.String()) && cleanup.CanonicalRequestDigest != (Digest{}) &&
+		cleanup.StopMainProcess && cleanup.StopChildProcesses && cleanup.RevokeSecrets &&
+		cleanup.RemoveNetwork && cleanup.FenceRuntimeView && cleanup.ReconcileContainment
+}
+
+func knownPhysicalReleaseEvidence(evidence PhysicalCapacityReleaseReadyEvidence) bool {
+	if evidence == (PhysicalCapacityReleaseReadyEvidence{}) {
+		return true
+	}
+	return validOpaqueID(evidence.WorkItemID.String()) && validOpaqueID(evidence.AdmissionGrantID.String()) &&
+		evidence.GrantGeneration > 0 && validOpaqueID(evidence.RuntimeRunID.String()) &&
+		validOpaqueID(evidence.StartOperationID.String()) && evidence.StartDigest != (Digest{}) &&
+		validOpaqueID(evidence.ReleaseOperationID.String()) && evidence.ReleaseOperationDigest != (Digest{}) &&
+		evidence.RuntimeRevision > 0 && evidence.RuntimeFence > 0 &&
+		validOpaqueID(evidence.SandboxLeaseID.String()) && evidence.LeaseGeneration > 0 && evidence.LeaseFence > 0 &&
+		validOpaqueID(evidence.SandboxID.String()) && evidence.SandboxGeneration > 0 && evidence.SandboxFence > 0 &&
+		validOpaqueID(evidence.ExecutionNodeID.String()) && evidence.NodeCapacityGeneration > 0 &&
+		validOpaqueID(evidence.ResetEvidenceID.String()) && evidence.ResetEvidenceDigest != (Digest{})
 }
 
 func knownRuntimeState(state RuntimeState) bool {
@@ -969,6 +1216,78 @@ func knownOperationStatus(status OperationBindingStatus) bool {
 
 func knownLeaseStatus(status LeaseAcquireStatus) bool {
 	return status >= LeaseNotRequested && status <= LeaseAcquireReconciliationRequired
+}
+
+func nodeEligibleForLease(node *ExecutionNodeFixture, record *runtimeRecord, now time.Time) bool {
+	return node != nil && node.Generation == NodeGeneration(record.operation.NodeCapacityGeneration) &&
+		node.Readiness == NodeReady && !node.Quarantined && node.Occupancy == NodeUnoccupied &&
+		node.Containment == ContainmentEstablished && node.Reset == ResetCompleted &&
+		!node.AttestedAt.After(now) && now.Before(node.ExpiresAt) && now.Before(node.AuthorizationExpiresAt) &&
+		node.AuthorizationGeneration > 0 && node.ResourceClassID == record.operation.ResourceClassID &&
+		node.ExecutionPolicyID == record.operation.ExecutionPolicyID &&
+		node.ReleaseSafetyEpoch == record.fixture.SafetyEpoch &&
+		node.CatalogSafetyEpoch == record.catalogSafetyEpoch && validOpaqueID(node.WorkerAuthorityID.String()) &&
+		node.WorkerGeneration > 0 && validOpaqueID(node.NodeAuthorityID.String())
+}
+
+func nodeSnapshot(node ExecutionNodeFixture) RuntimeNodeSnapshot {
+	return RuntimeNodeSnapshot{
+		ExecutionNodeID: node.ExecutionNodeID, Generation: node.Generation, Readiness: node.Readiness,
+		AttestationID: node.AttestationID, AttestationGeneration: node.AttestationGeneration,
+		AttestedAt: node.AttestedAt, ExpiresAt: node.ExpiresAt, Occupancy: node.Occupancy,
+		Quarantined: node.Quarantined, Containment: node.Containment, Reset: node.Reset,
+	}
+}
+
+func validExecutionNodeFixture(node ExecutionNodeFixture) bool {
+	return validOpaqueID(node.ExecutionNodeID.String()) && node.Generation > 0 && node.Readiness == NodeReady &&
+		validOpaqueID(node.AttestationID.String()) && node.AttestationGeneration > 0 && !node.AttestedAt.IsZero() &&
+		!node.ExpiresAt.IsZero() && node.ExpiresAt.After(node.AttestedAt) &&
+		validOpaqueID(node.ResourceClassID.String()) && validOpaqueID(node.ExecutionPolicyID.String()) &&
+		validOpaqueID(node.NodeAuthorityID.String()) && validOpaqueID(node.WorkerAuthorityID.String()) &&
+		node.WorkerGeneration > 0 && node.AuthorizationGeneration > 0 &&
+		node.AuthorizationExpiresAt.After(node.AttestedAt) && node.ReleaseSafetyEpoch > 0 &&
+		node.Occupancy >= NodeUnoccupied && node.Occupancy <= NodeOccupancyUnknown &&
+		node.Containment >= ContainmentPending && node.Containment <= ContainmentEstablished &&
+		node.Reset >= ResetRequired && node.Reset <= ResetCompleted
+}
+
+func validQuotaReservationFixture(reservation QuotaReservationFixture) bool {
+	return validOpaqueID(reservation.QuotaReservationID.String()) && reservation.Generation > 0 &&
+		(reservation.Mode == QuotaReservationObservation || reservation.Mode == QuotaReservationEnforced) &&
+		(reservation.State == QuotaReservationActive || reservation.State == QuotaReservationInactive) &&
+		validOpaqueID(reservation.PersonalWorkspaceID.String()) && validOpaqueID(reservation.PhaseRunID.String()) &&
+		reservation.Capability == ProviderCapabilityRequired && !reservation.ValidFrom.IsZero() &&
+		reservation.ExpiresAt.After(reservation.ValidFrom)
+}
+
+func reservationEligibleForLease(
+	reservations map[QuotaReservationID]*QuotaReservationFixture,
+	start StartRuntimeRun,
+	now time.Time,
+) bool {
+	if start.ProviderCapability == ProviderCapabilityNone {
+		return true
+	}
+	if start.ProviderCapability != ProviderCapabilityRequired || start.ProviderBinding == nil {
+		return false
+	}
+	reservation := reservations[start.ProviderBinding.QuotaReservationID]
+	return reservation != nil && reservation.Generation == start.ProviderBinding.Generation &&
+		reservation.Mode == start.ProviderBinding.Mode && reservation.State == QuotaReservationActive &&
+		reservation.PersonalWorkspaceID == start.PersonalWorkspaceID && reservation.PhaseRunID == start.PhaseRunID &&
+		reservation.Capability == ProviderCapabilityRequired && !now.Before(reservation.ValidFrom) &&
+		now.Before(reservation.ExpiresAt)
+}
+
+func earliestTime(values ...time.Time) time.Time {
+	result := values[0]
+	for _, value := range values[1:] {
+		if value.Before(result) {
+			result = value
+		}
+	}
+	return result.UTC()
 }
 
 func knownCancellationStatus(status CancellationStatus) bool {

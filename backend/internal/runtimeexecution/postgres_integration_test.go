@@ -911,8 +911,26 @@ func TestPostgresHeartbeatCompactionPreservesCurrentAuthorityFacts(t *testing.T)
 	fixture.RuntimeRevision = 9
 	fixture.State = RuntimeTerminal
 	fixture.Outcome = RuntimeFailed
+	fixture.Operation.ExecutionNodeID = ExecutionNodeID{value: "node-retention"}
+	fixture.Operation.NodeCapacityGeneration = 5
 	fixture.Lease = RuntimeLeaseSnapshot{
 		AcquireStatus: LeaseGranted, LeaseID: SandboxLeaseID{value: "lease-retention"}, Generation: 3, Fence: 7,
+		Disposition: LeaseRevoked, ExpiresAt: now.Add(time.Minute),
+		SandboxID: SandboxID{value: "sandbox-retention"}, SandboxGeneration: 2, SandboxFence: 8,
+		WorkerAuthorityID: WorkerAuthorityID{value: "worker-retention"}, WorkerGeneration: 2,
+		NodeAuthorityID: NodeAuthorityID{value: "node-authority-retention"}, AuthorizationGeneration: 3,
+		AuthorizationExpiresAt: now.Add(time.Minute),
+	}
+	fixture.Node = RuntimeNodeSnapshot{
+		ExecutionNodeID: fixture.Operation.ExecutionNodeID, Generation: 5, Readiness: NodeUnavailable,
+		AttestationID: NodeAttestationID{value: "attestation-retention"}, AttestationGeneration: 2,
+		AttestedAt: now.Add(-time.Minute), ExpiresAt: now.Add(time.Minute), Occupancy: NodeOccupancyUnknown,
+		Quarantined: true, Containment: ContainmentPending, Reset: ResetRequired,
+	}
+	fixture.Cleanup = RuntimeLeaseCleanupSnapshot{
+		Status: LeaseCleanupPending, OperationID: OperationID{value: "cleanup-retention"},
+		CanonicalRequestDigest: digest(69), StopMainProcess: true, StopChildProcesses: true,
+		RevokeSecrets: true, RemoveNetwork: true, FenceRuntimeView: true, ReconcileContainment: true,
 	}
 	fixture.EvidenceRoot = EvidenceRootSnapshot{
 		SchemaVersion: SchemaV1, EvidenceRootID: EvidenceRootID{value: "evidence-root-retention"}, Digest: digest(70),

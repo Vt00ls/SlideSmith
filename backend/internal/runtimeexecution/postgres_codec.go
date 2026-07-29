@@ -28,6 +28,19 @@ type postgresRuntimeState struct {
 	SandboxLeaseID           string                        `json:"sandbox_lease_id"`
 	LeaseGeneration          LeaseGeneration               `json:"lease_generation"`
 	LeaseFence               LeaseFence                    `json:"lease_fence"`
+	LeaseDisposition         LeaseDisposition              `json:"lease_disposition"`
+	LeaseExpiresAt           time.Time                     `json:"lease_expires_at"`
+	SandboxID                string                        `json:"sandbox_id"`
+	SandboxGeneration        SandboxGeneration             `json:"sandbox_generation"`
+	SandboxFence             SandboxFence                  `json:"sandbox_fence"`
+	WorkerAuthorityID        string                        `json:"worker_authority_id"`
+	WorkerGeneration         WorkerGeneration              `json:"worker_generation"`
+	NodeAuthorityID          string                        `json:"node_authority_id"`
+	AuthorizationGeneration  AuthorizationGeneration       `json:"authorization_generation"`
+	AuthorizationExpiresAt   time.Time                     `json:"authorization_expires_at"`
+	Node                     postgresRuntimeNodeState      `json:"node"`
+	Cleanup                  postgresLeaseCleanupState     `json:"cleanup"`
+	CatalogSafetyEpoch       CatalogSafetyEpoch            `json:"catalog_safety_epoch"`
 	Deadline                 time.Time                     `json:"deadline"`
 	LeaseAcquireBy           time.Time                     `json:"lease_acquire_by"`
 	CancellationStatus       CancellationStatus            `json:"cancellation_status"`
@@ -43,6 +56,32 @@ type postgresRuntimeState struct {
 	CapacityEvidence         postgresCapacityEvidenceState `json:"capacity_evidence"`
 	PreLeaseTerminalReason   PreLeaseTerminalReason        `json:"pre_lease_terminal_reason"`
 	Reconciliation           ReconciliationStatus          `json:"reconciliation"`
+}
+
+type postgresRuntimeNodeState struct {
+	ExecutionNodeID       string                    `json:"execution_node_id"`
+	Generation            NodeGeneration            `json:"generation"`
+	Readiness             NodeReadiness             `json:"readiness"`
+	AttestationID         string                    `json:"attestation_id"`
+	AttestationGeneration NodeAttestationGeneration `json:"attestation_generation"`
+	AttestedAt            time.Time                 `json:"attested_at"`
+	ExpiresAt             time.Time                 `json:"expires_at"`
+	Occupancy             NodeOccupancy             `json:"occupancy"`
+	Quarantined           bool                      `json:"quarantined"`
+	Containment           ContainmentStatus         `json:"containment"`
+	Reset                 ResetStatus               `json:"reset"`
+}
+
+type postgresLeaseCleanupState struct {
+	Status                 LeaseCleanupStatus `json:"status"`
+	OperationID            string             `json:"operation_id"`
+	CanonicalRequestDigest Digest             `json:"canonical_request_digest"`
+	StopMainProcess        bool               `json:"stop_main_process"`
+	StopChildProcesses     bool               `json:"stop_child_processes"`
+	RevokeSecrets          bool               `json:"revoke_secrets"`
+	RemoveNetwork          bool               `json:"remove_network"`
+	FenceRuntimeView       bool               `json:"fence_runtime_view"`
+	ReconcileContainment   bool               `json:"reconcile_containment"`
 }
 
 type postgresRuntimeFencedEvidenceState struct {
@@ -68,12 +107,26 @@ type postgresNoLeaseEvidenceState struct {
 }
 
 type postgresPhysicalReleaseEvidenceState struct {
-	RuntimeRunID           string          `json:"runtime_run_id"`
-	SandboxLeaseID         string          `json:"sandbox_lease_id"`
-	LeaseGeneration        LeaseGeneration `json:"lease_generation"`
-	LeaseFence             LeaseFence      `json:"lease_fence"`
-	ExecutionNodeID        string          `json:"execution_node_id"`
-	NodeCapacityGeneration uint64          `json:"node_capacity_generation"`
+	WorkItemID             string                   `json:"work_item_id"`
+	AdmissionGrantID       string                   `json:"admission_grant_id"`
+	GrantGeneration        AdmissionGrantGeneration `json:"grant_generation"`
+	RuntimeRunID           string                   `json:"runtime_run_id"`
+	StartOperationID       string                   `json:"start_operation_id"`
+	StartDigest            Digest                   `json:"start_digest"`
+	ReleaseOperationID     string                   `json:"release_operation_id"`
+	ReleaseOperationDigest Digest                   `json:"release_operation_digest"`
+	RuntimeRevision        RuntimeRevision          `json:"runtime_revision"`
+	RuntimeFence           RuntimeFence             `json:"runtime_fence"`
+	SandboxLeaseID         string                   `json:"sandbox_lease_id"`
+	LeaseGeneration        LeaseGeneration          `json:"lease_generation"`
+	LeaseFence             LeaseFence               `json:"lease_fence"`
+	SandboxID              string                   `json:"sandbox_id"`
+	SandboxGeneration      SandboxGeneration        `json:"sandbox_generation"`
+	SandboxFence           SandboxFence             `json:"sandbox_fence"`
+	ExecutionNodeID        string                   `json:"execution_node_id"`
+	NodeCapacityGeneration uint64                   `json:"node_capacity_generation"`
+	ResetEvidenceID        string                   `json:"reset_evidence_id"`
+	ResetEvidenceDigest    Digest                   `json:"reset_evidence_digest"`
 }
 
 type postgresCapacityEvidenceState struct {
@@ -149,7 +202,30 @@ func encodePostgresRuntimeFixture(fixture RuntimeFixture) ([]byte, error) {
 		LeaseAcquireStatus: fixture.Lease.AcquireStatus, LeaseAcquireOperationID: fixture.Lease.AcquireOperationID.String(),
 		LeaseAcquireDigest: fixture.Lease.AcquireDigest, SandboxLeaseID: fixture.Lease.LeaseID.String(),
 		LeaseGeneration: fixture.Lease.Generation, LeaseFence: fixture.Lease.Fence,
-		Deadline: fixture.Deadline.UTC(), LeaseAcquireBy: fixture.LeaseAcquireBy.UTC(),
+		LeaseDisposition: fixture.Lease.Disposition, LeaseExpiresAt: fixture.Lease.ExpiresAt.UTC(),
+		SandboxID: fixture.Lease.SandboxID.String(), SandboxGeneration: fixture.Lease.SandboxGeneration,
+		SandboxFence: fixture.Lease.SandboxFence, WorkerAuthorityID: fixture.Lease.WorkerAuthorityID.String(),
+		WorkerGeneration: fixture.Lease.WorkerGeneration, NodeAuthorityID: fixture.Lease.NodeAuthorityID.String(),
+		AuthorizationGeneration: fixture.Lease.AuthorizationGeneration,
+		AuthorizationExpiresAt:  fixture.Lease.AuthorizationExpiresAt.UTC(),
+		Node: postgresRuntimeNodeState{
+			ExecutionNodeID: fixture.Node.ExecutionNodeID.String(), Generation: fixture.Node.Generation,
+			Readiness: fixture.Node.Readiness, AttestationID: fixture.Node.AttestationID.String(),
+			AttestationGeneration: fixture.Node.AttestationGeneration,
+			AttestedAt:            fixture.Node.AttestedAt.UTC(), ExpiresAt: fixture.Node.ExpiresAt.UTC(),
+			Occupancy: fixture.Node.Occupancy, Quarantined: fixture.Node.Quarantined,
+			Containment: fixture.Node.Containment, Reset: fixture.Node.Reset,
+		},
+		Cleanup: postgresLeaseCleanupState{
+			Status: fixture.Cleanup.Status, OperationID: fixture.Cleanup.OperationID.String(),
+			CanonicalRequestDigest: fixture.Cleanup.CanonicalRequestDigest,
+			StopMainProcess:        fixture.Cleanup.StopMainProcess, StopChildProcesses: fixture.Cleanup.StopChildProcesses,
+			RevokeSecrets: fixture.Cleanup.RevokeSecrets, RemoveNetwork: fixture.Cleanup.RemoveNetwork,
+			FenceRuntimeView:     fixture.Cleanup.FenceRuntimeView,
+			ReconcileContainment: fixture.Cleanup.ReconcileContainment,
+		},
+		CatalogSafetyEpoch: fixture.CatalogSafetyEpoch,
+		Deadline:           fixture.Deadline.UTC(), LeaseAcquireBy: fixture.LeaseAcquireBy.UTC(),
 		CancellationStatus: fixture.Cancellation.Status, CancellationOperationID: fixture.Cancellation.OperationID.String(),
 		CancellationReason: fixture.Cancellation.Reason, CancellationAcceptedAt: fixture.Cancellation.AcceptedAt.UTC(),
 		EvidenceSchemaVersion: fixture.EvidenceRoot.SchemaVersion, EvidenceRootID: fixture.EvidenceRoot.EvidenceRootID.String(),
@@ -196,12 +272,26 @@ func postgresCapacityEvidenceFromSnapshot(value RuntimeCapacityEvidenceSnapshot)
 			NodeCapacityGeneration: value.NoLeasePhysicalDisposition.NodeCapacityGeneration,
 		},
 		PhysicalCapacityReleaseReady: postgresPhysicalReleaseEvidenceState{
+			WorkItemID:             value.PhysicalCapacityReleaseReady.WorkItemID.String(),
+			AdmissionGrantID:       value.PhysicalCapacityReleaseReady.AdmissionGrantID.String(),
+			GrantGeneration:        value.PhysicalCapacityReleaseReady.GrantGeneration,
 			RuntimeRunID:           value.PhysicalCapacityReleaseReady.RuntimeRunID.String(),
+			StartOperationID:       value.PhysicalCapacityReleaseReady.StartOperationID.String(),
+			StartDigest:            value.PhysicalCapacityReleaseReady.StartDigest,
+			ReleaseOperationID:     value.PhysicalCapacityReleaseReady.ReleaseOperationID.String(),
+			ReleaseOperationDigest: value.PhysicalCapacityReleaseReady.ReleaseOperationDigest,
+			RuntimeRevision:        value.PhysicalCapacityReleaseReady.RuntimeRevision,
+			RuntimeFence:           value.PhysicalCapacityReleaseReady.RuntimeFence,
 			SandboxLeaseID:         value.PhysicalCapacityReleaseReady.SandboxLeaseID.String(),
 			LeaseGeneration:        value.PhysicalCapacityReleaseReady.LeaseGeneration,
 			LeaseFence:             value.PhysicalCapacityReleaseReady.LeaseFence,
+			SandboxID:              value.PhysicalCapacityReleaseReady.SandboxID.String(),
+			SandboxGeneration:      value.PhysicalCapacityReleaseReady.SandboxGeneration,
+			SandboxFence:           value.PhysicalCapacityReleaseReady.SandboxFence,
 			ExecutionNodeID:        value.PhysicalCapacityReleaseReady.ExecutionNodeID.String(),
 			NodeCapacityGeneration: value.PhysicalCapacityReleaseReady.NodeCapacityGeneration,
+			ResetEvidenceID:        value.PhysicalCapacityReleaseReady.ResetEvidenceID.String(),
+			ResetEvidenceDigest:    value.PhysicalCapacityReleaseReady.ResetEvidenceDigest,
 		},
 	}
 }
@@ -234,12 +324,26 @@ func capacityEvidenceSnapshotFromPostgres(value postgresCapacityEvidenceState) R
 			NodeCapacityGeneration:  value.NoLeasePhysicalDisposition.NodeCapacityGeneration,
 		},
 		PhysicalCapacityReleaseReady: PhysicalCapacityReleaseReadyEvidence{
+			WorkItemID:             WorkItemID{value: value.PhysicalCapacityReleaseReady.WorkItemID},
+			AdmissionGrantID:       AdmissionGrantID{value: value.PhysicalCapacityReleaseReady.AdmissionGrantID},
+			GrantGeneration:        value.PhysicalCapacityReleaseReady.GrantGeneration,
 			RuntimeRunID:           RuntimeRunID{value: value.PhysicalCapacityReleaseReady.RuntimeRunID},
+			StartOperationID:       OperationID{value: value.PhysicalCapacityReleaseReady.StartOperationID},
+			StartDigest:            value.PhysicalCapacityReleaseReady.StartDigest,
+			ReleaseOperationID:     OperationID{value: value.PhysicalCapacityReleaseReady.ReleaseOperationID},
+			ReleaseOperationDigest: value.PhysicalCapacityReleaseReady.ReleaseOperationDigest,
+			RuntimeRevision:        value.PhysicalCapacityReleaseReady.RuntimeRevision,
+			RuntimeFence:           value.PhysicalCapacityReleaseReady.RuntimeFence,
 			SandboxLeaseID:         SandboxLeaseID{value: value.PhysicalCapacityReleaseReady.SandboxLeaseID},
 			LeaseGeneration:        value.PhysicalCapacityReleaseReady.LeaseGeneration,
 			LeaseFence:             value.PhysicalCapacityReleaseReady.LeaseFence,
+			SandboxID:              SandboxID{value: value.PhysicalCapacityReleaseReady.SandboxID},
+			SandboxGeneration:      value.PhysicalCapacityReleaseReady.SandboxGeneration,
+			SandboxFence:           value.PhysicalCapacityReleaseReady.SandboxFence,
 			ExecutionNodeID:        ExecutionNodeID{value: value.PhysicalCapacityReleaseReady.ExecutionNodeID},
 			NodeCapacityGeneration: value.PhysicalCapacityReleaseReady.NodeCapacityGeneration,
+			ResetEvidenceID:        EvidenceID{value: value.PhysicalCapacityReleaseReady.ResetEvidenceID},
+			ResetEvidenceDigest:    value.PhysicalCapacityReleaseReady.ResetEvidenceDigest,
 		},
 	}
 }
@@ -299,6 +403,14 @@ func scanPostgresRuntimeRecord(row rowScanner, runtimeRunID RuntimeRunID) (*runt
 			AcquireStatus: persisted.LeaseAcquireStatus, AcquireOperationID: OperationID{value: persisted.LeaseAcquireOperationID},
 			AcquireDigest: persisted.LeaseAcquireDigest, LeaseID: SandboxLeaseID{value: persisted.SandboxLeaseID},
 			Generation: persisted.LeaseGeneration, Fence: persisted.LeaseFence,
+			Disposition: persisted.LeaseDisposition, ExpiresAt: persisted.LeaseExpiresAt.UTC(),
+			SandboxID: SandboxID{value: persisted.SandboxID}, SandboxGeneration: persisted.SandboxGeneration,
+			SandboxFence:            persisted.SandboxFence,
+			WorkerAuthorityID:       WorkerAuthorityID{value: persisted.WorkerAuthorityID},
+			WorkerGeneration:        persisted.WorkerGeneration,
+			NodeAuthorityID:         NodeAuthorityID{value: persisted.NodeAuthorityID},
+			AuthorizationGeneration: persisted.AuthorizationGeneration,
+			AuthorizationExpiresAt:  persisted.AuthorizationExpiresAt.UTC(),
 		},
 		deadline: persisted.Deadline.UTC(), leaseAcquireBy: persisted.LeaseAcquireBy.UTC(),
 		cancellation: RuntimeCancellationSnapshot{
@@ -312,10 +424,31 @@ func scanPostgresRuntimeRecord(row rowScanner, runtimeRunID RuntimeRunID) (*runt
 		capacity: RuntimeCapacitySnapshot{
 			LogicalRelease: persisted.LogicalCapacity, NoLease: persisted.NoLeaseCapacity, Physical: persisted.PhysicalCapacity,
 		},
-		capacityEvidence:       capacityEvidenceSnapshotFromPostgres(persisted.CapacityEvidence),
+		capacityEvidence: capacityEvidenceSnapshotFromPostgres(persisted.CapacityEvidence),
+		node: RuntimeNodeSnapshot{
+			ExecutionNodeID: ExecutionNodeID{value: persisted.Node.ExecutionNodeID},
+			Generation:      persisted.Node.Generation, Readiness: persisted.Node.Readiness,
+			AttestationID:         NodeAttestationID{value: persisted.Node.AttestationID},
+			AttestationGeneration: persisted.Node.AttestationGeneration,
+			AttestedAt:            persisted.Node.AttestedAt.UTC(), ExpiresAt: persisted.Node.ExpiresAt.UTC(),
+			Occupancy: persisted.Node.Occupancy, Quarantined: persisted.Node.Quarantined,
+			Containment: persisted.Node.Containment, Reset: persisted.Node.Reset,
+		},
+		cleanup: RuntimeLeaseCleanupSnapshot{
+			Status: persisted.Cleanup.Status, OperationID: OperationID{value: persisted.Cleanup.OperationID},
+			CanonicalRequestDigest: persisted.Cleanup.CanonicalRequestDigest,
+			StopMainProcess:        persisted.Cleanup.StopMainProcess,
+			StopChildProcesses:     persisted.Cleanup.StopChildProcesses,
+			RevokeSecrets:          persisted.Cleanup.RevokeSecrets, RemoveNetwork: persisted.Cleanup.RemoveNetwork,
+			FenceRuntimeView:     persisted.Cleanup.FenceRuntimeView,
+			ReconcileContainment: persisted.Cleanup.ReconcileContainment,
+		},
+		catalogSafetyEpoch:     persisted.CatalogSafetyEpoch,
 		preLeaseTerminalReason: persisted.PreLeaseTerminalReason,
 		reconciliation:         persisted.Reconciliation,
 	}
+	record.acceptedStart.OperationID = record.operation.OperationID
+	record.acceptedStartDigest = record.operation.Digest
 	if !validRuntimeFixture(fixture) || !snapshotVariantsKnown(record) ||
 		(record.operation.Generation != 0 && record.operation.Generation != operationGeneration) {
 		return nil, newPersistenceError(PersistenceStateCorrupt)

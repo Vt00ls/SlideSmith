@@ -2,9 +2,27 @@ package runtimeexecution
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
+
+func TestPostgresMaintenanceReplayCodecRejectsMissingLifecycleAuthority(t *testing.T) {
+	t.Parallel()
+
+	encoded, err := json.Marshal(postgresMaintenanceDecisionState{
+		OperationID: "maintenance-missing-authority", CanonicalRequestDigest: digest(44),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = decodePostgresMaintenanceDecision(encoded)
+	var persistenceError *PersistenceError
+	if !errors.As(err, &persistenceError) || persistenceError.Code() != PersistenceStateCorrupt {
+		t.Fatalf("decode error = %T %v, want corrupt persistence state", err, err)
+	}
+}
 
 func TestMalformedZeroSchemaCancelIsInvalidRequest(t *testing.T) {
 	t.Parallel()
@@ -93,9 +111,41 @@ func TestRuntimeSnapshotClosedSchemaAndLosslessProjectionRules(t *testing.T) {
 	}
 	unknownVariant := schemaRuntimeFixture(t, authority, "unknown-variant")
 	unknownVariant.State = RuntimeState(255)
+	unknownLeaseVariant := schemaRuntimeFixture(t, authority, "unknown-lease-variant")
+	unknownLeaseVariant.Lease.Disposition = LeaseDisposition(255)
+	unknownNodeVariant := schemaRuntimeFixture(t, authority, "unknown-node-variant")
+	unknownNodeVariant.Node.Readiness = NodeReadiness(255)
+	grantedWithoutLifecycle := schemaRuntimeFixture(t, authority, "granted-without-lifecycle")
+	grantedWithoutLifecycle.Lease = RuntimeLeaseSnapshot{
+		AcquireStatus: LeaseGranted, AcquireOperationID: mustOperationID(t, "granted-without-lifecycle-acquire"),
+		AcquireDigest: digest(31), LeaseID: SandboxLeaseID{value: "granted-without-lifecycle-lease"},
+		Generation: 1, Fence: 1,
+	}
+	activeWithoutNodeTruth := schemaRuntimeFixture(t, authority, "active-without-node-truth")
+	activeWithoutNodeTruth.Operation = RuntimeOperationBinding{
+		Status: OperationBound, OperationID: mustOperationID(t, "active-without-node-start"), Digest: digest(32),
+		Generation: 1, AdmissionGrantID: AdmissionGrantID{value: "active-without-node-grant"},
+		WorkItemID: WorkItemID{value: "active-without-node-work"}, GrantGeneration: 1,
+		ExecutionNodeID: ExecutionNodeID{value: "active-without-node-node"}, NodeCapacityGeneration: 1,
+		ResourceClassID:   ResourceClassID{value: "active-without-node-class"},
+		ExecutionPolicyID: ExecutionPolicyID{value: "active-without-node-policy"},
+		SchedulerEpoch:    1, PolicyVersion: 1,
+	}
+	activeWithoutNodeTruth.Lease = RuntimeLeaseSnapshot{
+		AcquireStatus: LeaseGranted, AcquireOperationID: mustOperationID(t, "active-without-node-acquire"),
+		AcquireDigest: digest(33), LeaseID: SandboxLeaseID{value: "active-without-node-lease"},
+		Generation: 1, Fence: 1, Disposition: LeaseActive, ExpiresAt: now.Add(time.Minute),
+		SandboxID: SandboxID{value: "active-without-node-sandbox"}, SandboxGeneration: 1, SandboxFence: 1,
+		WorkerAuthorityID: WorkerAuthorityID{value: "active-without-node-worker"}, WorkerGeneration: 1,
+		NodeAuthorityID: NodeAuthorityID{value: "active-without-node-authority"}, AuthorizationGeneration: 1,
+		AuthorizationExpiresAt: now.Add(time.Minute),
+	}
 
 	harness, err := NewDeterministicHarness(HarnessConfig{
-		Now: now, Runtimes: []RuntimeFixture{normal, lossy, unknownEvidence, unknownVariant},
+		Now: now, Runtimes: []RuntimeFixture{
+			normal, lossy, unknownEvidence, unknownVariant, unknownLeaseVariant, unknownNodeVariant,
+			grantedWithoutLifecycle, activeWithoutNodeTruth,
+		},
 	})
 	if err != nil {
 		t.Fatalf("new harness: %v", err)
@@ -115,6 +165,10 @@ func TestRuntimeSnapshotClosedSchemaAndLosslessProjectionRules(t *testing.T) {
 	assertInspectError(t, harness, normal, authority, SchemaV1, NewSchemaVersion(9, 0), ErrorUnsupportedSchema)
 	assertInspectError(t, harness, unknownEvidence, authority, SchemaV1, SnapshotSchemaCurrent, ErrorUnsupportedSchema)
 	assertInspectError(t, harness, unknownVariant, authority, SchemaV1, SnapshotSchemaCurrent, ErrorUnsupportedSchema)
+	assertInspectError(t, harness, unknownLeaseVariant, authority, SchemaV1, SnapshotSchemaCurrent, ErrorUnsupportedSchema)
+	assertInspectError(t, harness, unknownNodeVariant, authority, SchemaV1, SnapshotSchemaCurrent, ErrorUnsupportedSchema)
+	assertInspectError(t, harness, grantedWithoutLifecycle, authority, SchemaV1, SnapshotSchemaCurrent, ErrorUnsupportedSchema)
+	assertInspectError(t, harness, activeWithoutNodeTruth, authority, SchemaV1, SnapshotSchemaCurrent, ErrorUnsupportedSchema)
 
 	assertInspectError(t, harness, normal, authority, NewSchemaVersion(2, 0), SnapshotSchemaCurrent, ErrorUnsupportedSchema)
 	missing := normal

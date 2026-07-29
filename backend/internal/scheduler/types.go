@@ -76,6 +76,7 @@ const (
 	GrantExpiredUnbound
 	GrantTerminalNoLease
 	GrantReleased
+	GrantLeaseAttached
 )
 
 type AdmissionGrant struct {
@@ -156,6 +157,7 @@ type WorkItemView struct {
 	Grant                   GrantView
 	LogicalReservation      ReservationState
 	SelectedNodeReservation ReservationState
+	PhysicalOccupancy       PhysicalOccupancyState
 }
 
 type ReservationState uint8
@@ -163,7 +165,16 @@ type ReservationState uint8
 const (
 	ReservationReservedUnbound ReservationState = iota + 1
 	ReservationBound
+	ReservationLeaseAttached
 	ReservationReleased ReservationState = 5
+)
+
+type PhysicalOccupancyState uint8
+
+const (
+	PhysicalOccupancyNone PhysicalOccupancyState = iota
+	PhysicalOccupancyHeld
+	PhysicalOccupancyReleased
 )
 
 type Scheduling interface {
@@ -172,6 +183,7 @@ type Scheduling interface {
 	Inspect(context.Context, WorkItemRef) (WorkItemView, error)
 	ApplyRuntimeFencedOrTerminal(context.Context, runtimeexecution.RuntimeFencedOrTerminalEvidence) error
 	ApplyNoLeasePhysicalDisposition(context.Context, runtimeexecution.NoLeasePhysicalDispositionEvidence) error
+	ApplyPhysicalCapacityReleaseReady(context.Context, runtimeexecution.PhysicalCapacityReleaseReadyEvidence) error
 }
 
 type ErrorCode uint8

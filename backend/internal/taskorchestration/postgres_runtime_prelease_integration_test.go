@@ -14,15 +14,19 @@ import (
 )
 
 type postgresRuntimeAdmissionSystem struct {
-	t          *testing.T
-	db         *sql.DB
-	schema     string
-	clock      *runtimeAdmissionClock
-	tasks      *taskorchestration.PostgresAdapter
-	scheduling *scheduler.PostgresAuthority
-	runtime    *runtimeexecution.PostgresAuthority
-	lease      runtimeexecution.LeaseAcquisitionAdapter
-	faults     runtimeexecution.PersistenceFaultInjector
+	t                    *testing.T
+	db                   *sql.DB
+	schema               string
+	clock                *runtimeAdmissionClock
+	tasks                *taskorchestration.PostgresAdapter
+	scheduling           *scheduler.PostgresAuthority
+	runtime              *runtimeexecution.PostgresAuthority
+	lease                runtimeexecution.LeaseAcquisitionAdapter
+	faults               runtimeexecution.PersistenceFaultInjector
+	nodeAttested         bool
+	fencingAuthority     runtimeexecution.LeaseFencingAuthority
+	resetAuthority       runtimeexecution.SandboxResetAuthority
+	attestationAuthority runtimeexecution.NodeAttestationAuthority
 }
 
 type admittedRuntimeWork struct {
@@ -1586,9 +1590,11 @@ func (system *postgresRuntimeAdmissionSystem) restartRuntime(t *testing.T) *runt
 	t.Helper()
 	restarted, err := runtimeexecution.NewPostgresAuthority(system.db, runtimeexecution.PostgresConfig{
 		Schema: system.schema, Now: system.clock.Now, Faults: system.faults,
-		SchedulerParticipant:        system.scheduling.RuntimeAcceptanceParticipant(),
-		SchedulerAcceptanceFunction: system.scheduling.RuntimeAcceptanceFunction(),
-		LeaseAcquisition:            system.lease,
+		SchedulerParticipant:                system.scheduling.RuntimeAcceptanceParticipant(),
+		SchedulerAcceptanceFunction:         system.scheduling.RuntimeAcceptanceFunction(),
+		SchedulerLeaseAttachmentParticipant: system.scheduling.RuntimeLeaseAttachmentParticipant(),
+		SchedulerLeaseAttachmentFunction:    system.scheduling.RuntimeLeaseAttachmentFunction(),
+		LeaseAcquisition:                    system.lease,
 	})
 	if err != nil {
 		t.Fatalf("restart Runtime Execution: %v", err)
@@ -1603,9 +1609,11 @@ func (system *postgresRuntimeAdmissionSystem) replaceRuntimeSchedulerParticipant
 	t.Helper()
 	restarted, err := runtimeexecution.NewPostgresAuthority(system.db, runtimeexecution.PostgresConfig{
 		Schema: system.schema, Now: system.clock.Now, Faults: system.faults,
-		SchedulerParticipant:        participant,
-		SchedulerAcceptanceFunction: system.scheduling.RuntimeAcceptanceFunction(),
-		LeaseAcquisition:            system.lease,
+		SchedulerParticipant:                participant,
+		SchedulerAcceptanceFunction:         system.scheduling.RuntimeAcceptanceFunction(),
+		SchedulerLeaseAttachmentParticipant: system.scheduling.RuntimeLeaseAttachmentParticipant(),
+		SchedulerLeaseAttachmentFunction:    system.scheduling.RuntimeLeaseAttachmentFunction(),
+		LeaseAcquisition:                    system.lease,
 	})
 	if err != nil {
 		t.Fatalf("replace Runtime Scheduler participant: %v", err)
@@ -1617,11 +1625,13 @@ func (system *postgresRuntimeAdmissionSystem) enableRuntimeCancellationParticipa
 	t.Helper()
 	restarted, err := runtimeexecution.NewPostgresAuthority(system.db, runtimeexecution.PostgresConfig{
 		Schema: system.schema, Now: system.clock.Now, Faults: system.faults,
-		SchedulerParticipant:             system.scheduling.RuntimeAcceptanceParticipant(),
-		SchedulerAcceptanceFunction:      system.scheduling.RuntimeAcceptanceFunction(),
-		SchedulerCancellationParticipant: system.scheduling.RuntimeCancellationParticipant(),
-		SchedulerCancellationFunction:    system.scheduling.RuntimeCancellationFunction(),
-		LeaseAcquisition:                 system.lease,
+		SchedulerParticipant:                system.scheduling.RuntimeAcceptanceParticipant(),
+		SchedulerAcceptanceFunction:         system.scheduling.RuntimeAcceptanceFunction(),
+		SchedulerLeaseAttachmentParticipant: system.scheduling.RuntimeLeaseAttachmentParticipant(),
+		SchedulerLeaseAttachmentFunction:    system.scheduling.RuntimeLeaseAttachmentFunction(),
+		SchedulerCancellationParticipant:    system.scheduling.RuntimeCancellationParticipant(),
+		SchedulerCancellationFunction:       system.scheduling.RuntimeCancellationFunction(),
+		LeaseAcquisition:                    system.lease,
 	})
 	if err != nil {
 		t.Fatalf("enable Runtime cancellation participant: %v", err)
@@ -1765,10 +1775,18 @@ func assertPostgresStartAcceptedAndBound(
 	currentStartBinding := snapshot.State == runtimeexecution.RuntimeTerminal ||
 		snapshot.Operation.OperationID == work.start.OperationID &&
 			snapshot.Operation.Digest == work.start.CanonicalRequestDigest
-	if view.State != scheduler.WorkItemAccepted || view.Grant.State != scheduler.GrantBound ||
+	wantGrantState := scheduler.GrantBound
+	wantNodeReservation := scheduler.ReservationBound
+	wantPhysical := scheduler.PhysicalOccupancyNone
+	if snapshot.Lease.AcquireStatus == runtimeexecution.LeaseGranted {
+		wantGrantState = scheduler.GrantLeaseAttached
+		wantNodeReservation = scheduler.ReservationLeaseAttached
+		wantPhysical = scheduler.PhysicalOccupancyHeld
+	}
+	if view.State != scheduler.WorkItemAccepted || view.Grant.State != wantGrantState ||
 		view.Grant.Generation != work.canonical.Grant.Generation ||
 		view.LogicalReservation != scheduler.ReservationBound ||
-		view.SelectedNodeReservation != scheduler.ReservationBound ||
+		view.SelectedNodeReservation != wantNodeReservation || view.PhysicalOccupancy != wantPhysical ||
 		!currentStartBinding ||
 		snapshot.Operation.AdmissionGrantID != work.start.AdmissionGrant.AdmissionGrantID ||
 		snapshot.Operation.WorkItemID != work.start.AdmissionGrant.WorkItemID ||
@@ -1909,9 +1927,21 @@ func newPostgresRuntimeAdmissionSystemWithLimits(
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtimeNodeID, err := runtimeexecution.NewExecutionNodeID(nodeID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	securityAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-security-authority")
+	cleanupAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-cleanup-authority")
+	recoveryAuthorityID, _ := runtimeexecution.NewAuthorityID("issue-76-recovery-authority")
+	fencingAuthority := runtimeexecution.NewSecurityLeaseFencingAuthority(securityAuthorityID, 3)
+	resetAuthority := runtimeexecution.NewSandboxResetAuthority(cleanupAuthorityID, 4)
+	attestationAuthority := runtimeexecution.NewRecoveryNodeAttestationAuthority(recoveryAuthorityID, 5)
 	scheduling, err := scheduler.NewPostgresAuthority(db, scheduler.PostgresConfig{
-		Schema: schema,
-		Now:    clock.Now,
+		Schema:                                 schema,
+		Now:                                    clock.Now,
+		RuntimeNodeFactFunction:                schema + ".runtime_execution_read_scheduler_node_fact",
+		RuntimePhysicalReleaseEvidenceFunction: schema + ".runtime_execution_validate_physical_release",
 		Admission: scheduler.LocalAdmissionConfig{
 			SchedulerEpoch: 1,
 			PolicyVersion:  1,
@@ -1939,9 +1969,16 @@ func newPostgresRuntimeAdmissionSystemWithLimits(
 	})
 	runtime, err := runtimeexecution.NewPostgresAuthority(db, runtimeexecution.PostgresConfig{
 		Schema: schema, Now: clock.Now, Faults: faults,
-		SchedulerParticipant:        scheduling.RuntimeAcceptanceParticipant(),
-		SchedulerAcceptanceFunction: scheduling.RuntimeAcceptanceFunction(),
-		LeaseAcquisition:            leaseAcquisition,
+		SchedulerParticipant:                scheduling.RuntimeAcceptanceParticipant(),
+		SchedulerAcceptanceFunction:         scheduling.RuntimeAcceptanceFunction(),
+		SchedulerLeaseAttachmentParticipant: scheduling.RuntimeLeaseAttachmentParticipant(),
+		SchedulerLeaseAttachmentFunction:    scheduling.RuntimeLeaseAttachmentFunction(),
+		LeaseAcquisition:                    leaseAcquisition,
+		MaintenanceAuthorities: []runtimeexecution.RuntimeMaintenanceAuthorityBinding{
+			runtimeexecution.BindLeaseFencingAuthority(runtimeNodeID, fencingAuthority),
+			runtimeexecution.BindSandboxResetAuthority(runtimeNodeID, resetAuthority),
+			runtimeexecution.BindNodeAttestationAuthority(runtimeNodeID, attestationAuthority),
+		},
 	})
 	if err != nil {
 		t.Fatalf("create Runtime Execution authority: %v", err)
@@ -1949,11 +1986,59 @@ func newPostgresRuntimeAdmissionSystemWithLimits(
 	if err := runtime.Migrate(context.Background()); err != nil {
 		t.Fatalf("migrate Runtime Execution authority: %v", err)
 	}
-	return &postgresRuntimeAdmissionSystem{
+	system := &postgresRuntimeAdmissionSystem{
 		t: t, db: db, schema: schema, clock: clock,
 		tasks: tasks, scheduling: scheduling, runtime: runtime,
 		lease: leaseAcquisition, faults: faults,
+		fencingAuthority: fencingAuthority, resetAuthority: resetAuthority,
+		attestationAuthority: attestationAuthority,
 	}
+	system.bootstrapConfiguredRuntimeNode(t, nodeID.String(), resourceClassID.String(), executionPolicyID.String())
+	return system
+}
+
+func (system *postgresRuntimeAdmissionSystem) bootstrapConfiguredRuntimeNode(
+	t *testing.T,
+	nodeValue string,
+	resourceClassValue string,
+	executionPolicyValue string,
+) {
+	t.Helper()
+	nodeID, err := runtimeexecution.NewExecutionNodeID(nodeValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resourceClassID, err := runtimeexecution.NewResourceClassID(resourceClassValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionPolicyID, err := runtimeexecution.NewExecutionPolicyID(executionPolicyValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestationID, _ := runtimeexecution.NewNodeAttestationID("issue-76-bootstrap-node-attestation")
+	nodeAuthorityID, _ := runtimeexecution.NewNodeAuthorityID("issue-76-bootstrap-node-authority")
+	workerAuthorityID, _ := runtimeexecution.NewWorkerAuthorityID("issue-76-bootstrap-worker-authority")
+	operationID, _ := runtimeexecution.NewOperationID("issue-76-bootstrap-node")
+	resetEvidenceID, _ := runtimeexecution.NewEvidenceID("issue-76-bootstrap-reset-evidence")
+	now := system.clock.Now()
+	attest, err := runtimeexecution.NewAttestExecutionNode(runtimeexecution.AttestExecutionNodeInput{
+		SchemaVersion: runtimeexecution.SchemaV1, OperationID: operationID, ExecutionNodeID: nodeID,
+		Authority:      system.attestationAuthority,
+		NodeGeneration: 1, AttestationID: attestationID, AttestationGeneration: 1,
+		AttestedAt: now, ExpiresAt: now.Add(24 * time.Hour), ResourceClassID: resourceClassID,
+		ExecutionPolicyID: executionPolicyID, NodeAuthorityID: nodeAuthorityID,
+		WorkerAuthorityID: workerAuthorityID, WorkerGeneration: 1, AuthorizationGeneration: 1,
+		AuthorizationExpiresAt: now.Add(24 * time.Hour), ReleaseSafetyEpoch: 1,
+		ResetEvidenceID: resetEvidenceID, ResetEvidenceDigest: runtimeexecution.Digest{31: 1}, OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatalf("construct configured node attestation: %v", err)
+	}
+	if _, err := system.runtime.Maintain(context.Background(), attest); err != nil {
+		t.Fatalf("bootstrap configured Runtime Execution node: %v", err)
+	}
+	system.nodeAttested = true
 }
 
 func (system *postgresRuntimeAdmissionSystem) enqueueRuntime(t *testing.T, suffix string) taskorchestration.UserAuthority {
@@ -2063,8 +2148,65 @@ func (system *postgresRuntimeAdmissionSystem) claimRuntime(t *testing.T) admitte
 	if err != nil {
 		t.Fatalf("bind canonical Runtime Start: %v", err)
 	}
-	return admittedRuntimeWork{
+	admitted := admittedRuntimeWork{
 		taskID:    taskID(t, decision.TaskID),
 		canonical: decision, start: start,
 	}
+	system.ensureRuntimeNodeAttested(t, admitted)
+	return admitted
+}
+
+func (system *postgresRuntimeAdmissionSystem) ensureRuntimeNodeAttested(t *testing.T, work admittedRuntimeWork) {
+	t.Helper()
+	if system.nodeAttested {
+		return
+	}
+	nodeID, err := runtimeexecution.NewExecutionNodeID(work.canonical.Grant.ExecutionNodeID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	attestationID, err := runtimeexecution.NewNodeAttestationID("issue-76-bootstrap-node-attestation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeAuthorityID, err := runtimeexecution.NewNodeAuthorityID("issue-76-bootstrap-node-authority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerAuthorityID, err := runtimeexecution.NewWorkerAuthorityID("issue-76-bootstrap-worker-authority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationID, err := runtimeexecution.NewOperationID("issue-76-bootstrap-node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resetEvidenceID, err := runtimeexecution.NewEvidenceID("issue-76-bootstrap-reset-evidence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalogEpoch := runtimeexecution.CatalogSafetyEpoch(0)
+	if work.start.CatalogBinding != nil {
+		catalogEpoch = work.start.CatalogBinding.SafetyEpoch
+	}
+	now := system.clock.Now()
+	attest, err := runtimeexecution.NewAttestExecutionNode(runtimeexecution.AttestExecutionNodeInput{
+		SchemaVersion: runtimeexecution.SchemaV1, OperationID: operationID, ExecutionNodeID: nodeID,
+		Authority:      system.attestationAuthority,
+		NodeGeneration: runtimeexecution.NodeGeneration(work.canonical.Grant.NodeCapacityGeneration),
+		AttestationID:  attestationID, AttestationGeneration: 1, AttestedAt: now,
+		ExpiresAt: now.Add(24 * time.Hour), ResourceClassID: work.start.ResourceClassID,
+		ExecutionPolicyID: work.start.ExecutionPolicyID, NodeAuthorityID: nodeAuthorityID,
+		WorkerAuthorityID: workerAuthorityID, WorkerGeneration: 1, AuthorizationGeneration: 1,
+		AuthorizationExpiresAt: now.Add(24 * time.Hour), ReleaseSafetyEpoch: work.start.ReleaseSafetyEpoch,
+		CatalogSafetyEpoch: catalogEpoch, ResetEvidenceID: resetEvidenceID,
+		ResetEvidenceDigest: runtimeexecution.Digest{31: 1}, OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatalf("construct bootstrap node attestation: %v", err)
+	}
+	if _, err := system.runtime.Maintain(context.Background(), attest); err != nil {
+		t.Fatalf("attest Runtime Execution node: %v", err)
+	}
+	system.nodeAttested = true
 }

@@ -142,10 +142,14 @@ func TestDeterministicLeaseCommitResponseLossReplaysExactlyOneLease(t *testing.T
 	authority := mustTaskOrchestrationAuthority(t, "lease-commit-authority", 4)
 	start := standardStart(t, now, authority, "lease-commit")
 	adapter := &recordingLeaseAcquisitionAdapter{observation: LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}}
+	grant := grantFixtureForStart(start, now.Add(10*time.Minute), true)
+	grant.ExecutionNodeID = startNodeID(t, "execution-node-"+grant.AdmissionGrantID.String())
+	grant.NodeCapacityGeneration = 1
 	harness, err := NewDeterministicHarness(HarnessConfig{
-		Now: now, IDs: DeterministicIDConfig{DecisionStart: 300, LeaseStart: 700},
+		Now: now, IDs: DeterministicIDConfig{DecisionStart: 300, LeaseStart: 700, SandboxStart: 800},
 		Runtimes:         []RuntimeFixture{runtimeFixtureForStart(start, authority)},
-		AdmissionGrants:  []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(10*time.Minute), true)},
+		AdmissionGrants:  []AdmissionGrantFixture{grant},
+		Nodes:            []ExecutionNodeFixture{executionNodeFixtureForStart(t, start, grant, now)},
 		LeaseAcquisition: adapter,
 	})
 	if err != nil {
@@ -171,6 +175,26 @@ func TestDeterministicLeaseCommitResponseLossReplaysExactlyOneLease(t *testing.T
 	}
 	if adapter.calls != 1 {
 		t.Fatalf("replay attempted a second physical acquisition: calls=%d", adapter.calls)
+	}
+}
+
+func executionNodeFixtureForStart(
+	t *testing.T,
+	start StartRuntimeRun,
+	grant AdmissionGrantFixture,
+	now time.Time,
+) ExecutionNodeFixture {
+	t.Helper()
+	return ExecutionNodeFixture{
+		ExecutionNodeID: grant.ExecutionNodeID, Generation: NodeGeneration(grant.NodeCapacityGeneration),
+		Readiness: NodeReady, AttestationID: startNodeAttestationID(t, "attestation-"+start.RuntimeRunID.String()),
+		AttestationGeneration: 1, AttestedAt: now.Add(-time.Second), ExpiresAt: now.Add(5 * time.Minute),
+		ResourceClassID: start.ResourceClassID, ExecutionPolicyID: start.ExecutionPolicyID,
+		NodeAuthorityID:   startNodeAuthorityID(t, "node-authority-"+start.RuntimeRunID.String()),
+		WorkerAuthorityID: startWorkerAuthorityID(t, "worker-authority-"+start.RuntimeRunID.String()),
+		WorkerGeneration:  1, AuthorizationGeneration: start.Authority.generation,
+		AuthorizationExpiresAt: now.Add(10 * time.Minute), ReleaseSafetyEpoch: start.ReleaseSafetyEpoch,
+		Containment: ContainmentEstablished, Reset: ResetCompleted,
 	}
 }
 
