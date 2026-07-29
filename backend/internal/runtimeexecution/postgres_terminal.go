@@ -87,21 +87,35 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 
 	startBinding := record.operation
 	leaseBinding := record.lease
+	leasedCancel := command.Outcome == RuntimeCancelled && leaseBinding.AcquireStatus == LeaseGranted &&
+		leaseBinding.Disposition == LeaseActive
+	validLeaseBinding := validAcceptedStartBinding(startBinding, leaseBinding)
+	if leasedCancel {
+		validLeaseBinding = validGrantedLeaseBinding(startBinding, leaseBinding)
+	}
 	if record.fixture.RuntimeRevision != command.ExpectedRuntimeRevision ||
 		startBinding.OperationID != command.ExpectedStartOperationID ||
 		record.fixture.OperationGeneration != command.ExpectedOperationGeneration ||
 		record.fixture.RuntimeFence != command.ExpectedRuntimeFence ||
 		record.fixture.SafetyEpoch != command.SafetyEpoch ||
 		command.Authority.generation != record.fixture.Owner.generation ||
-		!validAcceptedStartBinding(startBinding, leaseBinding) {
+		!validLeaseBinding {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
-	if record.fixture.State != RuntimeWaitingForLease && record.fixture.State != RuntimeReconciling ||
+	validState := record.fixture.State == RuntimeWaitingForLease || record.fixture.State == RuntimeReconciling
+	if leasedCancel {
+		validState = record.fixture.State >= RuntimePreparingPrerequisites && record.fixture.State < RuntimeTerminal
+	}
+	wantPhysical := PhysicalCapacityNotApplicable
+	if leasedCancel {
+		wantPhysical = PhysicalCapacityOccupied
+	}
+	if !validState ||
 		record.fixture.Outcome != RuntimeOutcomeNone ||
 		record.cancellation.Status != CancellationNotRequested ||
 		record.capacity.LogicalRelease != LogicalCapacityHeld ||
 		record.capacity.NoLease != NoLeaseDispositionNone ||
-		record.capacity.Physical != PhysicalCapacityNotApplicable ||
+		record.capacity.Physical != wantPhysical ||
 		record.capacityEvidence != (RuntimeCapacityEvidenceSnapshot{}) {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
@@ -113,8 +127,20 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		authority.table("runtime_execution_prelease_leases")), command.RuntimeRunID.String()).Scan(&leaseRootCount); err != nil {
 		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
-	if leaseRootCount != 0 {
+	wantLeaseRoots := uint64(0)
+	if leasedCancel {
+		wantLeaseRoots = 1
+	}
+	if leaseRootCount != wantLeaseRoots {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	var leasedNode *postgresExecutionNodeRecord
+	if leasedCancel {
+		leasedNode, err = authority.loadPostgresNodeForUpdate(ctx, tx, startBinding.ExecutionNodeID)
+		if err != nil || leasedNode.ActiveRuntimeRunID != command.RuntimeRunID ||
+			leasedNode.ActiveLeaseID != leaseBinding.LeaseID || leasedNode.Occupancy != NodeOccupied {
+			return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+		}
 	}
 	if authority.failAt(PersistenceFaultBeforeRuntimeWrite) {
 		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
@@ -139,7 +165,6 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 	record.operation.OperationID = command.OperationID
 	record.operation.Digest = command.CanonicalRequestDigest
 	record.operation.Generation = record.fixture.OperationGeneration
-	record.lease.AcquireStatus = LeaseNotRequested
 	if command.Outcome == RuntimeCancelled {
 		record.cancellation = RuntimeCancellationSnapshot{
 			Status: CancellationAccepted, OperationID: command.OperationID,
@@ -147,10 +172,33 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		}
 	}
 	record.preLeaseTerminalReason = command.PreLeaseTerminalReason
-	record.capacity = RuntimeCapacitySnapshot{
-		LogicalRelease: LogicalCapacityReleaseReady,
-		NoLease:        NoLeaseDispositionRecorded,
-		Physical:       PhysicalCapacityNotApplicable,
+	if leasedCancel {
+		record.lease.Generation++
+		record.lease.Fence++
+		record.lease.SandboxFence++
+		record.lease.Disposition = LeaseRevoked
+		leasedNode.Occupancy = NodeOccupancyUnknown
+		leasedNode.Quarantined = true
+		leasedNode.Containment = ContainmentPending
+		leasedNode.Reset = ResetRequired
+		record.node = nodeSnapshot(leasedNode.ExecutionNodeFixture)
+		record.cleanup = RuntimeLeaseCleanupSnapshot{
+			Status: LeaseCleanupPending, OperationID: command.OperationID,
+			CanonicalRequestDigest: command.CanonicalRequestDigest, StopMainProcess: true,
+			StopChildProcesses: true, RevokeSecrets: true, RemoveNetwork: true,
+			FenceRuntimeView: true, ReconcileContainment: true,
+		}
+		record.capacity = RuntimeCapacitySnapshot{
+			LogicalRelease: LogicalCapacityReleaseReady, NoLease: NoLeaseDispositionNone,
+			Physical: PhysicalCapacityUnknownOrQuarantined,
+		}
+	} else {
+		record.lease.AcquireStatus = LeaseNotRequested
+		record.capacity = RuntimeCapacitySnapshot{
+			LogicalRelease: LogicalCapacityReleaseReady,
+			NoLease:        NoLeaseDispositionRecorded,
+			Physical:       PhysicalCapacityNotApplicable,
+		}
 	}
 	baseEvidence := RuntimeFencedOrTerminalEvidence{
 		WorkItemID: startBinding.WorkItemID, AdmissionGrantID: startBinding.AdmissionGrantID,
@@ -161,9 +209,9 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		PolicyVersion:           startBinding.PolicyVersion,
 		LeaseAcquireOperationID: leaseBinding.AcquireOperationID, LeaseAcquireDigest: leaseBinding.AcquireDigest,
 	}
-	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{
-		RuntimeFencedOrTerminal: baseEvidence,
-		NoLeasePhysicalDisposition: NoLeasePhysicalDispositionEvidence{
+	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{RuntimeFencedOrTerminal: baseEvidence}
+	if !leasedCancel {
+		record.capacityEvidence.NoLeasePhysicalDisposition = NoLeasePhysicalDispositionEvidence{
 			WorkItemID: baseEvidence.WorkItemID, AdmissionGrantID: baseEvidence.AdmissionGrantID,
 			GrantGeneration: baseEvidence.GrantGeneration, RuntimeRunID: baseEvidence.RuntimeRunID,
 			StartOperationID: baseEvidence.StartOperationID, StartDigest: baseEvidence.StartDigest,
@@ -174,7 +222,7 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 			LeaseAcquireDigest:      baseEvidence.LeaseAcquireDigest,
 			ExecutionNodeID:         startBinding.ExecutionNodeID,
 			NodeCapacityGeneration:  startBinding.NodeCapacityGeneration,
-		},
+		}
 	}
 	record.reconciliation = ReconciliationStable
 	fact := RuntimeDecisionFact{
@@ -202,6 +250,14 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 	}
 	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	if leasedCancel {
+		if err := authority.updatePostgresLeaseLifecycle(ctx, tx, record.lease, command.RuntimeRunID); err != nil {
+			return RuntimeDecision{}, err
+		}
+		if err := authority.updatePostgresNode(ctx, tx, leasedNode, committedAt); err != nil {
+			return RuntimeDecision{}, err
+		}
 	}
 	if authority.failAt(PersistenceFaultBeforeDecision) {
 		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
@@ -291,6 +347,21 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		VALUES ($1,$2)`, authority.table("runtime_execution_outbox_delivery")),
 		command.OperationID.String(), OutboxPending); err != nil {
 		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
+	}
+	if leasedCancel {
+		cleanupDigest := digestBytes(append([]byte("slidesmith.runtime-execution.lease-cleanup/v1\n"), binding.canonical...))
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
+			operation_id, runtime_run_id, sandbox_lease_id, lease_generation, lease_fence,
+			sandbox_id, sandbox_generation, sandbox_fence, stop_main_process,
+			stop_child_processes, revoke_secrets, remove_network, fence_runtime_view,
+			reconcile_containment, canonical_digest, created_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,TRUE,TRUE,TRUE,TRUE,TRUE,$9,$10)`,
+			authority.table("runtime_execution_lease_cleanup_obligations")), command.OperationID.String(),
+			command.RuntimeRunID.String(), record.lease.LeaseID.String(), record.lease.Generation,
+			record.lease.Fence, record.lease.SandboxID.String(), record.lease.SandboxGeneration,
+			record.lease.SandboxFence, cleanupDigest[:], committedAt); err != nil {
+			return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
+		}
 	}
 	persistedEvidence := postgresCapacityEvidenceFromSnapshot(record.capacityEvidence)
 	runtimeFencedBytes, err := json.Marshal(persistedEvidence.RuntimeFencedOrTerminal)
@@ -410,4 +481,17 @@ func validAcceptedStartBinding(operation RuntimeOperationBinding, lease RuntimeL
 		operation.PolicyVersion > 0 && validLeaseStatus &&
 		validOpaqueID(lease.AcquireOperationID.String()) && lease.AcquireDigest != (Digest{}) &&
 		lease.LeaseID == (SandboxLeaseID{}) && lease.Generation == 0 && lease.Fence == 0
+}
+
+func validGrantedLeaseBinding(operation RuntimeOperationBinding, lease RuntimeLeaseSnapshot) bool {
+	return operation.Status == OperationBound && validOpaqueID(operation.OperationID.String()) &&
+		operation.Digest != (Digest{}) && operation.Generation > 0 &&
+		validOpaqueID(operation.AdmissionGrantID.String()) && validOpaqueID(operation.WorkItemID.String()) &&
+		operation.GrantGeneration > 0 && validOpaqueID(operation.ExecutionNodeID.String()) &&
+		operation.NodeCapacityGeneration > 0 && validOpaqueID(operation.ResourceClassID.String()) &&
+		validOpaqueID(operation.ExecutionPolicyID.String()) && operation.SchedulerEpoch > 0 && operation.PolicyVersion > 0 &&
+		lease.AcquireStatus == LeaseGranted && lease.Disposition == LeaseActive &&
+		validOpaqueID(lease.AcquireOperationID.String()) && lease.AcquireDigest != (Digest{}) &&
+		validOpaqueID(lease.LeaseID.String()) && lease.Generation > 0 && lease.Fence > 0 &&
+		validOpaqueID(lease.SandboxID.String()) && lease.SandboxGeneration > 0 && lease.SandboxFence > 0
 }

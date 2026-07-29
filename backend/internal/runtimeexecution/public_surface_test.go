@@ -77,6 +77,30 @@ func TestPublicSurfaceHasOnlyExecuteAndInspect(t *testing.T) {
 	assertIndependentType(t, RuntimeDecisionID{}, EvidenceRootID{})
 }
 
+func TestLeaseLifecycleUsesIndependentClosedMaintenanceSurface(t *testing.T) {
+	t.Parallel()
+	maintenance := reflect.TypeOf((*RuntimeMaintenance)(nil)).Elem()
+	if maintenance.NumMethod() != 1 || maintenance.Method(0).Name != "Maintain" {
+		t.Fatalf("RuntimeMaintenance methods = %v, want only Maintain", maintenance)
+	}
+	command := reflect.TypeOf((*RuntimeMaintenanceCommand)(nil)).Elem()
+	if command.NumMethod() != 3 {
+		t.Fatalf("RuntimeMaintenanceCommand marker surface = %d methods", command.NumMethod())
+	}
+	for index := 0; index < command.NumMethod(); index++ {
+		if command.Method(index).PkgPath == "" {
+			t.Fatalf("RuntimeMaintenanceCommand method %q is externally implementable", command.Method(index).Name)
+		}
+	}
+	for _, variant := range []RuntimeMaintenanceCommand{
+		RenewSandboxLease{}, FenceSandboxLease{}, ConfirmSandboxReset{}, AttestExecutionNode{},
+	} {
+		if variant == nil {
+			t.Fatal("maintenance variant is nil")
+		}
+	}
+}
+
 func assertIndependentType(t *testing.T, left, right any) {
 	t.Helper()
 	leftType := reflect.TypeOf(left)

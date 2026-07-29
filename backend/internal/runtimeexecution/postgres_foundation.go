@@ -446,6 +446,9 @@ func fixtureFromRuntimeRecord(record *runtimeRecord) RuntimeFixture {
 	fixture.EvidenceRoot = record.evidenceRoot
 	fixture.Capacity = record.capacity
 	fixture.CapacityEvidence = record.capacityEvidence
+	fixture.Node = record.node
+	fixture.Cleanup = record.cleanup
+	fixture.CatalogSafetyEpoch = record.catalogSafetyEpoch
 	fixture.PreLeaseTerminalReason = record.preLeaseTerminalReason
 	fixture.Reconciliation = record.reconciliation
 	return fixture

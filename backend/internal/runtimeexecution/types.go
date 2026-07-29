@@ -31,6 +31,11 @@ type (
 	RuntimeFence                     uint64
 	LeaseGeneration                  uint64
 	LeaseFence                       uint64
+	SandboxGeneration                uint64
+	SandboxFence                     uint64
+	WorkerGeneration                 uint64
+	NodeGeneration                   uint64
+	NodeAttestationGeneration        uint64
 	AuthorizationGeneration          uint64
 	ReleaseSafetyEpoch               uint64
 	CatalogSafetyEpoch               uint64
@@ -55,6 +60,10 @@ type ExecutionPolicyID struct{ value string }
 type AdmissionGrantID struct{ value string }
 type WorkItemID struct{ value string }
 type SandboxLeaseID struct{ value string }
+type SandboxID struct{ value string }
+type WorkerAuthorityID struct{ value string }
+type NodeAuthorityID struct{ value string }
+type NodeAttestationID struct{ value string }
 type EvidenceID struct{ value string }
 type EvidenceRootID struct{ value string }
 type ExecutionNodeID struct{ value string }
@@ -144,6 +153,21 @@ func NewExecutionNodeID(value string) (ExecutionNodeID, error) {
 	return ExecutionNodeID{value: value}, err
 }
 
+func NewWorkerAuthorityID(value string) (WorkerAuthorityID, error) {
+	value, err := newOpaqueID(value)
+	return WorkerAuthorityID{value: value}, err
+}
+
+func NewNodeAuthorityID(value string) (NodeAuthorityID, error) {
+	value, err := newOpaqueID(value)
+	return NodeAuthorityID{value: value}, err
+}
+
+func NewNodeAttestationID(value string) (NodeAttestationID, error) {
+	value, err := newOpaqueID(value)
+	return NodeAttestationID{value: value}, err
+}
+
 func NewTaskWorkspaceID(value string) (TaskWorkspaceID, error) {
 	value, err := newOpaqueID(value)
 	return TaskWorkspaceID{value: value}, err
@@ -199,6 +223,10 @@ func (id ExecutionPolicyID) String() string       { return id.value }
 func (id AdmissionGrantID) String() string        { return id.value }
 func (id WorkItemID) String() string              { return id.value }
 func (id SandboxLeaseID) String() string          { return id.value }
+func (id SandboxID) String() string               { return id.value }
+func (id WorkerAuthorityID) String() string       { return id.value }
+func (id NodeAuthorityID) String() string         { return id.value }
+func (id NodeAttestationID) String() string       { return id.value }
 func (id EvidenceID) String() string              { return id.value }
 func (id EvidenceRootID) String() string          { return id.value }
 func (id ExecutionNodeID) String() string         { return id.value }
@@ -601,13 +629,97 @@ const (
 	LeaseAcquireReconciliationRequired
 )
 
+type LeaseDisposition uint8
+
+const (
+	LeaseDispositionNone LeaseDisposition = iota
+	LeaseActive
+	LeaseRevoked
+	LeaseExpired
+	LeaseReleased
+)
+
+type NodeReadiness uint8
+
+const (
+	NodeReadinessUnknown NodeReadiness = iota
+	NodeReady
+	NodeUnavailable
+)
+
+type NodeOccupancy uint8
+
+const (
+	NodeUnoccupied NodeOccupancy = iota + 1
+	NodeOccupied
+	NodeOccupancyUnknown
+)
+
+type ContainmentStatus uint8
+
+const (
+	ContainmentPending ContainmentStatus = iota + 1
+	ContainmentEstablished
+)
+
+type ResetStatus uint8
+
+const (
+	ResetRequired ResetStatus = iota + 1
+	ResetCompleted
+)
+
 type RuntimeLeaseSnapshot struct {
-	AcquireStatus      LeaseAcquireStatus
-	AcquireOperationID OperationID
-	AcquireDigest      Digest
-	LeaseID            SandboxLeaseID
-	Generation         LeaseGeneration
-	Fence              LeaseFence
+	AcquireStatus           LeaseAcquireStatus
+	AcquireOperationID      OperationID
+	AcquireDigest           Digest
+	LeaseID                 SandboxLeaseID
+	Generation              LeaseGeneration
+	Fence                   LeaseFence
+	Disposition             LeaseDisposition
+	ExpiresAt               time.Time
+	SandboxID               SandboxID
+	SandboxGeneration       SandboxGeneration
+	SandboxFence            SandboxFence
+	WorkerAuthorityID       WorkerAuthorityID
+	WorkerGeneration        WorkerGeneration
+	NodeAuthorityID         NodeAuthorityID
+	AuthorizationGeneration AuthorizationGeneration
+	AuthorizationExpiresAt  time.Time
+}
+
+type RuntimeNodeSnapshot struct {
+	ExecutionNodeID       ExecutionNodeID
+	Generation            NodeGeneration
+	Readiness             NodeReadiness
+	AttestationID         NodeAttestationID
+	AttestationGeneration NodeAttestationGeneration
+	AttestedAt            time.Time
+	ExpiresAt             time.Time
+	Occupancy             NodeOccupancy
+	Quarantined           bool
+	Containment           ContainmentStatus
+	Reset                 ResetStatus
+}
+
+type LeaseCleanupStatus uint8
+
+const (
+	LeaseCleanupNone LeaseCleanupStatus = iota
+	LeaseCleanupPending
+	LeaseCleanupCompleted
+)
+
+type RuntimeLeaseCleanupSnapshot struct {
+	Status                 LeaseCleanupStatus
+	OperationID            OperationID
+	CanonicalRequestDigest Digest
+	StopMainProcess        bool
+	StopChildProcesses     bool
+	RevokeSecrets          bool
+	RemoveNetwork          bool
+	FenceRuntimeView       bool
+	ReconcileContainment   bool
 }
 
 type CancellationStatus uint8
@@ -701,15 +813,29 @@ type NoLeasePhysicalDispositionEvidence struct {
 	NodeCapacityGeneration  uint64
 }
 
-// PhysicalCapacityReleaseReadyEvidence is intentionally independent and is
-// never produced by the pre-lease implementation in this ticket.
+// PhysicalCapacityReleaseReadyEvidence is an independent, reset-bound fact.
+// Runtime terminal and NoLeasePhysicalDisposition never imply it.
 type PhysicalCapacityReleaseReadyEvidence struct {
+	WorkItemID             WorkItemID
+	AdmissionGrantID       AdmissionGrantID
+	GrantGeneration        AdmissionGrantGeneration
 	RuntimeRunID           RuntimeRunID
+	StartOperationID       OperationID
+	StartDigest            Digest
+	ReleaseOperationID     OperationID
+	ReleaseOperationDigest Digest
+	RuntimeRevision        RuntimeRevision
+	RuntimeFence           RuntimeFence
 	SandboxLeaseID         SandboxLeaseID
 	LeaseGeneration        LeaseGeneration
 	LeaseFence             LeaseFence
+	SandboxID              SandboxID
+	SandboxGeneration      SandboxGeneration
+	SandboxFence           SandboxFence
 	ExecutionNodeID        ExecutionNodeID
 	NodeCapacityGeneration uint64
+	ResetEvidenceID        EvidenceID
+	ResetEvidenceDigest    Digest
 }
 
 type RuntimeCapacityEvidenceSnapshot struct {
@@ -727,6 +853,8 @@ type RuntimeSnapshot struct {
 	Operation              RuntimeOperationBinding
 	RuntimeFence           RuntimeFence
 	Lease                  RuntimeLeaseSnapshot
+	Node                   RuntimeNodeSnapshot
+	Cleanup                RuntimeLeaseCleanupSnapshot
 	Deadline               time.Time
 	LeaseAcquireBy         time.Time
 	Cancellation           RuntimeCancellationSnapshot
