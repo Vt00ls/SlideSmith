@@ -203,6 +203,7 @@ func TestPostgresRuntimeInspectReconstructsExactActiveLeaseAndNodeOccupancy(t *t
 		SchedulerCancellationParticipant:    system.scheduling.RuntimeCancellationParticipant(),
 		SchedulerCancellationFunction:       system.scheduling.RuntimeCancellationFunction(),
 		LeaseAcquisition:                    ready,
+		RuntimeBindingValidator:             system.runtimeBinding,
 	})
 	if err != nil {
 		t.Fatalf("restart Runtime Execution authority: %v", err)
@@ -841,6 +842,7 @@ func TestPostgresProviderLeaseValidatesExactActiveQuotaReservationInCommit(t *te
 				SchedulerLeaseAttachmentFunction:    system.scheduling.RuntimeLeaseAttachmentFunction(),
 				LeaseAcquisition:                    ready, QuotaReservationParticipant: quotaParticipant,
 				QuotaReservationFunction: quotaFunction,
+				RuntimeBindingValidator:  system.runtimeBinding,
 			})
 			if err != nil {
 				t.Fatalf("create provider Runtime authority: %v", err)
@@ -983,6 +985,7 @@ func TestPostgresRenewCannotCrossConcurrentRevokeOrExpiryFence(t *testing.T) {
 				SchedulerLeaseAttachmentParticipant: system.scheduling.RuntimeLeaseAttachmentParticipant(),
 				SchedulerLeaseAttachmentFunction:    system.scheduling.RuntimeLeaseAttachmentFunction(),
 				LeaseAcquisition:                    ready,
+				RuntimeBindingValidator:             system.runtimeBinding,
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -1075,6 +1078,7 @@ func TestPostgresLeaseMaintenanceAuditOutboxFaultsAreAllOrNone(t *testing.T) {
 				SchedulerLeaseAttachmentParticipant: system.scheduling.RuntimeLeaseAttachmentParticipant(),
 				SchedulerLeaseAttachmentFunction:    system.scheduling.RuntimeLeaseAttachmentFunction(),
 				LeaseAcquisition:                    ready,
+				RuntimeBindingValidator:             system.runtimeBinding,
 			})
 			if err != nil {
 				t.Fatal(err)

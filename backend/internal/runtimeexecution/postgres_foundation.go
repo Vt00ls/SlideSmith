@@ -103,9 +103,11 @@ const (
 )
 
 const (
-	postgresReconciliationCommandKind   int16 = 100
-	postgresPreLeaseTerminalCommandKind int16 = 101
-	postgresLeaseCommitCommandKind      int16 = 102
+	postgresReconciliationCommandKind     int16 = 100
+	postgresPreLeaseTerminalCommandKind   int16 = 101
+	postgresLeaseCommitCommandKind        int16 = 102
+	postgresPostLeaseDeadlineCommandKind  int16 = 103
+	postgresPostLeaseRejectionCommandKind int16 = 104
 )
 
 type reconciliationFoundationIntent struct {
@@ -451,6 +453,8 @@ func fixtureFromRuntimeRecord(record *runtimeRecord) RuntimeFixture {
 	fixture.CatalogSafetyEpoch = record.catalogSafetyEpoch
 	fixture.PreLeaseTerminalReason = record.preLeaseTerminalReason
 	fixture.Reconciliation = record.reconciliation
+	fixture.Readiness = record.readiness
+	fixture.RuntimeViewBinding = record.runtimeViewBinding
 	return fixture
 }
 

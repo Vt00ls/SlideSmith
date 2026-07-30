@@ -177,6 +177,7 @@ func (authority *PostgresAuthority) executePostgresStart(
 		LogicalRelease: LogicalCapacityHeld, NoLease: NoLeaseDispositionNone, Physical: PhysicalCapacityNotApplicable,
 	}
 	record.reconciliation = ReconciliationStable
+	record.readiness = initialRuntimeReadiness(command)
 	aggregateState, err := encodePostgresRuntimeFixture(fixtureFromRuntimeRecord(record))
 	if err != nil {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)

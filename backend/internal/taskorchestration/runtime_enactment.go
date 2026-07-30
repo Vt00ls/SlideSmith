@@ -2,6 +2,8 @@ package taskorchestration
 
 import (
 	"crypto/sha256"
+	"encoding/json"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,6 +69,24 @@ func canonicalRuntimeStartEnactment(
 	if err != nil {
 		return runtimeRunRecord{}, EnactmentRef{}, invalidIntentError()
 	}
+	inputManifestID, err := runtimeexecution.NewImmutableInputManifestIdentity("input-manifest-" + runtimeRunID.value)
+	if err != nil {
+		return runtimeRunRecord{}, EnactmentRef{}, invalidIntentError()
+	}
+	inputManifest := runtimeexecution.ImmutableInputManifestBinding{
+		Identity: inputManifestID, SchemaVersion: runtimeexecution.SchemaV1,
+		Digest: runtimeEnactmentDigest("immutable-input-manifest", runtimeRunID.value),
+	}
+	var immutableInputs []runtimeexecution.ImmutableInputBinding
+	var catalogBinding *runtimeexecution.CatalogExecutionBinding
+	if record.aggregate.pinned.Route == RouteGeneration {
+		inputManifest, immutableInputs, catalogBinding, err = runtimeCatalogEnactmentBindings(
+			record.aggregate.pinned, inputManifestID,
+		)
+		if err != nil {
+			return runtimeRunRecord{}, EnactmentRef{}, invalidIntentError()
+		}
+	}
 
 	effect := runtimeexecution.EffectReadOnly
 	var viewRequirement *runtimeexecution.RuntimeViewRequirement
@@ -113,7 +133,10 @@ func canonicalRuntimeStartEnactment(
 		AllowedPlatformImagesDigest: runtimeEnactmentDigest("platform-images", record.aggregate.pinned.ExecutionLock.RuntimeReleaseID.value),
 		ExecutorContractDigest:      runtimeEnactmentDigest("executor-contract", record.aggregate.pinned.ExecutionLock.RuntimeReleaseID.value),
 		ReleaseSafetyEpoch:          runtimeexecution.ReleaseSafetyEpoch(record.safetyEpoch),
+		CatalogBinding:              catalogBinding,
 		WorkerClass:                 runtimeexecution.WorkerAgent, Effect: effect,
+		ImmutableInputManifest: inputManifest,
+		ImmutableInputs:        immutableInputs,
 		OutputContractDigest:   runtimeEnactmentDigest("output-contract", phase.Key.value),
 		EvidenceContractDigest: runtimeEnactmentDigest("evidence-contract", phase.Key.value),
 		RuntimeViewRequirement: viewRequirement, ResourceClassID: resourceClassID,
@@ -139,6 +162,103 @@ func canonicalRuntimeStartEnactment(
 		ActivityGeneration: header.ActivityGeneration, Fence: RuntimeFence(run.fence),
 		CausationID: CausationID{value: "causation-" + decisionID.value},
 	}, nil
+}
+
+func runtimeCatalogEnactmentBindings(
+	pinned PinnedTaskStart,
+	manifestID runtimeexecution.ImmutableInputManifestIdentity,
+) (
+	runtimeexecution.ImmutableInputManifestBinding,
+	[]runtimeexecution.ImmutableInputBinding,
+	*runtimeexecution.CatalogExecutionBinding,
+	error,
+) {
+	if pinned.Route != RouteGeneration || !validOpaqueID(pinned.TemplateLockID.String()) ||
+		!validPinnedCatalogBinding(pinned.CatalogBinding) {
+		return runtimeexecution.ImmutableInputManifestBinding{}, nil, nil, invalidIntentError()
+	}
+	runtimeTemplateLockID, err := runtimeexecution.NewTemplateLockID(pinned.TemplateLockID.String())
+	if err != nil {
+		return runtimeexecution.ImmutableInputManifestBinding{}, nil, nil, err
+	}
+	materializationEvidenceID, err := runtimeexecution.NewEvidenceID(
+		"template-lock-" + pinned.TemplateLockID.String(),
+	)
+	if err != nil {
+		return runtimeexecution.ImmutableInputManifestBinding{}, nil, nil, err
+	}
+	type inputMaterial struct {
+		identity string
+		digest   EvidenceDigest
+	}
+	materials := []inputMaterial{
+		{
+			identity: "template-version/" + pinned.CatalogBinding.TemplateVersionID.String() + "/manifest",
+			digest:   pinned.CatalogBinding.TemplateManifestDigest,
+		},
+		{
+			identity: "template-version/" + pinned.CatalogBinding.TemplateVersionID.String() + "/package",
+			digest:   pinned.CatalogBinding.TemplatePackageDigest,
+		},
+	}
+	closure := append([]ResourceBundleContract(nil), pinned.CatalogBinding.BundleClosure...)
+	sort.Slice(closure, func(i, j int) bool {
+		return closure[i].ResourceBundleID.String() < closure[j].ResourceBundleID.String()
+	})
+	for _, bundle := range closure {
+		materials = append(materials,
+			inputMaterial{
+				identity: "resource-bundle/" + bundle.ResourceBundleID.String() + "/manifest",
+				digest:   bundle.ManifestDigest,
+			},
+			inputMaterial{
+				identity: "resource-bundle/" + bundle.ResourceBundleID.String() + "/package",
+				digest:   bundle.PackageDigest,
+			},
+		)
+	}
+	inputs := make([]runtimeexecution.ImmutableInputBinding, len(materials))
+	for index, material := range materials {
+		identity, identityErr := runtimeexecution.NewImmutableInputIdentity(material.identity)
+		if identityErr != nil {
+			return runtimeexecution.ImmutableInputManifestBinding{}, nil, nil, identityErr
+		}
+		inputs[index] = runtimeexecution.ImmutableInputBinding{
+			Identity: identity, Digest: runtimeexecution.Digest(material.digest),
+		}
+	}
+	sort.Slice(inputs, func(i, j int) bool {
+		return inputs[i].Identity.String() < inputs[j].Identity.String()
+	})
+	manifest := runtimeexecution.ImmutableInputManifestBinding{
+		Identity: manifestID, SchemaVersion: runtimeexecution.SchemaV1,
+		Digest: runtimeCatalogInputManifestDigest(inputs), InputCount: uint64(len(inputs)),
+		MaterializationEvidenceID: materializationEvidenceID,
+		MaterializationEvidenceDigest: runtimeexecution.Digest(
+			pinned.CatalogBinding.TemplateLockDigest,
+		),
+	}
+	catalog := &runtimeexecution.CatalogExecutionBinding{
+		TemplateLockID: runtimeTemplateLockID,
+		TemplateLockDigest: runtimeexecution.Digest(
+			pinned.CatalogBinding.TemplateLockDigest,
+		),
+		ClosureRootDigest: runtimeexecution.Digest(pinned.CatalogBinding.ClosureRootDigest),
+		SafetyEpoch:       runtimeexecution.CatalogSafetyEpoch(pinned.CatalogBinding.SafetyEpoch),
+	}
+	return manifest, inputs, catalog, nil
+}
+
+func runtimeCatalogInputManifestDigest(inputs []runtimeexecution.ImmutableInputBinding) runtimeexecution.Digest {
+	canonical := make([]map[string]any, len(inputs))
+	for index, input := range inputs {
+		canonical[index] = map[string]any{
+			"identity": input.Identity.String(), "digest": input.Digest.String(),
+			"size_bytes": input.SizeBytes,
+		}
+	}
+	encoded, _ := json.Marshal(canonical)
+	return runtimeexecution.Digest(sha256.Sum256(encoded))
 }
 
 func canonicalPersonalWorkspaceID(owner userOwnershipBinding) (runtimeexecution.PersonalWorkspaceID, error) {

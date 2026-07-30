@@ -222,6 +222,19 @@ type ResourceBundleContract struct {
 	PackageDigest    EvidenceDigest
 }
 
+// PinnedCatalogBinding is the minimum immutable Catalog contract retained by
+// Task Orchestration for every Generation Runtime enactment. It contains no
+// live catalog pointer or physical package locator.
+type PinnedCatalogBinding struct {
+	TemplateVersionID      TemplateVersionID
+	TemplateManifestDigest EvidenceDigest
+	TemplatePackageDigest  EvidenceDigest
+	TemplateLockDigest     EvidenceDigest
+	ClosureRootDigest      EvidenceDigest
+	SafetyEpoch            SafetyEpoch
+	BundleClosure          []ResourceBundleContract
+}
+
 type PublishedTemplateLockContract struct {
 	SchemaVersion                EvidenceSchemaVersion
 	Producer                     EvidenceProducer
@@ -328,21 +341,7 @@ func (adapter *catalogPublicationAdapter) Resolve(
 }
 
 func TemplateLockContractDigest(record PublishedTemplateLockContract) EvidenceDigest {
-	bundles := make([]map[string]any, len(record.BundleClosure))
-	for index, bundle := range record.BundleClosure {
-		bundles[index] = map[string]any{
-			"manifest_digest":    bundle.ManifestDigest.String(),
-			"package_digest":     bundle.PackageDigest.String(),
-			"resource_bundle_id": bundle.ResourceBundleID.String(),
-		}
-	}
-	sort.Slice(bundles, func(i, j int) bool {
-		left := bundles[i]["resource_bundle_id"].(string) + "\x00" +
-			bundles[i]["manifest_digest"].(string) + "\x00" + bundles[i]["package_digest"].(string)
-		right := bundles[j]["resource_bundle_id"].(string) + "\x00" +
-			bundles[j]["manifest_digest"].(string) + "\x00" + bundles[j]["package_digest"].(string)
-		return left < right
-	})
+	bundles := canonicalBundleClosure(record.BundleClosure)
 	encoded, _ := json.Marshal(map[string]any{
 		"bundle_closure":                  bundles,
 		"observed_generation":             uint64(record.ObservedGeneration),
@@ -360,6 +359,95 @@ func TemplateLockContractDigest(record PublishedTemplateLockContract) EvidenceDi
 	})
 	sum := sha256.Sum256(encoded)
 	return EvidenceDigest(sum)
+}
+
+func canonicalBundleClosure(closure []ResourceBundleContract) []map[string]any {
+	bundles := make([]map[string]any, len(closure))
+	for index, bundle := range closure {
+		bundles[index] = map[string]any{
+			"manifest_digest":    bundle.ManifestDigest.String(),
+			"package_digest":     bundle.PackageDigest.String(),
+			"resource_bundle_id": bundle.ResourceBundleID.String(),
+		}
+	}
+	sort.Slice(bundles, func(i, j int) bool {
+		left := bundles[i]["resource_bundle_id"].(string) + "\x00" +
+			bundles[i]["manifest_digest"].(string) + "\x00" + bundles[i]["package_digest"].(string)
+		right := bundles[j]["resource_bundle_id"].(string) + "\x00" +
+			bundles[j]["manifest_digest"].(string) + "\x00" + bundles[j]["package_digest"].(string)
+		return left < right
+	})
+	return bundles
+}
+
+func catalogClosureRootDigest(
+	templateVersionID TemplateVersionID,
+	templateManifestDigest EvidenceDigest,
+	templatePackageDigest EvidenceDigest,
+	bundleClosure []ResourceBundleContract,
+) EvidenceDigest {
+	encoded, _ := json.Marshal(map[string]any{
+		"template_version_id":      templateVersionID.String(),
+		"template_manifest_digest": templateManifestDigest.String(),
+		"template_package_digest":  templatePackageDigest.String(),
+		"resource_bundles":         canonicalBundleClosure(bundleClosure),
+	})
+	return EvidenceDigest(sha256.Sum256(encoded))
+}
+
+func newPinnedCatalogBinding(template ResolvedTemplateLockContract) *PinnedCatalogBinding {
+	closure := append([]ResourceBundleContract(nil), template.BundleClosure...)
+	sort.Slice(closure, func(i, j int) bool {
+		left := closure[i]
+		right := closure[j]
+		if left.ResourceBundleID != right.ResourceBundleID {
+			return left.ResourceBundleID.String() < right.ResourceBundleID.String()
+		}
+		if left.ManifestDigest != right.ManifestDigest {
+			return left.ManifestDigest.String() < right.ManifestDigest.String()
+		}
+		return left.PackageDigest.String() < right.PackageDigest.String()
+	})
+	return &PinnedCatalogBinding{
+		TemplateVersionID:      template.TemplateVersionID,
+		TemplateManifestDigest: template.TemplateManifestDigest,
+		TemplatePackageDigest:  template.TemplatePackageDigest,
+		TemplateLockDigest:     template.LockDigest,
+		ClosureRootDigest: catalogClosureRootDigest(
+			template.TemplateVersionID, template.TemplateManifestDigest,
+			template.TemplatePackageDigest, closure,
+		),
+		SafetyEpoch:   template.SafetyEpoch,
+		BundleClosure: closure,
+	}
+}
+
+func validPinnedCatalogBinding(binding *PinnedCatalogBinding) bool {
+	return binding != nil && validOpaqueID(binding.TemplateVersionID.String()) &&
+		binding.TemplateManifestDigest != (EvidenceDigest{}) &&
+		binding.TemplatePackageDigest != (EvidenceDigest{}) &&
+		binding.TemplateLockDigest != (EvidenceDigest{}) &&
+		binding.ClosureRootDigest != (EvidenceDigest{}) && binding.SafetyEpoch > 0 &&
+		len(binding.BundleClosure) > 0 && validBundleClosure(binding.BundleClosure) &&
+		binding.ClosureRootDigest == catalogClosureRootDigest(
+			binding.TemplateVersionID, binding.TemplateManifestDigest,
+			binding.TemplatePackageDigest, binding.BundleClosure,
+		)
+}
+
+func (binding *PinnedCatalogBinding) canonical() any {
+	if binding == nil {
+		return nil
+	}
+	return map[string]any{
+		"template_version_id":      binding.TemplateVersionID.String(),
+		"template_manifest_digest": binding.TemplateManifestDigest.String(),
+		"template_package_digest":  binding.TemplatePackageDigest.String(),
+		"template_lock_digest":     binding.TemplateLockDigest.String(),
+		"closure_root_digest":      binding.ClosureRootDigest.String(),
+		"safety_epoch":             uint64(binding.SafetyEpoch),
+		"bundle_closure":           canonicalBundleClosure(binding.BundleClosure),
+	}
 }
 
 func validatePinnedTemplateLockRequest(request PinnedTemplateLockRequest) *DownstreamError {
@@ -477,6 +565,7 @@ func NewTaskStartAdmission(
 			return TaskStartAdmission{}, invalidIntentError()
 		}
 		pinned.TemplateLockID = template.TemplateLockID
+		pinned.CatalogBinding = newPinnedCatalogBinding(*template)
 	} else if template != nil {
 		return TaskStartAdmission{}, invalidIntentError()
 	}

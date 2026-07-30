@@ -140,11 +140,20 @@ func TestRuntimeSnapshotClosedSchemaAndLosslessProjectionRules(t *testing.T) {
 		NodeAuthorityID: NodeAuthorityID{value: "active-without-node-authority"}, AuthorizationGeneration: 1,
 		AuthorizationExpiresAt: now.Add(time.Minute),
 	}
+	readinessOnly := normal
+	readinessOnly.RuntimeRunID = mustRuntimeRunID(t, "schema-readiness-only")
+	readinessOnly.Readiness = RuntimeReadinessSnapshot{
+		Lease:           PrerequisiteFact{State: PrerequisitePending},
+		RuntimeBinding:  PrerequisiteFact{State: PrerequisitePending},
+		RuntimeView:     PrerequisiteFact{State: PrerequisitePending},
+		ImmutableInputs: PrerequisiteFact{State: PrerequisitePending},
+		LLMGateway:      PrerequisiteFact{State: PrerequisitePending},
+	}
 
 	harness, err := NewDeterministicHarness(HarnessConfig{
 		Now: now, Runtimes: []RuntimeFixture{
 			normal, lossy, unknownEvidence, unknownVariant, unknownLeaseVariant, unknownNodeVariant,
-			grantedWithoutLifecycle, activeWithoutNodeTruth,
+			grantedWithoutLifecycle, activeWithoutNodeTruth, readinessOnly,
 		},
 	})
 	if err != nil {
@@ -155,6 +164,19 @@ func TestRuntimeSnapshotClosedSchemaAndLosslessProjectionRules(t *testing.T) {
 	if current.SchemaVersion != SnapshotSchemaCurrent {
 		t.Fatalf("optional request minor changed projection: %v", current.SchemaVersion)
 	}
+	if SnapshotSchemaCurrent != NewSchemaVersion(1, 2) {
+		t.Fatalf("prerequisite projection schema = %v, want 1.2", SnapshotSchemaCurrent)
+	}
+	legacyLeaseProjection := NewSchemaVersion(1, 1)
+	leaseProjection := inspectRuntime(t, harness, normal, authority, SchemaV1, legacyLeaseProjection)
+	if leaseProjection.SchemaVersion != legacyLeaseProjection {
+		t.Fatalf("explicit lossless 1.1 projection = %#v", leaseProjection)
+	}
+	currentReadiness := inspectRuntime(t, harness, readinessOnly, authority, SchemaV1, SnapshotSchemaCurrent)
+	if currentReadiness.Readiness != readinessOnly.Readiness {
+		t.Fatalf("current readiness projection = %#v", currentReadiness)
+	}
+	assertInspectError(t, harness, readinessOnly, authority, SchemaV1, legacyLeaseProjection, ErrorUnsupportedSchema)
 	old := inspectRuntime(t, harness, normal, authority, SchemaV1, SnapshotSchemaV1)
 	if old.SchemaVersion != SnapshotSchemaV1 || old.RuntimeRunID != normal.RuntimeRunID {
 		t.Fatalf("explicit lossless old projection = %#v", old)

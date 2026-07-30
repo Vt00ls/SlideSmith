@@ -184,6 +184,7 @@ type PinnedTaskStart struct {
 	TaskWorkspaceID TaskWorkspaceID
 	ExecutionLock   ExecutionLock
 	TemplateLockID  TemplateLockID
+	CatalogBinding  *PinnedCatalogBinding
 	Authorities     DownstreamAuthorityBindings
 }
 
@@ -229,10 +230,11 @@ func (pinned PinnedTaskStart) valid() bool {
 		return false
 	}
 	if pinned.Route == RouteGeneration {
-		if !validOpaqueID(pinned.TemplateLockID.value) {
+		if !validOpaqueID(pinned.TemplateLockID.value) ||
+			!validPinnedCatalogBinding(pinned.CatalogBinding) {
 			return false
 		}
-	} else if pinned.TemplateLockID != (TemplateLockID{}) {
+	} else if pinned.TemplateLockID != (TemplateLockID{}) || pinned.CatalogBinding != nil {
 		return false
 	}
 	_, ok := pinned.ExecutionLock.PipelineContract.route(pinned.Route)
@@ -366,6 +368,11 @@ func phaseValidationContractName(contract PhaseValidationContract) string {
 
 func clonePinnedTaskStart(pinned PinnedTaskStart) PinnedTaskStart {
 	cloned := pinned
+	if pinned.CatalogBinding != nil {
+		binding := *pinned.CatalogBinding
+		binding.BundleClosure = append([]ResourceBundleContract(nil), pinned.CatalogBinding.BundleClosure...)
+		cloned.CatalogBinding = &binding
+	}
 	cloned.ExecutionLock.PipelineContract.Routes = make([]RouteDefinition, len(pinned.ExecutionLock.PipelineContract.Routes))
 	for index, route := range pinned.ExecutionLock.PipelineContract.Routes {
 		cloned.ExecutionLock.PipelineContract.Routes[index] = cloneRouteDefinition(route)

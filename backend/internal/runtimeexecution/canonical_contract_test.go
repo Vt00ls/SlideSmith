@@ -24,6 +24,12 @@ func TestCanonicalStartEncodingIsVersionedDeterministicAndExact(t *testing.T) {
 		CapabilityContractDigest: digest(8), AllowedPlatformImagesDigest: digest(9), ExecutorContractDigest: digest(10),
 		ReleaseSafetyEpoch: 22,
 		WorkerClass:        WorkerAgent, Effect: EffectReadOnly,
+		ImmutableInputManifest: ImmutableInputManifestBinding{
+			Identity: mustInputManifestIdentity(t, "input-manifest-canonical"), SchemaVersion: SchemaV1,
+			Digest: digest(11), TotalSizeBytes: 30, InputCount: 2,
+			MaterializationEvidenceID:     mustEvidenceID(t, "input-materialization-canonical"),
+			MaterializationEvidenceDigest: digest(12),
+		},
 		ImmutableInputs: []ImmutableInputBinding{
 			{Identity: mustInputIdentity(t, "input-b"), Digest: digest(4), SizeBytes: 20},
 			{Identity: mustInputIdentity(t, "input-a"), Digest: digest(3), SizeBytes: 10},
@@ -44,9 +50,9 @@ func TestCanonicalStartEncodingIsVersionedDeterministicAndExact(t *testing.T) {
 
 	digestHex := func(last string) string { return strings.Repeat("0", 62) + last }
 	expectedJSON := fmt.Sprintf(
-		`{"schema":{"major":1,"minor":0},"kind":"start_runtime_run","operation_id":"op-canonical","personal_workspace_id":"workspace-canonical","task_id":"task-canonical","phase_run_id":"phase-canonical","runtime_run_id":"runtime-canonical","attempt":2,"expected_task_revision":15,"expected_runtime_revision":8,"expected_operation_generation":9,"expected_runtime_fence":10,"authority":{"kind":"task_orchestration","id":"auth-canonical","generation":3},"runtime_binding_id":"binding-canonical","runtime_binding_digest":"%s","execution_lock_digest":"%s","capability_contract_digest":"%s","allowed_platform_images_digest":"%s","executor_contract_digest":"%s","release_safety_epoch":22,"catalog_binding":null,"worker_class":"agent","effect":"read_only","immutable_inputs":[{"identity":"input-a","digest":"%s","size_bytes":10},{"identity":"input-b","digest":"%s","size_bytes":20}],"output_contract_digest":"%s","evidence_contract_digest":"%s","runtime_view_requirement":null,"resource_class_id":"class-canonical","execution_policy_id":"policy-canonical","provider_capability":"none","provider_binding":null,"network_policy_id":"network-policy-canonical","secret_policy_id":"secret-policy-canonical","deadline":"2026-07-28T04:34:56.123400000Z","cancellation_policy":"fence_first"}`,
+		`{"schema":{"major":1,"minor":0},"kind":"start_runtime_run","operation_id":"op-canonical","personal_workspace_id":"workspace-canonical","task_id":"task-canonical","phase_run_id":"phase-canonical","runtime_run_id":"runtime-canonical","attempt":2,"expected_task_revision":15,"expected_runtime_revision":8,"expected_operation_generation":9,"expected_runtime_fence":10,"authority":{"kind":"task_orchestration","id":"auth-canonical","generation":3},"runtime_binding_id":"binding-canonical","runtime_binding_digest":"%s","execution_lock_digest":"%s","capability_contract_digest":"%s","allowed_platform_images_digest":"%s","executor_contract_digest":"%s","release_safety_epoch":22,"catalog_binding":null,"worker_class":"agent","effect":"read_only","immutable_input_manifest":{"identity":"input-manifest-canonical","schema":{"major":1,"minor":0},"digest":"%s","total_size_bytes":30,"input_count":2,"materialization_evidence_id":"input-materialization-canonical","materialization_evidence_digest":"%s"},"immutable_inputs":[{"identity":"input-a","digest":"%s","size_bytes":10},{"identity":"input-b","digest":"%s","size_bytes":20}],"output_contract_digest":"%s","evidence_contract_digest":"%s","runtime_view_requirement":null,"resource_class_id":"class-canonical","execution_policy_id":"policy-canonical","provider_capability":"none","provider_binding":null,"network_policy_id":"network-policy-canonical","secret_policy_id":"secret-policy-canonical","deadline":"2026-07-28T04:34:56.123400000Z","cancellation_policy":"fence_first"}`,
 		digestHex("01"), digestHex("02"), digestHex("08"), digestHex("09"), digestHex("0a"),
-		digestHex("03"), digestHex("04"), digestHex("05"), digestHex("06"),
+		digestHex("0b"), digestHex("0c"), digestHex("03"), digestHex("04"), digestHex("05"), digestHex("06"),
 	)
 	expected := Digest(sha256.Sum256(append([]byte("slidesmith.runtime-execution.request/v1\n"), []byte(expectedJSON)...)))
 	if command.CanonicalRequestDigest != expected {
@@ -155,6 +161,90 @@ func TestCanonicalStartBindsCompleteExecutionAuthority(t *testing.T) {
 				t.Fatalf("%s did not enter canonical start", test.name)
 			}
 		})
+	}
+}
+
+func TestImmutableInputManifestAndRuntimeViewEffectInvalidCasesFailClosed(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 7, 29, 22, 0, 0, 0, time.UTC)
+	authority := mustTaskOrchestrationAuthority(t, "manifest-invalid-authority", 3)
+	valid := standardStart(t, now, authority, "manifest-invalid").StartRuntimeRunInput
+	tests := []struct {
+		name   string
+		mutate func(*StartRuntimeRunInput)
+	}{
+		{name: "missing manifest identity", mutate: func(input *StartRuntimeRunInput) {
+			input.ImmutableInputManifest.Identity = ImmutableInputManifestIdentity{}
+		}},
+		{name: "unknown manifest schema major", mutate: func(input *StartRuntimeRunInput) {
+			input.ImmutableInputManifest.SchemaVersion = NewSchemaVersion(2, 0)
+		}},
+		{name: "missing manifest digest", mutate: func(input *StartRuntimeRunInput) {
+			input.ImmutableInputManifest.Digest = Digest{}
+		}},
+		{name: "wrong manifest count", mutate: func(input *StartRuntimeRunInput) {
+			input.ImmutableInputManifest.InputCount++
+		}},
+		{name: "wrong manifest total size", mutate: func(input *StartRuntimeRunInput) {
+			input.ImmutableInputManifest.TotalSizeBytes++
+		}},
+		{name: "missing materialization evidence identity", mutate: func(input *StartRuntimeRunInput) {
+			input.ImmutableInputManifest.MaterializationEvidenceID = EvidenceID{}
+		}},
+		{name: "missing materialization evidence digest", mutate: func(input *StartRuntimeRunInput) {
+			input.ImmutableInputManifest.MaterializationEvidenceDigest = Digest{}
+		}},
+		{name: "duplicate immutable input identity", mutate: func(input *StartRuntimeRunInput) {
+			duplicate := input.ImmutableInputs[0]
+			input.ImmutableInputs = append(input.ImmutableInputs, duplicate)
+			input.ImmutableInputManifest.InputCount++
+			input.ImmutableInputManifest.TotalSizeBytes += duplicate.SizeBytes
+		}},
+		{name: "input size overflow", mutate: func(input *StartRuntimeRunInput) {
+			input.ImmutableInputs = []ImmutableInputBinding{
+				{Identity: mustInputIdentity(t, "overflow-a"), Digest: digest(60), SizeBytes: ^uint64(0)},
+				{Identity: mustInputIdentity(t, "overflow-b"), Digest: digest(61), SizeBytes: 1},
+			}
+			input.ImmutableInputManifest.InputCount = 2
+			input.ImmutableInputManifest.TotalSizeBytes = 0
+		}},
+		{name: "read-only carries writable view requirement", mutate: func(input *StartRuntimeRunInput) {
+			input.RuntimeViewRequirement = &RuntimeViewRequirement{
+				TaskWorkspaceID:     mustTaskWorkspaceID(t, "effect-upgrade-workspace"),
+				MaterializationID:   mustTaskWorkspaceMaterializationID(t, "effect-upgrade-materialization"),
+				BaseRevisionID:      mustTaskWorkspaceRevisionID(t, "effect-upgrade-revision"),
+				LifecycleGeneration: 1, LifecycleFence: 1,
+				ExpiryPolicy: RuntimeViewExpiryAtDeadline, OpenOperationDerivation: digest(62),
+			}
+		}},
+		{name: "mutating omits view requirement", mutate: func(input *StartRuntimeRunInput) {
+			input.Effect = EffectMutating
+			input.RuntimeViewRequirement = nil
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			changed := valid
+			changed.ImmutableInputs = append([]ImmutableInputBinding(nil), valid.ImmutableInputs...)
+			test.mutate(&changed)
+			if _, err := NewStartRuntimeRun(changed); err == nil {
+				t.Fatal("invalid canonical Start was accepted")
+			}
+		})
+	}
+
+	empty := valid
+	empty.ImmutableInputs = nil
+	empty.ImmutableInputManifest.TotalSizeBytes = 0
+	empty.ImmutableInputManifest.InputCount = 0
+	if _, err := NewStartRuntimeRun(empty); err == nil {
+		t.Fatal("empty manifest retained materialization evidence")
+	}
+	empty.ImmutableInputManifest.MaterializationEvidenceID = EvidenceID{}
+	empty.ImmutableInputManifest.MaterializationEvidenceDigest = Digest{}
+	if _, err := NewStartRuntimeRun(empty); err != nil {
+		t.Fatalf("canonical empty manifest was rejected: %v", err)
 	}
 }
 

@@ -180,6 +180,7 @@ func (payload pinnedTaskStartPayload) canonical() map[string]any {
 		"route":             payload.pinned.Route.String(),
 		"task_workspace_id": payload.pinned.TaskWorkspaceID.value,
 		"template_lock_id":  payload.pinned.TemplateLockID.value,
+		"catalog_binding":   payload.pinned.CatalogBinding.canonical(),
 	}
 }
 

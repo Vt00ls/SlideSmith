@@ -142,6 +142,20 @@ func knownPreLeaseTerminalReason(reason PreLeaseTerminalReason) bool {
 	return reason >= PreLeaseTerminalNone && reason <= PreLeaseTerminalRuntimeDeadline
 }
 
+func preLeaseTimeBoundTerminal(
+	now time.Time,
+	deadline time.Time,
+	leaseAcquireBy time.Time,
+) (RuntimeOutcome, PreLeaseTerminalReason, bool) {
+	if !now.Before(deadline) {
+		return RuntimeTimedOut, PreLeaseTerminalRuntimeDeadline, true
+	}
+	if !now.Before(leaseAcquireBy) {
+		return RuntimeRejected, PreLeaseTerminalAdmissionAuthorityExpired, true
+	}
+	return RuntimeOutcomeNone, PreLeaseTerminalNone, false
+}
+
 func leaseAcquisitionRequest(record *runtimeRecord) LeaseAcquisitionRequest {
 	return LeaseAcquisitionRequest{
 		RuntimeRunID: record.fixture.RuntimeRunID,

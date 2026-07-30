@@ -2,6 +2,7 @@ package runtimeexecution
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,15 @@ import (
 	"time"
 )
 
-type postgresNoLeaseTerminalCommand struct {
+type postgresRuntimeTerminalLeaseStage uint8
+
+const (
+	postgresTerminalPreLeaseOnly postgresRuntimeTerminalLeaseStage = iota + 1
+	postgresTerminalAnyLeaseStage
+	postgresTerminalPostLeaseOnly
+)
+
+type postgresRuntimeTerminalCommand struct {
 	OperationID                 OperationID
 	PersonalWorkspaceID         PersonalWorkspaceID
 	TaskID                      TaskID
@@ -26,17 +35,19 @@ type postgresNoLeaseTerminalCommand struct {
 	CanonicalRequestDigest      Digest
 	Outcome                     RuntimeOutcome
 	PreLeaseTerminalReason      PreLeaseTerminalReason
+	LeaseStage                  postgresRuntimeTerminalLeaseStage
 }
 
-// executePostgresCancel linearizes an accepted pre-lease cancellation. The
-// locked Runtime row and absence of a lease root are the proof that no Sandbox
-// Lease, process, or dispatch can have committed for this Runtime fence.
+// executePostgresCancel linearizes an accepted cancellation. Before lease grant,
+// the locked Runtime row and absence of a lease root prove that no Sandbox Lease,
+// process, or dispatch committed; after grant, the same transaction revokes the
+// exact active lease before returning the terminal decision.
 func (authority *PostgresAuthority) executePostgresCancel(
 	ctx context.Context,
 	command CancelRuntimeRun,
 	binding retainedCommandBindingValue,
 ) (RuntimeDecision, error) {
-	return authority.executePostgresNoLeaseTerminal(ctx, postgresNoLeaseTerminalCommand{
+	return authority.executePostgresRuntimeTerminal(ctx, postgresRuntimeTerminalCommand{
 		OperationID: command.OperationID, PersonalWorkspaceID: command.PersonalWorkspaceID,
 		TaskID: command.TaskID, PhaseRunID: command.PhaseRunID, RuntimeRunID: command.RuntimeRunID,
 		ExpectedRuntimeRevision:     command.ExpectedRuntimeRevision,
@@ -45,19 +56,132 @@ func (authority *PostgresAuthority) executePostgresCancel(
 		ExpectedRuntimeFence:        command.ExpectedRuntimeFence, Authority: command.Authority,
 		CancellationReason: command.Reason, SafetyEpoch: command.SafetyEpoch,
 		OccurredAt: command.OccurredAt, CanonicalRequestDigest: command.CanonicalRequestDigest,
-		Outcome: RuntimeCancelled,
+		Outcome: RuntimeCancelled, LeaseStage: postgresTerminalAnyLeaseStage,
 	}, binding)
 }
 
-func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
+func (authority *PostgresAuthority) executePostgresPostLeaseDeadline(
 	ctx context.Context,
-	command postgresNoLeaseTerminalCommand,
+	start StartRuntimeRun,
+	snapshot RuntimeSnapshot,
+) (RuntimeDecision, error) {
+	if snapshot.State != RuntimePreparingPrerequisites || snapshot.Outcome != RuntimeOutcomeNone ||
+		snapshot.Lease.AcquireStatus != LeaseGranted || snapshot.Lease.Disposition != LeaseActive ||
+		authority.now().Before(snapshot.Deadline) {
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	operationID, digest, canonical := stablePostgresPostLeaseDeadlineBinding(snapshot, start.OperationID)
+	binding := retainedCommandBindingValue{
+		kind: postgresPostLeaseDeadlineCommandKind, operationID: operationID,
+		workspaceID: start.PersonalWorkspaceID, runtimeRunID: start.RuntimeRunID,
+		caller: start.Authority, digest: digest, canonical: canonical,
+		expectedOperationGeneration: snapshot.Operation.Generation,
+		expectedRuntimeFence:        snapshot.RuntimeFence, safetyEpoch: start.ReleaseSafetyEpoch,
+		auditAction: postgresAuditPostLeaseDeadline, auditReasonCode: uint8(RuntimeTimedOut),
+	}
+	return authority.executePostgresRuntimeTerminal(ctx, postgresRuntimeTerminalCommand{
+		OperationID: operationID, PersonalWorkspaceID: start.PersonalWorkspaceID,
+		TaskID: start.TaskID, PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID,
+		ExpectedRuntimeRevision: snapshot.RuntimeRevision, ExpectedStartOperationID: start.OperationID,
+		ExpectedOperationGeneration: snapshot.Operation.Generation,
+		ExpectedRuntimeFence:        snapshot.RuntimeFence, Authority: start.Authority,
+		SafetyEpoch: start.ReleaseSafetyEpoch, OccurredAt: postgresTimestamp(authority.now()),
+		CanonicalRequestDigest: digest, Outcome: RuntimeTimedOut, LeaseStage: postgresTerminalPostLeaseOnly,
+	}, binding)
+}
+
+func (authority *PostgresAuthority) executePostgresPostLeasePrerequisiteRejection(
+	ctx context.Context,
+	start StartRuntimeRun,
+	snapshot RuntimeSnapshot,
+	cause postLeaseTerminalCause,
+	fact PrerequisiteFact,
+) (RuntimeDecision, error) {
+	if snapshot.State != RuntimePreparingPrerequisites || snapshot.Outcome != RuntimeOutcomeNone ||
+		snapshot.Lease.AcquireStatus != LeaseGranted || snapshot.Lease.Disposition != LeaseActive ||
+		!validPostLeaseTerminalCause(cause, fact) {
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	operationID, digest, canonical := stablePostgresPostLeasePrerequisiteRejectionBinding(
+		snapshot, start.OperationID, cause, fact,
+	)
+	binding := retainedCommandBindingValue{
+		kind: postgresPostLeaseRejectionCommandKind, operationID: operationID,
+		workspaceID: start.PersonalWorkspaceID, runtimeRunID: start.RuntimeRunID,
+		caller: start.Authority, digest: digest, canonical: canonical,
+		expectedOperationGeneration: snapshot.Operation.Generation,
+		expectedRuntimeFence:        snapshot.RuntimeFence, safetyEpoch: start.ReleaseSafetyEpoch,
+		auditAction: postgresAuditPostLeasePrerequisiteRejected, auditReasonCode: uint8(cause),
+	}
+	return authority.executePostgresRuntimeTerminal(ctx, postgresRuntimeTerminalCommand{
+		OperationID: operationID, PersonalWorkspaceID: start.PersonalWorkspaceID,
+		TaskID: start.TaskID, PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID,
+		ExpectedRuntimeRevision: snapshot.RuntimeRevision, ExpectedStartOperationID: start.OperationID,
+		ExpectedOperationGeneration: snapshot.Operation.Generation,
+		ExpectedRuntimeFence:        snapshot.RuntimeFence, Authority: start.Authority,
+		SafetyEpoch: start.ReleaseSafetyEpoch, OccurredAt: postgresTimestamp(authority.now()),
+		CanonicalRequestDigest: digest, Outcome: RuntimeRejected, LeaseStage: postgresTerminalPostLeaseOnly,
+	}, binding)
+}
+
+func stablePostgresPostLeasePrerequisiteRejectionBinding(
+	snapshot RuntimeSnapshot,
+	startOperationID OperationID,
+	cause postLeaseTerminalCause,
+	fact PrerequisiteFact,
+) (OperationID, Digest, []byte) {
+	identity := []byte(fmt.Sprintf(
+		"slidesmith.runtime-execution.post-lease-prerequisite-rejected/v1\n%s\n%s\n%s\n%d\n%s\n%s\n%d",
+		snapshot.RuntimeRunID.String(), startOperationID.String(), snapshot.Lease.AcquireOperationID.String(),
+		cause, fact.OperationID.String(), fact.RequestDigest.String(), fact.Failure,
+	))
+	identityDigest := sha256.Sum256(identity)
+	operationID := OperationID{value: fmt.Sprintf("postlease-rejected-%x", identityDigest[:16])}
+	canonical := []byte(fmt.Sprintf(
+		"slidesmith.runtime-execution.post-lease-prerequisite-rejected-command/v1\n%s\n%s\n%s\n%s\n%d\n%d\n%d\n%s\n%s\n%d",
+		operationID.String(), snapshot.RuntimeRunID.String(), startOperationID.String(),
+		snapshot.Lease.LeaseID.String(), snapshot.Lease.Generation, snapshot.Lease.Fence,
+		cause, fact.OperationID.String(), fact.RequestDigest.String(), fact.Failure,
+	))
+	digest := Digest(sha256.Sum256(canonical))
+	return operationID, digest, canonical
+}
+
+func stablePostgresPostLeaseDeadlineBinding(
+	snapshot RuntimeSnapshot,
+	startOperationID OperationID,
+) (OperationID, Digest, []byte) {
+	identity := []byte(fmt.Sprintf(
+		"slidesmith.runtime-execution.post-lease-deadline/v1\n%s\n%s\n%s\n%s",
+		snapshot.RuntimeRunID.String(), startOperationID.String(),
+		snapshot.Lease.AcquireOperationID.String(), snapshot.Deadline.UTC().Format(time.RFC3339Nano),
+	))
+	identityDigest := sha256.Sum256(identity)
+	operationID := OperationID{value: fmt.Sprintf("postlease-deadline-%x", identityDigest[:16])}
+	canonical := []byte(fmt.Sprintf(
+		"slidesmith.runtime-execution.post-lease-deadline-command/v1\n%s\n%s\n%s\n%s\n%d\n%d\n%s",
+		operationID.String(), snapshot.RuntimeRunID.String(), startOperationID.String(),
+		snapshot.Lease.LeaseID.String(), snapshot.Lease.Generation, snapshot.Lease.Fence,
+		snapshot.Deadline.UTC().Format(time.RFC3339Nano),
+	))
+	digest := Digest(sha256.Sum256(canonical))
+	return operationID, digest, canonical
+}
+
+func (authority *PostgresAuthority) executePostgresRuntimeTerminal(
+	ctx context.Context,
+	command postgresRuntimeTerminalCommand,
 	binding retainedCommandBindingValue,
 ) (RuntimeDecision, error) {
 	if command.Outcome != RuntimeCancelled && command.Outcome != RuntimeRejected && command.Outcome != RuntimeTimedOut ||
 		command.Outcome == RuntimeCancelled && (command.CancellationReason < CancellationUserRequested ||
 			command.CancellationReason > CancellationAdministratorRequested) ||
-		command.Outcome != RuntimeCancelled && command.PreLeaseTerminalReason == PreLeaseTerminalNone {
+		command.LeaseStage == postgresTerminalAnyLeaseStage && command.Outcome != RuntimeCancelled ||
+		command.LeaseStage == postgresTerminalPostLeaseOnly &&
+			command.Outcome != RuntimeTimedOut && command.Outcome != RuntimeRejected ||
+		command.LeaseStage == postgresTerminalPreLeaseOnly &&
+			(command.Outcome == RuntimeCancelled || command.PreLeaseTerminalReason == PreLeaseTerminalNone) ||
+		command.LeaseStage < postgresTerminalPreLeaseOnly || command.LeaseStage > postgresTerminalPostLeaseOnly {
 		return RuntimeDecision{}, newError(ErrorInvalidRequest)
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -87,10 +211,15 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 
 	startBinding := record.operation
 	leaseBinding := record.lease
-	leasedCancel := command.Outcome == RuntimeCancelled && leaseBinding.AcquireStatus == LeaseGranted &&
-		leaseBinding.Disposition == LeaseActive
+	hasActiveLease := leaseBinding.AcquireStatus == LeaseGranted && leaseBinding.Disposition == LeaseActive
+	leasedTerminal := (command.LeaseStage == postgresTerminalAnyLeaseStage && hasActiveLease) ||
+		command.LeaseStage == postgresTerminalPostLeaseOnly
+	if command.LeaseStage == postgresTerminalPostLeaseOnly && !hasActiveLease ||
+		command.LeaseStage == postgresTerminalPreLeaseOnly && hasActiveLease {
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
 	validLeaseBinding := validAcceptedStartBinding(startBinding, leaseBinding)
-	if leasedCancel {
+	if leasedTerminal {
 		validLeaseBinding = validGrantedLeaseBinding(startBinding, leaseBinding)
 	}
 	if record.fixture.RuntimeRevision != command.ExpectedRuntimeRevision ||
@@ -103,11 +232,11 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
 	validState := record.fixture.State == RuntimeWaitingForLease || record.fixture.State == RuntimeReconciling
-	if leasedCancel {
+	if leasedTerminal {
 		validState = record.fixture.State >= RuntimePreparingPrerequisites && record.fixture.State < RuntimeTerminal
 	}
 	wantPhysical := PhysicalCapacityNotApplicable
-	if leasedCancel {
+	if leasedTerminal {
 		wantPhysical = PhysicalCapacityOccupied
 	}
 	if !validState ||
@@ -128,14 +257,14 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
 	wantLeaseRoots := uint64(0)
-	if leasedCancel {
+	if leasedTerminal {
 		wantLeaseRoots = 1
 	}
 	if leaseRootCount != wantLeaseRoots {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
 	var leasedNode *postgresExecutionNodeRecord
-	if leasedCancel {
+	if leasedTerminal {
 		leasedNode, err = authority.loadPostgresNodeForUpdate(ctx, tx, startBinding.ExecutionNodeID)
 		if err != nil || leasedNode.ActiveRuntimeRunID != command.RuntimeRunID ||
 			leasedNode.ActiveLeaseID != leaseBinding.LeaseID || leasedNode.Occupancy != NodeOccupied {
@@ -172,11 +301,13 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		}
 	}
 	record.preLeaseTerminalReason = command.PreLeaseTerminalReason
-	if leasedCancel {
+	if leasedTerminal {
+		fenceRuntimeView := command.Outcome == RuntimeCancelled
 		record.lease.Generation++
 		record.lease.Fence++
 		record.lease.SandboxFence++
 		record.lease.Disposition = LeaseRevoked
+		updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
 		leasedNode.Occupancy = NodeOccupancyUnknown
 		leasedNode.Quarantined = true
 		leasedNode.Containment = ContainmentPending
@@ -186,7 +317,7 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 			Status: LeaseCleanupPending, OperationID: command.OperationID,
 			CanonicalRequestDigest: command.CanonicalRequestDigest, StopMainProcess: true,
 			StopChildProcesses: true, RevokeSecrets: true, RemoveNetwork: true,
-			FenceRuntimeView: true, ReconcileContainment: true,
+			FenceRuntimeView: fenceRuntimeView, ReconcileContainment: true,
 		}
 		record.capacity = RuntimeCapacitySnapshot{
 			LogicalRelease: LogicalCapacityReleaseReady, NoLease: NoLeaseDispositionNone,
@@ -210,7 +341,7 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		LeaseAcquireOperationID: leaseBinding.AcquireOperationID, LeaseAcquireDigest: leaseBinding.AcquireDigest,
 	}
 	record.capacityEvidence = RuntimeCapacityEvidenceSnapshot{RuntimeFencedOrTerminal: baseEvidence}
-	if !leasedCancel {
+	if !leasedTerminal {
 		record.capacityEvidence.NoLeasePhysicalDisposition = NoLeasePhysicalDispositionEvidence{
 			WorkItemID: baseEvidence.WorkItemID, AdmissionGrantID: baseEvidence.AdmissionGrantID,
 			GrantGeneration: baseEvidence.GrantGeneration, RuntimeRunID: baseEvidence.RuntimeRunID,
@@ -251,7 +382,7 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 	if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows != 1 {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
-	if leasedCancel {
+	if leasedTerminal {
 		if err := authority.updatePostgresLeaseLifecycle(ctx, tx, record.lease, command.RuntimeRunID); err != nil {
 			return RuntimeDecision{}, err
 		}
@@ -348,18 +479,18 @@ func (authority *PostgresAuthority) executePostgresNoLeaseTerminal(
 		command.OperationID.String(), OutboxPending); err != nil {
 		return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 	}
-	if leasedCancel {
+	if leasedTerminal {
 		cleanupDigest := digestBytes(append([]byte("slidesmith.runtime-execution.lease-cleanup/v1\n"), binding.canonical...))
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
 			operation_id, runtime_run_id, sandbox_lease_id, lease_generation, lease_fence,
 			sandbox_id, sandbox_generation, sandbox_fence, stop_main_process,
 			stop_child_processes, revoke_secrets, remove_network, fence_runtime_view,
 			reconcile_containment, canonical_digest, created_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,TRUE,TRUE,TRUE,TRUE,TRUE,$9,$10)`,
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,TRUE,TRUE,TRUE,$9,TRUE,$10,$11)`,
 			authority.table("runtime_execution_lease_cleanup_obligations")), command.OperationID.String(),
 			command.RuntimeRunID.String(), record.lease.LeaseID.String(), record.lease.Generation,
 			record.lease.Fence, record.lease.SandboxID.String(), record.lease.SandboxGeneration,
-			record.lease.SandboxFence, cleanupDigest[:], committedAt); err != nil {
+			record.lease.SandboxFence, record.cleanup.FenceRuntimeView, cleanupDigest[:], committedAt); err != nil {
 			return RuntimeDecision{}, normalizeRuntimePersistenceFailure(err)
 		}
 	}
@@ -458,7 +589,7 @@ func (authority *PostgresAuthority) executePostgresPreLeaseTerminal(
 		expectedRuntimeFence:        snapshot.RuntimeFence, safetyEpoch: start.ReleaseSafetyEpoch,
 		auditAction: postgresAuditPreLeaseTerminal, auditReasonCode: uint8(reason),
 	}
-	return authority.executePostgresNoLeaseTerminal(ctx, postgresNoLeaseTerminalCommand{
+	return authority.executePostgresRuntimeTerminal(ctx, postgresRuntimeTerminalCommand{
 		OperationID: operationID, PersonalWorkspaceID: start.PersonalWorkspaceID,
 		TaskID: start.TaskID, PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID,
 		ExpectedRuntimeRevision: snapshot.RuntimeRevision, ExpectedStartOperationID: start.OperationID,
@@ -466,6 +597,7 @@ func (authority *PostgresAuthority) executePostgresPreLeaseTerminal(
 		ExpectedRuntimeFence:        snapshot.RuntimeFence, Authority: start.Authority,
 		SafetyEpoch: start.ReleaseSafetyEpoch, OccurredAt: occurredAt,
 		CanonicalRequestDigest: digest, Outcome: outcome, PreLeaseTerminalReason: reason,
+		LeaseStage: postgresTerminalPreLeaseOnly,
 	}, binding)
 }
 

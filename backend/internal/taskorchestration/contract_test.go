@@ -38,7 +38,7 @@ func TestDecideCommitsThroughTheTaskOrchestrationSeam(t *testing.T) {
 			taskorchestration.AuthorizationGeneration(1),
 		),
 	)
-	const canonicalGolden = "726c9c7dbbccfa56a86f1e767c01bf95fe4f6986d3c7606f8fce0d3d77d1680e"
+	const canonicalGolden = "003f06de6f1fa84faca48ffdf24a2f2a4d7c7be500316d3c7512e46f7676c6f0"
 	if intent.Header().CanonicalRequestDigest.String() != canonicalGolden {
 		t.Fatalf("intent canonical digest = %s, want schema-v1 golden %s", intent.Header().CanonicalRequestDigest.String(), canonicalGolden)
 	}
