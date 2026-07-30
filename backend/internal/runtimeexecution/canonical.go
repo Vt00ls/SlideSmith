@@ -57,10 +57,13 @@ type canonicalCatalogBinding struct {
 }
 
 type canonicalProviderBinding struct {
-	QuotaReservationID   string `json:"quota_reservation_id"`
-	Generation           uint64 `json:"generation"`
-	Mode                 string `json:"mode"`
-	GatewayRoutePolicyID string `json:"gateway_route_policy_id"`
+	QuotaReservationID           string `json:"quota_reservation_id"`
+	Generation                   uint64 `json:"generation"`
+	Mode                         string `json:"mode"`
+	GatewayRoutePolicyID         string `json:"gateway_route_policy_id"`
+	GatewayRoutePolicyGeneration uint64 `json:"gateway_route_policy_generation"`
+	CapabilityScope              uint64 `json:"capability_scope"`
+	RoutePolicyExpiresAt         string `json:"route_policy_expires_at"`
 }
 
 type canonicalStart struct {
@@ -150,6 +153,9 @@ func canonicalStartEncoding(command StartRuntimeRun) ([]byte, error) {
 		provider = &canonicalProviderBinding{
 			QuotaReservationID: command.ProviderBinding.QuotaReservationID.String(), Generation: uint64(command.ProviderBinding.Generation),
 			Mode: quotaReservationModeName(command.ProviderBinding.Mode), GatewayRoutePolicyID: command.ProviderBinding.GatewayRoutePolicyID.String(),
+			GatewayRoutePolicyGeneration: uint64(command.ProviderBinding.GatewayRoutePolicyGeneration),
+			CapabilityScope:              uint64(command.ProviderBinding.CapabilityScope),
+			RoutePolicyExpiresAt:         command.ProviderBinding.RoutePolicyExpiresAt.UTC().Format(canonicalTimeFormat),
 		}
 	}
 	encoded, err := json.Marshal(canonicalStart{
@@ -512,10 +518,16 @@ func startInputFromCanonical(wire canonicalStart) (StartRuntimeRunInput, error) 
 		case "enforced":
 			mode = QuotaReservationEnforced
 		}
+		routePolicyExpiresAt, timeErr := time.Parse(canonicalTimeFormat, wire.ProviderBinding.RoutePolicyExpiresAt)
+		if timeErr != nil {
+			return StartRuntimeRunInput{}, newError(ErrorInvalidRequest)
+		}
 		provider = &ProviderExecutionBinding{
 			QuotaReservationID: QuotaReservationID{value: wire.ProviderBinding.QuotaReservationID},
 			Generation:         QuotaReservationGeneration(wire.ProviderBinding.Generation), Mode: mode,
-			GatewayRoutePolicyID: GatewayRoutePolicyID{value: wire.ProviderBinding.GatewayRoutePolicyID},
+			GatewayRoutePolicyID:         GatewayRoutePolicyID{value: wire.ProviderBinding.GatewayRoutePolicyID},
+			GatewayRoutePolicyGeneration: GatewayRoutePolicyGeneration(wire.ProviderBinding.GatewayRoutePolicyGeneration),
+			CapabilityScope:              ProviderCapabilityScope(wire.ProviderBinding.CapabilityScope), RoutePolicyExpiresAt: routePolicyExpiresAt,
 		}
 	}
 	return StartRuntimeRunInput{
@@ -609,7 +621,10 @@ func validProviderBinding(capability ProviderCapability, binding *ProviderExecut
 		return binding == nil
 	}
 	return capability == ProviderCapabilityRequired && binding != nil && validOpaqueID(binding.QuotaReservationID.String()) &&
-		binding.Generation > 0 && quotaReservationModeName(binding.Mode) != "" && validOpaqueID(binding.GatewayRoutePolicyID.String())
+		binding.Generation > 0 && quotaReservationModeName(binding.Mode) != "" && validOpaqueID(binding.GatewayRoutePolicyID.String()) &&
+		binding.GatewayRoutePolicyGeneration > 0 && binding.CapabilityScope != 0 &&
+		binding.CapabilityScope&^knownProviderCapabilityScope == 0 &&
+		!binding.RoutePolicyExpiresAt.IsZero()
 }
 
 func validAuthority(authority RuntimeAuthority) bool {

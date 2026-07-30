@@ -58,6 +58,8 @@ type postgresRuntimeState struct {
 	Reconciliation           ReconciliationStatus            `json:"reconciliation"`
 	Readiness                postgresReadinessState          `json:"readiness"`
 	RuntimeViewBinding       postgresRuntimeViewBindingState `json:"runtime_view_binding"`
+	Gateway                  postgresGatewayState            `json:"gateway"`
+	Usage                    postgresUsageEvidenceState      `json:"usage"`
 }
 
 type postgresPrerequisiteFactState struct {
@@ -90,6 +92,52 @@ type postgresRuntimeViewBindingState struct {
 	ExpiresAt                   time.Time                        `json:"expires_at"`
 	LifecycleGeneration         TaskWorkspaceLifecycleGeneration `json:"lifecycle_generation"`
 	LifecycleFence              TaskWorkspaceLifecycleFence      `json:"lifecycle_fence"`
+}
+
+type postgresGatewayState struct {
+	Applicability          GatewayPrerequisiteApplicability `json:"applicability"`
+	Status                 GatewayGrantStatus               `json:"status"`
+	Ready                  bool                             `json:"ready"`
+	OperationID            string                           `json:"operation_id"`
+	CanonicalRequestDigest Digest                           `json:"canonical_request_digest"`
+	RequestedGeneration    GatewayGrantGeneration           `json:"requested_generation"`
+	CurrentGrant           postgresGatewayGrantState        `json:"current_grant"`
+}
+
+type postgresGatewayGrantState struct {
+	GatewayGrantID               string                       `json:"gateway_grant_id"`
+	Generation                   GatewayGrantGeneration       `json:"generation"`
+	PersonalWorkspaceID          string                       `json:"personal_workspace_id"`
+	TaskID                       string                       `json:"task_id"`
+	PhaseRunID                   string                       `json:"phase_run_id"`
+	RuntimeRunID                 string                       `json:"runtime_run_id"`
+	StartOperationID             string                       `json:"start_operation_id"`
+	RuntimeBindingID             string                       `json:"runtime_binding_id"`
+	RuntimeBindingDigest         Digest                       `json:"runtime_binding_digest"`
+	ReleaseSafetyEpoch           ReleaseSafetyEpoch           `json:"release_safety_epoch"`
+	LeaseID                      string                       `json:"lease_id"`
+	LeaseGeneration              LeaseGeneration              `json:"lease_generation"`
+	LeaseFence                   LeaseFence                   `json:"lease_fence"`
+	RuntimeFence                 RuntimeFence                 `json:"runtime_fence"`
+	QuotaReservationID           string                       `json:"quota_reservation_id"`
+	QuotaReservationGeneration   QuotaReservationGeneration   `json:"quota_reservation_generation"`
+	QuotaReservationMode         QuotaReservationMode         `json:"quota_reservation_mode"`
+	OwnerAuthorityGeneration     AuthorizationGeneration      `json:"owner_authority_generation"`
+	AuthorizationGeneration      AuthorizationGeneration      `json:"authorization_generation"`
+	GatewayRoutePolicyID         string                       `json:"gateway_route_policy_id"`
+	GatewayRoutePolicyGeneration GatewayRoutePolicyGeneration `json:"gateway_route_policy_generation"`
+	CapabilityScope              ProviderCapabilityScope      `json:"capability_scope"`
+	RecoveryGeneration           GatewayRecoveryGeneration    `json:"recovery_generation"`
+	RecoveryMode                 GatewayRecoveryMode          `json:"recovery_mode"`
+	RecoveryExpiresAt            time.Time                    `json:"recovery_expires_at"`
+	ExpiresAt                    time.Time                    `json:"expires_at"`
+	CanonicalDigest              Digest                       `json:"canonical_digest"`
+}
+
+type postgresUsageEvidenceState struct {
+	Disposition  UsageEvidenceDisposition `json:"disposition"`
+	ReceiptCount uint64                   `json:"receipt_count"`
+	ReceiptRoot  Digest                   `json:"receipt_root"`
 }
 
 type postgresRuntimeNodeState struct {
@@ -270,8 +318,96 @@ func encodePostgresRuntimeFixture(fixture RuntimeFixture) ([]byte, error) {
 		Reconciliation:         fixture.Reconciliation,
 		Readiness:              postgresReadinessFromSnapshot(fixture.Readiness),
 		RuntimeViewBinding:     postgresRuntimeViewBindingFromSnapshot(fixture.RuntimeViewBinding),
+		Gateway:                postgresGatewayStateFromSnapshot(fixture.Gateway),
+		Usage:                  postgresUsageStateFromSnapshot(fixture.Usage),
 	}
 	return json.Marshal(state)
+}
+
+func postgresGatewayStateFromSnapshot(snapshot GatewayPrerequisiteSnapshot) postgresGatewayState {
+	grant := snapshot.CurrentGrant
+	expiresAt := grant.ExpiresAt
+	if !expiresAt.IsZero() {
+		expiresAt = expiresAt.UTC()
+	}
+	return postgresGatewayState{
+		Applicability: snapshot.Applicability, Status: snapshot.Status, Ready: snapshot.Ready,
+		OperationID: snapshot.OperationID.String(), CanonicalRequestDigest: snapshot.CanonicalRequestDigest,
+		RequestedGeneration: snapshot.RequestedGeneration,
+		CurrentGrant: postgresGatewayGrantState{
+			GatewayGrantID: grant.GatewayGrantID.String(), Generation: grant.Generation,
+			PersonalWorkspaceID: grant.PersonalWorkspaceID.String(), TaskID: grant.TaskID.String(),
+			PhaseRunID:   grant.PhaseRunID.String(),
+			RuntimeRunID: grant.RuntimeRunID.String(), StartOperationID: grant.StartOperationID.String(),
+			RuntimeBindingID: grant.RuntimeBindingID.String(), RuntimeBindingDigest: grant.RuntimeBindingDigest,
+			ReleaseSafetyEpoch: grant.ReleaseSafetyEpoch,
+			LeaseID:            grant.LeaseID.String(), LeaseGeneration: grant.LeaseGeneration, LeaseFence: grant.LeaseFence,
+			RuntimeFence: grant.RuntimeFence, QuotaReservationID: grant.QuotaReservationID.String(),
+			QuotaReservationGeneration:   grant.QuotaReservationGeneration,
+			QuotaReservationMode:         grant.QuotaReservationMode,
+			OwnerAuthorityGeneration:     grant.OwnerAuthorityGeneration,
+			AuthorizationGeneration:      grant.AuthorizationGeneration,
+			GatewayRoutePolicyID:         grant.GatewayRoutePolicyID.String(),
+			GatewayRoutePolicyGeneration: grant.GatewayRoutePolicyGeneration,
+			CapabilityScope:              grant.CapabilityScope, RecoveryGeneration: grant.RecoveryGeneration,
+			RecoveryMode: grant.RecoveryMode, RecoveryExpiresAt: grant.RecoveryExpiresAt.UTC(),
+			ExpiresAt: expiresAt, CanonicalDigest: grant.CanonicalDigest,
+		},
+	}
+}
+
+func gatewaySnapshotFromPostgres(state postgresGatewayState) GatewayPrerequisiteSnapshot {
+	expiresAt := state.CurrentGrant.ExpiresAt
+	if !expiresAt.IsZero() {
+		expiresAt = expiresAt.UTC()
+	}
+	return GatewayPrerequisiteSnapshot{
+		Applicability: state.Applicability, Status: state.Status, Ready: state.Ready,
+		OperationID: OperationID{value: state.OperationID}, CanonicalRequestDigest: state.CanonicalRequestDigest,
+		RequestedGeneration: state.RequestedGeneration,
+		CurrentGrant: GatewayGrant{
+			GatewayGrantInput: GatewayGrantInput{
+				GatewayGrantID:      GatewayGrantID{value: state.CurrentGrant.GatewayGrantID},
+				Generation:          state.CurrentGrant.Generation,
+				PersonalWorkspaceID: PersonalWorkspaceID{value: state.CurrentGrant.PersonalWorkspaceID},
+				TaskID:              TaskID{value: state.CurrentGrant.TaskID}, PhaseRunID: PhaseRunID{value: state.CurrentGrant.PhaseRunID},
+				RuntimeRunID:         RuntimeRunID{value: state.CurrentGrant.RuntimeRunID},
+				StartOperationID:     OperationID{value: state.CurrentGrant.StartOperationID},
+				RuntimeBindingID:     RuntimeBindingID{value: state.CurrentGrant.RuntimeBindingID},
+				RuntimeBindingDigest: state.CurrentGrant.RuntimeBindingDigest,
+				ReleaseSafetyEpoch:   state.CurrentGrant.ReleaseSafetyEpoch,
+				LeaseID:              SandboxLeaseID{value: state.CurrentGrant.LeaseID},
+				LeaseGeneration:      state.CurrentGrant.LeaseGeneration, LeaseFence: state.CurrentGrant.LeaseFence,
+				RuntimeFence:                 state.CurrentGrant.RuntimeFence,
+				QuotaReservationID:           QuotaReservationID{value: state.CurrentGrant.QuotaReservationID},
+				QuotaReservationGeneration:   state.CurrentGrant.QuotaReservationGeneration,
+				QuotaReservationMode:         state.CurrentGrant.QuotaReservationMode,
+				OwnerAuthorityGeneration:     state.CurrentGrant.OwnerAuthorityGeneration,
+				AuthorizationGeneration:      state.CurrentGrant.AuthorizationGeneration,
+				GatewayRoutePolicyID:         GatewayRoutePolicyID{value: state.CurrentGrant.GatewayRoutePolicyID},
+				GatewayRoutePolicyGeneration: state.CurrentGrant.GatewayRoutePolicyGeneration,
+				CapabilityScope:              state.CurrentGrant.CapabilityScope,
+				RecoveryGeneration:           state.CurrentGrant.RecoveryGeneration,
+				RecoveryMode:                 state.CurrentGrant.RecoveryMode,
+				RecoveryExpiresAt:            state.CurrentGrant.RecoveryExpiresAt.UTC(), ExpiresAt: expiresAt,
+			},
+			CanonicalDigest: state.CurrentGrant.CanonicalDigest,
+		},
+	}
+}
+
+func postgresUsageStateFromSnapshot(snapshot RuntimeUsageEvidenceSnapshot) postgresUsageEvidenceState {
+	return postgresUsageEvidenceState{
+		Disposition: snapshot.Disposition, ReceiptCount: snapshot.Receipts.Count,
+		ReceiptRoot: snapshot.Receipts.RootDigest,
+	}
+}
+
+func usageSnapshotFromPostgres(state postgresUsageEvidenceState) RuntimeUsageEvidenceSnapshot {
+	return RuntimeUsageEvidenceSnapshot{
+		Disposition: state.Disposition,
+		Receipts:    UsageReceiptReferenceSet{Count: state.ReceiptCount, RootDigest: state.ReceiptRoot},
+	}
 }
 
 func postgresFencedEvidenceFromRuntime(value RuntimeFencedOrTerminalEvidence) postgresRuntimeFencedEvidenceState {
@@ -484,6 +620,8 @@ func scanPostgresRuntimeRecord(row rowScanner, runtimeRunID RuntimeRunID) (*runt
 		reconciliation:         persisted.Reconciliation,
 		readiness:              readinessSnapshotFromPostgres(persisted.Readiness),
 		runtimeViewBinding:     runtimeViewBindingSnapshotFromPostgres(persisted.RuntimeViewBinding),
+		gateway:                gatewaySnapshotFromPostgres(persisted.Gateway),
+		usage:                  usageSnapshotFromPostgres(persisted.Usage),
 	}
 	record.acceptedStart.OperationID = record.operation.OperationID
 	record.acceptedStartDigest = record.operation.Digest

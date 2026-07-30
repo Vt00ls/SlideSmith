@@ -119,34 +119,47 @@ func (function SchedulerLeaseAttachmentParticipantFunc) ParticipateLeaseAttachme
 }
 
 type QuotaReservationValidationFact struct {
-	QuotaReservationID  QuotaReservationID
-	Generation          QuotaReservationGeneration
-	Mode                QuotaReservationMode
-	PersonalWorkspaceID PersonalWorkspaceID
-	PhaseRunID          PhaseRunID
-	Capability          ProviderCapability
-	ValidAt             time.Time
+	QuotaReservationID           QuotaReservationID
+	Generation                   QuotaReservationGeneration
+	Mode                         QuotaReservationMode
+	PersonalWorkspaceID          PersonalWorkspaceID
+	TaskID                       TaskID
+	PhaseRunID                   PhaseRunID
+	AuthorizationGeneration      AuthorizationGeneration
+	Capability                   ProviderCapability
+	GatewayRoutePolicyID         GatewayRoutePolicyID
+	GatewayRoutePolicyGeneration GatewayRoutePolicyGeneration
+	CapabilityScope              ProviderCapabilityScope
+	ValidAt                      time.Time
+}
+
+type QuotaReservationValidationResult struct {
+	ExpiresAt time.Time
 }
 
 type QuotaReservationValidationTransaction interface {
-	ValidateQuotaReservation(context.Context) error
+	ValidateQuotaReservation(context.Context) (QuotaReservationValidationResult, error)
 }
 
 type QuotaReservationParticipant interface {
-	ParticipateQuotaReservation(context.Context, QuotaReservationValidationTransaction, QuotaReservationValidationFact) error
+	ParticipateQuotaReservation(
+		context.Context,
+		QuotaReservationValidationTransaction,
+		QuotaReservationValidationFact,
+	) (QuotaReservationValidationResult, error)
 }
 
 type QuotaReservationParticipantFunc func(
 	context.Context,
 	QuotaReservationValidationTransaction,
 	QuotaReservationValidationFact,
-) error
+) (QuotaReservationValidationResult, error)
 
 func (function QuotaReservationParticipantFunc) ParticipateQuotaReservation(
 	ctx context.Context,
 	transaction QuotaReservationValidationTransaction,
 	fact QuotaReservationValidationFact,
-) error {
+) (QuotaReservationValidationResult, error) {
 	return function(ctx, transaction, fact)
 }
 

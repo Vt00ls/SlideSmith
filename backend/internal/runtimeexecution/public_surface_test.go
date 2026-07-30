@@ -1,8 +1,10 @@
 package runtimeexecution
 
 import (
+	"encoding/json"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -63,6 +65,7 @@ func TestPublicSurfaceHasOnlyExecuteAndInspect(t *testing.T) {
 	assertIndependentType(t, AuthorizationGeneration(0), ReleaseSafetyEpoch(0))
 	assertIndependentType(t, ReleaseSafetyEpoch(0), CatalogSafetyEpoch(0))
 	assertIndependentType(t, AdmissionGrantGeneration(0), QuotaReservationGeneration(0))
+	assertIndependentType(t, GatewayRecoveryGeneration(0), AuthorizationGeneration(0))
 	assertIndependentType(t, TaskWorkspaceLifecycleGeneration(0), OperationGeneration(0))
 	assertIndependentType(t, TaskWorkspaceLifecycleFence(0), RuntimeFence(0))
 	assertIndependentType(t, RuntimeRunID{}, OperationID{})
@@ -75,6 +78,76 @@ func TestPublicSurfaceHasOnlyExecuteAndInspect(t *testing.T) {
 	assertIndependentType(t, TaskWorkspaceRevisionID{}, RuntimeRevision(0))
 	assertIndependentType(t, OperationID{}, RuntimeDecisionID{})
 	assertIndependentType(t, RuntimeDecisionID{}, EvidenceRootID{})
+}
+
+func TestGatewayUsageContractsCarryNoProviderOrPersistenceAuthority(t *testing.T) {
+	types := []reflect.Type{
+		reflect.TypeOf(ProviderExecutionBinding{}),
+		reflect.TypeOf(GatewayGrantRequest{}),
+		reflect.TypeOf(GatewayGrant{}),
+		reflect.TypeOf(GatewayGrantDecision{}),
+		reflect.TypeOf(GatewayRecoverySnapshot{}),
+		reflect.TypeOf(GatewayCallRequest{}),
+		reflect.TypeOf(GatewayCallAuthorityFact{}),
+		reflect.TypeOf(GatewayCallExternalAuthorityFact{}),
+		reflect.TypeOf(GatewayCallDecision{}),
+		reflect.TypeOf(GatewayAttemptSettlement{}),
+		reflect.TypeOf(UsageReceiptReference{}),
+		reflect.TypeOf(RuntimeUsageEvidenceSnapshot{}),
+		reflect.TypeOf(postgresGatewayGrantRequestState{}),
+		reflect.TypeOf(postgresGatewayGrantDecisionState{}),
+	}
+	forbidden := []string{
+		"credential", "api_key", "apikey", "access_token", "provider_endpoint", "direct_endpoint",
+		"provider_url", "vendor", "raw_response", "provider_response", "dsn", "sql", "file_path", "host_path",
+	}
+	visited := make(map[reflect.Type]bool)
+	var inspect func(reflect.Type, string)
+	inspect = func(typ reflect.Type, path string) {
+		for typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
+		if visited[typ] || typ.PkgPath() != reflect.TypeOf(RuntimeSnapshot{}).PkgPath() || typ.Kind() != reflect.Struct {
+			return
+		}
+		visited[typ] = true
+		for index := 0; index < typ.NumField(); index++ {
+			field := typ.Field(index)
+			name := strings.ToLower(field.Name)
+			jsonName := strings.ToLower(strings.Split(field.Tag.Get("json"), ",")[0])
+			for _, fragment := range forbidden {
+				if strings.Contains(name, fragment) || strings.Contains(jsonName, fragment) {
+					t.Fatalf("%s.%s exposes forbidden authority fragment %q", path, field.Name, fragment)
+				}
+			}
+			inspect(field.Type, path+"."+field.Name)
+		}
+	}
+	for _, typ := range types {
+		inspect(typ, typ.Name())
+	}
+
+	encoded, err := json.Marshal(postgresGatewayGrantRequestState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wireKeys := strings.ToLower(string(encoded))
+	for _, fragment := range forbidden {
+		if strings.Contains(wireKeys, fragment) {
+			t.Fatalf("Gateway persistence wire contains forbidden authority key %q: %s", fragment, wireKeys)
+		}
+	}
+
+	grantPort := reflect.TypeOf((*GatewayGrantAdapter)(nil)).Elem()
+	callPort := reflect.TypeOf((*GatewayCallAccess)(nil)).Elem()
+	validator := reflect.TypeOf((*GatewayCallAuthorityValidator)(nil)).Elem()
+	externalAuthority := reflect.TypeOf((*GatewayCallExternalAuthority)(nil)).Elem()
+	if grantPort.NumMethod() != 2 || callPort.NumMethod() != 2 || validator.NumMethod() != 1 ||
+		validator.Method(0).Name != "ValidateGatewayCall" || externalAuthority.NumMethod() != 1 ||
+		externalAuthority.Method(0).Name != "ValidateGatewayCallExternalAuthority" {
+		t.Fatalf("Gateway internal seams widened: grant=%v call=%v validator=%v external=%v",
+			grantPort, callPort, validator, externalAuthority)
+	}
 }
 
 func TestLeaseLifecycleUsesIndependentClosedMaintenanceSurface(t *testing.T) {

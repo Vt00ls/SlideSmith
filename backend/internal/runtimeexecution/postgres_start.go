@@ -117,6 +117,10 @@ func (authority *PostgresAuthority) executePostgresStart(
 	if authority.failAt(PersistenceFaultBeforeRuntimeWrite) {
 		return RuntimeDecision{}, newError(ErrorDependencyUnavailable)
 	}
+	acceptedAt := postgresTimestamp(authority.now())
+	if _, err := authority.validatePostgresQuotaReservation(ctx, tx, command, acceptedAt); err != nil {
+		return RuntimeDecision{}, err
+	}
 
 	previousRevision := record.fixture.RuntimeRevision
 	previousOperationGeneration := record.fixture.OperationGeneration
@@ -133,7 +137,6 @@ func (authority *PostgresAuthority) executePostgresStart(
 		ResultingRuntimeRevision: previousRevision + 1, StateAtDecision: RuntimeWaitingForLease,
 		OutcomeAtDecision: RuntimeOutcomeNone, Retry: RetryNever, Reconciliation: ReconciliationNotRequired,
 	}
-	acceptedAt := postgresTimestamp(authority.now())
 	schedulerFact := SchedulerAcceptanceFact{
 		WorkItemID: command.AdmissionGrant.WorkItemID, AdmissionGrantID: command.AdmissionGrant.AdmissionGrantID,
 		GrantGeneration: command.AdmissionGrant.Generation, OperationID: command.OperationID,
@@ -178,6 +181,17 @@ func (authority *PostgresAuthority) executePostgresStart(
 	}
 	record.reconciliation = ReconciliationStable
 	record.readiness = initialRuntimeReadiness(command)
+	if command.ProviderCapability == ProviderCapabilityRequired {
+		record.gateway = GatewayPrerequisiteSnapshot{
+			Applicability: GatewayPrerequisiteRequired, Status: GatewayGrantWaitingForLease,
+		}
+		record.usage = RuntimeUsageEvidenceSnapshot{Disposition: UsageEvidenceMissing}
+	} else {
+		record.gateway = GatewayPrerequisiteSnapshot{
+			Applicability: GatewayPrerequisiteNotApplicable, Status: GatewayGrantNotApplicable, Ready: true,
+		}
+		record.usage = RuntimeUsageEvidenceSnapshot{Disposition: UsageEvidenceNotApplicable}
+	}
 	aggregateState, err := encodePostgresRuntimeFixture(fixtureFromRuntimeRecord(record))
 	if err != nil {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
