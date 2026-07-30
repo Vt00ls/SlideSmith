@@ -33,6 +33,12 @@ func TestExecuteAcceptedCanonicalStartAndInspectCurrentSnapshot(t *testing.T) {
 		ReleaseSafetyEpoch:          13,
 		WorkerClass:                 WorkerAgent,
 		Effect:                      EffectReadOnly,
+		ImmutableInputManifest: ImmutableInputManifestBinding{
+			Identity: mustInputManifestIdentity(t, "input-manifest-1"), SchemaVersion: SchemaV1,
+			Digest: digest(10), TotalSizeBytes: 30, InputCount: 2,
+			MaterializationEvidenceID:     mustEvidenceID(t, "input-materialization-1"),
+			MaterializationEvidenceDigest: digest(11),
+		},
 		ImmutableInputs: []ImmutableInputBinding{
 			{Identity: mustInputIdentity(t, "input-b"), Digest: digest(4), SizeBytes: 20},
 			{Identity: mustInputIdentity(t, "input-a"), Digest: digest(3), SizeBytes: 10},
@@ -195,6 +201,15 @@ func mustRuntimeBindingID(t *testing.T, value string) RuntimeBindingID {
 func mustInputIdentity(t *testing.T, value string) ImmutableInputIdentity {
 	t.Helper()
 	id, err := NewImmutableInputIdentity(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func mustInputManifestIdentity(t *testing.T, value string) ImmutableInputManifestIdentity {
+	t.Helper()
+	id, err := NewImmutableInputManifestIdentity(value)
 	if err != nil {
 		t.Fatal(err)
 	}

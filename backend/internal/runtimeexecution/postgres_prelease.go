@@ -20,8 +20,9 @@ func (authority *PostgresAuthority) advancePostgresPreLease(
 	start StartRuntimeRun,
 	startDecision RuntimeDecision,
 ) (RuntimeDecision, error) {
-	if startDecision.Fact.Disposition != DecisionAccepted {
-		return startDecision, nil
+	startDecision, err := authority.advancePostgresPreLeaseTimeBounds(ctx, start, startDecision)
+	if err != nil || startDecision.Snapshot.State == RuntimeTerminal {
+		return startDecision, err
 	}
 	snapshot := startDecision.Snapshot
 	if snapshot.State == RuntimeTerminal || snapshot.Lease.AcquireStatus == LeaseGranted ||
@@ -29,26 +30,6 @@ func (authority *PostgresAuthority) advancePostgresPreLease(
 		return startDecision, nil
 	}
 	now := postgresTimestamp(authority.now())
-	if !now.Before(snapshot.Deadline) {
-		terminal, err := authority.executePostgresPreLeaseTerminal(
-			ctx, start, RuntimeTimedOut, PreLeaseTerminalRuntimeDeadline, now,
-		)
-		if err != nil {
-			return RuntimeDecision{}, err
-		}
-		startDecision.Snapshot = terminal.Snapshot
-		return startDecision, nil
-	}
-	if !now.Before(snapshot.LeaseAcquireBy) {
-		terminal, err := authority.executePostgresPreLeaseTerminal(
-			ctx, start, RuntimeRejected, PreLeaseTerminalAdmissionAuthorityExpired, now,
-		)
-		if err != nil {
-			return RuntimeDecision{}, err
-		}
-		startDecision.Snapshot = terminal.Snapshot
-		return startDecision, nil
-	}
 	if authority.leaseAcquisition == nil {
 		return startDecision, nil
 	}
@@ -120,6 +101,35 @@ func (authority *PostgresAuthority) advancePostgresPreLease(
 	default:
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
+}
+
+func (authority *PostgresAuthority) advancePostgresPreLeaseTimeBounds(
+	ctx context.Context,
+	start StartRuntimeRun,
+	startDecision RuntimeDecision,
+) (RuntimeDecision, error) {
+	if startDecision.Fact.Disposition != DecisionAccepted {
+		return startDecision, nil
+	}
+	snapshot := startDecision.Snapshot
+	if snapshot.State == RuntimeTerminal || snapshot.Lease.AcquireStatus == LeaseGranted ||
+		snapshot.State != RuntimeWaitingForLease && snapshot.State != RuntimeReconciling {
+		return startDecision, nil
+	}
+	now := postgresTimestamp(authority.now())
+	if outcome, reason, terminal := preLeaseTimeBoundTerminal(
+		now, snapshot.Deadline, snapshot.LeaseAcquireBy,
+	); terminal {
+		terminal, err := authority.executePostgresPreLeaseTerminal(
+			ctx, start, outcome, reason, now,
+		)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		startDecision.Snapshot = terminal.Snapshot
+		return startDecision, nil
+	}
+	return startDecision, nil
 }
 
 func postgresLeaseAcquisitionRequest(start StartRuntimeRun, snapshot RuntimeSnapshot) LeaseAcquisitionRequest {
@@ -314,6 +324,11 @@ func (authority *PostgresAuthority) commitPostgresPreLease(
 	record.node = nodeSnapshot(node.ExecutionNodeFixture)
 	record.capacity.Physical = PhysicalCapacityOccupied
 	record.reconciliation = ReconciliationStable
+	if record.readiness == (RuntimeReadinessSnapshot{}) {
+		record.readiness = initialRuntimeReadiness(start)
+	}
+	record.readiness.Lease = leasePrerequisiteFact(record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
 	fact := RuntimeDecisionFact{
 		DecisionID: decisionID, Disposition: DecisionAccepted,
 		OperationID: request.OperationID, CanonicalRequestDigest: request.Digest,

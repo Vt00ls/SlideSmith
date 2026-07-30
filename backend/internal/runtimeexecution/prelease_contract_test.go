@@ -25,6 +25,239 @@ func TestPostgresPreLeaseTerminalDigestBindsExactCanonicalBytes(t *testing.T) {
 	}
 }
 
+func TestMissingRuntimeBindingValidatorCannotReachLeaseAcquisition(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 29, 8, 55, 0, 0, time.UTC)
+	authority := mustTaskOrchestrationAuthority(t, "missing-binding-validator-authority", 2)
+	start := standardStart(t, now, authority, "missing-binding-validator")
+	leaseCalls := 0
+	harness, err := NewDeterministicHarness(HarnessConfig{
+		Now: now, Runtimes: []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants: []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(10*time.Minute), true)},
+		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
+			context.Context,
+			LeaseAcquisitionRequest,
+		) (LeaseAcquisitionObservation, error) {
+			leaseCalls++
+			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil || decision.Snapshot.State != RuntimeWaitingForLease ||
+		decision.Snapshot.Readiness.RuntimeBinding.State != PrerequisitePending ||
+		decision.Snapshot.Lease.AcquireStatus != LeaseAcquirePending || leaseCalls != 0 {
+		t.Fatalf("missing Runtime Binding validator crossed lease gate: %+v err=%v calls=%d",
+			decision, err, leaseCalls)
+	}
+	if err := harness.AdvanceClock(10 * time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil || terminal.Snapshot.State != RuntimeTerminal ||
+		terminal.Snapshot.Outcome != RuntimeRejected ||
+		terminal.Snapshot.PreLeaseTerminalReason != PreLeaseTerminalAdmissionAuthorityExpired ||
+		leaseCalls != 0 {
+		t.Fatalf("missing Runtime Binding validator outlived LeaseAcquireBy: %+v err=%v calls=%d",
+			terminal, err, leaseCalls)
+	}
+	assertProvenNoLeaseTerminal(t, terminal.Snapshot)
+}
+
+func TestAmbiguousRuntimeBindingCannotOutlivePreLeaseTimeBounds(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 29, 8, 56, 0, 0, time.UTC)
+	for _, testCase := range []struct {
+		name        string
+		grantExpiry time.Time
+		advance     time.Duration
+		wantOutcome RuntimeOutcome
+		wantReason  PreLeaseTerminalReason
+	}{
+		{
+			name: "LeaseAcquireBy", grantExpiry: now.Add(5 * time.Minute), advance: 5 * time.Minute,
+			wantOutcome: RuntimeRejected, wantReason: PreLeaseTerminalAdmissionAuthorityExpired,
+		},
+		{
+			name: "Runtime deadline", grantExpiry: now.Add(30 * time.Minute), advance: 20 * time.Minute,
+			wantOutcome: RuntimeTimedOut, wantReason: PreLeaseTerminalRuntimeDeadline,
+		},
+		{
+			name: "Runtime deadline wins when both expire", grantExpiry: now.Add(5 * time.Minute), advance: 20 * time.Minute,
+			wantOutcome: RuntimeTimedOut, wantReason: PreLeaseTerminalRuntimeDeadline,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			suffix := "ambiguous-binding-" + safeTestID(testCase.name)
+			authority := mustTaskOrchestrationAuthority(t, suffix+"-authority", 2)
+			start := standardStart(t, now, authority, suffix)
+			validationCalls := 0
+			leaseCalls := 0
+			harness, err := NewDeterministicHarness(HarnessConfig{
+				Now: now, Runtimes: []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+				AdmissionGrants: []AdmissionGrantFixture{grantFixtureForStart(start, testCase.grantExpiry, true)},
+				RuntimeBindingValidator: RuntimeBindingValidatorFunc(func(
+					context.Context,
+					RuntimeBindingValidationRequest,
+				) (PrerequisiteObservation, error) {
+					validationCalls++
+					return PrerequisiteObservation{
+						Disposition: PrerequisiteObservationAmbiguous,
+						Failure:     PrerequisiteFailureDependencyUnavailable,
+					}, nil
+				}),
+				LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
+					context.Context,
+					LeaseAcquisitionRequest,
+				) (LeaseAcquisitionObservation, error) {
+					leaseCalls++
+					return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			waiting, err := harness.Runtime.Execute(context.Background(), start)
+			if err != nil || waiting.Snapshot.State != RuntimeWaitingForLease ||
+				waiting.Snapshot.Readiness.RuntimeBinding.State != PrerequisiteReconciliationRequired ||
+				validationCalls != 1 || leaseCalls != 0 {
+				t.Fatalf("initial ambiguous binding: %+v err=%v validation=%d lease=%d",
+					waiting, err, validationCalls, leaseCalls)
+			}
+			if err := harness.AdvanceClock(testCase.advance); err != nil {
+				t.Fatal(err)
+			}
+			terminal, err := harness.Runtime.Execute(context.Background(), start)
+			if err != nil || terminal.Snapshot.State != RuntimeTerminal ||
+				terminal.Snapshot.Outcome != testCase.wantOutcome ||
+				terminal.Snapshot.PreLeaseTerminalReason != testCase.wantReason ||
+				validationCalls != 2 || leaseCalls != 0 {
+				t.Fatalf("ambiguous binding after time bound: %+v err=%v validation=%d lease=%d",
+					terminal, err, validationCalls, leaseCalls)
+			}
+			assertProvenNoLeaseTerminal(t, terminal.Snapshot)
+		})
+	}
+}
+
+func TestRuntimeDeadlineWinsOverLateRuntimeBindingRejection(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 29, 8, 56, 30, 0, time.UTC)
+	authority := mustTaskOrchestrationAuthority(t, "late-binding-rejection-authority", 2)
+	start := standardStart(t, now, authority, "late-binding-rejection")
+	validationCalls := 0
+	leaseCalls := 0
+	harness, err := NewDeterministicHarness(HarnessConfig{
+		Now: now, Runtimes: []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants: []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(5*time.Minute), true)},
+		RuntimeBindingValidator: RuntimeBindingValidatorFunc(func(
+			context.Context,
+			RuntimeBindingValidationRequest,
+		) (PrerequisiteObservation, error) {
+			validationCalls++
+			if validationCalls == 1 {
+				return PrerequisiteObservation{
+					Disposition: PrerequisiteObservationAmbiguous,
+					Failure:     PrerequisiteFailureDependencyUnavailable,
+				}, nil
+			}
+			return PrerequisiteObservation{
+				Disposition: PrerequisiteObservationRejected,
+				Failure:     PrerequisiteFailureRevoked,
+			}, nil
+		}),
+		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
+			context.Context,
+			LeaseAcquisitionRequest,
+		) (LeaseAcquisitionObservation, error) {
+			leaseCalls++
+			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil || waiting.Snapshot.State != RuntimeWaitingForLease ||
+		waiting.Snapshot.Readiness.RuntimeBinding.State != PrerequisiteReconciliationRequired ||
+		validationCalls != 1 || leaseCalls != 0 {
+		t.Fatalf("initial late-rejection setup: %+v err=%v validation=%d lease=%d",
+			waiting, err, validationCalls, leaseCalls)
+	}
+	if err := harness.AdvanceClock(start.Deadline.Sub(now)); err != nil {
+		t.Fatal(err)
+	}
+	timedOut, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil || timedOut.Snapshot.State != RuntimeTerminal ||
+		timedOut.Snapshot.Outcome != RuntimeTimedOut ||
+		timedOut.Snapshot.PreLeaseTerminalReason != PreLeaseTerminalRuntimeDeadline ||
+		validationCalls != 2 || leaseCalls != 0 {
+		t.Fatalf("late Runtime Binding rejection defeated deadline: %+v err=%v validation=%d lease=%d",
+			timedOut, err, validationCalls, leaseCalls)
+	}
+	assertProvenNoLeaseTerminal(t, timedOut.Snapshot)
+}
+
+func TestRuntimeBindingIsRevalidatedBeforeDelayedLeaseAcquisition(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 29, 8, 57, 0, 0, time.UTC)
+	authority := mustTaskOrchestrationAuthority(t, "binding-revalidation-authority", 2)
+	start := standardStart(t, now, authority, "binding-revalidation")
+	validationCalls := 0
+	leaseCalls := 0
+	harness, err := NewDeterministicHarness(HarnessConfig{
+		Now: now, Runtimes: []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants: []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(10*time.Minute), true)},
+		RuntimeBindingValidator: RuntimeBindingValidatorFunc(func(
+			context.Context,
+			RuntimeBindingValidationRequest,
+		) (PrerequisiteObservation, error) {
+			validationCalls++
+			if validationCalls == 1 {
+				return acceptedPrerequisiteObservation(t, "binding-revalidation-evidence", digest(249)), nil
+			}
+			return PrerequisiteObservation{
+				Disposition: PrerequisiteObservationRejected,
+				Failure:     PrerequisiteFailureRevoked,
+			}, nil
+		}),
+		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
+			context.Context,
+			LeaseAcquisitionRequest,
+		) (LeaseAcquisitionObservation, error) {
+			leaseCalls++
+			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionTemporaryUnavailable}, nil
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil || waiting.Snapshot.State != RuntimeWaitingForLease ||
+		waiting.Snapshot.Readiness.RuntimeBinding.State != PrerequisiteAccepted ||
+		validationCalls != 1 || leaseCalls != 1 {
+		t.Fatalf("first lease attempt: %+v err=%v validation=%d lease=%d",
+			waiting, err, validationCalls, leaseCalls)
+	}
+	rejected, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil || rejected.Snapshot.State != RuntimeTerminal ||
+		rejected.Snapshot.Outcome != RuntimeRejected ||
+		rejected.Snapshot.PreLeaseTerminalReason != PreLeaseTerminalImmutableBinding ||
+		rejected.Snapshot.Readiness.RuntimeBinding.State != PrerequisiteRejected ||
+		rejected.Snapshot.Readiness.RuntimeBinding.Failure != PrerequisiteFailureRevoked ||
+		validationCalls != 2 || leaseCalls != 1 {
+		t.Fatalf("revoked binding crossed delayed lease attempt: %+v err=%v validation=%d lease=%d",
+			rejected, err, validationCalls, leaseCalls)
+	}
+	assertProvenNoLeaseTerminal(t, rejected.Snapshot)
+}
+
 func TestDeterministicPostBindPreLeaseObservationMatrixUsesOneStableLeaseOperation(t *testing.T) {
 	t.Parallel()
 
@@ -60,8 +293,9 @@ func TestDeterministicPostBindPreLeaseObservationMatrixUsesOneStableLeaseOperati
 			adapter := &recordingLeaseAcquisitionAdapter{observation: testCase.observation}
 			harness, err := NewDeterministicHarness(HarnessConfig{
 				Now: now, Runtimes: []RuntimeFixture{runtimeFixtureForStart(start, authority)},
-				AdmissionGrants:  []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(10*time.Minute), true)},
-				LeaseAcquisition: adapter,
+				AdmissionGrants:         []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(10*time.Minute), true)},
+				LeaseAcquisition:        adapter,
+				RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -147,10 +381,11 @@ func TestDeterministicLeaseCommitResponseLossReplaysExactlyOneLease(t *testing.T
 	grant.NodeCapacityGeneration = 1
 	harness, err := NewDeterministicHarness(HarnessConfig{
 		Now: now, IDs: DeterministicIDConfig{DecisionStart: 300, LeaseStart: 700, SandboxStart: 800},
-		Runtimes:         []RuntimeFixture{runtimeFixtureForStart(start, authority)},
-		AdmissionGrants:  []AdmissionGrantFixture{grant},
-		Nodes:            []ExecutionNodeFixture{executionNodeFixtureForStart(t, start, grant, now)},
-		LeaseAcquisition: adapter,
+		Runtimes:                []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants:         []AdmissionGrantFixture{grant},
+		Nodes:                   []ExecutionNodeFixture{executionNodeFixtureForStart(t, start, grant, now)},
+		LeaseAcquisition:        adapter,
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -215,6 +450,16 @@ func (adapter *recordingLeaseAcquisitionAdapter) ObserveLeaseAcquisition(
 
 func permanentPreLeaseObservation(reason PreLeasePermanentFailure) LeaseAcquisitionObservation {
 	return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionPermanentFailure, PermanentFailure: reason}
+}
+
+func acceptedRuntimeBindingValidatorForTest(t *testing.T) RuntimeBindingValidator {
+	t.Helper()
+	return RuntimeBindingValidatorFunc(func(
+		context.Context,
+		RuntimeBindingValidationRequest,
+	) (PrerequisiteObservation, error) {
+		return acceptedPrerequisiteObservation(t, "test-runtime-binding-evidence", digest(250)), nil
+	})
 }
 
 func assertProvenNoLeaseTerminal(t *testing.T, snapshot RuntimeSnapshot) {

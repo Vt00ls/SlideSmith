@@ -9,53 +9,87 @@ import (
 )
 
 type postgresRuntimeState struct {
-	OperationStatus          OperationBindingStatus        `json:"operation_status"`
-	OperationID              string                        `json:"operation_id"`
-	OperationDigest          Digest                        `json:"operation_digest"`
-	OperationGeneration      OperationGeneration           `json:"operation_generation"`
-	AdmissionGrantID         string                        `json:"admission_grant_id"`
-	AdmissionWorkItemID      string                        `json:"admission_work_item_id"`
-	AdmissionGrantGeneration AdmissionGrantGeneration      `json:"admission_grant_generation"`
-	ExecutionNodeID          string                        `json:"execution_node_id"`
-	NodeCapacityGeneration   uint64                        `json:"node_capacity_generation"`
-	ResourceClassID          string                        `json:"resource_class_id"`
-	ExecutionPolicyID        string                        `json:"execution_policy_id"`
-	SchedulerEpoch           uint64                        `json:"scheduler_epoch"`
-	PolicyVersion            uint64                        `json:"policy_version"`
-	LeaseAcquireStatus       LeaseAcquireStatus            `json:"lease_acquire_status"`
-	LeaseAcquireOperationID  string                        `json:"lease_acquire_operation_id"`
-	LeaseAcquireDigest       Digest                        `json:"lease_acquire_digest"`
-	SandboxLeaseID           string                        `json:"sandbox_lease_id"`
-	LeaseGeneration          LeaseGeneration               `json:"lease_generation"`
-	LeaseFence               LeaseFence                    `json:"lease_fence"`
-	LeaseDisposition         LeaseDisposition              `json:"lease_disposition"`
-	LeaseExpiresAt           time.Time                     `json:"lease_expires_at"`
-	SandboxID                string                        `json:"sandbox_id"`
-	SandboxGeneration        SandboxGeneration             `json:"sandbox_generation"`
-	SandboxFence             SandboxFence                  `json:"sandbox_fence"`
-	WorkerAuthorityID        string                        `json:"worker_authority_id"`
-	WorkerGeneration         WorkerGeneration              `json:"worker_generation"`
-	NodeAuthorityID          string                        `json:"node_authority_id"`
-	AuthorizationGeneration  AuthorizationGeneration       `json:"authorization_generation"`
-	AuthorizationExpiresAt   time.Time                     `json:"authorization_expires_at"`
-	Node                     postgresRuntimeNodeState      `json:"node"`
-	Cleanup                  postgresLeaseCleanupState     `json:"cleanup"`
-	CatalogSafetyEpoch       CatalogSafetyEpoch            `json:"catalog_safety_epoch"`
-	Deadline                 time.Time                     `json:"deadline"`
-	LeaseAcquireBy           time.Time                     `json:"lease_acquire_by"`
-	CancellationStatus       CancellationStatus            `json:"cancellation_status"`
-	CancellationOperationID  string                        `json:"cancellation_operation_id"`
-	CancellationReason       CancellationReason            `json:"cancellation_reason"`
-	CancellationAcceptedAt   time.Time                     `json:"cancellation_accepted_at"`
-	EvidenceSchemaVersion    SchemaVersion                 `json:"evidence_schema_version"`
-	EvidenceRootID           string                        `json:"evidence_root_id"`
-	EvidenceDigest           Digest                        `json:"evidence_digest"`
-	LogicalCapacity          LogicalCapacityDisposition    `json:"logical_capacity"`
-	NoLeaseCapacity          NoLeaseCapacityDisposition    `json:"no_lease_capacity"`
-	PhysicalCapacity         PhysicalCapacityDisposition   `json:"physical_capacity"`
-	CapacityEvidence         postgresCapacityEvidenceState `json:"capacity_evidence"`
-	PreLeaseTerminalReason   PreLeaseTerminalReason        `json:"pre_lease_terminal_reason"`
-	Reconciliation           ReconciliationStatus          `json:"reconciliation"`
+	OperationStatus          OperationBindingStatus          `json:"operation_status"`
+	OperationID              string                          `json:"operation_id"`
+	OperationDigest          Digest                          `json:"operation_digest"`
+	OperationGeneration      OperationGeneration             `json:"operation_generation"`
+	AdmissionGrantID         string                          `json:"admission_grant_id"`
+	AdmissionWorkItemID      string                          `json:"admission_work_item_id"`
+	AdmissionGrantGeneration AdmissionGrantGeneration        `json:"admission_grant_generation"`
+	ExecutionNodeID          string                          `json:"execution_node_id"`
+	NodeCapacityGeneration   uint64                          `json:"node_capacity_generation"`
+	ResourceClassID          string                          `json:"resource_class_id"`
+	ExecutionPolicyID        string                          `json:"execution_policy_id"`
+	SchedulerEpoch           uint64                          `json:"scheduler_epoch"`
+	PolicyVersion            uint64                          `json:"policy_version"`
+	LeaseAcquireStatus       LeaseAcquireStatus              `json:"lease_acquire_status"`
+	LeaseAcquireOperationID  string                          `json:"lease_acquire_operation_id"`
+	LeaseAcquireDigest       Digest                          `json:"lease_acquire_digest"`
+	SandboxLeaseID           string                          `json:"sandbox_lease_id"`
+	LeaseGeneration          LeaseGeneration                 `json:"lease_generation"`
+	LeaseFence               LeaseFence                      `json:"lease_fence"`
+	LeaseDisposition         LeaseDisposition                `json:"lease_disposition"`
+	LeaseExpiresAt           time.Time                       `json:"lease_expires_at"`
+	SandboxID                string                          `json:"sandbox_id"`
+	SandboxGeneration        SandboxGeneration               `json:"sandbox_generation"`
+	SandboxFence             SandboxFence                    `json:"sandbox_fence"`
+	WorkerAuthorityID        string                          `json:"worker_authority_id"`
+	WorkerGeneration         WorkerGeneration                `json:"worker_generation"`
+	NodeAuthorityID          string                          `json:"node_authority_id"`
+	AuthorizationGeneration  AuthorizationGeneration         `json:"authorization_generation"`
+	AuthorizationExpiresAt   time.Time                       `json:"authorization_expires_at"`
+	Node                     postgresRuntimeNodeState        `json:"node"`
+	Cleanup                  postgresLeaseCleanupState       `json:"cleanup"`
+	CatalogSafetyEpoch       CatalogSafetyEpoch              `json:"catalog_safety_epoch"`
+	Deadline                 time.Time                       `json:"deadline"`
+	LeaseAcquireBy           time.Time                       `json:"lease_acquire_by"`
+	CancellationStatus       CancellationStatus              `json:"cancellation_status"`
+	CancellationOperationID  string                          `json:"cancellation_operation_id"`
+	CancellationReason       CancellationReason              `json:"cancellation_reason"`
+	CancellationAcceptedAt   time.Time                       `json:"cancellation_accepted_at"`
+	EvidenceSchemaVersion    SchemaVersion                   `json:"evidence_schema_version"`
+	EvidenceRootID           string                          `json:"evidence_root_id"`
+	EvidenceDigest           Digest                          `json:"evidence_digest"`
+	LogicalCapacity          LogicalCapacityDisposition      `json:"logical_capacity"`
+	NoLeaseCapacity          NoLeaseCapacityDisposition      `json:"no_lease_capacity"`
+	PhysicalCapacity         PhysicalCapacityDisposition     `json:"physical_capacity"`
+	CapacityEvidence         postgresCapacityEvidenceState   `json:"capacity_evidence"`
+	PreLeaseTerminalReason   PreLeaseTerminalReason          `json:"pre_lease_terminal_reason"`
+	Reconciliation           ReconciliationStatus            `json:"reconciliation"`
+	Readiness                postgresReadinessState          `json:"readiness"`
+	RuntimeViewBinding       postgresRuntimeViewBindingState `json:"runtime_view_binding"`
+}
+
+type postgresPrerequisiteFactState struct {
+	State          PrerequisiteState   `json:"state"`
+	OperationID    string              `json:"operation_id"`
+	RequestDigest  Digest              `json:"request_digest"`
+	EvidenceID     string              `json:"evidence_id"`
+	EvidenceDigest Digest              `json:"evidence_digest"`
+	Failure        PrerequisiteFailure `json:"failure"`
+}
+
+type postgresReadinessState struct {
+	Lease           postgresPrerequisiteFactState `json:"lease"`
+	RuntimeBinding  postgresPrerequisiteFactState `json:"runtime_binding"`
+	RuntimeView     postgresPrerequisiteFactState `json:"runtime_view"`
+	ImmutableInputs postgresPrerequisiteFactState `json:"immutable_inputs"`
+	LLMGateway      postgresPrerequisiteFactState `json:"llm_gateway"`
+	CapsuleReady    bool                          `json:"capsule_ready"`
+}
+
+type postgresRuntimeViewBindingState struct {
+	RuntimeViewID               string                           `json:"runtime_view_id"`
+	OpenOperationID             string                           `json:"open_operation_id"`
+	OpenRequestDigest           Digest                           `json:"open_request_digest"`
+	SandboxLeaseAuthorityDigest Digest                           `json:"sandbox_lease_authority_digest"`
+	SandboxLeaseID              string                           `json:"sandbox_lease_id"`
+	LeaseGeneration             LeaseGeneration                  `json:"lease_generation"`
+	LeaseFence                  LeaseFence                       `json:"lease_fence"`
+	Effect                      EffectClass                      `json:"effect"`
+	ExpiresAt                   time.Time                        `json:"expires_at"`
+	LifecycleGeneration         TaskWorkspaceLifecycleGeneration `json:"lifecycle_generation"`
+	LifecycleFence              TaskWorkspaceLifecycleFence      `json:"lifecycle_fence"`
 }
 
 type postgresRuntimeNodeState struct {
@@ -234,6 +268,8 @@ func encodePostgresRuntimeFixture(fixture RuntimeFixture) ([]byte, error) {
 		PhysicalCapacity: fixture.Capacity.Physical, CapacityEvidence: postgresCapacityEvidenceFromSnapshot(fixture.CapacityEvidence),
 		PreLeaseTerminalReason: fixture.PreLeaseTerminalReason,
 		Reconciliation:         fixture.Reconciliation,
+		Readiness:              postgresReadinessFromSnapshot(fixture.Readiness),
+		RuntimeViewBinding:     postgresRuntimeViewBindingFromSnapshot(fixture.RuntimeViewBinding),
 	}
 	return json.Marshal(state)
 }
@@ -446,6 +482,8 @@ func scanPostgresRuntimeRecord(row rowScanner, runtimeRunID RuntimeRunID) (*runt
 		catalogSafetyEpoch:     persisted.CatalogSafetyEpoch,
 		preLeaseTerminalReason: persisted.PreLeaseTerminalReason,
 		reconciliation:         persisted.Reconciliation,
+		readiness:              readinessSnapshotFromPostgres(persisted.Readiness),
+		runtimeViewBinding:     runtimeViewBindingSnapshotFromPostgres(persisted.RuntimeViewBinding),
 	}
 	record.acceptedStart.OperationID = record.operation.OperationID
 	record.acceptedStartDigest = record.operation.Digest
@@ -454,6 +492,71 @@ func scanPostgresRuntimeRecord(row rowScanner, runtimeRunID RuntimeRunID) (*runt
 		return nil, newPersistenceError(PersistenceStateCorrupt)
 	}
 	return record, nil
+}
+
+func postgresPrerequisiteFactFromSnapshot(fact PrerequisiteFact) postgresPrerequisiteFactState {
+	return postgresPrerequisiteFactState{
+		State: fact.State, OperationID: fact.OperationID.String(), RequestDigest: fact.RequestDigest,
+		EvidenceID: fact.EvidenceID.String(), EvidenceDigest: fact.EvidenceDigest, Failure: fact.Failure,
+	}
+}
+
+func prerequisiteFactSnapshotFromPostgres(fact postgresPrerequisiteFactState) PrerequisiteFact {
+	return PrerequisiteFact{
+		State: fact.State, OperationID: OperationID{value: fact.OperationID}, RequestDigest: fact.RequestDigest,
+		EvidenceID: EvidenceID{value: fact.EvidenceID}, EvidenceDigest: fact.EvidenceDigest, Failure: fact.Failure,
+	}
+}
+
+func postgresReadinessFromSnapshot(readiness RuntimeReadinessSnapshot) postgresReadinessState {
+	return postgresReadinessState{
+		Lease:           postgresPrerequisiteFactFromSnapshot(readiness.Lease),
+		RuntimeBinding:  postgresPrerequisiteFactFromSnapshot(readiness.RuntimeBinding),
+		RuntimeView:     postgresPrerequisiteFactFromSnapshot(readiness.RuntimeView),
+		ImmutableInputs: postgresPrerequisiteFactFromSnapshot(readiness.ImmutableInputs),
+		LLMGateway:      postgresPrerequisiteFactFromSnapshot(readiness.LLMGateway), CapsuleReady: readiness.CapsuleReady,
+	}
+}
+
+func readinessSnapshotFromPostgres(readiness postgresReadinessState) RuntimeReadinessSnapshot {
+	return RuntimeReadinessSnapshot{
+		Lease:           prerequisiteFactSnapshotFromPostgres(readiness.Lease),
+		RuntimeBinding:  prerequisiteFactSnapshotFromPostgres(readiness.RuntimeBinding),
+		RuntimeView:     prerequisiteFactSnapshotFromPostgres(readiness.RuntimeView),
+		ImmutableInputs: prerequisiteFactSnapshotFromPostgres(readiness.ImmutableInputs),
+		LLMGateway:      prerequisiteFactSnapshotFromPostgres(readiness.LLMGateway), CapsuleReady: readiness.CapsuleReady,
+	}
+}
+
+func postgresRuntimeViewBindingFromSnapshot(binding RuntimeViewBindingSnapshot) postgresRuntimeViewBindingState {
+	if binding == (RuntimeViewBindingSnapshot{}) {
+		return postgresRuntimeViewBindingState{}
+	}
+	return postgresRuntimeViewBindingState{
+		RuntimeViewID: binding.RuntimeViewID.String(), OpenOperationID: binding.OpenOperationID.String(),
+		OpenRequestDigest:           binding.OpenRequestDigest,
+		SandboxLeaseAuthorityDigest: binding.SandboxLeaseAuthorityDigest,
+		SandboxLeaseID:              binding.SandboxLeaseID.String(), LeaseGeneration: binding.LeaseGeneration,
+		LeaseFence: binding.LeaseFence, Effect: binding.Effect, ExpiresAt: binding.ExpiresAt.UTC(),
+		LifecycleGeneration: binding.LifecycleGeneration, LifecycleFence: binding.LifecycleFence,
+	}
+}
+
+func runtimeViewBindingSnapshotFromPostgres(binding postgresRuntimeViewBindingState) RuntimeViewBindingSnapshot {
+	if binding.RuntimeViewID == "" && binding.OpenOperationID == "" && binding.OpenRequestDigest == (Digest{}) &&
+		binding.SandboxLeaseAuthorityDigest == (Digest{}) && binding.SandboxLeaseID == "" &&
+		binding.LeaseGeneration == 0 && binding.LeaseFence == 0 && binding.Effect == 0 &&
+		binding.LifecycleGeneration == 0 && binding.LifecycleFence == 0 {
+		return RuntimeViewBindingSnapshot{}
+	}
+	return RuntimeViewBindingSnapshot{
+		RuntimeViewID:   RuntimeViewID{value: binding.RuntimeViewID},
+		OpenOperationID: OperationID{value: binding.OpenOperationID}, OpenRequestDigest: binding.OpenRequestDigest,
+		SandboxLeaseAuthorityDigest: binding.SandboxLeaseAuthorityDigest,
+		SandboxLeaseID:              SandboxLeaseID{value: binding.SandboxLeaseID}, LeaseGeneration: binding.LeaseGeneration,
+		LeaseFence: binding.LeaseFence, Effect: binding.Effect, ExpiresAt: binding.ExpiresAt.UTC(),
+		LifecycleGeneration: binding.LifecycleGeneration, LifecycleFence: binding.LifecycleFence,
+	}
 }
 
 func ensureJSONEOF(decoder *json.Decoder) error {

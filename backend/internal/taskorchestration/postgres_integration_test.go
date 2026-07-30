@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -691,6 +692,313 @@ func TestPostgresRuntimeWorkItemBindsCompleteCanonicalC03RequestInTaskTransactio
 	if !bytes.Equal(persisted, captured.CanonicalPayload) {
 		t.Fatal("Task outbox and Scheduler participant observed different C03 payloads")
 	}
+}
+
+func TestPostgresGenerationRuntimeWorkItemCarriesExactPinnedCatalogPackages(t *testing.T) {
+	now := time.Date(2026, time.July, 29, 9, 15, 0, 0, time.UTC)
+	db, schema := isolatedPostgresSchema(t)
+	var captured taskorchestration.SchedulerEnqueueFact
+	adapter := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
+		Now: func() time.Time { return now },
+		SchedulerParticipant: taskorchestration.SchedulerTransactionalParticipantFunc(func(
+			ctx context.Context,
+			transaction taskorchestration.SchedulerTransaction,
+			fact taskorchestration.SchedulerEnqueueFact,
+		) error {
+			captured = fact
+			return transaction.Enqueue(ctx)
+		}),
+	})
+	owner := taskorchestration.NewUserAuthority(
+		authorityID(t, "postgres-catalog-binding-owner"), taskorchestration.AuthorizationGeneration(1),
+	)
+	worker := taskorchestration.NewWorkerAuthority(
+		authorityID(t, "postgres-catalog-binding-worker"), taskorchestration.AuthorizationGeneration(1),
+	)
+	task := taskID(t, "postgres-catalog-binding-task")
+	pinned := generationPinnedPipeline(t, []taskorchestration.PhaseDefinition{{
+		Key: phaseKey(t, "postgres-catalog-binding-phase"), Kind: taskorchestration.PhaseNonMutating,
+		ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+		RequiredRuntimeRuns: 1,
+	}})
+	executionRecord := taskorchestration.PublishedExecutionContract{
+		SchemaVersion: taskorchestration.EvidenceSchemaV1,
+		Producer: taskorchestration.EvidenceProducer{
+			AuthorityID: authorityID(t, "postgres-catalog-release-authority"), Generation: 1,
+		},
+		ExecutionLock: pinned.ExecutionLock, SafetyEpoch: 1,
+	}
+	executionRecord.ContractDigest = taskorchestration.ExecutionLockContractDigest(executionRecord.ExecutionLock)
+	execution, err := taskorchestration.NewReleaseManagementAdapter(
+		&releaseManagementPortDouble{record: executionRecord},
+	).Resolve(context.Background(), taskorchestration.PinnedExecutionLockRequest{
+		TaskID: task, ExecutionLock: pinned.ExecutionLock,
+		ContractDigest: executionRecord.ContractDigest, SafetyEpoch: executionRecord.SafetyEpoch,
+		Purpose: taskorchestration.PinnedLockStart,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	templateRecord := validPublishedTemplateLockContract(
+		t, pinned.TemplateLockID, pinned.ExecutionLock.ID, "postgres-catalog-binding", 17, 1,
+	)
+	templateRecord.BundleClosure = []taskorchestration.ResourceBundleContract{
+		{
+			ResourceBundleID: downstreamResourceBundleID(t, "postgres-catalog-bundle-z"),
+			ManifestDigest: downstreamEvidenceRef(
+				t, "postgres-catalog-bundle-z-manifest", taskorchestration.EvidencePublication,
+			).Digest,
+			PackageDigest: downstreamEvidenceRef(
+				t, "postgres-catalog-bundle-z-package", taskorchestration.EvidencePublication,
+			).Digest,
+		},
+		{
+			ResourceBundleID: downstreamResourceBundleID(t, "postgres-catalog-bundle-a"),
+			ManifestDigest: downstreamEvidenceRef(
+				t, "postgres-catalog-bundle-a-manifest", taskorchestration.EvidencePublication,
+			).Digest,
+			PackageDigest: downstreamEvidenceRef(
+				t, "postgres-catalog-bundle-a-package", taskorchestration.EvidencePublication,
+			).Digest,
+		},
+	}
+	templateRecord.LockDigest = taskorchestration.TemplateLockContractDigest(templateRecord)
+	template, err := taskorchestration.NewCatalogPublicationAdapter(
+		&catalogPublicationPortDouble{record: templateRecord},
+	).Resolve(context.Background(), taskorchestration.PinnedTemplateLockRequest{
+		TaskID: task, TemplateLockID: templateRecord.TemplateLockID,
+		LockDigest: templateRecord.LockDigest, ObservedGeneration: templateRecord.ObservedGeneration,
+		SafetyEpoch: templateRecord.SafetyEpoch, Purpose: taskorchestration.PinnedLockStart,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := taskorchestration.NewTaskStartAdmission(
+		task, pinned.Route, pinned.TaskWorkspaceID, pinned.Authorities, execution, &template,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The admission owns an immutable clone. A caller retaining the resolved
+	// Catalog value cannot repin or rewrite a later Runtime enactment.
+	template.TemplatePackageDigest = downstreamEvidenceRef(
+		t, "postgres-catalog-caller-mutated-template-package", taskorchestration.EvidencePublication,
+	).Digest
+	template.BundleClosure[0].PackageDigest = downstreamEvidenceRef(
+		t, "postgres-catalog-caller-mutated-bundle-package", taskorchestration.EvidencePublication,
+	).Digest
+	startHeader := intentHeader(t, "postgres-catalog-binding-start", task.String(), now)
+	started, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+		startHeader, owner, admission,
+	))
+	if err != nil {
+		t.Fatalf("start Generation Task: %v", err)
+	}
+	restarted := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
+		Now: func() time.Time { return now },
+		SchedulerParticipant: taskorchestration.SchedulerTransactionalParticipantFunc(func(
+			ctx context.Context,
+			transaction taskorchestration.SchedulerTransaction,
+			fact taskorchestration.SchedulerEnqueueFact,
+		) error {
+			captured = fact
+			return transaction.Enqueue(ctx)
+		}),
+	})
+	workHeader := intentHeader(t, "postgres-catalog-binding-work", task.String(), now.Add(time.Second))
+	workHeader.ExpectedTaskRevision = started.AcceptedTaskRevision
+	if _, err := restarted.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+		workHeader, worker, operationID(t, "postgres-catalog-binding-availability"),
+	)); err != nil {
+		t.Fatalf("make Generation Runtime work available: %v", err)
+	}
+	runtimeStart, err := runtimeexecution.ParseCanonicalStartPayload(
+		captured.CanonicalPayload, runtimeexecution.Digest(captured.PayloadDigest),
+	)
+	if err != nil {
+		t.Fatalf("parse Generation Runtime request: %v", err)
+	}
+	wantClosureRoot := expectedRuntimeCatalogClosureRoot(templateRecord)
+	if runtimeStart.CatalogBinding == nil ||
+		runtimeStart.CatalogBinding.TemplateLockID.String() != templateRecord.TemplateLockID.String() ||
+		runtimeStart.CatalogBinding.TemplateLockDigest != runtimeexecution.Digest(templateRecord.LockDigest) ||
+		runtimeStart.CatalogBinding.ClosureRootDigest != wantClosureRoot ||
+		runtimeStart.CatalogBinding.SafetyEpoch != runtimeexecution.CatalogSafetyEpoch(templateRecord.SafetyEpoch) {
+		t.Fatalf("Generation Runtime lacks exact catalog binding: got=%+v want lock=%s digest=%s closure=%s epoch=%d",
+			runtimeStart.CatalogBinding, templateRecord.TemplateLockID, templateRecord.LockDigest,
+			wantClosureRoot, templateRecord.SafetyEpoch)
+	}
+	wantInputs := expectedRuntimeCatalogInputs(templateRecord)
+	if !reflect.DeepEqual(runtimeStart.ImmutableInputs, wantInputs) ||
+		runtimeStart.ImmutableInputManifest.InputCount != uint64(len(wantInputs)) ||
+		runtimeStart.ImmutableInputManifest.TotalSizeBytes != 0 ||
+		runtimeStart.ImmutableInputManifest.Digest != expectedRuntimeInputManifestDigest(wantInputs) ||
+		runtimeStart.ImmutableInputManifest.MaterializationEvidenceID.String() !=
+			"template-lock-"+templateRecord.TemplateLockID.String() ||
+		runtimeStart.ImmutableInputManifest.MaterializationEvidenceDigest !=
+			runtimeexecution.Digest(templateRecord.LockDigest) {
+		t.Fatalf("Generation immutable catalog inputs drifted: manifest=%+v inputs=%+v want=%+v",
+			runtimeStart.ImmutableInputManifest, runtimeStart.ImmutableInputs, wantInputs)
+	}
+}
+
+func TestPostgresNonGenerationRuntimeWorkItemsDoNotFabricateCatalogPackages(t *testing.T) {
+	for _, route := range []taskorchestration.Route{
+		taskorchestration.RouteBeautify,
+		taskorchestration.RouteTemplateFill,
+	} {
+		t.Run(route.String(), func(t *testing.T) {
+			now := time.Date(2026, time.July, 29, 9, 20, 0, 0, time.UTC)
+			db, schema := isolatedPostgresSchema(t)
+			var captured taskorchestration.SchedulerEnqueueFact
+			adapter := newPostgresAdapter(t, db, schema, taskorchestration.PostgresConfig{
+				Now: func() time.Time { return now },
+				SchedulerParticipant: taskorchestration.SchedulerTransactionalParticipantFunc(func(
+					ctx context.Context,
+					transaction taskorchestration.SchedulerTransaction,
+					fact taskorchestration.SchedulerEnqueueFact,
+				) error {
+					captured = fact
+					return transaction.Enqueue(ctx)
+				}),
+			})
+			prefix := "postgres-no-catalog-" + route.String()
+			task := taskID(t, prefix+"-task")
+			owner := taskorchestration.NewUserAuthority(
+				authorityID(t, prefix+"-owner"), taskorchestration.AuthorizationGeneration(1),
+			)
+			worker := taskorchestration.NewWorkerAuthority(
+				authorityID(t, prefix+"-worker"), taskorchestration.AuthorizationGeneration(1),
+			)
+			pinned := routePinnedPipeline(t, route, []taskorchestration.PhaseDefinition{{
+				Key: phaseKey(t, prefix+"-phase"), Kind: taskorchestration.PhaseNonMutating,
+				ValidationContract:  taskorchestration.PhaseValidationAllRuntimeRunsSucceeded,
+				RequiredRuntimeRuns: 1,
+			}})
+			executionRecord := taskorchestration.PublishedExecutionContract{
+				SchemaVersion: taskorchestration.EvidenceSchemaV1,
+				Producer: taskorchestration.EvidenceProducer{
+					AuthorityID: authorityID(t, prefix+"-release-authority"), Generation: 1,
+				},
+				ExecutionLock: pinned.ExecutionLock, SafetyEpoch: 1,
+			}
+			executionRecord.ContractDigest = taskorchestration.ExecutionLockContractDigest(executionRecord.ExecutionLock)
+			execution, err := taskorchestration.NewReleaseManagementAdapter(
+				&releaseManagementPortDouble{record: executionRecord},
+			).Resolve(context.Background(), taskorchestration.PinnedExecutionLockRequest{
+				TaskID: task, ExecutionLock: pinned.ExecutionLock,
+				ContractDigest: executionRecord.ContractDigest, SafetyEpoch: executionRecord.SafetyEpoch,
+				Purpose: taskorchestration.PinnedLockStart,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			admission, err := taskorchestration.NewTaskStartAdmission(
+				task, route, pinned.TaskWorkspaceID, pinned.Authorities, execution, nil,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			started, err := adapter.Decide(context.Background(), taskorchestration.NewStartPinnedTaskIntent(
+				intentHeader(t, prefix+"-start", task.String(), now), owner, admission,
+			))
+			if err != nil {
+				t.Fatalf("start %s Task: %v", route, err)
+			}
+			workHeader := intentHeader(t, prefix+"-work", task.String(), now.Add(time.Second))
+			workHeader.ExpectedTaskRevision = started.AcceptedTaskRevision
+			if _, err := adapter.Decide(context.Background(), taskorchestration.NewMakeWorkAvailableIntent(
+				workHeader, worker, operationID(t, prefix+"-availability"),
+			)); err != nil {
+				t.Fatalf("make %s Runtime work available: %v", route, err)
+			}
+			runtimeStart, err := runtimeexecution.ParseCanonicalStartPayload(
+				captured.CanonicalPayload, runtimeexecution.Digest(captured.PayloadDigest),
+			)
+			if err != nil {
+				t.Fatalf("parse %s Runtime request: %v", route, err)
+			}
+			if runtimeStart.CatalogBinding != nil || len(runtimeStart.ImmutableInputs) != 0 ||
+				runtimeStart.ImmutableInputManifest.InputCount != 0 ||
+				runtimeStart.ImmutableInputManifest.TotalSizeBytes != 0 ||
+				runtimeStart.ImmutableInputManifest.MaterializationEvidenceID.String() != "" ||
+				runtimeStart.ImmutableInputManifest.MaterializationEvidenceDigest != (runtimeexecution.Digest{}) {
+				t.Fatalf("%s Runtime fabricated Catalog packages: catalog=%+v manifest=%+v inputs=%+v",
+					route, runtimeStart.CatalogBinding, runtimeStart.ImmutableInputManifest, runtimeStart.ImmutableInputs)
+			}
+		})
+	}
+}
+
+func expectedRuntimeCatalogClosureRoot(
+	record taskorchestration.PublishedTemplateLockContract,
+) runtimeexecution.Digest {
+	bundles := append([]taskorchestration.ResourceBundleContract(nil), record.BundleClosure...)
+	sort.Slice(bundles, func(i, j int) bool {
+		return bundles[i].ResourceBundleID.String() < bundles[j].ResourceBundleID.String()
+	})
+	canonicalBundles := make([]map[string]string, len(bundles))
+	for index, bundle := range bundles {
+		canonicalBundles[index] = map[string]string{
+			"resource_bundle_id": bundle.ResourceBundleID.String(), "manifest_digest": bundle.ManifestDigest.String(),
+			"package_digest": bundle.PackageDigest.String(),
+		}
+	}
+	encoded, _ := json.Marshal(map[string]any{
+		"template_version_id":      record.TemplateVersionID.String(),
+		"template_manifest_digest": record.TemplateManifestDigest.String(),
+		"template_package_digest":  record.TemplatePackageDigest.String(),
+		"resource_bundles":         canonicalBundles,
+	})
+	return runtimeexecution.Digest(sha256.Sum256(encoded))
+}
+
+func expectedRuntimeCatalogInputs(
+	record taskorchestration.PublishedTemplateLockContract,
+) []runtimeexecution.ImmutableInputBinding {
+	bundles := append([]taskorchestration.ResourceBundleContract(nil), record.BundleClosure...)
+	sort.Slice(bundles, func(i, j int) bool {
+		return bundles[i].ResourceBundleID.String() < bundles[j].ResourceBundleID.String()
+	})
+	type inputSpec struct {
+		identity string
+		digest   taskorchestration.EvidenceDigest
+	}
+	specs := []inputSpec{
+		{identity: "template-version/" + record.TemplateVersionID.String() + "/manifest", digest: record.TemplateManifestDigest},
+		{identity: "template-version/" + record.TemplateVersionID.String() + "/package", digest: record.TemplatePackageDigest},
+	}
+	for _, bundle := range bundles {
+		specs = append(specs,
+			inputSpec{identity: "resource-bundle/" + bundle.ResourceBundleID.String() + "/manifest", digest: bundle.ManifestDigest},
+			inputSpec{identity: "resource-bundle/" + bundle.ResourceBundleID.String() + "/package", digest: bundle.PackageDigest},
+		)
+	}
+	inputs := make([]runtimeexecution.ImmutableInputBinding, len(specs))
+	for index, spec := range specs {
+		identity, err := runtimeexecution.NewImmutableInputIdentity(spec.identity)
+		if err != nil {
+			panic(err)
+		}
+		inputs[index] = runtimeexecution.ImmutableInputBinding{
+			Identity: identity, Digest: runtimeexecution.Digest(spec.digest),
+		}
+	}
+	sort.Slice(inputs, func(i, j int) bool {
+		return inputs[i].Identity.String() < inputs[j].Identity.String()
+	})
+	return inputs
+}
+
+func expectedRuntimeInputManifestDigest(inputs []runtimeexecution.ImmutableInputBinding) runtimeexecution.Digest {
+	canonical := make([]map[string]any, len(inputs))
+	for index, input := range inputs {
+		canonical[index] = map[string]any{
+			"identity": input.Identity.String(), "digest": input.Digest.String(), "size_bytes": input.SizeBytes,
+		}
+	}
+	encoded, _ := json.Marshal(canonical)
+	return runtimeexecution.Digest(sha256.Sum256(encoded))
 }
 
 func TestPostgresSchedulerClaimAndAdmitIsTheUniqueGenerationAuthority(t *testing.T) {

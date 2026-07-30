@@ -213,7 +213,7 @@ func validPostgresMaintenanceDecision(decision RuntimeMaintenanceDecision) bool 
 	}
 	if !knownLeaseLifecycleSnapshot(decision.Lease) || decision.Lease.Disposition == LeaseDispositionNone ||
 		!knownNodeSnapshot(decision.Node) || decision.Node == (RuntimeNodeSnapshot{}) ||
-		!knownLeaseCleanupSnapshot(decision.Cleanup) ||
+		!knownLeaseCleanupSnapshot(decision.Cleanup, true) ||
 		!knownPhysicalReleaseEvidence(decision.PhysicalCapacityReleaseReady) {
 		return false
 	}
@@ -321,7 +321,16 @@ func (authority *PostgresAuthority) Maintain(
 		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
 			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 		}
-		return authority.fencePostgresSandboxLease(ctx, typed, canonical)
+		decision, err := authority.fencePostgresSandboxLease(ctx, typed, canonical)
+		if err != nil {
+			return RuntimeMaintenanceDecision{}, err
+		}
+		if err := authority.advancePostgresRuntimeViewFence(
+			ctx, typed.RuntimeRunID, runtimeViewFenceReason(typed.Reason),
+		); err != nil {
+			return RuntimeMaintenanceDecision{}, err
+		}
+		return decision, nil
 	case ConfirmSandboxReset:
 		canonical, valid := canonicalConfirmSandboxReset(typed)
 		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
@@ -683,8 +692,16 @@ func (authority *PostgresAuthority) confirmPostgresSandboxReset(
 	if err != nil {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
+	runtimeViewTerminalRetained, err := authority.postgresRuntimeViewTerminalRetained(
+		ctx, tx, command.RuntimeRunID,
+	)
+	if err != nil {
+		return RuntimeMaintenanceDecision{}, err
+	}
 	now := postgresTimestamp(authority.now())
-	if !validSandboxResetTransition(record, &node.ExecutionNodeFixture, command, now) {
+	if !validSandboxResetTransition(
+		record, &node.ExecutionNodeFixture, command, now, runtimeViewTerminalRetained,
+	) {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
 	previousRevision, previousFence, previousState := record.fixture.RuntimeRevision,

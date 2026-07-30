@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/slidesmith/slidesmith/backend/internal/taskworkspace"
 )
 
 type PersistenceErrorCode uint8
@@ -77,6 +78,9 @@ type PostgresConfig struct {
 	SchedulerCancellationParticipant    SchedulerCancellationParticipant
 	SchedulerCancellationFunction       string
 	LeaseAcquisition                    LeaseAcquisitionAdapter
+	RuntimeBindingValidator             RuntimeBindingValidator
+	ImmutableInputValidator             ImmutableInputValidator
+	RuntimeViewPrerequisite             RuntimeViewPrerequisitePort
 	QuotaReservationParticipant         QuotaReservationParticipant
 	QuotaReservationFunction            string
 	MaintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
@@ -98,6 +102,9 @@ type PostgresAuthority struct {
 	schedulerCancellationParticipant    SchedulerCancellationParticipant
 	schedulerCancellationFunction       string
 	leaseAcquisition                    LeaseAcquisitionAdapter
+	runtimeBindingValidator             RuntimeBindingValidator
+	immutableInputValidator             ImmutableInputValidator
+	runtimeViewPrerequisite             RuntimeViewPrerequisitePort
 	quotaReservationParticipant         QuotaReservationParticipant
 	quotaReservationFunction            string
 	maintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
@@ -151,6 +158,9 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 		schedulerCancellationParticipant:    config.SchedulerCancellationParticipant,
 		schedulerCancellationFunction:       config.SchedulerCancellationFunction,
 		leaseAcquisition:                    config.LeaseAcquisition,
+		runtimeBindingValidator:             config.RuntimeBindingValidator,
+		immutableInputValidator:             config.ImmutableInputValidator,
+		runtimeViewPrerequisite:             config.RuntimeViewPrerequisite,
 		quotaReservationParticipant:         config.QuotaReservationParticipant,
 		quotaReservationFunction:            config.QuotaReservationFunction,
 		maintenanceAuthorities:              append([]RuntimeMaintenanceAuthorityBinding(nil), config.MaintenanceAuthorities...),
@@ -238,6 +248,14 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	outbox := authority.table("runtime_execution_outbox")
 	capacityOutbox := authority.table("runtime_execution_capacity_outbox")
 	preLeaseLeases := authority.table("runtime_execution_prelease_leases")
+	prerequisiteOperations := authority.table("runtime_execution_prerequisite_operations")
+	prerequisiteAudit := authority.table("runtime_execution_prerequisite_audit")
+	prerequisiteOutbox := authority.table("runtime_execution_prerequisite_outbox")
+	prerequisiteOutboxDelivery := authority.table("runtime_execution_prerequisite_outbox_delivery")
+	runtimeViewTerminalOperations := authority.table("runtime_execution_runtime_view_terminal_operations")
+	runtimeViewTerminalAudit := authority.table("runtime_execution_runtime_view_terminal_audit")
+	runtimeViewTerminalOutbox := authority.table("runtime_execution_runtime_view_terminal_outbox")
+	runtimeViewTerminalOutboxDelivery := authority.table("runtime_execution_runtime_view_terminal_outbox_delivery")
 	nodes := authority.table("runtime_execution_nodes")
 	maintenance := authority.table("runtime_execution_maintenance_operations")
 	maintenanceAuthorities := authority.table("runtime_execution_maintenance_authorities")
@@ -259,6 +277,8 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	compaction := authority.table("runtime_execution_heartbeat_compaction")
 	immutableFunction := authority.table("runtime_execution_reject_immutable_mutation")
 	cleanupRebindingFunction := authority.table("runtime_execution_reject_cleanup_rebinding")
+	prerequisiteRebindingFunction := authority.table("runtime_execution_reject_prerequisite_operation_rebinding")
+	runtimeViewTerminalRebindingFunction := authority.table("runtime_execution_reject_runtime_view_terminal_operation_rebinding")
 	return []string{
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_decision_sequence")),
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_sandbox_lease_sequence")),
@@ -471,6 +491,86 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			ALTER COLUMN authorization_generation SET NOT NULL,
 			ALTER COLUMN authorization_expires_at SET NOT NULL,
 			ALTER COLUMN catalog_safety_epoch SET NOT NULL`, preLeaseLeases),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			prerequisite_kind smallint NOT NULL,
+			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			canonical_request bytea NOT NULL,
+			fact_state jsonb NOT NULL,
+			view_binding jsonb NOT NULL,
+			created_at timestamptz NOT NULL,
+			updated_at timestamptz NOT NULL,
+			UNIQUE (runtime_run_id, prerequisite_kind)
+		)`, prerequisiteOperations, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			audit_id text PRIMARY KEY,
+			operation_id text NOT NULL REFERENCES %s(operation_id),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			prerequisite_kind smallint NOT NULL,
+			event_kind smallint NOT NULL,
+			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			fact_state jsonb NOT NULL,
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			recorded_at timestamptz NOT NULL,
+			UNIQUE (operation_id, event_kind)
+		)`, prerequisiteAudit, prerequisiteOperations, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			prerequisite_kind smallint NOT NULL,
+			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			payload bytea NOT NULL,
+			payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
+			committed_at timestamptz NOT NULL
+		)`, prerequisiteOutbox, prerequisiteOperations, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			disposition smallint NOT NULL,
+			delivery_count bigint NOT NULL DEFAULT 0 CHECK (delivery_count >= 0),
+			last_attempt_at timestamptz,
+			acknowledged_at timestamptz
+		)`, prerequisiteOutboxDelivery, prerequisiteOutbox),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL UNIQUE REFERENCES %s(runtime_run_id),
+			terminal_kind smallint NOT NULL,
+			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			canonical_request bytea NOT NULL,
+			terminal_state smallint NOT NULL,
+			error_code text NOT NULL DEFAULT '',
+			created_at timestamptz NOT NULL,
+			updated_at timestamptz NOT NULL
+		)`, runtimeViewTerminalOperations, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			audit_id text PRIMARY KEY,
+			operation_id text NOT NULL REFERENCES %s(operation_id),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			terminal_kind smallint NOT NULL,
+			event_kind smallint NOT NULL,
+			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			terminal_state smallint NOT NULL,
+			error_code text NOT NULL DEFAULT '',
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			recorded_at timestamptz NOT NULL,
+			UNIQUE (operation_id, event_kind)
+		)`, runtimeViewTerminalAudit, runtimeViewTerminalOperations, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			terminal_kind smallint NOT NULL,
+			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			payload bytea NOT NULL,
+			payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
+			committed_at timestamptz NOT NULL
+		)`, runtimeViewTerminalOutbox, runtimeViewTerminalOperations, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			disposition smallint NOT NULL,
+			delivery_count bigint NOT NULL DEFAULT 0 CHECK (delivery_count >= 0),
+			last_attempt_at timestamptz,
+			acknowledged_at timestamptz
+		)`, runtimeViewTerminalOutboxDelivery, runtimeViewTerminalOutbox),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			operation_id text PRIMARY KEY,
 			command_kind smallint NOT NULL,
@@ -800,6 +900,36 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			END IF;
 			RETURN NEW;
 		END $$`, cleanupRebindingFunction),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF TG_OP = 'DELETE' THEN
+				RAISE EXCEPTION USING ERRCODE = '23000', MESSAGE = 'immutable prerequisite binding';
+			END IF;
+			IF OLD.operation_id IS DISTINCT FROM NEW.operation_id
+				OR OLD.runtime_run_id IS DISTINCT FROM NEW.runtime_run_id
+				OR OLD.prerequisite_kind IS DISTINCT FROM NEW.prerequisite_kind
+				OR OLD.request_digest IS DISTINCT FROM NEW.request_digest
+				OR OLD.canonical_request IS DISTINCT FROM NEW.canonical_request
+				OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN
+				RAISE EXCEPTION USING ERRCODE = '23000', MESSAGE = 'immutable prerequisite binding';
+			END IF;
+			RETURN NEW;
+		END $$`, prerequisiteRebindingFunction),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF TG_OP = 'DELETE' THEN
+				RAISE EXCEPTION USING ERRCODE = '23000', MESSAGE = 'immutable runtime view terminal binding';
+			END IF;
+			IF OLD.operation_id IS DISTINCT FROM NEW.operation_id
+				OR OLD.runtime_run_id IS DISTINCT FROM NEW.runtime_run_id
+				OR OLD.terminal_kind IS DISTINCT FROM NEW.terminal_kind
+				OR OLD.request_digest IS DISTINCT FROM NEW.request_digest
+				OR OLD.canonical_request IS DISTINCT FROM NEW.canonical_request
+				OR OLD.created_at IS DISTINCT FROM NEW.created_at THEN
+				RAISE EXCEPTION USING ERRCODE = '23000', MESSAGE = 'immutable runtime view terminal binding';
+			END IF;
+			RETURN NEW;
+		END $$`, runtimeViewTerminalRebindingFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", decisions),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", decisions, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", requests),
@@ -834,6 +964,18 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", physicalReleaseEvidence, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_cleanup_rebinding ON %s", cleanup),
 		fmt.Sprintf("CREATE TRIGGER reject_cleanup_rebinding BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanup, cleanupRebindingFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_prerequisite_operation_rebinding ON %s", prerequisiteOperations),
+		fmt.Sprintf("CREATE TRIGGER reject_prerequisite_operation_rebinding BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", prerequisiteOperations, prerequisiteRebindingFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_runtime_view_terminal_operation_rebinding ON %s", runtimeViewTerminalOperations),
+		fmt.Sprintf("CREATE TRIGGER reject_runtime_view_terminal_operation_rebinding BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", runtimeViewTerminalOperations, runtimeViewTerminalRebindingFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", prerequisiteAudit),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", prerequisiteAudit, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", prerequisiteOutbox),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", prerequisiteOutbox, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", runtimeViewTerminalAudit),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", runtimeViewTerminalAudit, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", runtimeViewTerminalOutbox),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", runtimeViewTerminalOutbox, immutableFunction),
 	}
 }
 
@@ -872,10 +1014,46 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 		if executeErr != nil {
 			return RuntimeDecision{}, executeErr
 		}
-		return authority.advancePostgresPreLease(ctx, start, decision)
+		decision, executeErr = authority.advancePostgresRuntimeBindingPrerequisite(ctx, start, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		decision, executeErr = authority.advancePostgresPreLeaseTimeBounds(ctx, start, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		decision, executeErr = authority.advancePostgresRuntimeBindingRejection(ctx, start, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		if (decision.Snapshot.State == RuntimeWaitingForLease || decision.Snapshot.State == RuntimeReconciling) &&
+			(authority.runtimeBindingValidator == nil ||
+				decision.Snapshot.Readiness.RuntimeBinding.State != PrerequisiteAccepted) {
+			projectCapsuleReadinessAt(&decision.Snapshot, postgresTimestamp(authority.now()))
+			return decision, nil
+		}
+		decision, executeErr = authority.advancePostgresPreLease(ctx, start, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		decision, executeErr = authority.advancePostgresPrerequisites(ctx, start, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		projectCapsuleReadinessAt(&decision.Snapshot, postgresTimestamp(authority.now()))
+		return decision, nil
 	}
 	if cancel, ok := command.(CancelRuntimeRun); ok {
-		return authority.executePostgresCancel(ctx, cancel, binding)
+		decision, executeErr := authority.executePostgresCancel(ctx, cancel, binding)
+		if executeErr != nil || decision.Fact.Disposition != DecisionAccepted {
+			return decision, executeErr
+		}
+		if err := authority.advancePostgresRuntimeViewFence(
+			ctx, cancel.RuntimeRunID, taskworkspace.RuntimeViewCancelled,
+		); err != nil {
+			return RuntimeDecision{}, err
+		}
+		return decision, nil
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
@@ -1147,7 +1325,8 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref RuntimeRunR
 		return RuntimeSnapshot{}, newError(ErrorInvalidRequest)
 	}
 	if ref.SchemaVersion.Major() != SchemaV1.Major() ||
-		(ref.ProjectionVersion != SnapshotSchemaCurrent && ref.ProjectionVersion != SnapshotSchemaV1) {
+		(ref.ProjectionVersion != SnapshotSchemaCurrent &&
+			ref.ProjectionVersion != SnapshotSchemaLeaseLifecycle && ref.ProjectionVersion != SnapshotSchemaV1) {
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
@@ -1175,6 +1354,7 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref RuntimeRunR
 	if !representable {
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
 	}
+	projectCapsuleReadinessAt(&projected, postgresTimestamp(authority.now()))
 	if err := tx.Commit(); err != nil {
 		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
 	}

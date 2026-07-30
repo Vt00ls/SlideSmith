@@ -22,6 +22,7 @@ type postgresRuntimeAdmissionSystem struct {
 	scheduling           *scheduler.PostgresAuthority
 	runtime              *runtimeexecution.PostgresAuthority
 	lease                runtimeexecution.LeaseAcquisitionAdapter
+	runtimeBinding       runtimeexecution.RuntimeBindingValidator
 	faults               runtimeexecution.PersistenceFaultInjector
 	nodeAttested         bool
 	fencingAuthority     runtimeexecution.LeaseFencingAuthority
@@ -46,6 +47,27 @@ type controlledLeaseAcquisitionAdapter struct {
 	observation runtimeexecution.LeaseAcquisitionObservation
 	calls       int
 	requests    []runtimeexecution.LeaseAcquisitionRequest
+}
+
+func acceptedRuntimeBindingValidatorForTaskOrchestrationTest(
+	t *testing.T,
+) runtimeexecution.RuntimeBindingValidator {
+	t.Helper()
+	evidenceID, err := runtimeexecution.NewEvidenceID("task-orchestration-runtime-binding-evidence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation := runtimeexecution.PrerequisiteObservation{
+		Disposition:    runtimeexecution.PrerequisiteObservationAccepted,
+		EvidenceID:     evidenceID,
+		EvidenceDigest: runtimeexecution.Digest{31: 77},
+	}
+	return runtimeexecution.RuntimeBindingValidatorFunc(func(
+		context.Context,
+		runtimeexecution.RuntimeBindingValidationRequest,
+	) (runtimeexecution.PrerequisiteObservation, error) {
+		return observation, nil
+	})
 }
 
 type schedulerAcceptanceBarrier struct {
@@ -810,6 +832,7 @@ func TestPostgresPostBindPreLeaseMatrixAndCapacityEvidenceSeparation(t *testing.
 				SchedulerParticipant:        system.scheduling.RuntimeAcceptanceParticipant(),
 				SchedulerAcceptanceFunction: system.scheduling.RuntimeAcceptanceFunction(),
 				LeaseAcquisition:            adapter,
+				RuntimeBindingValidator:     system.runtimeBinding,
 			})
 			if err != nil {
 				t.Fatalf("restart Runtime Execution: %v", err)
@@ -1595,6 +1618,7 @@ func (system *postgresRuntimeAdmissionSystem) restartRuntime(t *testing.T) *runt
 		SchedulerLeaseAttachmentParticipant: system.scheduling.RuntimeLeaseAttachmentParticipant(),
 		SchedulerLeaseAttachmentFunction:    system.scheduling.RuntimeLeaseAttachmentFunction(),
 		LeaseAcquisition:                    system.lease,
+		RuntimeBindingValidator:             system.runtimeBinding,
 	})
 	if err != nil {
 		t.Fatalf("restart Runtime Execution: %v", err)
@@ -1614,6 +1638,7 @@ func (system *postgresRuntimeAdmissionSystem) replaceRuntimeSchedulerParticipant
 		SchedulerLeaseAttachmentParticipant: system.scheduling.RuntimeLeaseAttachmentParticipant(),
 		SchedulerLeaseAttachmentFunction:    system.scheduling.RuntimeLeaseAttachmentFunction(),
 		LeaseAcquisition:                    system.lease,
+		RuntimeBindingValidator:             system.runtimeBinding,
 	})
 	if err != nil {
 		t.Fatalf("replace Runtime Scheduler participant: %v", err)
@@ -1632,6 +1657,7 @@ func (system *postgresRuntimeAdmissionSystem) enableRuntimeCancellationParticipa
 		SchedulerCancellationParticipant:    system.scheduling.RuntimeCancellationParticipant(),
 		SchedulerCancellationFunction:       system.scheduling.RuntimeCancellationFunction(),
 		LeaseAcquisition:                    system.lease,
+		RuntimeBindingValidator:             system.runtimeBinding,
 	})
 	if err != nil {
 		t.Fatalf("enable Runtime cancellation participant: %v", err)
@@ -1967,6 +1993,7 @@ func newPostgresRuntimeAdmissionSystemWithLimits(
 		SchedulerParticipant:     scheduling.TaskEnqueueParticipant(),
 		SchedulerEnqueueFunction: scheduling.TaskEnqueueFunction(),
 	})
+	runtimeBindingValidator := acceptedRuntimeBindingValidatorForTaskOrchestrationTest(t)
 	runtime, err := runtimeexecution.NewPostgresAuthority(db, runtimeexecution.PostgresConfig{
 		Schema: schema, Now: clock.Now, Faults: faults,
 		SchedulerParticipant:                scheduling.RuntimeAcceptanceParticipant(),
@@ -1974,6 +2001,7 @@ func newPostgresRuntimeAdmissionSystemWithLimits(
 		SchedulerLeaseAttachmentParticipant: scheduling.RuntimeLeaseAttachmentParticipant(),
 		SchedulerLeaseAttachmentFunction:    scheduling.RuntimeLeaseAttachmentFunction(),
 		LeaseAcquisition:                    leaseAcquisition,
+		RuntimeBindingValidator:             runtimeBindingValidator,
 		MaintenanceAuthorities: []runtimeexecution.RuntimeMaintenanceAuthorityBinding{
 			runtimeexecution.BindLeaseFencingAuthority(runtimeNodeID, fencingAuthority),
 			runtimeexecution.BindSandboxResetAuthority(runtimeNodeID, resetAuthority),
@@ -1989,7 +2017,7 @@ func newPostgresRuntimeAdmissionSystemWithLimits(
 	system := &postgresRuntimeAdmissionSystem{
 		t: t, db: db, schema: schema, clock: clock,
 		tasks: tasks, scheduling: scheduling, runtime: runtime,
-		lease: leaseAcquisition, faults: faults,
+		lease: leaseAcquisition, runtimeBinding: runtimeBindingValidator, faults: faults,
 		fencingAuthority: fencingAuthority, resetAuthority: resetAuthority,
 		attestationAuthority: attestationAuthority,
 	}
@@ -2030,7 +2058,8 @@ func (system *postgresRuntimeAdmissionSystem) bootstrapConfiguredRuntimeNode(
 		ExecutionPolicyID: executionPolicyID, NodeAuthorityID: nodeAuthorityID,
 		WorkerAuthorityID: workerAuthorityID, WorkerGeneration: 1, AuthorizationGeneration: 1,
 		AuthorizationExpiresAt: now.Add(24 * time.Hour), ReleaseSafetyEpoch: 1,
-		ResetEvidenceID: resetEvidenceID, ResetEvidenceDigest: runtimeexecution.Digest{31: 1}, OccurredAt: now,
+		CatalogSafetyEpoch: 1,
+		ResetEvidenceID:    resetEvidenceID, ResetEvidenceDigest: runtimeexecution.Digest{31: 1}, OccurredAt: now,
 	})
 	if err != nil {
 		t.Fatalf("construct configured node attestation: %v", err)

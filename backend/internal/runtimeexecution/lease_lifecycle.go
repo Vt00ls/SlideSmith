@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/slidesmith/slidesmith/backend/internal/taskworkspace"
 )
 
 // RuntimeMaintenance is the protected operational interface for exact node,
@@ -483,7 +485,16 @@ func (engine *invariantEngine) Maintain(
 		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
 			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 		}
-		return engine.fenceSandboxLease(typed)
+		decision, err := engine.fenceSandboxLease(typed)
+		if err != nil {
+			return RuntimeMaintenanceDecision{}, err
+		}
+		if err := engine.advanceInMemoryRuntimeViewFence(
+			ctx, typed.RuntimeRunID, runtimeViewFenceReason(typed.Reason),
+		); err != nil {
+			return RuntimeMaintenanceDecision{}, err
+		}
+		return decision, nil
 	case ConfirmSandboxReset:
 		canonical, valid := canonicalConfirmSandboxReset(typed)
 		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
@@ -499,6 +510,13 @@ func (engine *invariantEngine) Maintain(
 	default:
 		return RuntimeMaintenanceDecision{}, newError(ErrorInvalidRequest)
 	}
+}
+
+func runtimeViewFenceReason(reason LeaseFenceReason) taskworkspace.RuntimeViewFenceReason {
+	if reason == LeaseFenceExpired {
+		return taskworkspace.RuntimeViewTimedOut
+	}
+	return taskworkspace.RuntimeViewRevoked
 }
 
 func (engine *invariantEngine) replayMaintenanceLocked(
@@ -591,6 +609,7 @@ func applyLeaseRenewalTransition(
 	record.lease.Fence++
 	record.lease.ExpiresAt = command.RequestedExpiresAt
 	record.node = nodeSnapshot(*node)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
 	return RuntimeMaintenanceDecision{
 		OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
 		RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
@@ -659,6 +678,7 @@ func applyLeaseFenceTransition(
 	} else {
 		record.lease.Disposition = LeaseRevoked
 	}
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
 	node.Occupancy = NodeOccupancyUnknown
 	node.Quarantined = true
 	node.Containment = ContainmentPending
@@ -711,7 +731,10 @@ func (engine *invariantEngine) confirmSandboxReset(
 		return RuntimeMaintenanceDecision{}, newError(ErrorAuthorizationDenied)
 	}
 	node := engine.store.nodes[command.ExecutionNodeID]
-	if !validSandboxResetTransition(record, node, command, engine.clock.current()) {
+	if !validSandboxResetTransition(
+		record, node, command, engine.clock.current(),
+		record.runtimeViewTerminal != nil && record.runtimeViewTerminal.Kind == runtimeViewTerminalFence,
+	) {
 		return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 	}
 	decision := applySandboxResetTransition(record, node, command)
@@ -724,6 +747,7 @@ func validSandboxResetTransition(
 	node *ExecutionNodeFixture,
 	command ConfirmSandboxReset,
 	now time.Time,
+	runtimeViewTerminalRetained bool,
 ) bool {
 	if record == nil || node == nil {
 		return false
@@ -731,6 +755,9 @@ func validSandboxResetTransition(
 	lease := record.lease
 	return lease.AcquireStatus == LeaseGranted &&
 		(lease.Disposition == LeaseRevoked || lease.Disposition == LeaseExpired) &&
+		record.readiness.RuntimeView.State != PrerequisiteReconciliationRequired &&
+		(!record.cleanup.FenceRuntimeView || record.readiness.RuntimeView.State != PrerequisiteAccepted ||
+			runtimeViewTerminalRetained) &&
 		command.ExpectedRuntimeFence == record.fixture.RuntimeFence && lease.LeaseID == command.SandboxLeaseID &&
 		lease.Generation == command.LeaseGeneration && lease.Fence == command.LeaseFence &&
 		lease.SandboxID == command.SandboxID && lease.SandboxGeneration == command.SandboxGeneration &&
@@ -750,6 +777,7 @@ func applySandboxResetTransition(
 	record.lease.Fence++
 	record.lease.SandboxFence++
 	record.lease.Disposition = LeaseReleased
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
 	node.Occupancy = NodeUnoccupied
 	node.Containment = ContainmentEstablished
 	node.Reset = ResetCompleted

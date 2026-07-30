@@ -29,6 +29,16 @@ type canonicalInput struct {
 	SizeBytes uint64 `json:"size_bytes"`
 }
 
+type canonicalInputManifest struct {
+	Identity                      string          `json:"identity"`
+	Schema                        canonicalSchema `json:"schema"`
+	Digest                        string          `json:"digest"`
+	TotalSizeBytes                uint64          `json:"total_size_bytes"`
+	InputCount                    uint64          `json:"input_count"`
+	MaterializationEvidenceID     string          `json:"materialization_evidence_id"`
+	MaterializationEvidenceDigest string          `json:"materialization_evidence_digest"`
+}
+
 type canonicalRuntimeViewRequirement struct {
 	TaskWorkspaceID         string `json:"task_workspace_id"`
 	MaterializationID       string `json:"materialization_id"`
@@ -77,6 +87,7 @@ type canonicalStart struct {
 	CatalogBinding              *canonicalCatalogBinding         `json:"catalog_binding"`
 	WorkerClass                 string                           `json:"worker_class"`
 	Effect                      string                           `json:"effect"`
+	ImmutableInputManifest      canonicalInputManifest           `json:"immutable_input_manifest"`
 	ImmutableInputs             []canonicalInput                 `json:"immutable_inputs"`
 	OutputContractDigest        string                           `json:"output_contract_digest"`
 	EvidenceContractDigest      string                           `json:"evidence_contract_digest"`
@@ -156,6 +167,14 @@ func canonicalStartEncoding(command StartRuntimeRun) ([]byte, error) {
 		AllowedPlatformImagesDigest: command.AllowedPlatformImagesDigest.String(), ExecutorContractDigest: command.ExecutorContractDigest.String(),
 		ReleaseSafetyEpoch: uint64(command.ReleaseSafetyEpoch), CatalogBinding: catalog,
 		WorkerClass: workerClassName(command.WorkerClass), Effect: effectClassName(command.Effect),
+		ImmutableInputManifest: canonicalInputManifest{
+			Identity: command.ImmutableInputManifest.Identity.String(),
+			Schema:   canonicalSchema{Major: command.ImmutableInputManifest.SchemaVersion.Major(), Minor: command.ImmutableInputManifest.SchemaVersion.Minor()},
+			Digest:   command.ImmutableInputManifest.Digest.String(), TotalSizeBytes: command.ImmutableInputManifest.TotalSizeBytes,
+			InputCount:                    command.ImmutableInputManifest.InputCount,
+			MaterializationEvidenceID:     command.ImmutableInputManifest.MaterializationEvidenceID.String(),
+			MaterializationEvidenceDigest: command.ImmutableInputManifest.MaterializationEvidenceDigest.String(),
+		},
 		ImmutableInputs: inputs, OutputContractDigest: command.OutputContractDigest.String(),
 		EvidenceContractDigest: command.EvidenceContractDigest.String(), RuntimeViewRequirement: view,
 		ResourceClassID: command.ResourceClassID.String(), ExecutionPolicyID: command.ExecutionPolicyID.String(),
@@ -226,6 +245,7 @@ func validCanonicalStart(command StartRuntimeRun) bool {
 		command.CapabilityContractDigest == (Digest{}) || command.AllowedPlatformImagesDigest == (Digest{}) ||
 		command.ExecutorContractDigest == (Digest{}) || command.ReleaseSafetyEpoch == 0 || !validCatalogBinding(command.CatalogBinding) ||
 		workerClassName(command.WorkerClass) == "" || effectClassName(command.Effect) == "" ||
+		!validImmutableInputManifest(command.ImmutableInputManifest, command.ImmutableInputs) ||
 		command.OutputContractDigest == (Digest{}) || command.EvidenceContractDigest == (Digest{}) ||
 		!validOpaqueID(command.ResourceClassID.String()) || !validOpaqueID(command.ExecutionPolicyID.String()) ||
 		providerCapabilityName(command.ProviderCapability) == "" || !validProviderBinding(command.ProviderCapability, command.ProviderBinding) ||
@@ -428,6 +448,17 @@ func startInputFromCanonical(wire canonicalStart) (StartRuntimeRunInput, error) 
 	if err != nil {
 		return StartRuntimeRunInput{}, err
 	}
+	manifestDigest, err := digestFromCanonicalText(wire.ImmutableInputManifest.Digest)
+	if err != nil {
+		return StartRuntimeRunInput{}, err
+	}
+	var materializationEvidenceDigest Digest
+	if wire.ImmutableInputManifest.MaterializationEvidenceDigest != (Digest{}).String() {
+		materializationEvidenceDigest, err = digestFromCanonicalText(wire.ImmutableInputManifest.MaterializationEvidenceDigest)
+		if err != nil {
+			return StartRuntimeRunInput{}, err
+		}
+	}
 	inputs := make([]ImmutableInputBinding, len(wire.ImmutableInputs))
 	for index, item := range wire.ImmutableInputs {
 		digest, digestErr := digestFromCanonicalText(item.Digest)
@@ -499,7 +530,16 @@ func startInputFromCanonical(wire canonicalStart) (StartRuntimeRunInput, error) 
 		ExecutionLockDigest: executionLockDigest, CapabilityContractDigest: capabilityDigest,
 		AllowedPlatformImagesDigest: imagesDigest, ExecutorContractDigest: executorDigest,
 		ReleaseSafetyEpoch: ReleaseSafetyEpoch(wire.ReleaseSafetyEpoch), CatalogBinding: catalog,
-		WorkerClass: workerClass, Effect: effect, ImmutableInputs: inputs,
+		WorkerClass: workerClass, Effect: effect,
+		ImmutableInputManifest: ImmutableInputManifestBinding{
+			Identity:      ImmutableInputManifestIdentity{value: wire.ImmutableInputManifest.Identity},
+			SchemaVersion: NewSchemaVersion(wire.ImmutableInputManifest.Schema.Major, wire.ImmutableInputManifest.Schema.Minor),
+			Digest:        manifestDigest, TotalSizeBytes: wire.ImmutableInputManifest.TotalSizeBytes,
+			InputCount:                    wire.ImmutableInputManifest.InputCount,
+			MaterializationEvidenceID:     EvidenceID{value: wire.ImmutableInputManifest.MaterializationEvidenceID},
+			MaterializationEvidenceDigest: materializationEvidenceDigest,
+		},
+		ImmutableInputs:      inputs,
 		OutputContractDigest: outputDigest, EvidenceContractDigest: evidenceDigest, RuntimeViewRequirement: runtimeView,
 		ResourceClassID: ResourceClassID{value: wire.ResourceClassID}, ExecutionPolicyID: ExecutionPolicyID{value: wire.ExecutionPolicyID},
 		ProviderCapability: providerCapability, ProviderBinding: provider,
@@ -531,6 +571,32 @@ func validRuntimeViewRequirement(requirement *RuntimeViewRequirement) bool {
 		validOpaqueID(requirement.BaseRevisionID.String()) &&
 		requirement.LifecycleGeneration > 0 && requirement.LifecycleFence > 0 && runtimeViewExpiryPolicyName(requirement.ExpiryPolicy) != "" &&
 		requirement.OpenOperationDerivation != (Digest{})
+}
+
+func validImmutableInputManifest(
+	manifest ImmutableInputManifestBinding,
+	inputs []ImmutableInputBinding,
+) bool {
+	if !validOpaqueID(manifest.Identity.String()) || manifest.SchemaVersion.Major() != SchemaV1.Major() ||
+		manifest.Digest == (Digest{}) || manifest.InputCount != uint64(len(inputs)) {
+		return false
+	}
+	var size uint64
+	for _, input := range inputs {
+		if ^uint64(0)-size < input.SizeBytes {
+			return false
+		}
+		size += input.SizeBytes
+	}
+	if size != manifest.TotalSizeBytes {
+		return false
+	}
+	if len(inputs) == 0 {
+		return manifest.MaterializationEvidenceID == (EvidenceID{}) &&
+			manifest.MaterializationEvidenceDigest == (Digest{})
+	}
+	return validOpaqueID(manifest.MaterializationEvidenceID.String()) &&
+		manifest.MaterializationEvidenceDigest != (Digest{})
 }
 
 func validCatalogBinding(binding *CatalogExecutionBinding) bool {

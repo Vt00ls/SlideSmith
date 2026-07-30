@@ -20,8 +20,9 @@ func (version SchemaVersion) Major() uint16 { return uint16(uint32(version) >> 1
 func (version SchemaVersion) Minor() uint16 { return uint16(version) }
 
 const (
-	SnapshotSchemaV1      SchemaVersion = SchemaV1
-	SnapshotSchemaCurrent SchemaVersion = SchemaVersion(1<<16 | 1)
+	SnapshotSchemaV1             SchemaVersion = SchemaV1
+	SnapshotSchemaLeaseLifecycle SchemaVersion = SchemaVersion(1<<16 | 1)
+	SnapshotSchemaCurrent        SchemaVersion = SchemaVersion(1<<16 | 2)
 )
 
 type (
@@ -55,6 +56,7 @@ type RuntimeObservationID struct{ value string }
 type AuthorityID struct{ value string }
 type RuntimeBindingID struct{ value string }
 type ImmutableInputIdentity struct{ value string }
+type ImmutableInputManifestIdentity struct{ value string }
 type ResourceClassID struct{ value string }
 type ExecutionPolicyID struct{ value string }
 type AdmissionGrantID struct{ value string }
@@ -70,6 +72,7 @@ type ExecutionNodeID struct{ value string }
 type TaskWorkspaceID struct{ value string }
 type TaskWorkspaceRevisionID struct{ value string }
 type TaskWorkspaceMaterializationID struct{ value string }
+type RuntimeViewID struct{ value string }
 type TemplateLockID struct{ value string }
 type QuotaReservationID struct{ value string }
 type GatewayRoutePolicyID struct{ value string }
@@ -121,6 +124,11 @@ func NewRuntimeBindingID(value string) (RuntimeBindingID, error) {
 func NewImmutableInputIdentity(value string) (ImmutableInputIdentity, error) {
 	value, err := newOpaqueID(value)
 	return ImmutableInputIdentity{value: value}, err
+}
+
+func NewImmutableInputManifestIdentity(value string) (ImmutableInputManifestIdentity, error) {
+	value, err := newOpaqueID(value)
+	return ImmutableInputManifestIdentity{value: value}, err
 }
 
 func NewResourceClassID(value string) (ResourceClassID, error) {
@@ -183,6 +191,11 @@ func NewTaskWorkspaceMaterializationID(value string) (TaskWorkspaceMaterializati
 	return TaskWorkspaceMaterializationID{value: value}, err
 }
 
+func NewRuntimeViewID(value string) (RuntimeViewID, error) {
+	value, err := newOpaqueID(value)
+	return RuntimeViewID{value: value}, err
+}
+
 func NewTemplateLockID(value string) (TemplateLockID, error) {
 	value, err := newOpaqueID(value)
 	return TemplateLockID{value: value}, err
@@ -208,33 +221,35 @@ func NewSecretPolicyID(value string) (SecretPolicyID, error) {
 	return SecretPolicyID{value: value}, err
 }
 
-func (id PersonalWorkspaceID) String() string     { return id.value }
-func (id TaskID) String() string                  { return id.value }
-func (id PhaseRunID) String() string              { return id.value }
-func (id RuntimeRunID) String() string            { return id.value }
-func (id OperationID) String() string             { return id.value }
-func (id RuntimeDecisionID) String() string       { return id.value }
-func (id RuntimeObservationID) String() string    { return id.value }
-func (id AuthorityID) String() string             { return id.value }
-func (id RuntimeBindingID) String() string        { return id.value }
-func (id ImmutableInputIdentity) String() string  { return id.value }
-func (id ResourceClassID) String() string         { return id.value }
-func (id ExecutionPolicyID) String() string       { return id.value }
-func (id AdmissionGrantID) String() string        { return id.value }
-func (id WorkItemID) String() string              { return id.value }
-func (id SandboxLeaseID) String() string          { return id.value }
-func (id SandboxID) String() string               { return id.value }
-func (id WorkerAuthorityID) String() string       { return id.value }
-func (id NodeAuthorityID) String() string         { return id.value }
-func (id NodeAttestationID) String() string       { return id.value }
-func (id EvidenceID) String() string              { return id.value }
-func (id EvidenceRootID) String() string          { return id.value }
-func (id ExecutionNodeID) String() string         { return id.value }
-func (id TaskWorkspaceID) String() string         { return id.value }
-func (id TaskWorkspaceRevisionID) String() string { return id.value }
+func (id PersonalWorkspaceID) String() string            { return id.value }
+func (id TaskID) String() string                         { return id.value }
+func (id PhaseRunID) String() string                     { return id.value }
+func (id RuntimeRunID) String() string                   { return id.value }
+func (id OperationID) String() string                    { return id.value }
+func (id RuntimeDecisionID) String() string              { return id.value }
+func (id RuntimeObservationID) String() string           { return id.value }
+func (id AuthorityID) String() string                    { return id.value }
+func (id RuntimeBindingID) String() string               { return id.value }
+func (id ImmutableInputIdentity) String() string         { return id.value }
+func (id ImmutableInputManifestIdentity) String() string { return id.value }
+func (id ResourceClassID) String() string                { return id.value }
+func (id ExecutionPolicyID) String() string              { return id.value }
+func (id AdmissionGrantID) String() string               { return id.value }
+func (id WorkItemID) String() string                     { return id.value }
+func (id SandboxLeaseID) String() string                 { return id.value }
+func (id SandboxID) String() string                      { return id.value }
+func (id WorkerAuthorityID) String() string              { return id.value }
+func (id NodeAuthorityID) String() string                { return id.value }
+func (id NodeAttestationID) String() string              { return id.value }
+func (id EvidenceID) String() string                     { return id.value }
+func (id EvidenceRootID) String() string                 { return id.value }
+func (id ExecutionNodeID) String() string                { return id.value }
+func (id TaskWorkspaceID) String() string                { return id.value }
+func (id TaskWorkspaceRevisionID) String() string        { return id.value }
 func (id TaskWorkspaceMaterializationID) String() string {
 	return id.value
 }
+func (id RuntimeViewID) String() string        { return id.value }
 func (id TemplateLockID) String() string       { return id.value }
 func (id QuotaReservationID) String() string   { return id.value }
 func (id GatewayRoutePolicyID) String() string { return id.value }
@@ -303,6 +318,16 @@ type ImmutableInputBinding struct {
 	Identity  ImmutableInputIdentity
 	Digest    Digest
 	SizeBytes uint64
+}
+
+type ImmutableInputManifestBinding struct {
+	Identity                      ImmutableInputManifestIdentity
+	SchemaVersion                 SchemaVersion
+	Digest                        Digest
+	TotalSizeBytes                uint64
+	InputCount                    uint64
+	MaterializationEvidenceID     EvidenceID
+	MaterializationEvidenceDigest Digest
 }
 
 type RuntimeViewRequirement struct {
@@ -378,6 +403,7 @@ type StartRuntimeRunInput struct {
 	CatalogBinding              *CatalogExecutionBinding
 	WorkerClass                 WorkerClass
 	Effect                      EffectClass
+	ImmutableInputManifest      ImmutableInputManifestBinding
 	ImmutableInputs             []ImmutableInputBinding
 	OutputContractDigest        Digest
 	EvidenceContractDigest      Digest
@@ -863,6 +889,8 @@ type RuntimeSnapshot struct {
 	CapacityEvidence       RuntimeCapacityEvidenceSnapshot
 	PreLeaseTerminalReason PreLeaseTerminalReason
 	Reconciliation         ReconciliationStatus
+	Readiness              RuntimeReadinessSnapshot
+	RuntimeViewBinding     RuntimeViewBindingSnapshot
 }
 
 type RetryDisposition uint8

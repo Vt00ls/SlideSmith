@@ -129,7 +129,8 @@ func harnessForStartWithGrantExpiry(
 	t.Helper()
 	harness, err := NewDeterministicHarness(HarnessConfig{
 		Now: now, Runtimes: []RuntimeFixture{runtimeFixtureForStart(start, authority)},
-		AdmissionGrants: []AdmissionGrantFixture{grantFixtureForStart(start, expiresAt, true)},
+		AdmissionGrants:         []AdmissionGrantFixture{grantFixtureForStart(start, expiresAt, true)},
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 	})
 	if err != nil {
 		t.Fatalf("new harness: %v", err)

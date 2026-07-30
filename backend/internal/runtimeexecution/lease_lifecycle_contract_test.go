@@ -52,6 +52,7 @@ func TestInspectShowsAuthoritativeActiveLeaseAndPhysicalOccupancy(t *testing.T) 
 		) (LeaseAcquisitionObservation, error) {
 			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
 		}),
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 	})
 	if err != nil {
 		t.Fatalf("new harness: %v", err)
@@ -147,6 +148,7 @@ func TestProviderCapableLeaseRequiresExactActiveQuotaReservation(t *testing.T) {
 				) (LeaseAcquisitionObservation, error) {
 					return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
 				}),
+				RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 			})
 			if err != nil {
 				t.Fatalf("new harness: %v", err)
@@ -198,6 +200,7 @@ func TestLeaseAcquireRejectsStaleNodeCatalogSafetyEpoch(t *testing.T) {
 		) (LeaseAcquisitionObservation, error) {
 			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
 		}),
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -234,6 +237,7 @@ func TestLeaseRenewalIsFencedIdempotentAndInspectable(t *testing.T) {
 		) (LeaseAcquisitionObservation, error) {
 			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
 		}),
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -315,6 +319,7 @@ func TestPostLeaseCancelFencesAuthorityBeforeCleanupAndDoesNotClaimPhysicalRelea
 		) (LeaseAcquisitionObservation, error) {
 			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
 		}),
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -382,6 +387,7 @@ func TestNodeLossFencingAuthorizesOnlyLogicalCapacityRelease(t *testing.T) {
 		) (LeaseAcquisitionObservation, error) {
 			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
 		}),
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -466,6 +472,7 @@ func TestRevokeResetAndPoolReuseRequireCompleteCurrentEvidence(t *testing.T) {
 		) (LeaseAcquisitionObservation, error) {
 			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
 		}),
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 	})
 	if err != nil {
 		t.Fatal(err)

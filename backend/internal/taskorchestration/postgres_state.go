@@ -251,7 +251,24 @@ type postgresPinnedTaskState struct {
 	TaskWorkspaceID string
 	ExecutionLock   postgresExecutionLockState
 	TemplateLockID  string
+	CatalogBinding  *postgresPinnedCatalogBindingState
 	Authorities     postgresDownstreamAuthorityBindingsState
+}
+
+type postgresPinnedCatalogBindingState struct {
+	TemplateVersionID      string
+	TemplateManifestDigest EvidenceDigest
+	TemplatePackageDigest  EvidenceDigest
+	TemplateLockDigest     EvidenceDigest
+	ClosureRootDigest      EvidenceDigest
+	SafetyEpoch            SafetyEpoch
+	BundleClosure          []postgresResourceBundleContractState
+}
+
+type postgresResourceBundleContractState struct {
+	ResourceBundleID string
+	ManifestDigest   EvidenceDigest
+	PackageDigest    EvidenceDigest
 }
 
 type postgresDownstreamAuthorityBindingsState struct {
@@ -983,7 +1000,7 @@ func (state postgresAggregateState) aggregate() *taskAggregate {
 }
 
 func postgresPinnedTaskStateFromPinned(pinned PinnedTaskStart) postgresPinnedTaskState {
-	return postgresPinnedTaskState{
+	state := postgresPinnedTaskState{
 		Route: pinned.Route, TaskWorkspaceID: pinned.TaskWorkspaceID.value,
 		ExecutionLock: postgresExecutionLockState{
 			ID:                      pinned.ExecutionLock.ID.value,
@@ -1003,10 +1020,30 @@ func postgresPinnedTaskStateFromPinned(pinned PinnedTaskStart) postgresPinnedTas
 			Scheduler:   postgresAuthorityStateFromAuthority(pinned.Authorities.Scheduler.value),
 		},
 	}
+	if pinned.CatalogBinding != nil {
+		state.CatalogBinding = &postgresPinnedCatalogBindingState{
+			TemplateVersionID:      pinned.CatalogBinding.TemplateVersionID.value,
+			TemplateManifestDigest: pinned.CatalogBinding.TemplateManifestDigest,
+			TemplatePackageDigest:  pinned.CatalogBinding.TemplatePackageDigest,
+			TemplateLockDigest:     pinned.CatalogBinding.TemplateLockDigest,
+			ClosureRootDigest:      pinned.CatalogBinding.ClosureRootDigest,
+			SafetyEpoch:            pinned.CatalogBinding.SafetyEpoch,
+			BundleClosure: make(
+				[]postgresResourceBundleContractState, len(pinned.CatalogBinding.BundleClosure),
+			),
+		}
+		for index, bundle := range pinned.CatalogBinding.BundleClosure {
+			state.CatalogBinding.BundleClosure[index] = postgresResourceBundleContractState{
+				ResourceBundleID: bundle.ResourceBundleID.value,
+				ManifestDigest:   bundle.ManifestDigest, PackageDigest: bundle.PackageDigest,
+			}
+		}
+	}
+	return state
 }
 
 func (state postgresPinnedTaskState) pinned() PinnedTaskStart {
-	return PinnedTaskStart{
+	pinned := PinnedTaskStart{
 		Route: state.Route, TaskWorkspaceID: TaskWorkspaceID{state.TaskWorkspaceID},
 		ExecutionLock: ExecutionLock{
 			ID:                      ExecutionLockID{state.ExecutionLock.ID},
@@ -1026,6 +1063,24 @@ func (state postgresPinnedTaskState) pinned() PinnedTaskStart {
 			Scheduler:   SchedulerAuthority{value: state.Authorities.Scheduler.authority()},
 		},
 	}
+	if state.CatalogBinding != nil {
+		pinned.CatalogBinding = &PinnedCatalogBinding{
+			TemplateVersionID:      TemplateVersionID{state.CatalogBinding.TemplateVersionID},
+			TemplateManifestDigest: state.CatalogBinding.TemplateManifestDigest,
+			TemplatePackageDigest:  state.CatalogBinding.TemplatePackageDigest,
+			TemplateLockDigest:     state.CatalogBinding.TemplateLockDigest,
+			ClosureRootDigest:      state.CatalogBinding.ClosureRootDigest,
+			SafetyEpoch:            state.CatalogBinding.SafetyEpoch,
+			BundleClosure:          make([]ResourceBundleContract, len(state.CatalogBinding.BundleClosure)),
+		}
+		for index, bundle := range state.CatalogBinding.BundleClosure {
+			pinned.CatalogBinding.BundleClosure[index] = ResourceBundleContract{
+				ResourceBundleID: ResourceBundleID{bundle.ResourceBundleID},
+				ManifestDigest:   bundle.ManifestDigest, PackageDigest: bundle.PackageDigest,
+			}
+		}
+	}
+	return pinned
 }
 
 func postgresPipelineContractStateFromContract(contract PipelineContract) postgresPipelineContractState {

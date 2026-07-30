@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/slidesmith/slidesmith/backend/internal/taskworkspace"
 )
 
 type DeterministicIDConfig struct {
@@ -81,6 +83,8 @@ type RuntimeFixture struct {
 	CatalogSafetyEpoch     CatalogSafetyEpoch
 	PreLeaseTerminalReason PreLeaseTerminalReason
 	Reconciliation         ReconciliationStatus
+	Readiness              RuntimeReadinessSnapshot
+	RuntimeViewBinding     RuntimeViewBindingSnapshot
 }
 
 type AdmissionGrantFixture struct {
@@ -148,23 +152,29 @@ type QuotaReservationFixture struct {
 }
 
 type HarnessConfig struct {
-	Now                    time.Time
-	IDs                    DeterministicIDConfig
-	Runtimes               []RuntimeFixture
-	AdmissionGrants        []AdmissionGrantFixture
-	Nodes                  []ExecutionNodeFixture
-	QuotaReservations      []QuotaReservationFixture
-	MaintenanceAuthorities []RuntimeMaintenanceAuthorityBinding
-	LeaseAcquisition       LeaseAcquisitionAdapter
+	Now                     time.Time
+	IDs                     DeterministicIDConfig
+	Runtimes                []RuntimeFixture
+	AdmissionGrants         []AdmissionGrantFixture
+	Nodes                   []ExecutionNodeFixture
+	QuotaReservations       []QuotaReservationFixture
+	MaintenanceAuthorities  []RuntimeMaintenanceAuthorityBinding
+	LeaseAcquisition        LeaseAcquisitionAdapter
+	RuntimeBindingValidator RuntimeBindingValidator
+	ImmutableInputValidator ImmutableInputValidator
+	RuntimeViewPrerequisite RuntimeViewPrerequisitePort
 }
 
 type DeterministicHarness struct {
-	Runtime          RuntimeExecution
-	Maintenance      RuntimeMaintenance
-	store            *memoryStore
-	clock            *controlledClock
-	controls         *harnessControls
-	leaseAcquisition LeaseAcquisitionAdapter
+	Runtime                 RuntimeExecution
+	Maintenance             RuntimeMaintenance
+	store                   *memoryStore
+	clock                   *controlledClock
+	controls                *harnessControls
+	leaseAcquisition        LeaseAcquisitionAdapter
+	runtimeBindingValidator RuntimeBindingValidator
+	immutableInputValidator ImmutableInputValidator
+	runtimeViewPrerequisite RuntimeViewPrerequisitePort
 }
 
 func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error) {
@@ -220,6 +230,8 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 			capacity: capacity, capacityEvidence: fixture.CapacityEvidence, node: fixture.Node,
 			cleanup: fixture.Cleanup, catalogSafetyEpoch: fixture.CatalogSafetyEpoch,
 			preLeaseTerminalReason: fixture.PreLeaseTerminalReason, reconciliation: reconciliation,
+			readiness:          fixture.Readiness,
+			runtimeViewBinding: fixture.RuntimeViewBinding,
 		}
 	}
 	for _, grant := range config.AdmissionGrants {
@@ -280,14 +292,31 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		store.maintenanceAuthorities[key] = binding.caller
 	}
 	clock := &controlledClock{now: config.Now.UTC()}
-	return newHarness(store, clock, config.LeaseAcquisition), nil
+	return newHarness(
+		store, clock, config.LeaseAcquisition, config.RuntimeBindingValidator,
+		config.ImmutableInputValidator, config.RuntimeViewPrerequisite,
+	), nil
 }
 
-func newHarness(store *memoryStore, clock *controlledClock, leaseAcquisition LeaseAcquisitionAdapter) *DeterministicHarness {
+func newHarness(
+	store *memoryStore,
+	clock *controlledClock,
+	leaseAcquisition LeaseAcquisitionAdapter,
+	runtimeBindingValidator RuntimeBindingValidator,
+	immutableInputValidator ImmutableInputValidator,
+	runtimeViewPrerequisite RuntimeViewPrerequisitePort,
+) *DeterministicHarness {
 	controls := &harnessControls{}
-	engine := &invariantEngine{store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition}
+	engine := &invariantEngine{
+		store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition,
+		runtimeBindingValidator: runtimeBindingValidator, immutableInputValidator: immutableInputValidator,
+		runtimeViewPrerequisite: runtimeViewPrerequisite,
+	}
 	return &DeterministicHarness{
-		Runtime: engine, Maintenance: engine, store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition,
+		Runtime: engine, Maintenance: engine, store: store, clock: clock, controls: controls,
+		leaseAcquisition: leaseAcquisition, runtimeBindingValidator: runtimeBindingValidator,
+		immutableInputValidator: immutableInputValidator,
+		runtimeViewPrerequisite: runtimeViewPrerequisite,
 	}
 }
 
@@ -331,7 +360,11 @@ func (harness *DeterministicHarness) Restart() *DeterministicHarness {
 	harness.controls.mu.Lock()
 	harness.controls.crashed = true
 	harness.controls.mu.Unlock()
-	return newHarness(harness.store, harness.clock, harness.leaseAcquisition)
+	return newHarness(
+		harness.store, harness.clock, harness.leaseAcquisition,
+		harness.runtimeBindingValidator, harness.immutableInputValidator,
+		harness.runtimeViewPrerequisite,
+	)
 }
 
 func (harness *DeterministicHarness) IngressObservations() []IngressObservation {
@@ -445,13 +478,20 @@ type runtimeRecord struct {
 	node                   RuntimeNodeSnapshot
 	catalogSafetyEpoch     CatalogSafetyEpoch
 	cleanup                RuntimeLeaseCleanupSnapshot
+	readiness              RuntimeReadinessSnapshot
+	runtimeViewBinding     RuntimeViewBindingSnapshot
+	runtimeViewOpen        *retainedRuntimeViewOpen
+	runtimeViewTerminal    *retainedRuntimeViewTerminal
 }
 
 type invariantEngine struct {
-	store            *memoryStore
-	clock            *controlledClock
-	controls         *harnessControls
-	leaseAcquisition LeaseAcquisitionAdapter
+	store                   *memoryStore
+	clock                   *controlledClock
+	controls                *harnessControls
+	leaseAcquisition        LeaseAcquisitionAdapter
+	runtimeBindingValidator RuntimeBindingValidator
+	immutableInputValidator ImmutableInputValidator
+	runtimeViewPrerequisite RuntimeViewPrerequisitePort
 }
 
 func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeCommand) (RuntimeDecision, error) {
@@ -471,9 +511,50 @@ func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeComma
 		if err != nil {
 			return RuntimeDecision{}, err
 		}
-		return engine.advancePreLease(ctx, typed, decision)
+		decision, err = engine.advanceInMemoryRuntimeBindingPrerequisite(ctx, typed, decision)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		decision, err = engine.advanceInMemoryPreLeaseTimeBounds(typed, decision)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		decision, err = engine.advanceInMemoryRuntimeBindingRejection(typed, decision)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		if (decision.Snapshot.State == RuntimeWaitingForLease || decision.Snapshot.State == RuntimeReconciling) &&
+			(engine.runtimeBindingValidator == nil ||
+				decision.Snapshot.Readiness.RuntimeBinding.State != PrerequisiteAccepted) {
+			projectCapsuleReadinessAt(&decision.Snapshot, engine.clock.current())
+			return decision, nil
+		}
+		decision, err = engine.advancePreLease(ctx, typed, decision)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		decision, err = engine.advancePostLeasePrerequisites(ctx, typed, decision)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		projectCapsuleReadinessAt(&decision.Snapshot, engine.clock.current())
+		return decision, nil
 	case CancelRuntimeRun:
-		return engine.executeCancel(typed)
+		decision, err := engine.executeCancel(typed)
+		if err != nil || decision.Fact.Disposition != DecisionAccepted {
+			return decision, err
+		}
+		if err := engine.advanceInMemoryRuntimeViewFence(
+			ctx, typed.RuntimeRunID, taskworkspace.RuntimeViewCancelled,
+		); err != nil {
+			return RuntimeDecision{}, err
+		}
+		engine.store.mu.Lock()
+		if record := engine.store.runtimes[typed.RuntimeRunID]; record != nil {
+			decision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+		}
+		engine.store.mu.Unlock()
+		return decision, nil
 	default:
 		engine.observeIngress(IngressMalformed)
 		return RuntimeDecision{}, newError(ErrorInvalidRequest)
@@ -568,6 +649,7 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 		record.lease.Fence++
 		record.lease.SandboxFence++
 		record.lease.Disposition = LeaseRevoked
+		updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
 		leasedNode.Occupancy = NodeOccupancyUnknown
 		leasedNode.Quarantined = true
 		leasedNode.Containment = ContainmentPending
@@ -632,8 +714,9 @@ func (engine *invariantEngine) advancePreLease(
 	start StartRuntimeRun,
 	startDecision RuntimeDecision,
 ) (RuntimeDecision, error) {
-	if startDecision.Fact.Disposition != DecisionAccepted {
-		return startDecision, nil
+	startDecision, err := engine.advanceInMemoryPreLeaseTimeBounds(start, startDecision)
+	if err != nil || startDecision.Snapshot.State == RuntimeTerminal {
+		return startDecision, err
 	}
 	now := engine.clock.current()
 	engine.store.mu.Lock()
@@ -647,16 +730,6 @@ func (engine *invariantEngine) advancePreLease(
 		startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
 		engine.store.mu.Unlock()
 		return startDecision, nil
-	}
-	if !now.Before(record.deadline) {
-		return engine.finishInMemoryNoLeaseLocked(
-			record, startDecision, RuntimeTimedOut, PreLeaseTerminalRuntimeDeadline, now,
-		)
-	}
-	if !now.Before(record.leaseAcquireBy) {
-		return engine.finishInMemoryNoLeaseLocked(
-			record, startDecision, RuntimeRejected, PreLeaseTerminalAdmissionAuthorityExpired, now,
-		)
 	}
 	request := leaseAcquisitionRequest(record)
 	if engine.leaseAcquisition == nil {
@@ -691,14 +764,11 @@ func (engine *invariantEngine) advancePreLease(
 		return startDecision, nil
 	}
 	now = engine.clock.current()
-	if !now.Before(record.deadline) {
+	if outcome, reason, terminal := preLeaseTimeBoundTerminal(
+		now, record.deadline, record.leaseAcquireBy,
+	); terminal {
 		return engine.finishInMemoryNoLeaseLocked(
-			record, startDecision, RuntimeTimedOut, PreLeaseTerminalRuntimeDeadline, now,
-		)
-	}
-	if !now.Before(record.leaseAcquireBy) {
-		return engine.finishInMemoryNoLeaseLocked(
-			record, startDecision, RuntimeRejected, PreLeaseTerminalAdmissionAuthorityExpired, now,
+			record, startDecision, outcome, reason, now,
 		)
 	}
 
@@ -775,6 +845,38 @@ func (engine *invariantEngine) advancePreLease(
 		engine.store.mu.Unlock()
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
+}
+
+func (engine *invariantEngine) advanceInMemoryPreLeaseTimeBounds(
+	start StartRuntimeRun,
+	startDecision RuntimeDecision,
+) (RuntimeDecision, error) {
+	if startDecision.Fact.Disposition != DecisionAccepted {
+		return startDecision, nil
+	}
+	now := engine.clock.current()
+	engine.store.mu.Lock()
+	record := engine.store.runtimes[start.RuntimeRunID]
+	if record == nil {
+		engine.store.mu.Unlock()
+		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
+	}
+	if record.fixture.State == RuntimeTerminal || record.lease.AcquireStatus == LeaseGranted ||
+		record.fixture.State != RuntimeWaitingForLease && record.fixture.State != RuntimeReconciling {
+		startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+		engine.store.mu.Unlock()
+		return startDecision, nil
+	}
+	if outcome, reason, terminal := preLeaseTimeBoundTerminal(
+		now, record.deadline, record.leaseAcquireBy,
+	); terminal {
+		return engine.finishInMemoryNoLeaseLocked(
+			record, startDecision, outcome, reason, now,
+		)
+	}
+	startDecision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
+	engine.store.mu.Unlock()
+	return startDecision, nil
 }
 
 func (engine *invariantEngine) finishInMemoryNoLeaseLocked(
@@ -969,6 +1071,7 @@ func (engine *invariantEngine) executeStart(command StartRuntimeRun) (RuntimeDec
 		LogicalRelease: LogicalCapacityHeld, NoLease: NoLeaseDispositionNone, Physical: PhysicalCapacityNotApplicable,
 	}
 	record.reconciliation = ReconciliationStable
+	record.readiness = initialRuntimeReadiness(command)
 	fact := RuntimeDecisionFact{
 		DecisionID: engine.nextDecisionID(), Disposition: DecisionAccepted,
 		OperationID: command.OperationID, CanonicalRequestDigest: digest,
@@ -1036,7 +1139,8 @@ func (engine *invariantEngine) Inspect(ctx context.Context, ref RuntimeRunRef) (
 		return RuntimeSnapshot{}, newError(ErrorInvalidRequest)
 	}
 	if ref.SchemaVersion.Major() != SchemaV1.Major() ||
-		(ref.ProjectionVersion != SnapshotSchemaCurrent && ref.ProjectionVersion != SnapshotSchemaV1) {
+		(ref.ProjectionVersion != SnapshotSchemaCurrent &&
+			ref.ProjectionVersion != SnapshotSchemaLeaseLifecycle && ref.ProjectionVersion != SnapshotSchemaV1) {
 		engine.observeIngress(IngressUnsupportedSchema)
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
 	}
@@ -1056,6 +1160,7 @@ func (engine *invariantEngine) Inspect(ctx context.Context, ref RuntimeRunRef) (
 		engine.observeIngressLocked(IngressUnsupportedSchema)
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
 	}
+	projectCapsuleReadinessAt(&projected, engine.clock.current())
 	return projected, nil
 }
 
@@ -1071,8 +1176,9 @@ func snapshot(record *runtimeRecord, version SchemaVersion) RuntimeSnapshot {
 type snapshotRenderer func(*runtimeRecord) (RuntimeSnapshot, bool)
 
 var snapshotRenderers = map[SchemaVersion]snapshotRenderer{
-	SnapshotSchemaV1:      renderSnapshotV1,
-	SnapshotSchemaCurrent: renderSnapshotCurrent,
+	SnapshotSchemaV1:             renderSnapshotV1,
+	SnapshotSchemaLeaseLifecycle: renderSnapshotLeaseLifecycle,
+	SnapshotSchemaCurrent:        renderSnapshotCurrent,
 }
 
 func renderSnapshot(record *runtimeRecord, version SchemaVersion) (RuntimeSnapshot, bool) {
@@ -1090,11 +1196,20 @@ func renderSnapshotCurrent(record *runtimeRecord) (RuntimeSnapshot, bool) {
 	return buildSnapshot(record, SnapshotSchemaCurrent), true
 }
 
+func renderSnapshotLeaseLifecycle(record *runtimeRecord) (RuntimeSnapshot, bool) {
+	if !snapshotVariantsKnown(record) || record.readiness != (RuntimeReadinessSnapshot{}) ||
+		record.runtimeViewBinding != (RuntimeViewBindingSnapshot{}) {
+		return RuntimeSnapshot{}, false
+	}
+	return buildSnapshot(record, SnapshotSchemaLeaseLifecycle), true
+}
+
 func renderSnapshotV1(record *runtimeRecord) (RuntimeSnapshot, bool) {
 	if !snapshotVariantsKnown(record) || record.capacity.Physical == PhysicalCapacityUnknownOrQuarantined ||
 		record.reconciliation == ReconciliationRequiredStatus || record.lease.Disposition != LeaseDispositionNone ||
 		record.node != (RuntimeNodeSnapshot{}) || record.cleanup != (RuntimeLeaseCleanupSnapshot{}) ||
-		record.capacityEvidence.PhysicalCapacityReleaseReady != (PhysicalCapacityReleaseReadyEvidence{}) {
+		record.capacityEvidence.PhysicalCapacityReleaseReady != (PhysicalCapacityReleaseReadyEvidence{}) ||
+		record.readiness != (RuntimeReadinessSnapshot{}) || record.runtimeViewBinding != (RuntimeViewBindingSnapshot{}) {
 		return RuntimeSnapshot{}, false
 	}
 	return buildSnapshot(record, SnapshotSchemaV1), true
@@ -1110,6 +1225,8 @@ func buildSnapshot(record *runtimeRecord, version SchemaVersion) RuntimeSnapshot
 		EvidenceRoot: record.evidenceRoot, Capacity: record.capacity, CapacityEvidence: record.capacityEvidence,
 		PreLeaseTerminalReason: record.preLeaseTerminalReason,
 		Reconciliation:         record.reconciliation,
+		Readiness:              record.readiness,
+		RuntimeViewBinding:     record.runtimeViewBinding,
 	}
 }
 
@@ -1128,10 +1245,12 @@ func snapshotVariantsKnown(record *runtimeRecord) bool {
 		!knownCancellationStatus(record.cancellation.Status) || !knownCapacity(record.capacity) ||
 		!knownLeaseLifecycleSnapshot(record.lease) || !knownNodeSnapshot(record.node) ||
 		!knownLeaseNodeBinding(record) ||
-		!knownLeaseCleanupSnapshot(record.cleanup) ||
+		!knownRuntimeLeaseCleanupSnapshot(record) ||
 		!knownPhysicalReleaseEvidence(record.capacityEvidence.PhysicalCapacityReleaseReady) ||
 		!knownPreLeaseTerminalReason(record.preLeaseTerminalReason) ||
-		!knownReconciliation(record.reconciliation) || !knownEvidenceRoot(record.evidenceRoot) {
+		!knownReconciliation(record.reconciliation) || !knownEvidenceRoot(record.evidenceRoot) ||
+		!knownRuntimeReadiness(record.readiness, record.runtimeViewBinding, record.lease) ||
+		!knownRuntimeViewBinding(record.runtimeViewBinding, record.readiness) {
 		return false
 	}
 	return true
@@ -1177,14 +1296,35 @@ func knownNodeSnapshot(node RuntimeNodeSnapshot) bool {
 		node.Reset >= ResetRequired && node.Reset <= ResetCompleted
 }
 
-func knownLeaseCleanupSnapshot(cleanup RuntimeLeaseCleanupSnapshot) bool {
+func knownRuntimeLeaseCleanupSnapshot(record *runtimeRecord) bool {
+	if record.cleanup.Status == LeaseCleanupNone {
+		return knownLeaseCleanupSnapshot(record.cleanup, false)
+	}
+	var fenceRuntimeView bool
+	switch {
+	case record.fixture.State == RuntimeStopping && record.fixture.Outcome == RuntimeOutcomeNone:
+		fenceRuntimeView = true
+	case record.fixture.State == RuntimeTerminal &&
+		(record.fixture.Outcome == RuntimeFailed || record.fixture.Outcome == RuntimeCancelled ||
+			record.fixture.Outcome == RuntimeLost):
+		fenceRuntimeView = true
+	case record.fixture.State == RuntimeTerminal &&
+		(record.fixture.Outcome == RuntimeRejected || record.fixture.Outcome == RuntimeTimedOut):
+		fenceRuntimeView = false
+	default:
+		return false
+	}
+	return knownLeaseCleanupSnapshot(record.cleanup, fenceRuntimeView)
+}
+
+func knownLeaseCleanupSnapshot(cleanup RuntimeLeaseCleanupSnapshot, fenceRuntimeView bool) bool {
 	if cleanup.Status == LeaseCleanupNone {
 		return cleanup == (RuntimeLeaseCleanupSnapshot{})
 	}
 	return cleanup.Status >= LeaseCleanupPending && cleanup.Status <= LeaseCleanupCompleted &&
 		validOpaqueID(cleanup.OperationID.String()) && cleanup.CanonicalRequestDigest != (Digest{}) &&
 		cleanup.StopMainProcess && cleanup.StopChildProcesses && cleanup.RevokeSecrets &&
-		cleanup.RemoveNetwork && cleanup.FenceRuntimeView && cleanup.ReconcileContainment
+		cleanup.RemoveNetwork && cleanup.FenceRuntimeView == fenceRuntimeView && cleanup.ReconcileContainment
 }
 
 func knownPhysicalReleaseEvidence(evidence PhysicalCapacityReleaseReadyEvidence) bool {
