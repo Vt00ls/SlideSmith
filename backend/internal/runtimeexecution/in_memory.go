@@ -85,6 +85,8 @@ type RuntimeFixture struct {
 	Reconciliation         ReconciliationStatus
 	Readiness              RuntimeReadinessSnapshot
 	RuntimeViewBinding     RuntimeViewBindingSnapshot
+	Gateway                GatewayPrerequisiteSnapshot
+	Usage                  RuntimeUsageEvidenceSnapshot
 }
 
 type AdmissionGrantFixture struct {
@@ -140,15 +142,20 @@ const (
 )
 
 type QuotaReservationFixture struct {
-	QuotaReservationID  QuotaReservationID
-	Generation          QuotaReservationGeneration
-	Mode                QuotaReservationMode
-	State               QuotaReservationState
-	PersonalWorkspaceID PersonalWorkspaceID
-	PhaseRunID          PhaseRunID
-	Capability          ProviderCapability
-	ValidFrom           time.Time
-	ExpiresAt           time.Time
+	QuotaReservationID           QuotaReservationID
+	Generation                   QuotaReservationGeneration
+	Mode                         QuotaReservationMode
+	State                        QuotaReservationState
+	PersonalWorkspaceID          PersonalWorkspaceID
+	TaskID                       TaskID
+	PhaseRunID                   PhaseRunID
+	AuthorizationGeneration      AuthorizationGeneration
+	Capability                   ProviderCapability
+	GatewayRoutePolicyID         GatewayRoutePolicyID
+	GatewayRoutePolicyGeneration GatewayRoutePolicyGeneration
+	CapabilityScope              ProviderCapabilityScope
+	ValidFrom                    time.Time
+	ExpiresAt                    time.Time
 }
 
 type HarnessConfig struct {
@@ -163,6 +170,11 @@ type HarnessConfig struct {
 	RuntimeBindingValidator RuntimeBindingValidator
 	ImmutableInputValidator ImmutableInputValidator
 	RuntimeViewPrerequisite RuntimeViewPrerequisitePort
+	GatewayGrants           GatewayGrantAdapter
+	GatewayRecovery         GatewayRecoveryAuthority
+	GatewayCallAuthority    GatewayCallExternalAuthority
+	GatewayGrantLifetime    time.Duration
+	UsageReceipts           UsageReceiptEvidenceSource
 }
 
 type DeterministicHarness struct {
@@ -175,6 +187,11 @@ type DeterministicHarness struct {
 	runtimeBindingValidator RuntimeBindingValidator
 	immutableInputValidator ImmutableInputValidator
 	runtimeViewPrerequisite RuntimeViewPrerequisitePort
+	gatewayGrants           GatewayGrantAdapter
+	gatewayRecovery         GatewayRecoveryAuthority
+	gatewayCallAuthority    GatewayCallExternalAuthority
+	grantLifetime           time.Duration
+	usageReceipts           UsageReceiptEvidenceSource
 }
 
 func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error) {
@@ -230,8 +247,8 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 			capacity: capacity, capacityEvidence: fixture.CapacityEvidence, node: fixture.Node,
 			cleanup: fixture.Cleanup, catalogSafetyEpoch: fixture.CatalogSafetyEpoch,
 			preLeaseTerminalReason: fixture.PreLeaseTerminalReason, reconciliation: reconciliation,
-			readiness:          fixture.Readiness,
-			runtimeViewBinding: fixture.RuntimeViewBinding,
+			readiness: fixture.Readiness, runtimeViewBinding: fixture.RuntimeViewBinding,
+			gateway: fixture.Gateway, usage: fixture.Usage,
 		}
 	}
 	for _, grant := range config.AdmissionGrants {
@@ -292,9 +309,21 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		store.maintenanceAuthorities[key] = binding.caller
 	}
 	clock := &controlledClock{now: config.Now.UTC()}
+	grantLifetime := config.GatewayGrantLifetime
+	if grantLifetime == 0 {
+		grantLifetime = time.Minute
+	}
+	if grantLifetime < 0 {
+		return nil, newError(ErrorInvalidRequest)
+	}
+	usageReceipts := config.UsageReceipts
+	if usageReceipts == nil {
+		usageReceipts, _ = config.GatewayGrants.(UsageReceiptEvidenceSource)
+	}
 	return newHarness(
 		store, clock, config.LeaseAcquisition, config.RuntimeBindingValidator,
 		config.ImmutableInputValidator, config.RuntimeViewPrerequisite,
+		config.GatewayGrants, config.GatewayRecovery, config.GatewayCallAuthority, grantLifetime, usageReceipts,
 	), nil
 }
 
@@ -305,18 +334,28 @@ func newHarness(
 	runtimeBindingValidator RuntimeBindingValidator,
 	immutableInputValidator ImmutableInputValidator,
 	runtimeViewPrerequisite RuntimeViewPrerequisitePort,
+	gatewayGrants GatewayGrantAdapter,
+	gatewayRecovery GatewayRecoveryAuthority,
+	gatewayCallAuthority GatewayCallExternalAuthority,
+	grantLifetime time.Duration,
+	usageReceipts UsageReceiptEvidenceSource,
 ) *DeterministicHarness {
 	controls := &harnessControls{}
 	engine := &invariantEngine{
 		store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition,
 		runtimeBindingValidator: runtimeBindingValidator, immutableInputValidator: immutableInputValidator,
 		runtimeViewPrerequisite: runtimeViewPrerequisite,
+		gatewayGrants:           gatewayGrants, gatewayRecovery: gatewayRecovery,
+		gatewayCallAuthority: gatewayCallAuthority, grantLifetime: grantLifetime,
+		usageReceipts: usageReceipts,
 	}
 	return &DeterministicHarness{
 		Runtime: engine, Maintenance: engine, store: store, clock: clock, controls: controls,
 		leaseAcquisition: leaseAcquisition, runtimeBindingValidator: runtimeBindingValidator,
-		immutableInputValidator: immutableInputValidator,
-		runtimeViewPrerequisite: runtimeViewPrerequisite,
+		immutableInputValidator: immutableInputValidator, runtimeViewPrerequisite: runtimeViewPrerequisite,
+		gatewayGrants: gatewayGrants, gatewayRecovery: gatewayRecovery,
+		gatewayCallAuthority: gatewayCallAuthority, grantLifetime: grantLifetime,
+		usageReceipts: usageReceipts,
 	}
 }
 
@@ -364,7 +403,28 @@ func (harness *DeterministicHarness) Restart() *DeterministicHarness {
 		harness.store, harness.clock, harness.leaseAcquisition,
 		harness.runtimeBindingValidator, harness.immutableInputValidator,
 		harness.runtimeViewPrerequisite,
+		harness.gatewayGrants, harness.gatewayRecovery, harness.gatewayCallAuthority,
+		harness.grantLifetime, harness.usageReceipts,
 	)
+}
+
+// ReplaceQuotaReservation is a deterministic harness control for simulating
+// Usage Accounting authority changes between C03 admission and lease commit.
+// It is intentionally absent from the RuntimeExecution interface.
+func (harness *DeterministicHarness) ReplaceQuotaReservation(reservation QuotaReservationFixture) error {
+	reservation.ValidFrom = reservation.ValidFrom.UTC()
+	reservation.ExpiresAt = reservation.ExpiresAt.UTC()
+	if !validQuotaReservationFixture(reservation) {
+		return newError(ErrorInvalidRequest)
+	}
+	harness.store.mu.Lock()
+	defer harness.store.mu.Unlock()
+	if harness.store.reservations[reservation.QuotaReservationID] == nil {
+		return newError(ErrorInvalidRequest)
+	}
+	copyReservation := reservation
+	harness.store.reservations[reservation.QuotaReservationID] = &copyReservation
+	return nil
 }
 
 func (harness *DeterministicHarness) IngressObservations() []IngressObservation {
@@ -482,6 +542,9 @@ type runtimeRecord struct {
 	runtimeViewBinding     RuntimeViewBindingSnapshot
 	runtimeViewOpen        *retainedRuntimeViewOpen
 	runtimeViewTerminal    *retainedRuntimeViewTerminal
+	gateway                GatewayPrerequisiteSnapshot
+	gatewayRequest         *GatewayGrantRequest
+	usage                  RuntimeUsageEvidenceSnapshot
 }
 
 type invariantEngine struct {
@@ -492,6 +555,11 @@ type invariantEngine struct {
 	runtimeBindingValidator RuntimeBindingValidator
 	immutableInputValidator ImmutableInputValidator
 	runtimeViewPrerequisite RuntimeViewPrerequisitePort
+	gatewayGrants           GatewayGrantAdapter
+	gatewayRecovery         GatewayRecoveryAuthority
+	gatewayCallAuthority    GatewayCallExternalAuthority
+	grantLifetime           time.Duration
+	usageReceipts           UsageReceiptEvidenceSource
 }
 
 func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeCommand) (RuntimeDecision, error) {
@@ -537,6 +605,14 @@ func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeComma
 		if err != nil {
 			return RuntimeDecision{}, err
 		}
+		decision, err = engine.advanceGatewayPrerequisite(ctx, typed, decision)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		decision, err = engine.advanceUsageEvidence(ctx, typed.RuntimeRunID, decision)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
 		projectCapsuleReadinessAt(&decision.Snapshot, engine.clock.current())
 		return decision, nil
 	case CancelRuntimeRun:
@@ -554,6 +630,11 @@ func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeComma
 			decision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
 		}
 		engine.store.mu.Unlock()
+		decision, err = engine.advanceUsageEvidence(ctx, typed.RuntimeRunID, decision)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		projectCapsuleReadinessAt(&decision.Snapshot, engine.clock.current())
 		return decision, nil
 	default:
 		engine.observeIngress(IngressMalformed)
@@ -1036,6 +1117,9 @@ func (engine *invariantEngine) executeStart(command StartRuntimeRun) (RuntimeDec
 		!command.Deadline.After(now) {
 		return engine.reject(record, attempt, command.OperationID, digest, CommandRejectionPolicy)
 	}
+	if !reservationEligibleForLease(engine.store.reservations, command, now) {
+		return engine.reject(record, attempt, command.OperationID, digest, CommandRejectionPolicy)
+	}
 	if command.ExpectedTaskRevision != record.fixture.TaskRevision || command.ExpectedRuntimeRevision != record.fixture.RuntimeRevision {
 		return engine.reject(record, attempt, command.OperationID, digest, CommandRejectionStaleRevision)
 	}
@@ -1072,6 +1156,17 @@ func (engine *invariantEngine) executeStart(command StartRuntimeRun) (RuntimeDec
 	}
 	record.reconciliation = ReconciliationStable
 	record.readiness = initialRuntimeReadiness(command)
+	if command.ProviderCapability == ProviderCapabilityRequired {
+		record.gateway = GatewayPrerequisiteSnapshot{
+			Applicability: GatewayPrerequisiteRequired, Status: GatewayGrantWaitingForLease,
+		}
+		record.usage = RuntimeUsageEvidenceSnapshot{Disposition: UsageEvidenceMissing}
+	} else {
+		record.gateway = GatewayPrerequisiteSnapshot{
+			Applicability: GatewayPrerequisiteNotApplicable, Status: GatewayGrantNotApplicable, Ready: true,
+		}
+		record.usage = RuntimeUsageEvidenceSnapshot{Disposition: UsageEvidenceNotApplicable}
+	}
 	fact := RuntimeDecisionFact{
 		DecisionID: engine.nextDecisionID(), Disposition: DecisionAccepted,
 		OperationID: command.OperationID, CanonicalRequestDigest: digest,
@@ -1148,6 +1243,7 @@ func (engine *invariantEngine) Inspect(ctx context.Context, ref RuntimeRunRef) (
 		engine.observeIngress(IngressMalformed)
 		return RuntimeSnapshot{}, newError(ErrorInvalidRequest)
 	}
+	recovery, recoveryErr := inspectGatewayRecovery(ctx, engine.gatewayRecovery)
 	engine.store.mu.Lock()
 	defer engine.store.mu.Unlock()
 	record, exists := engine.store.runtimes[ref.RuntimeRunID]
@@ -1160,7 +1256,19 @@ func (engine *invariantEngine) Inspect(ctx context.Context, ref RuntimeRunRef) (
 		engine.observeIngressLocked(IngressUnsupportedSchema)
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
 	}
-	projectCapsuleReadinessAt(&projected, engine.clock.current())
+	now := engine.clock.current()
+	currentGatewayAuthority := true
+	if record.gateway.Applicability == GatewayPrerequisiteRequired &&
+		record.gateway.Status == GatewayGrantCurrent && record.gateway.Ready {
+		grant := record.gateway.CurrentGrant
+		reservation := engine.store.reservations[grant.QuotaReservationID]
+		externalErr := validateGatewayCallExternalAuthority(ctx, engine.gatewayCallAuthority,
+			gatewayCallExternalAuthorityFact(grant, now), func() error { return nil })
+		currentGatewayAuthority = recoveryErr == nil && gatewayGrantCurrentForRecord(record, recovery, now) &&
+			quotaReservationAuthorizesGateway(reservation, record, now) && externalErr == nil
+	}
+	projectGatewayAuthorityAt(&projected, currentGatewayAuthority, now)
+	projectCapsuleReadinessAt(&projected, now)
 	return projected, nil
 }
 
@@ -1227,6 +1335,8 @@ func buildSnapshot(record *runtimeRecord, version SchemaVersion) RuntimeSnapshot
 		Reconciliation:         record.reconciliation,
 		Readiness:              record.readiness,
 		RuntimeViewBinding:     record.runtimeViewBinding,
+		Gateway:                record.gateway,
+		Usage:                  record.usage,
 	}
 }
 
@@ -1246,6 +1356,8 @@ func snapshotVariantsKnown(record *runtimeRecord) bool {
 		!knownLeaseLifecycleSnapshot(record.lease) || !knownNodeSnapshot(record.node) ||
 		!knownLeaseNodeBinding(record) ||
 		!knownRuntimeLeaseCleanupSnapshot(record) ||
+		!knownGatewayPrerequisite(record.gateway) ||
+		!knownRuntimeUsageEvidence(record.usage) ||
 		!knownPhysicalReleaseEvidence(record.capacityEvidence.PhysicalCapacityReleaseReady) ||
 		!knownPreLeaseTerminalReason(record.preLeaseTerminalReason) ||
 		!knownReconciliation(record.reconciliation) || !knownEvidenceRoot(record.evidenceRoot) ||
@@ -1396,8 +1508,11 @@ func validQuotaReservationFixture(reservation QuotaReservationFixture) bool {
 	return validOpaqueID(reservation.QuotaReservationID.String()) && reservation.Generation > 0 &&
 		(reservation.Mode == QuotaReservationObservation || reservation.Mode == QuotaReservationEnforced) &&
 		(reservation.State == QuotaReservationActive || reservation.State == QuotaReservationInactive) &&
-		validOpaqueID(reservation.PersonalWorkspaceID.String()) && validOpaqueID(reservation.PhaseRunID.String()) &&
-		reservation.Capability == ProviderCapabilityRequired && !reservation.ValidFrom.IsZero() &&
+		validOpaqueID(reservation.PersonalWorkspaceID.String()) && validOpaqueID(reservation.TaskID.String()) &&
+		validOpaqueID(reservation.PhaseRunID.String()) && reservation.AuthorizationGeneration > 0 &&
+		reservation.Capability == ProviderCapabilityRequired && validOpaqueID(reservation.GatewayRoutePolicyID.String()) &&
+		reservation.GatewayRoutePolicyGeneration > 0 && reservation.CapabilityScope != 0 &&
+		reservation.CapabilityScope&^knownProviderCapabilityScope == 0 && !reservation.ValidFrom.IsZero() &&
 		reservation.ExpiresAt.After(reservation.ValidFrom)
 }
 
@@ -1415,8 +1530,13 @@ func reservationEligibleForLease(
 	reservation := reservations[start.ProviderBinding.QuotaReservationID]
 	return reservation != nil && reservation.Generation == start.ProviderBinding.Generation &&
 		reservation.Mode == start.ProviderBinding.Mode && reservation.State == QuotaReservationActive &&
-		reservation.PersonalWorkspaceID == start.PersonalWorkspaceID && reservation.PhaseRunID == start.PhaseRunID &&
-		reservation.Capability == ProviderCapabilityRequired && !now.Before(reservation.ValidFrom) &&
+		reservation.PersonalWorkspaceID == start.PersonalWorkspaceID && reservation.TaskID == start.TaskID &&
+		reservation.PhaseRunID == start.PhaseRunID && reservation.AuthorizationGeneration == start.Authority.generation &&
+		reservation.Capability == ProviderCapabilityRequired &&
+		reservation.GatewayRoutePolicyID == start.ProviderBinding.GatewayRoutePolicyID &&
+		reservation.GatewayRoutePolicyGeneration == start.ProviderBinding.GatewayRoutePolicyGeneration &&
+		reservation.CapabilityScope == start.ProviderBinding.CapabilityScope &&
+		!now.Before(reservation.ValidFrom) &&
 		now.Before(reservation.ExpiresAt)
 }
 

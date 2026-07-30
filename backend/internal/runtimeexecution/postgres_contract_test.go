@@ -2,12 +2,52 @@ package runtimeexecution
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestPostgresRuntimeAggregateCodecRetainsGatewayAndUsageEvidence(t *testing.T) {
+	gateway := GatewayPrerequisiteSnapshot{
+		Applicability:          GatewayPrerequisiteRequired,
+		Status:                 GatewayGrantPending,
+		OperationID:            mustOperationID(t, "gateway-codec-operation"),
+		CanonicalRequestDigest: digest(41),
+		RequestedGeneration:    3,
+	}
+	usage := RuntimeUsageEvidenceSnapshot{
+		Disposition: UsageEvidenceEstimated,
+		Receipts: UsageReceiptReferenceSet{
+			Count: 37, RootDigest: digest(42),
+		},
+	}
+	fixture := RuntimeFixture{Gateway: gateway, Usage: usage}
+
+	encoded, err := encodePostgresRuntimeFixture(fixture)
+	if err != nil {
+		t.Fatalf("encode Runtime aggregate: %v", err)
+	}
+	var persisted postgresRuntimeState
+	if err := json.Unmarshal(encoded, &persisted); err != nil {
+		t.Fatalf("decode Runtime aggregate JSON: %v", err)
+	}
+	gotGateway := gatewaySnapshotFromPostgres(persisted.Gateway)
+	gotUsage := usageSnapshotFromPostgres(persisted.Usage)
+	if gotGateway != gateway || gotUsage != usage {
+		t.Fatalf("aggregate dropped Gateway/Usage: got=%+v/%+v want=%+v/%+v",
+			gotGateway, gotUsage, gateway, usage)
+	}
+
+	record := &runtimeRecord{fixture: fixture, gateway: gateway, usage: usage}
+	retained := fixtureFromRuntimeRecord(record)
+	if retained.Gateway != gateway || retained.Usage != usage {
+		t.Fatalf("fixture projection dropped Gateway/Usage: got=%+v/%+v want=%+v/%+v",
+			retained.Gateway, retained.Usage, gateway, usage)
+	}
+}
 
 func TestPostgresAuthorityRejectsUnsafeConfigurationWithClosedError(t *testing.T) {
 	t.Parallel()

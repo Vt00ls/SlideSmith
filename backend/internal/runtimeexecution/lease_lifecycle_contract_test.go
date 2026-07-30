@@ -87,7 +87,7 @@ func TestInspectShowsAuthoritativeActiveLeaseAndPhysicalOccupancy(t *testing.T) 
 	}
 }
 
-func TestProviderCapableLeaseRequiresExactActiveQuotaReservation(t *testing.T) {
+func TestProviderCapableAdmissionAndLeaseRequireExactActiveQuotaReservation(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.July, 29, 16, 30, 0, 0, time.UTC)
@@ -116,7 +116,9 @@ func TestProviderCapableLeaseRequiresExactActiveQuotaReservation(t *testing.T) {
 			input.ProviderBinding = &ProviderExecutionBinding{
 				QuotaReservationID: mustQuotaReservationID(t, "reservation-"+testCase.suffix),
 				Generation:         4, Mode: QuotaReservationObservation,
-				GatewayRoutePolicyID: mustGatewayRoutePolicyID(t, "gateway-route-"+testCase.suffix),
+				GatewayRoutePolicyID:         mustGatewayRoutePolicyID(t, "gateway-route-"+testCase.suffix),
+				GatewayRoutePolicyGeneration: 3, CapabilityScope: ProviderScopeTextGeneration,
+				RoutePolicyExpiresAt: now.Add(8 * time.Minute),
 			}
 			start := mustStart(t, input)
 			grant := grantFixtureForStart(start, now.Add(10*time.Minute), true)
@@ -126,8 +128,12 @@ func TestProviderCapableLeaseRequiresExactActiveQuotaReservation(t *testing.T) {
 				QuotaReservationID: start.ProviderBinding.QuotaReservationID,
 				Generation:         start.ProviderBinding.Generation, Mode: start.ProviderBinding.Mode,
 				State: QuotaReservationActive, PersonalWorkspaceID: start.PersonalWorkspaceID,
-				PhaseRunID: start.PhaseRunID, Capability: start.ProviderCapability,
-				ValidFrom: now.Add(-time.Minute), ExpiresAt: now.Add(10 * time.Minute),
+				TaskID: start.TaskID, PhaseRunID: start.PhaseRunID,
+				AuthorizationGeneration: start.Authority.generation, Capability: start.ProviderCapability,
+				GatewayRoutePolicyID:         start.ProviderBinding.GatewayRoutePolicyID,
+				GatewayRoutePolicyGeneration: start.ProviderBinding.GatewayRoutePolicyGeneration,
+				CapabilityScope:              start.ProviderBinding.CapabilityScope,
+				ValidFrom:                    now.Add(-time.Minute), ExpiresAt: now.Add(10 * time.Minute),
 			}
 			if testCase.mutate != nil {
 				testCase.mutate(&reservation)
@@ -163,12 +169,11 @@ func TestProviderCapableLeaseRequiresExactActiveQuotaReservation(t *testing.T) {
 				}
 				return
 			}
-			if decision.Snapshot.State != RuntimeTerminal || decision.Snapshot.Outcome != RuntimeRejected ||
-				decision.Snapshot.PreLeaseTerminalReason != PreLeaseTerminalReservation ||
-				decision.Snapshot.Lease.Disposition != LeaseDispositionNone ||
-				decision.Snapshot.Capacity.NoLease != NoLeaseDispositionRecorded ||
-				decision.Snapshot.CapacityEvidence.PhysicalCapacityReleaseReady != (PhysicalCapacityReleaseReadyEvidence{}) {
-				t.Fatalf("invalid Reservation did not fail closed as proven no-lease: %+v", decision.Snapshot)
+			if decision.Fact.Disposition != DecisionRejected || decision.Snapshot.State != RuntimeCreated ||
+				decision.Snapshot.Outcome != RuntimeOutcomeNone || decision.Snapshot.Lease.AcquireStatus != LeaseNotRequested ||
+				decision.Snapshot.Capacity.NoLease != NoLeaseDispositionNone ||
+				decision.Snapshot.CapacityEvidence != (RuntimeCapacityEvidenceSnapshot{}) {
+				t.Fatalf("invalid Reservation crossed admission: %+v", decision)
 			}
 		})
 	}

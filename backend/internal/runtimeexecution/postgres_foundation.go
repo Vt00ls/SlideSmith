@@ -26,6 +26,12 @@ const (
 	PersistenceFaultAfterLeaseCommit
 	PersistenceFaultBeforeNoLeaseCommit
 	PersistenceFaultAfterNoLeaseCommit
+	PersistenceFaultBeforeGatewayRequestCommit
+	PersistenceFaultAfterGatewayRequestCommit
+	PersistenceFaultBeforeGatewayAcceptanceCommit
+	PersistenceFaultAfterGatewayAcceptanceCommit
+	PersistenceFaultBeforeUsageEvidenceCommit
+	PersistenceFaultAfterUsageEvidenceCommit
 )
 
 func (point PersistenceFaultPoint) String() string {
@@ -56,6 +62,18 @@ func (point PersistenceFaultPoint) String() string {
 		return "before_no_lease_commit"
 	case PersistenceFaultAfterNoLeaseCommit:
 		return "after_no_lease_commit"
+	case PersistenceFaultBeforeGatewayRequestCommit:
+		return "before_gateway_request_commit"
+	case PersistenceFaultAfterGatewayRequestCommit:
+		return "after_gateway_request_commit"
+	case PersistenceFaultBeforeGatewayAcceptanceCommit:
+		return "before_gateway_acceptance_commit"
+	case PersistenceFaultAfterGatewayAcceptanceCommit:
+		return "after_gateway_acceptance_commit"
+	case PersistenceFaultBeforeUsageEvidenceCommit:
+		return "before_usage_evidence_commit"
+	case PersistenceFaultAfterUsageEvidenceCommit:
+		return "after_usage_evidence_commit"
 	default:
 		return "unknown"
 	}
@@ -73,7 +91,7 @@ type PersistenceFaultController struct {
 }
 
 func (controller *PersistenceFaultController) FailNextAt(point PersistenceFaultPoint) error {
-	if point < PersistenceFaultBeforeRequestLookup || point > PersistenceFaultAfterNoLeaseCommit {
+	if point < PersistenceFaultBeforeRequestLookup || point > PersistenceFaultAfterUsageEvidenceCommit {
 		return newPersistenceError(PersistenceInvalidConfiguration)
 	}
 	controller.mu.Lock()
@@ -455,6 +473,8 @@ func fixtureFromRuntimeRecord(record *runtimeRecord) RuntimeFixture {
 	fixture.Reconciliation = record.reconciliation
 	fixture.Readiness = record.readiness
 	fixture.RuntimeViewBinding = record.runtimeViewBinding
+	fixture.Gateway = record.gateway
+	fixture.Usage = record.usage
 	return fixture
 }
 

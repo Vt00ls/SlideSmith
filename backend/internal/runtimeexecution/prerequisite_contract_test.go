@@ -1546,9 +1546,13 @@ func TestProviderCapableRunKeepsGatewayExtensionExplicitlyUnsatisfied(t *testing
 	input := standardStart(t, now, authority, "provider-readiness").StartRuntimeRunInput
 	input.ProviderCapability = ProviderCapabilityRequired
 	input.ProviderBinding = &ProviderExecutionBinding{
-		QuotaReservationID: mustQuotaReservationID(t, "provider-readiness-reservation"),
-		Generation:         3, Mode: QuotaReservationObservation,
-		GatewayRoutePolicyID: mustGatewayRoutePolicyID(t, "provider-readiness-route"),
+		QuotaReservationID:           mustQuotaReservationID(t, "provider-readiness-reservation"),
+		Generation:                   3,
+		Mode:                         QuotaReservationObservation,
+		GatewayRoutePolicyID:         mustGatewayRoutePolicyID(t, "provider-readiness-route"),
+		GatewayRoutePolicyGeneration: 2,
+		CapabilityScope:              ProviderScopeTextGeneration,
+		RoutePolicyExpiresAt:         now.Add(5 * time.Minute),
 	}
 	start := mustStart(t, input)
 	grant := grantFixtureForStart(start, now.Add(10*time.Minute), true)
@@ -1559,8 +1563,13 @@ func TestProviderCapableRunKeepsGatewayExtensionExplicitlyUnsatisfied(t *testing
 		QuotaReservationID: start.ProviderBinding.QuotaReservationID,
 		Generation:         start.ProviderBinding.Generation, Mode: start.ProviderBinding.Mode,
 		State: QuotaReservationActive, PersonalWorkspaceID: start.PersonalWorkspaceID,
-		PhaseRunID: start.PhaseRunID, Capability: ProviderCapabilityRequired,
-		ValidFrom: now.Add(-time.Minute), ExpiresAt: now.Add(5 * time.Minute),
+		TaskID: start.TaskID, PhaseRunID: start.PhaseRunID,
+		AuthorizationGeneration:      start.Authority.generation,
+		Capability:                   ProviderCapabilityRequired,
+		GatewayRoutePolicyID:         start.ProviderBinding.GatewayRoutePolicyID,
+		GatewayRoutePolicyGeneration: start.ProviderBinding.GatewayRoutePolicyGeneration,
+		CapabilityScope:              start.ProviderBinding.CapabilityScope,
+		ValidFrom:                    now.Add(-time.Minute), ExpiresAt: now.Add(5 * time.Minute),
 	}
 	harness, err := NewDeterministicHarness(HarnessConfig{
 		Now: now, Runtimes: []RuntimeFixture{runtimeFixtureForStart(start, authority)},

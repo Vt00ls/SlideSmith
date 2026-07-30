@@ -83,6 +83,11 @@ type PostgresConfig struct {
 	RuntimeViewPrerequisite             RuntimeViewPrerequisitePort
 	QuotaReservationParticipant         QuotaReservationParticipant
 	QuotaReservationFunction            string
+	GatewayGrants                       GatewayGrantAdapter
+	GatewayRecovery                     GatewayRecoveryAuthority
+	GatewayCallAuthority                GatewayCallExternalAuthority
+	GatewayGrantLifetime                time.Duration
+	UsageReceipts                       UsageReceiptEvidenceSource
 	MaintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
 }
 
@@ -107,11 +112,17 @@ type PostgresAuthority struct {
 	runtimeViewPrerequisite             RuntimeViewPrerequisitePort
 	quotaReservationParticipant         QuotaReservationParticipant
 	quotaReservationFunction            string
+	gatewayGrants                       GatewayGrantAdapter
+	gatewayRecovery                     GatewayRecoveryAuthority
+	gatewayCallAuthority                GatewayCallExternalAuthority
+	gatewayGrantLifetime                time.Duration
+	usageReceipts                       UsageReceiptEvidenceSource
 	maintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
 }
 
 var _ RuntimeExecution = (*PostgresAuthority)(nil)
 var _ RuntimeMaintenance = (*PostgresAuthority)(nil)
+var _ GatewayCallAuthorityValidator = (*PostgresAuthority)(nil)
 
 func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority, error) {
 	if db == nil {
@@ -138,6 +149,17 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 		config.QuotaReservationParticipant == nil && config.QuotaReservationFunction != "" {
 		return nil, newPersistenceError(PersistenceInvalidConfiguration)
 	}
+	grantLifetime := config.GatewayGrantLifetime
+	if grantLifetime == 0 {
+		grantLifetime = time.Minute
+	}
+	if grantLifetime < 0 {
+		return nil, newPersistenceError(PersistenceInvalidConfiguration)
+	}
+	usageReceipts := config.UsageReceipts
+	if usageReceipts == nil {
+		usageReceipts, _ = config.GatewayGrants.(UsageReceiptEvidenceSource)
+	}
 	seenMaintenanceAuthorities := make(map[maintenanceAuthorityKey]maintenanceCallerAuthority)
 	for _, binding := range config.MaintenanceAuthorities {
 		if !validMaintenanceAuthorityBinding(binding) {
@@ -163,6 +185,11 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 		runtimeViewPrerequisite:             config.RuntimeViewPrerequisite,
 		quotaReservationParticipant:         config.QuotaReservationParticipant,
 		quotaReservationFunction:            config.QuotaReservationFunction,
+		gatewayGrants:                       config.GatewayGrants,
+		gatewayRecovery:                     config.GatewayRecovery,
+		gatewayCallAuthority:                config.GatewayCallAuthority,
+		gatewayGrantLifetime:                grantLifetime,
+		usageReceipts:                       usageReceipts,
 		maintenanceAuthorities:              append([]RuntimeMaintenanceAuthorityBinding(nil), config.MaintenanceAuthorities...),
 	}, nil
 }
@@ -256,6 +283,11 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	runtimeViewTerminalAudit := authority.table("runtime_execution_runtime_view_terminal_audit")
 	runtimeViewTerminalOutbox := authority.table("runtime_execution_runtime_view_terminal_outbox")
 	runtimeViewTerminalOutboxDelivery := authority.table("runtime_execution_runtime_view_terminal_outbox_delivery")
+	gatewayOutbox := authority.table("runtime_execution_gateway_outbox")
+	gatewayAcceptances := authority.table("runtime_execution_gateway_grant_acceptances")
+	gatewayCurrent := authority.table("runtime_execution_gateway_current")
+	usageReceipts := authority.table("runtime_execution_usage_receipts")
+	usageEvidenceRoots := authority.table("runtime_execution_usage_evidence_roots")
 	nodes := authority.table("runtime_execution_nodes")
 	maintenance := authority.table("runtime_execution_maintenance_operations")
 	maintenanceAuthorities := authority.table("runtime_execution_maintenance_authorities")
@@ -302,6 +334,49 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			aggregate_state jsonb NOT NULL,
 			updated_at timestamptz NOT NULL
 		)`, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			canonical_request_digest bytea NOT NULL CHECK (octet_length(canonical_request_digest) = 32),
+			requested_generation bigint NOT NULL CHECK (requested_generation > 0),
+			previous_generation bigint NOT NULL CHECK (previous_generation >= 0),
+			previous_grant_id text NOT NULL DEFAULT '',
+			request_state jsonb NOT NULL,
+			created_at timestamptz NOT NULL
+		)`, gatewayOutbox, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			canonical_request_digest bytea NOT NULL CHECK (octet_length(canonical_request_digest) = 32),
+			gateway_grant_id text NOT NULL UNIQUE,
+			grant_generation bigint NOT NULL CHECK (grant_generation > 0),
+			decision_state jsonb NOT NULL,
+			accepted_at timestamptz NOT NULL,
+			UNIQUE (runtime_run_id, grant_generation)
+		)`, gatewayAcceptances, gatewayOutbox, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			runtime_run_id text PRIMARY KEY REFERENCES %s(runtime_run_id),
+			operation_id text NOT NULL UNIQUE REFERENCES %s(operation_id),
+			gateway_grant_id text NOT NULL UNIQUE,
+			grant_generation bigint NOT NULL CHECK (grant_generation > 0),
+			activated_at timestamptz NOT NULL
+		)`, gatewayCurrent, runtimes, gatewayAcceptances),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			usage_receipt_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			gateway_attempt_id text NOT NULL,
+			disposition smallint NOT NULL,
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			recorded_at timestamptz NOT NULL
+		)`, usageReceipts, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			disposition smallint NOT NULL,
+			receipt_count bigint NOT NULL CHECK (receipt_count > 0),
+			receipt_root bytea NOT NULL CHECK (octet_length(receipt_root) = 32),
+			recorded_at timestamptz NOT NULL,
+			PRIMARY KEY (runtime_run_id, receipt_root)
+		)`, usageEvidenceRoots, runtimes),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			decision_id text PRIMARY KEY,
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
@@ -940,6 +1015,14 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", audit, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", outbox),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", outbox, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", gatewayOutbox),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", gatewayOutbox, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", gatewayAcceptances),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", gatewayAcceptances, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", usageReceipts),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", usageReceipts, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", usageEvidenceRoots),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", usageEvidenceRoots, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", evidenceRoots),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", evidenceRoots, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", compaction),
@@ -1040,6 +1123,14 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 		if executeErr != nil {
 			return RuntimeDecision{}, executeErr
 		}
+		decision, executeErr = authority.advancePostgresGatewayPrerequisite(ctx, start, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		decision, executeErr = authority.advancePostgresUsageEvidence(ctx, start.RuntimeRunID, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
 		projectCapsuleReadinessAt(&decision.Snapshot, postgresTimestamp(authority.now()))
 		return decision, nil
 	}
@@ -1053,6 +1144,11 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 		); err != nil {
 			return RuntimeDecision{}, err
 		}
+		decision, executeErr = authority.advancePostgresUsageEvidence(ctx, cancel.RuntimeRunID, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		projectCapsuleReadinessAt(&decision.Snapshot, postgresTimestamp(authority.now()))
 		return decision, nil
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
@@ -1329,7 +1425,10 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref RuntimeRunR
 			ref.ProjectionVersion != SnapshotSchemaLeaseLifecycle && ref.ProjectionVersion != SnapshotSchemaV1) {
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
 	}
-	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelRepeatableRead})
+	// The owned Reservation validation function may take a share lock. The
+	// method remains projection-only even though PostgreSQL cannot mark that
+	// transaction read-only.
+	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
 		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
 	}
@@ -1350,12 +1449,48 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref RuntimeRunR
 	if !authorized(record, ref.PersonalWorkspaceID, ref.Authority) {
 		return RuntimeSnapshot{}, newError(ErrorAuthorizationDenied)
 	}
+	now := postgresTimestamp(authority.now())
+	currentGatewayAuthority := true
+	if record.gateway.Applicability == GatewayPrerequisiteRequired &&
+		record.gateway.Status == GatewayGrantCurrent && record.gateway.Ready {
+		grant := record.gateway.CurrentGrant
+		recovery, recoveryErr := inspectGatewayRecovery(ctx, authority.gatewayRecovery)
+		reservationFact := QuotaReservationValidationFact{
+			QuotaReservationID: grant.QuotaReservationID, Generation: grant.QuotaReservationGeneration,
+			Mode: grant.QuotaReservationMode, PersonalWorkspaceID: record.fixture.PersonalWorkspaceID,
+			TaskID: record.fixture.TaskID, PhaseRunID: record.fixture.PhaseRunID,
+			AuthorizationGeneration: grant.OwnerAuthorityGeneration, Capability: ProviderCapabilityRequired,
+			GatewayRoutePolicyID:         grant.GatewayRoutePolicyID,
+			GatewayRoutePolicyGeneration: grant.GatewayRoutePolicyGeneration,
+			CapabilityScope:              grant.CapabilityScope, ValidAt: now,
+		}
+		if _, err := tx.ExecContext(ctx, "SAVEPOINT inspect_gateway_authority"); err != nil {
+			return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
+		}
+		reservation, reservationErr := authority.validatePostgresQuotaReservationFact(ctx, tx, reservationFact)
+		if reservationErr != nil {
+			if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT inspect_gateway_authority"); err != nil {
+				return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT inspect_gateway_authority"); err != nil {
+			return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
+		}
+		externalErr := validateGatewayCallExternalAuthority(ctx, authority.gatewayCallAuthority,
+			gatewayCallExternalAuthorityFact(grant, now), func() error { return nil })
+		currentGatewayAuthority = recoveryErr == nil && reservationErr == nil &&
+			!grant.ExpiresAt.After(reservation.ExpiresAt) && gatewayGrantCurrentForRecord(record, recovery, now) &&
+			externalErr == nil
+	}
 	projected, representable := renderSnapshot(record, ref.ProjectionVersion)
 	if !representable {
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
 	}
-	projectCapsuleReadinessAt(&projected, postgresTimestamp(authority.now()))
-	if err := tx.Commit(); err != nil {
+	projectGatewayAuthorityAt(&projected, currentGatewayAuthority, now)
+	projectCapsuleReadinessAt(&projected, now)
+	// Inspect is projection-only. Roll back the transaction after all reads so
+	// even an owned validation function cannot persist a side effect here.
+	if err := tx.Rollback(); err != nil {
 		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
 	}
 	return projected, nil

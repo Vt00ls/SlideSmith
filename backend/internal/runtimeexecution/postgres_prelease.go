@@ -260,26 +260,8 @@ func (authority *PostgresAuthority) commitPostgresPreLease(
 	if err != nil || !postgresNodeEligibleForLease(node, record, committedAt) {
 		return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
 	}
-	if start.ProviderCapability == ProviderCapabilityRequired {
-		if start.ProviderBinding == nil || authority.quotaReservationParticipant == nil {
-			return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
-		}
-		reservationFact := QuotaReservationValidationFact{
-			QuotaReservationID: start.ProviderBinding.QuotaReservationID,
-			Generation:         start.ProviderBinding.Generation, Mode: start.ProviderBinding.Mode,
-			PersonalWorkspaceID: start.PersonalWorkspaceID, PhaseRunID: start.PhaseRunID,
-			Capability: start.ProviderCapability, ValidAt: committedAt,
-		}
-		reservationTransaction := &postgresQuotaReservationTransaction{
-			tx: tx, function: authority.quotaReservationFunction, fact: reservationFact,
-		}
-		if err := authority.quotaReservationParticipant.ParticipateQuotaReservation(
-			ctx, reservationTransaction, reservationFact,
-		); err != nil || !reservationTransaction.called {
-			return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
-		}
-	} else if start.ProviderCapability != ProviderCapabilityNone {
-		return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
+	if _, err := authority.validatePostgresQuotaReservation(ctx, tx, start, committedAt); err != nil {
+		return RuntimeSnapshot{}, err
 	}
 	if authority.failAt(PersistenceFaultBeforeLeaseCommit) {
 		return RuntimeSnapshot{}, newError(ErrorDependencyUnavailable)

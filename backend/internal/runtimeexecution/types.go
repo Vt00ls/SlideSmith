@@ -42,6 +42,7 @@ type (
 	CatalogSafetyEpoch               uint64
 	AdmissionGrantGeneration         uint64
 	QuotaReservationGeneration       uint64
+	GatewayRoutePolicyGeneration     uint64
 	TaskWorkspaceLifecycleGeneration uint64
 	TaskWorkspaceLifecycleFence      uint64
 )
@@ -287,6 +288,10 @@ func NewAdministratorAuthority(id AuthorityID, generation AuthorizationGeneratio
 	return RuntimeAuthority{id: id, generation: generation, kind: AuthorityAdministrator}
 }
 
+func (authority RuntimeAuthority) AuthorizationGeneration() AuthorizationGeneration {
+	return authority.generation
+}
+
 type WorkerClass uint8
 
 const (
@@ -354,6 +359,15 @@ const (
 	ProviderCapabilityRequired
 )
 
+type ProviderCapabilityScope uint64
+
+const (
+	ProviderScopeTextGeneration ProviderCapabilityScope = 1 << iota
+	ProviderScopeImageGeneration
+)
+
+const knownProviderCapabilityScope = ProviderScopeTextGeneration | ProviderScopeImageGeneration
+
 type QuotaReservationMode uint8
 
 const (
@@ -362,10 +376,13 @@ const (
 )
 
 type ProviderExecutionBinding struct {
-	QuotaReservationID   QuotaReservationID
-	Generation           QuotaReservationGeneration
-	Mode                 QuotaReservationMode
-	GatewayRoutePolicyID GatewayRoutePolicyID
+	QuotaReservationID           QuotaReservationID
+	Generation                   QuotaReservationGeneration
+	Mode                         QuotaReservationMode
+	GatewayRoutePolicyID         GatewayRoutePolicyID
+	GatewayRoutePolicyGeneration GatewayRoutePolicyGeneration
+	CapabilityScope              ProviderCapabilityScope
+	RoutePolicyExpiresAt         time.Time
 }
 
 type RuntimeViewExpiryPolicy uint8
@@ -439,6 +456,7 @@ func NewStartRuntimeRun(input StartRuntimeRunInput) (StartRuntimeRun, error) {
 	}
 	if input.ProviderBinding != nil {
 		binding := *input.ProviderBinding
+		binding.RoutePolicyExpiresAt = binding.RoutePolicyExpiresAt.UTC()
 		input.ProviderBinding = &binding
 	}
 	command := StartRuntimeRun{StartRuntimeRunInput: input}
@@ -470,6 +488,7 @@ func NewCanonicalStartRuntimeRun(input StartRuntimeRunInput) (StartRuntimeRun, e
 	}
 	if input.ProviderBinding != nil {
 		binding := *input.ProviderBinding
+		binding.RoutePolicyExpiresAt = binding.RoutePolicyExpiresAt.UTC()
 		input.ProviderBinding = &binding
 	}
 	command := StartRuntimeRun{StartRuntimeRunInput: input}
@@ -891,6 +910,8 @@ type RuntimeSnapshot struct {
 	Reconciliation         ReconciliationStatus
 	Readiness              RuntimeReadinessSnapshot
 	RuntimeViewBinding     RuntimeViewBindingSnapshot
+	Gateway                GatewayPrerequisiteSnapshot
+	Usage                  RuntimeUsageEvidenceSnapshot
 }
 
 type RetryDisposition uint8

@@ -765,6 +765,8 @@ func TestPostgresProviderLeaseValidatesExactActiveQuotaReservationInCommit(t *te
 			input.ProviderBinding = &runtimeexecution.ProviderExecutionBinding{
 				QuotaReservationID: reservationID, Generation: 4,
 				Mode: runtimeexecution.QuotaReservationObservation, GatewayRoutePolicyID: gatewayID,
+				GatewayRoutePolicyGeneration: 3, CapabilityScope: runtimeexecution.ProviderScopeTextGeneration,
+				RoutePolicyExpiresAt: now.Add(8 * time.Minute),
 			}
 			providerStart, err := runtimeexecution.NewStartRuntimeRun(input)
 			if err != nil {
@@ -788,25 +790,34 @@ func TestPostgresProviderLeaseValidatesExactActiveQuotaReservationInCommit(t *te
 			quotaFunction := system.schema + ".issue76_validate_quota_reservation"
 			if _, err := system.db.ExecContext(context.Background(), fmt.Sprintf(`CREATE TABLE %s (
 				quota_reservation_id text PRIMARY KEY, generation bigint NOT NULL, mode smallint NOT NULL,
-				state smallint NOT NULL, personal_workspace_id text NOT NULL, phase_run_id text NOT NULL,
-				capability smallint NOT NULL, valid_from timestamptz NOT NULL, expires_at timestamptz NOT NULL
+				state smallint NOT NULL, personal_workspace_id text NOT NULL, task_id text NOT NULL,
+				phase_run_id text NOT NULL, authorization_generation bigint NOT NULL,
+				capability smallint NOT NULL, gateway_route_policy_id text NOT NULL,
+				gateway_route_policy_generation bigint NOT NULL, capability_scope bigint NOT NULL,
+				valid_from timestamptz NOT NULL, expires_at timestamptz NOT NULL
 			)`, quotaTable)); err != nil {
 				t.Fatalf("create Usage Reservation fixture: %v", err)
 			}
 			if _, err := system.db.ExecContext(context.Background(), fmt.Sprintf(`CREATE FUNCTION %s(
-				p_id text, p_generation bigint, p_mode smallint, p_workspace text,
-				p_phase text, p_capability smallint, p_valid_at timestamptz
-			) RETURNS void LANGUAGE plpgsql AS $quota$
+				p_id text, p_generation bigint, p_mode smallint, p_workspace text, p_task text,
+				p_phase text, p_authorization_generation bigint, p_capability smallint,
+				p_route_policy_id text, p_route_policy_generation bigint,
+				p_capability_scope bigint, p_valid_at timestamptz
+			) RETURNS timestamptz LANGUAGE plpgsql AS $quota$
 			DECLARE retained %s%%ROWTYPE;
 			BEGIN
 				SELECT * INTO retained FROM %s WHERE quota_reservation_id=p_id FOR SHARE;
 				IF retained.quota_reservation_id IS NULL OR retained.generation <> p_generation OR
 					retained.mode <> p_mode OR retained.state <> 1 OR
-					retained.personal_workspace_id <> p_workspace OR retained.phase_run_id <> p_phase OR
-					retained.capability <> p_capability OR retained.valid_from > p_valid_at OR
+					retained.personal_workspace_id <> p_workspace OR retained.task_id <> p_task OR
+					retained.phase_run_id <> p_phase OR retained.authorization_generation <> p_authorization_generation OR
+					retained.capability <> p_capability OR retained.gateway_route_policy_id <> p_route_policy_id OR
+					retained.gateway_route_policy_generation <> p_route_policy_generation OR
+					retained.capability_scope <> p_capability_scope OR retained.valid_from > p_valid_at OR
 					retained.expires_at <= p_valid_at THEN
 					RAISE EXCEPTION 'quota reservation binding conflict' USING ERRCODE = '23000';
 				END IF;
+				RETURN retained.expires_at;
 			END $quota$`, quotaFunction, quotaTable, quotaTable)); err != nil {
 				t.Fatalf("create Usage Reservation participant: %v", err)
 			}
@@ -820,10 +831,12 @@ func TestPostgresProviderLeaseValidatesExactActiveQuotaReservationInCommit(t *te
 					expiresAt = testCase.expiresAt
 				}
 				if _, err := system.db.ExecContext(context.Background(), fmt.Sprintf(`INSERT INTO %s
-					VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, quotaTable), reservationID.String(),
-					testCase.generation, testCase.mode, testCase.state, workspace,
-					providerStart.PhaseRunID.String(), runtimeexecution.ProviderCapabilityRequired,
-					now.Add(-time.Minute), expiresAt); err != nil {
+					VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, quotaTable), reservationID.String(),
+					testCase.generation, testCase.mode, testCase.state, workspace, providerStart.TaskID.String(),
+					providerStart.PhaseRunID.String(), providerStart.Authority.AuthorizationGeneration(), runtimeexecution.ProviderCapabilityRequired,
+					providerStart.ProviderBinding.GatewayRoutePolicyID.String(),
+					providerStart.ProviderBinding.GatewayRoutePolicyGeneration,
+					providerStart.ProviderBinding.CapabilityScope, now.Add(-time.Minute), expiresAt); err != nil {
 					t.Fatalf("seed Usage Reservation: %v", err)
 				}
 			}
@@ -831,7 +844,7 @@ func TestPostgresProviderLeaseValidatesExactActiveQuotaReservationInCommit(t *te
 				ctx context.Context,
 				transaction runtimeexecution.QuotaReservationValidationTransaction,
 				_ runtimeexecution.QuotaReservationValidationFact,
-			) error {
+			) (runtimeexecution.QuotaReservationValidationResult, error) {
 				return transaction.ValidateQuotaReservation(ctx)
 			})
 			providerRuntime, err := runtimeexecution.NewPostgresAuthority(system.db, runtimeexecution.PostgresConfig{
@@ -855,14 +868,18 @@ func TestPostgresProviderLeaseValidatesExactActiveQuotaReservationInCommit(t *te
 				return
 			}
 			assertRuntimeExecutionErrorCode(t, executeErr, runtimeexecution.ErrorIntegrityConflict)
-			inspected, inspectErr := providerRuntime.Inspect(context.Background(), runtimeexecution.RuntimeRunRef{
+			_, inspectErr := providerRuntime.Inspect(context.Background(), runtimeexecution.RuntimeRunRef{
 				SchemaVersion: runtimeexecution.SchemaV1, ProjectionVersion: runtimeexecution.SnapshotSchemaCurrent,
 				PersonalWorkspaceID: providerStart.PersonalWorkspaceID, RuntimeRunID: providerStart.RuntimeRunID,
 				Authority: providerStart.Authority,
 			})
-			if inspectErr != nil || inspected.Lease.AcquireStatus == runtimeexecution.LeaseGranted ||
-				inspected.Capacity.Physical != runtimeexecution.PhysicalCapacityNotApplicable {
-				t.Fatalf("invalid Reservation committed lease authority: snapshot=%+v err=%v", inspected, inspectErr)
+			assertRuntimeExecutionErrorCode(t, inspectErr, runtimeexecution.ErrorAuthorizationDenied)
+			schedulerView, schedulerErr := system.scheduling.Inspect(
+				context.Background(), schedulerOwnerWorkItemRef(t, work),
+			)
+			if schedulerErr != nil || schedulerView.State != scheduler.WorkItemDelivering ||
+				schedulerView.Grant.State != scheduler.GrantReservedUnbound {
+				t.Fatalf("invalid Reservation crossed admission: view=%+v err=%v", schedulerView, schedulerErr)
 			}
 		})
 	}

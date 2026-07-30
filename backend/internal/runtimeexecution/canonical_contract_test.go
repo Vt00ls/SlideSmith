@@ -123,10 +123,13 @@ func TestCanonicalStartBindsCompleteExecutionAuthority(t *testing.T) {
 	}
 	input.ProviderCapability = ProviderCapabilityRequired
 	input.ProviderBinding = &ProviderExecutionBinding{
-		QuotaReservationID:   mustQuotaReservationID(t, "quota-complete-authority"),
-		Generation:           5,
-		Mode:                 QuotaReservationObservation,
-		GatewayRoutePolicyID: mustGatewayRoutePolicyID(t, "gateway-policy-complete-authority"),
+		QuotaReservationID:           mustQuotaReservationID(t, "quota-complete-authority"),
+		Generation:                   5,
+		Mode:                         QuotaReservationObservation,
+		GatewayRoutePolicyID:         mustGatewayRoutePolicyID(t, "gateway-policy-complete-authority"),
+		GatewayRoutePolicyGeneration: 6,
+		CapabilityScope:              ProviderScopeTextGeneration | ProviderScopeImageGeneration,
+		RoutePolicyExpiresAt:         now.Add(10 * time.Minute),
 	}
 	input.NetworkPolicyID = mustNetworkPolicyID(t, "network-policy-complete-authority")
 	input.SecretPolicyID = mustSecretPolicyID(t, "secret-policy-complete-authority")

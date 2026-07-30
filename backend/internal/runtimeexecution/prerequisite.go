@@ -356,6 +356,9 @@ func projectCapsuleReadinessAt(snapshot *RuntimeSnapshot, now time.Time) {
 	if snapshot == nil || snapshot.Readiness == (RuntimeReadinessSnapshot{}) {
 		return
 	}
+	if snapshot.Gateway != (GatewayPrerequisiteSnapshot{}) {
+		snapshot.Readiness.LLMGateway = gatewayPrerequisiteFactAt(snapshot.Gateway, now)
+	}
 	want := snapshot.Readiness
 	updateCapsuleReadiness(&want, snapshot.RuntimeViewBinding, snapshot.Lease)
 	currentLeaseAuthority := now.Before(snapshot.Lease.ExpiresAt) &&
@@ -363,6 +366,21 @@ func projectCapsuleReadinessAt(snapshot *RuntimeSnapshot, now time.Time) {
 	currentRuntimeViewAuthority := snapshot.RuntimeViewBinding == (RuntimeViewBindingSnapshot{}) ||
 		now.Before(snapshot.RuntimeViewBinding.ExpiresAt)
 	snapshot.Readiness.CapsuleReady = want.CapsuleReady && currentLeaseAuthority && currentRuntimeViewAuthority
+}
+
+func gatewayRequestPrerequisitesSatisfiedAt(snapshot RuntimeSnapshot, now time.Time) bool {
+	if snapshot.State != RuntimePreparingPrerequisites || snapshot.Outcome != RuntimeOutcomeNone ||
+		snapshot.Readiness == (RuntimeReadinessSnapshot{}) || !now.UTC().Before(snapshot.Deadline) ||
+		snapshot.Lease.AcquireStatus != LeaseGranted || snapshot.Lease.Disposition != LeaseActive ||
+		!now.UTC().Before(snapshot.Lease.ExpiresAt) || !now.UTC().Before(snapshot.Lease.AuthorizationExpiresAt) {
+		return false
+	}
+	currentRuntimeViewAuthority := snapshot.RuntimeViewBinding == (RuntimeViewBindingSnapshot{}) ||
+		now.UTC().Before(snapshot.RuntimeViewBinding.ExpiresAt)
+	return prerequisiteSatisfied(snapshot.Readiness.Lease) &&
+		prerequisiteSatisfied(snapshot.Readiness.RuntimeBinding) &&
+		runtimeViewPrerequisiteSatisfied(snapshot.Readiness.RuntimeView, snapshot.RuntimeViewBinding, snapshot.Lease) &&
+		currentRuntimeViewAuthority && prerequisiteSatisfied(snapshot.Readiness.ImmutableInputs)
 }
 
 func runtimeViewPrerequisiteSatisfied(
