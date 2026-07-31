@@ -63,6 +63,42 @@ func TestAgentWorkerAcceptIsDurableInspectableAndPayloadBound(t *testing.T) {
 	}
 }
 
+func TestAgentCapabilityContractRejectsIntentAndPromptSubstitution(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 31, 11, 10, 0, 0, time.UTC)
+	authority := mustTaskOrchestrationAuthority(t, "agent-contract-authority", 7)
+	start := standardStart(t, now, authority, "agent-contract")
+	plan := validAgentPlanForStart(start, "agent-contract")
+	if _, err := newAgentWorkerCapabilityAdapter(plan, newContractAgentWorkerBackend()); err != nil {
+		t.Fatalf("canonical Agent contract: %v", err)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*agentCapabilityPlan)
+	}{
+		{name: "intent", mutate: func(changed *agentCapabilityPlan) {
+			changed.IntentReference = AgentIntentReference{value: "substituted-agent-intent"}
+		}},
+		{name: "prompt", mutate: func(changed *agentCapabilityPlan) {
+			changed.PromptReference = AgentPromptReference{value: "substituted-agent-prompt"}
+		}},
+	}
+	for _, test := range mutations {
+		t.Run(test.name, func(t *testing.T) {
+			changed := plan
+			test.mutate(&changed)
+			if canonicalAgentCapabilityContractDigest(changed) == plan.CapabilityContractDigest {
+				t.Fatalf("Agent capability contract omitted %s reference", test.name)
+			}
+			if _, err := newAgentWorkerCapabilityAdapter(changed, newContractAgentWorkerBackend()); errorCode(err) != ErrorInvalidRequest {
+				t.Fatalf("retained contract accepted substituted %s: %v", test.name, err)
+			}
+		})
+	}
+}
+
 func TestWorkerHeartbeatDelegatesToCurrentLeaseLifecycleAndRejectsStaleFence(t *testing.T) {
 	t.Parallel()
 
@@ -104,8 +140,37 @@ func TestWorkerHeartbeatDelegatesToCurrentLeaseLifecycleAndRejectsStaleFence(t *
 	if err != nil {
 		t.Fatalf("heartbeat: %v", err)
 	}
+	if first.SchemaVersion != SchemaV1 || first.CanonicalRequestDigest != heartbeat.CanonicalDigest ||
+		first.CanonicalDigest == heartbeat.CanonicalDigest || !validWorkerLeaseDecision(first) {
+		t.Fatalf("heartbeat returned an unbound decision envelope: %+v", first)
+	}
+	decisionMutations := []struct {
+		name   string
+		mutate func(*workerLeaseDecision)
+	}{
+		{name: "schema version", mutate: func(changed *workerLeaseDecision) { changed.SchemaVersion++ }},
+		{name: "operation", mutate: func(changed *workerLeaseDecision) {
+			changed.OperationID = mustOperationID(t, "different-worker-heartbeat-decision-operation")
+		}},
+		{name: "request digest", mutate: func(changed *workerLeaseDecision) { changed.CanonicalRequestDigest = digest(202) }},
+		{name: "runtime revision", mutate: func(changed *workerLeaseDecision) { changed.RuntimeRevision++ }},
+		{name: "runtime fence", mutate: func(changed *workerLeaseDecision) { changed.RuntimeFence++ }},
+		{name: "lease snapshot", mutate: func(changed *workerLeaseDecision) {
+			changed.Lease.AuthorizationExpiresAt = changed.Lease.AuthorizationExpiresAt.Add(time.Second)
+		}},
+	}
+	for _, test := range decisionMutations {
+		t.Run("decision "+test.name, func(t *testing.T) {
+			changed := first
+			test.mutate(&changed)
+			if canonicalWorkerLeaseDecisionDigest(changed) == first.CanonicalDigest {
+				t.Fatalf("canonical worker lease decision omitted %s", test.name)
+			}
+		})
+	}
 	replayed, err := harness.workers.heartbeat(context.Background(), heartbeat)
-	if err != nil || !replayed.Replayed || replayed.Lease != first.Lease {
+	if err != nil || !replayed.Replayed || replayed.Lease != first.Lease ||
+		replayed.CanonicalDigest != first.CanonicalDigest || !validWorkerLeaseDecision(replayed) {
 		t.Fatalf("heartbeat replay = %+v err=%v first=%+v", replayed, err, first)
 	}
 	if first.Lease.Generation != before.Lease.Generation+1 || first.Lease.Fence != before.Lease.Fence+1 ||
@@ -121,6 +186,80 @@ func TestWorkerHeartbeatDelegatesToCurrentLeaseLifecycleAndRejectsStaleFence(t *
 	after, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
 	if err != nil || after.Lease != first.Lease || after.Capacity.Physical != PhysicalCapacityOccupied {
 		t.Fatalf("stale heartbeat changed lease/capacity: %+v err=%v", after, err)
+	}
+}
+
+func TestWorkerHeartbeatCanonicalDigestBindsCompleteLeaseAndNodeSnapshots(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 31, 11, 30, 0, 0, time.UTC)
+	harness, start, accepted := newReadyWorkerProtocolHarness(
+		t, now, "worker-heartbeat-complete-snapshot", WorkerAgent, newContractAgentWorkerBackend(), nil,
+	)
+	delivery, err := harness.Dispatch.ClaimDispatch(context.Background(), DispatchClaimRequest{
+		RuntimeRunID: start.RuntimeRunID, CapsuleID: accepted.Snapshot.Capsule.CapsuleID,
+		Digest: accepted.Snapshot.Capsule.Digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accept, err := newWorkerAccept(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.workers.accept(context.Background(), accept); err != nil {
+		t.Fatal(err)
+	}
+	current, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, err := newWorkerHeartbeat(workerHeartbeatInput{
+		SchemaVersion: SchemaV1, OperationID: mustOperationID(t, "worker-heartbeat-complete-snapshot-operation"),
+		PersonalWorkspaceID: start.PersonalWorkspaceID, RuntimeRunID: start.RuntimeRunID,
+		StartOperationID: start.OperationID, CapsuleID: current.Capsule.CapsuleID,
+		CapsuleDigest: current.Capsule.Digest, RuntimeFence: current.RuntimeFence,
+		Lease: current.Lease, Node: current.Node, ReleaseSafetyEpoch: start.ReleaseSafetyEpoch,
+		CatalogSafetyEpoch: startCatalogSafetyEpoch(start),
+		RequestedExpiresAt: current.Lease.ExpiresAt.Add(time.Second), OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutations := []struct {
+		name   string
+		mutate func(*workerHeartbeat)
+	}{
+		{name: "lease acquire status", mutate: func(value *workerHeartbeat) { value.Lease.AcquireStatus++ }},
+		{name: "lease acquire operation", mutate: func(value *workerHeartbeat) {
+			value.Lease.AcquireOperationID = mustOperationID(t, "different-acquire-operation")
+		}},
+		{name: "lease acquire digest", mutate: func(value *workerHeartbeat) { value.Lease.AcquireDigest = digest(201) }},
+		{name: "lease disposition", mutate: func(value *workerHeartbeat) { value.Lease.Disposition++ }},
+		{name: "lease expiry", mutate: func(value *workerHeartbeat) { value.Lease.ExpiresAt = value.Lease.ExpiresAt.Add(time.Second) }},
+		{name: "sandbox identity", mutate: func(value *workerHeartbeat) { value.Lease.SandboxID = SandboxID{value: "different-sandbox"} }},
+		{name: "sandbox generation", mutate: func(value *workerHeartbeat) { value.Lease.SandboxGeneration++ }},
+		{name: "sandbox fence", mutate: func(value *workerHeartbeat) { value.Lease.SandboxFence++ }},
+		{name: "authorization expiry", mutate: func(value *workerHeartbeat) {
+			value.Lease.AuthorizationExpiresAt = value.Lease.AuthorizationExpiresAt.Add(time.Second)
+		}},
+		{name: "node readiness", mutate: func(value *workerHeartbeat) { value.Node.Readiness++ }},
+		{name: "node attested at", mutate: func(value *workerHeartbeat) { value.Node.AttestedAt = value.Node.AttestedAt.Add(time.Second) }},
+		{name: "node expiry", mutate: func(value *workerHeartbeat) { value.Node.ExpiresAt = value.Node.ExpiresAt.Add(time.Second) }},
+		{name: "node occupancy", mutate: func(value *workerHeartbeat) { value.Node.Occupancy++ }},
+		{name: "node quarantine", mutate: func(value *workerHeartbeat) { value.Node.Quarantined = !value.Node.Quarantined }},
+		{name: "node containment", mutate: func(value *workerHeartbeat) { value.Node.Containment++ }},
+		{name: "node reset", mutate: func(value *workerHeartbeat) { value.Node.Reset++ }},
+	}
+	for _, test := range mutations {
+		t.Run(test.name, func(t *testing.T) {
+			changed := heartbeat
+			test.mutate(&changed)
+			if canonicalWorkerHeartbeatDigest(changed) == heartbeat.CanonicalDigest {
+				t.Fatalf("canonical heartbeat digest omitted %s", test.name)
+			}
+		})
 	}
 }
 
@@ -628,19 +767,48 @@ func TestToolWorkerUsesIndependentBackendAndClosedTypedCapabilityPayload(t *test
 		t.Fatalf("Tool backend independence: snapshot=%+v calls=%d err=%v", inspected, backend.acceptCount(), err)
 	}
 
-	for _, envelope := range []reflect.Type{
-		reflect.TypeOf(toolTypedParameters{}), reflect.TypeOf(toolCapabilityPlan{}),
-		reflect.TypeOf(toolCapabilityInvocation{}), reflect.TypeOf(agentCapabilityPlan{}),
-		reflect.TypeOf(agentCapabilityInvocation{}),
-	} {
-		assertNoArbitraryExecutionFields(t, envelope)
-	}
-	for _, backendInterface := range []reflect.Type{
-		reflect.TypeOf((*toolWorkerBackend)(nil)).Elem(),
-		reflect.TypeOf((*agentWorkerBackend)(nil)).Elem(),
-	} {
-		assertNoArbitraryExecutionBackend(t, backendInterface)
-	}
+	assertExactStructFieldTypes(t, reflect.TypeOf(toolTypedParameters{}), []permittedFieldType{
+		{reflect.TypeOf(SchemaVersion(0)), 1}, {reflect.TypeOf(ToolParameterKind(0)), 1},
+		{reflect.TypeOf(ImmutableInputManifestIdentity{}), 1}, {reflect.TypeOf(Digest{}), 2},
+	})
+	assertExactStructFieldTypes(t, reflect.TypeOf(toolCapabilityPlan{}), []permittedFieldType{
+		{reflect.TypeOf(RuntimeBindingID{}), 1}, {reflect.TypeOf(Digest{}), 7},
+		{reflect.TypeOf(ToolCapabilityKey(0)), 1}, {reflect.TypeOf(toolTypedParameters{}), 1},
+		{reflect.TypeOf(false), 1},
+	})
+	assertExactStructFieldTypes(t, reflect.TypeOf(agentCapabilityPlan{}), []permittedFieldType{
+		{reflect.TypeOf(RuntimeBindingID{}), 1}, {reflect.TypeOf(Digest{}), 7},
+		{reflect.TypeOf(AgentIntentReference{}), 1}, {reflect.TypeOf(AgentPromptReference{}), 1},
+		{reflect.TypeOf(false), 1},
+	})
+	assertExactStructFieldTypes(t, reflect.TypeOf(toolCapabilityInvocation{}), []permittedFieldType{
+		{reflect.TypeOf(RuntimeRunID{}), 1}, {reflect.TypeOf(OperationID{}), 1},
+		{reflect.TypeOf(ExecutionCapsuleID{}), 1}, {reflect.TypeOf(Digest{}), 7},
+		{reflect.TypeOf(RuntimeBindingID{}), 1}, {reflect.TypeOf(ToolCapabilityKey(0)), 1},
+		{reflect.TypeOf(toolTypedParameters{}), 1}, {reflect.TypeOf(ResolvedImmutableInputManifest{}), 1},
+		{reflect.TypeOf(GatewayGrantID{}), 1}, {reflect.TypeOf(GatewayGrantGeneration(0)), 1},
+		{reflect.TypeOf(LeaseGeneration(0)), 1}, {reflect.TypeOf(LeaseFence(0)), 1},
+	})
+	assertExactStructFieldTypes(t, reflect.TypeOf(agentCapabilityInvocation{}), []permittedFieldType{
+		{reflect.TypeOf(RuntimeRunID{}), 1}, {reflect.TypeOf(OperationID{}), 1},
+		{reflect.TypeOf(ExecutionCapsuleID{}), 1}, {reflect.TypeOf(Digest{}), 7},
+		{reflect.TypeOf(RuntimeBindingID{}), 1}, {reflect.TypeOf(AgentIntentReference{}), 1},
+		{reflect.TypeOf(AgentPromptReference{}), 1}, {reflect.TypeOf(ResolvedImmutableInputManifest{}), 1},
+		{reflect.TypeOf(GatewayGrantID{}), 1}, {reflect.TypeOf(GatewayGrantGeneration(0)), 1},
+		{reflect.TypeOf(QuotaReservationID{}), 1}, {reflect.TypeOf(QuotaReservationGeneration(0)), 1},
+		{reflect.TypeOf(LeaseGeneration(0)), 1}, {reflect.TypeOf(LeaseFence(0)), 1},
+	})
+
+	assertExactInterfaceSignatures(t, reflect.TypeOf((*toolWorkerBackend)(nil)).Elem(), []reflect.Type{
+		reflect.TypeOf((func(context.Context, toolCapabilityInvocation, workerAccept) (workerOperationAck, error))(nil)),
+		reflect.TypeOf((func(context.Context, toolCapabilityInvocation, workerObserve) (workerBackendObservation, error))(nil)),
+		reflect.TypeOf((func(context.Context, toolCapabilityInvocation, workerStopIntent) (workerStopAck, error))(nil)),
+	})
+	assertExactInterfaceSignatures(t, reflect.TypeOf((*agentWorkerBackend)(nil)).Elem(), []reflect.Type{
+		reflect.TypeOf((func(context.Context, agentCapabilityInvocation, workerAccept) (workerOperationAck, error))(nil)),
+		reflect.TypeOf((func(context.Context, agentCapabilityInvocation, workerObserve) (workerBackendObservation, error))(nil)),
+		reflect.TypeOf((func(context.Context, agentCapabilityInvocation, workerStopIntent) (workerStopAck, error))(nil)),
+	})
 }
 
 func TestProviderCapableToolWorkerLifecyclePreservesGatewayLineage(t *testing.T) {
@@ -724,6 +892,86 @@ func TestProviderCapableToolWorkerLifecyclePreservesGatewayLineage(t *testing.T)
 	}
 	if _, err := harness.workers.stop(context.Background(), stop); err != nil || backend.stopCount() != 1 {
 		t.Fatalf("provider Tool Stop: err=%v calls=%d", err, backend.stopCount())
+	}
+}
+
+func TestProviderCapableAgentWorkerInvocationBindsGatewayAndQuotaLineage(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 31, 12, 35, 0, 0, time.UTC)
+	authority := mustTaskOrchestrationAuthority(t, "provider-agent-worker-authority", 7)
+	initial, reservation, _, _ := providerGatewayFixture(t, now, authority, "provider-agent-worker")
+	plan := validAgentPlanForStart(initial, "provider-agent-worker")
+	input := initial.StartRuntimeRunInput
+	input.WorkerClass = WorkerAgent
+	input.CapabilityContractDigest = plan.CapabilityContractDigest
+	start := mustStart(t, input)
+	plan = validAgentPlanForStart(start, "provider-agent-worker")
+	plan.ProviderRequired = true
+	backend := newContractAgentWorkerBackend()
+	adapter, err := newAgentWorkerCapabilityAdapter(plan, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grant := grantFixtureForStart(start, now.Add(10*time.Minute), true)
+	grant.ExecutionNodeID, grant.NodeCapacityGeneration = startNodeID(t, "provider-agent-worker-node"), 1
+	node := executionNodeFixtureForStart(t, start, grant, now)
+	bindingValidator, inputValidator := acceptedGatewayPrerequisiteValidators(t, "provider-agent-worker")
+	recovery := writableGatewayRecoveryAuthority(now)
+	var harness *DeterministicHarness
+	gateway, err := NewDeterministicGateway(func() time.Time {
+		if harness == nil {
+			return now
+		}
+		return harness.clock.current()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, err = NewDeterministicHarness(HarnessConfig{
+		Now: now, IDs: DeterministicIDConfig{DecisionStart: 1, LeaseStart: 1, SandboxStart: 1},
+		Runtimes:        []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants: []AdmissionGrantFixture{grant}, QuotaReservations: []QuotaReservationFixture{reservation},
+		Nodes: []ExecutionNodeFixture{node},
+		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
+			context.Context, LeaseAcquisitionRequest,
+		) (LeaseAcquisitionObservation, error) {
+			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
+		}),
+		RuntimeBindingValidator: bindingValidator, ImmutableInputValidator: inputValidator,
+		GatewayGrants: gateway, GatewayRecovery: recovery,
+		GatewayCallAuthority: gatewayCallExternalAuthorityForStart(recovery, start),
+		agentWorker:          adapter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil || !prepared.Snapshot.Readiness.CapsuleReady {
+		t.Fatalf("prepare provider Agent Capsule: %+v err=%v", prepared, err)
+	}
+	delivery, err := harness.Dispatch.ClaimDispatch(context.Background(), DispatchClaimRequest{
+		RuntimeRunID: start.RuntimeRunID, CapsuleID: prepared.Snapshot.Capsule.CapsuleID,
+		Digest: prepared.Snapshot.Capsule.Digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accept, err := newWorkerAccept(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.workers.accept(context.Background(), accept); err != nil {
+		t.Fatalf("provider Agent Accept: %v", err)
+	}
+	invocation := backend.lastAcceptInvocation()
+	currentGrant := prepared.Snapshot.Gateway.CurrentGrant
+	if invocation.GatewayGrantID != currentGrant.GatewayGrantID ||
+		invocation.GatewayGrantGeneration != currentGrant.Generation ||
+		invocation.GatewayGrantDigest != currentGrant.CanonicalDigest ||
+		invocation.QuotaReservationID != start.ProviderBinding.QuotaReservationID ||
+		invocation.QuotaReservationGeneration != start.ProviderBinding.Generation {
+		t.Fatalf("provider Agent invocation lost Gateway/Quota lineage: invocation=%+v grant=%+v", invocation, currentGrant)
 	}
 }
 
@@ -936,40 +1184,58 @@ func startCatalogSafetyEpoch(start StartRuntimeRun) CatalogSafetyEpoch {
 	return start.CatalogBinding.SafetyEpoch
 }
 
-func assertNoArbitraryExecutionFields(t *testing.T, envelope reflect.Type) {
+type permittedFieldType struct {
+	typeOf reflect.Type
+	count  int
+}
+
+func assertExactStructFieldTypes(t *testing.T, envelope reflect.Type, permitted []permittedFieldType) {
 	t.Helper()
+	if envelope.Kind() != reflect.Struct {
+		t.Fatalf("worker protocol envelope kind=%v, want struct", envelope.Kind())
+	}
+	want := make(map[reflect.Type]int, len(permitted))
+	for _, field := range permitted {
+		if field.typeOf == nil || field.count <= 0 || want[field.typeOf] != 0 {
+			t.Fatalf("invalid closed field-type allowlist for %s: %+v", envelope, permitted)
+		}
+		want[field.typeOf] = field.count
+	}
+	got := make(map[reflect.Type]int, len(want))
 	for index := 0; index < envelope.NumField(); index++ {
 		field := envelope.Field(index)
-		name := strings.ToLower(field.Name)
-		digestBinding := field.Type == reflect.TypeOf(Digest{}) &&
-			(strings.Contains(name, "entrypoint") || strings.Contains(name, "executor"))
-		unsafeName := strings.Contains(name, "shell") || strings.Contains(name, "command") ||
-			strings.Contains(name, "path") || strings.Contains(name, "rawexec") ||
-			strings.Contains(name, "executable")
-		rawValue := field.Type.Kind() == reflect.String ||
-			field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() == reflect.Uint8
-		if rawValue || unsafeName && !digestBinding {
-			t.Fatalf("arbitrary execution surface leaked into %s: %s %s", envelope, field.Name, field.Type)
+		if field.Anonymous || want[field.Type] == 0 {
+			t.Fatalf("worker protocol envelope %s has unpermitted structural field type %s", envelope, field.Type)
 		}
+		got[field.Type]++
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("worker protocol envelope %s field-type multiset=%v, want %v", envelope, got, want)
 	}
 }
 
-func assertNoArbitraryExecutionBackend(t *testing.T, backend reflect.Type) {
+func assertExactInterfaceSignatures(t *testing.T, backend reflect.Type, permitted []reflect.Type) {
 	t.Helper()
+	if backend.Kind() != reflect.Interface {
+		t.Fatalf("worker backend kind=%v, want interface", backend.Kind())
+	}
+	want := make(map[reflect.Type]int, len(permitted))
+	for _, signature := range permitted {
+		if signature == nil || signature.Kind() != reflect.Func || want[signature] != 0 {
+			t.Fatalf("invalid closed method-signature allowlist for %s: %v", backend, permitted)
+		}
+		want[signature] = 1
+	}
+	got := make(map[reflect.Type]int, len(want))
 	for index := 0; index < backend.NumMethod(); index++ {
-		method := backend.Method(index)
-		name := strings.ToLower(method.Name)
-		if strings.Contains(name, "shell") || strings.Contains(name, "command") ||
-			strings.Contains(name, "rawexec") || strings.Contains(name, "executable") {
-			t.Fatalf("arbitrary execution method leaked into %s: %s", backend, method.Name)
+		signature := backend.Method(index).Type
+		if want[signature] == 0 {
+			t.Fatalf("worker backend %s has unpermitted method signature %s", backend, signature)
 		}
-		for argument := 0; argument < method.Type.NumIn(); argument++ {
-			typeOfArgument := method.Type.In(argument)
-			if typeOfArgument.Kind() == reflect.String ||
-				typeOfArgument.Kind() == reflect.Slice && typeOfArgument.Elem().Kind() == reflect.Uint8 {
-				t.Fatalf("raw execution argument leaked into %s.%s: %s", backend, method.Name, typeOfArgument)
-			}
-		}
+		got[signature]++
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("worker backend %s method-signature multiset=%v, want %v", backend, got, want)
 	}
 }
 
@@ -980,6 +1246,7 @@ type contractAgentWorkerBackend struct {
 	observations     []contractWorkerObservation
 	stops            int
 	nextObserveError error
+	lastAccept       agentCapabilityInvocation
 }
 
 type contractWorkerBackendControl interface {
@@ -1014,12 +1281,19 @@ func (backend *contractAgentWorkerBackend) acceptAgent(
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	backend.accepts++
+	backend.lastAccept = invocation
 	if invocation.RuntimeRunID != command.RuntimeRunID || invocation.CapsuleID != command.CapsuleID ||
 		invocation.CapsuleDigest != command.CapsuleDigest || invocation.LeaseGeneration != command.LeaseGeneration ||
 		invocation.LeaseFence != command.LeaseFence {
 		return workerOperationAck{}, newError(ErrorIntegrityConflict)
 	}
 	return newWorkerOperationAck(command), nil
+}
+
+func (backend *contractAgentWorkerBackend) lastAcceptInvocation() agentCapabilityInvocation {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	return backend.lastAccept
 }
 
 func (backend *contractAgentWorkerBackend) acceptCount() int {
@@ -1217,6 +1491,15 @@ func newReadyWorkerProtocolHarness(
 			t.Fatal(err)
 		}
 	}
+	if class == WorkerAgent {
+		input := start.StartRuntimeRunInput
+		input.CapabilityContractDigest = validAgentPlanForStart(start, suffix).CapabilityContractDigest
+		var err error
+		start, err = NewStartRuntimeRun(input)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
 	grant := grantFixtureForStart(start, now.Add(10*time.Minute), true)
 	grant.ExecutionNodeID, grant.NodeCapacityGeneration = startNodeID(t, suffix+"-node"), 1
 	node := executionNodeFixtureForStart(t, start, grant, now)
@@ -1224,16 +1507,7 @@ func newReadyWorkerProtocolHarness(
 	var toolAdapter workerCapabilityAdapter
 	if class == WorkerAgent {
 		var err error
-		agentAdapter, err = newAgentWorkerCapabilityAdapter(agentCapabilityPlan{
-			RuntimeBindingID: start.RuntimeBindingID, RuntimeBindingDigest: start.RuntimeBindingDigest,
-			CapabilityContractDigest:    start.CapabilityContractDigest,
-			AllowedPlatformImagesDigest: start.AllowedPlatformImagesDigest,
-			ExecutorContractDigest:      start.ExecutorContractDigest,
-			IntentReference:             AgentIntentReference{value: suffix + "-agent-intent"},
-			PromptReference:             AgentPromptReference{value: suffix + "-prompt-reference"},
-			EntrypointDigest:            digestBytes([]byte("actual-executor")), ActualImageDigest: digestBytes([]byte("actual-image")),
-			ActualExecutorDigest: digestBytes([]byte("actual-executor")),
-		}, agentBackend)
+		agentAdapter, err = newAgentWorkerCapabilityAdapter(validAgentPlanForStart(start, suffix), agentBackend)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1348,5 +1622,20 @@ func validToolPlanForStart(start StartRuntimeRun) toolCapabilityPlan {
 		ActualImageDigest:           digestBytes([]byte("actual-image")), ActualExecutorDigest: digestBytes([]byte("actual-executor")),
 	}
 	plan.CapabilityContractDigest = canonicalToolCapabilityContractDigest(plan)
+	return plan
+}
+
+func validAgentPlanForStart(start StartRuntimeRun, suffix string) agentCapabilityPlan {
+	plan := agentCapabilityPlan{
+		RuntimeBindingID: start.RuntimeBindingID, RuntimeBindingDigest: start.RuntimeBindingDigest,
+		AllowedPlatformImagesDigest: start.AllowedPlatformImagesDigest,
+		ExecutorContractDigest:      start.ExecutorContractDigest,
+		IntentReference:             AgentIntentReference{value: suffix + "-agent-intent"},
+		PromptReference:             AgentPromptReference{value: suffix + "-prompt-reference"},
+		EntrypointDigest:            digestBytes([]byte("actual-executor")),
+		ActualImageDigest:           digestBytes([]byte("actual-image")),
+		ActualExecutorDigest:        digestBytes([]byte("actual-executor")),
+	}
+	plan.CapabilityContractDigest = canonicalAgentCapabilityContractDigest(plan)
 	return plan
 }

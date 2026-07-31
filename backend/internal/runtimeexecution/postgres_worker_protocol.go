@@ -92,17 +92,6 @@ func decodePostgresWorkerObservation(encoded []byte) (workerObservation, error) 
 	return observation, nil
 }
 
-func (authority *PostgresAuthority) workerAdapter(class WorkerClass) workerCapabilityAdapter {
-	switch class {
-	case WorkerAgent:
-		return authority.agentWorker
-	case WorkerTool:
-		return authority.toolWorker
-	default:
-		return nil
-	}
-}
-
 func (authority *PostgresAuthority) accept(ctx context.Context, command workerAccept) (workerOperationAck, error) {
 	if ctx == nil || ctx.Err() != nil {
 		return workerOperationAck{}, newError(ErrorDependencyUnavailable)
@@ -142,7 +131,7 @@ func (authority *PostgresAuthority) accept(ctx context.Context, command workerAc
 	if len(retainedDispatchAck) != 0 {
 		return workerOperationAck{}, newError(ErrorIntegrityConflict)
 	}
-	adapter := authority.workerAdapter(command.WorkerClass)
+	adapter := selectWorkerCapabilityAdapter(command.WorkerClass, authority.agentWorker, authority.toolWorker)
 	now := postgresTimestamp(authority.now())
 	if adapter == nil || !workerAcceptCurrent(record, command, capsule, now) {
 		return workerOperationAck{}, newError(ErrorAuthorizationDenied)
@@ -155,11 +144,7 @@ func (authority *PostgresAuthority) accept(ctx context.Context, command workerAc
 		return workerOperationAck{}, newError(ErrorIntegrityConflict)
 	}
 	previousRevision, previousFence, previousState := record.fixture.RuntimeRevision, record.fixture.RuntimeFence, record.fixture.State
-	record.capsule.disposition, record.capsule.ackDigest = DispatchAcknowledged, ack.CanonicalDigest
-	record.fixture.RuntimeRevision++
-	record.fixture.State = RuntimeStarting
-	record.worker = workerSnapshotFromAcceptance(command, ack)
-	record.workerAcceptance = &ack
+	applyWorkerAcceptance(record, command, ack)
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
 		operation_id, runtime_run_id, request_digest, capsule_digest, ack_id, ack_digest, accepted_at
 	) VALUES ($1,$2,$3,$4,$5,$6,$7)`, authority.table("runtime_execution_worker_acceptances")),
@@ -244,7 +229,13 @@ func (authority *PostgresAuthority) heartbeat(ctx context.Context, heartbeat wor
 		}
 	} else {
 		record, loadErr := authority.loadRuntimeForUpdate(ctx, tx, heartbeat.RuntimeRunID)
-		if loadErr != nil || !workerHeartbeatCurrent(record, heartbeat, postgresTimestamp(authority.now())) {
+		if errors.Is(loadErr, sql.ErrNoRows) {
+			return workerLeaseDecision{}, newError(ErrorIntegrityConflict)
+		}
+		if loadErr != nil {
+			return workerLeaseDecision{}, normalizeRuntimePersistenceFailure(loadErr)
+		}
+		if !workerHeartbeatCurrent(record, heartbeat, postgresTimestamp(authority.now())) {
 			return workerLeaseDecision{}, newError(ErrorIntegrityConflict)
 		}
 		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
@@ -277,11 +268,10 @@ func (authority *PostgresAuthority) heartbeat(ctx context.Context, heartbeat wor
 	if err != nil {
 		return workerLeaseDecision{}, err
 	}
-	return workerLeaseDecision{
-		OperationID: heartbeat.OperationID, CanonicalDigest: heartbeat.CanonicalDigest,
-		RuntimeRevision: maintained.RuntimeRevision, RuntimeFence: maintained.RuntimeFence,
-		Lease: maintained.Lease, Replayed: replayed || maintained.Replayed,
-	}, nil
+	return newWorkerLeaseDecision(
+		heartbeat, maintained.RuntimeRevision, maintained.RuntimeFence, maintained.Lease,
+		replayed || maintained.Replayed,
+	), nil
 }
 
 func (authority *PostgresAuthority) observe(ctx context.Context, request workerObserve) (workerObservationResult, error) {
@@ -309,7 +299,7 @@ func (authority *PostgresAuthority) observe(ctx context.Context, request workerO
 		}
 		return replay, replayErr
 	}
-	adapter := authority.workerAdapter(request.Ref.WorkerClass)
+	adapter := selectWorkerCapabilityAdapter(request.Ref.WorkerClass, authority.agentWorker, authority.toolWorker)
 	now := postgresTimestamp(authority.now())
 	if adapter == nil || !workerObserveCurrent(record, request, now) {
 		return workerObservationResult{}, newError(ErrorAuthorizationDenied)
@@ -417,7 +407,7 @@ func (authority *PostgresAuthority) stop(ctx context.Context, intent workerStopI
 		}
 		return replay, replayErr
 	}
-	adapter := authority.workerAdapter(intent.WorkerClass)
+	adapter := selectWorkerCapabilityAdapter(intent.WorkerClass, authority.agentWorker, authority.toolWorker)
 	now := postgresTimestamp(authority.now())
 	if adapter == nil || !workerStopCurrent(record, intent, now) {
 		return workerStopAck{}, newError(ErrorAuthorizationDenied)
@@ -430,12 +420,7 @@ func (authority *PostgresAuthority) stop(ctx context.Context, intent workerStopI
 		return workerStopAck{}, newError(ErrorIntegrityConflict)
 	}
 	previousRevision, previousFence, previousState := record.fixture.RuntimeRevision, record.fixture.RuntimeFence, record.fixture.State
-	record.fixture.RuntimeRevision++
-	record.worker.Stop = WorkerStopSnapshot{
-		Status: WorkerStopAccepted, OperationID: intent.OperationID, AckID: ack.AckID,
-		AckDigest: ack.CanonicalDigest, Reason: intent.Reason, RuntimeFence: intent.RuntimeFence,
-		LeaseGeneration: intent.LeaseGeneration, LeaseFence: intent.LeaseFence,
-	}
+	applyWorkerStopAcceptance(record, intent, ack)
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
 		operation_id, runtime_run_id, original_operation_id, request_digest, ack_id, ack_digest, accepted_at
 	) VALUES ($1,$2,$3,$4,$5,$6,$7)`, authority.table("runtime_execution_worker_stops")),

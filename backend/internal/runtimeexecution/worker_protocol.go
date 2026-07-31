@@ -200,6 +200,26 @@ type workerCapabilityAdapter interface {
 	stopCapability(context.Context, workerStopIntent, executionCapsule) (workerStopAck, error)
 }
 
+func selectWorkerCapabilityAdapter(
+	class WorkerClass,
+	agent workerCapabilityAdapter,
+	tool workerCapabilityAdapter,
+) workerCapabilityAdapter {
+	var selected workerCapabilityAdapter
+	switch class {
+	case WorkerAgent:
+		selected = agent
+	case WorkerTool:
+		selected = tool
+	default:
+		return nil
+	}
+	if selected == nil || selected.workerClass() != class {
+		return nil
+	}
+	return selected
+}
+
 type AgentIntentReference struct{ value string }
 type AgentPromptReference struct{ value string }
 
@@ -217,24 +237,35 @@ type agentCapabilityPlan struct {
 	ProviderRequired            bool
 }
 
+func canonicalAgentCapabilityContractDigest(plan agentCapabilityPlan) Digest {
+	return digestBytes([]byte(strings.Join([]string{
+		"slidesmith.runtime-execution.agent-capability-contract/v1",
+		plan.RuntimeBindingID.String(), plan.RuntimeBindingDigest.String(),
+		plan.IntentReference.value, plan.PromptReference.value, plan.EntrypointDigest.String(),
+	}, "\n")))
+}
+
 type agentCapabilityInvocation struct {
-	RuntimeRunID             RuntimeRunID
-	OperationID              OperationID
-	CapsuleID                ExecutionCapsuleID
-	CapsuleDigest            Digest
-	RuntimeBindingID         RuntimeBindingID
-	RuntimeBindingDigest     Digest
-	CapabilityContractDigest Digest
-	IntentReference          AgentIntentReference
-	PromptReference          AgentPromptReference
-	EntrypointDigest         Digest
-	ImmutableInputManifest   ResolvedImmutableInputManifest
-	OutputContractDigest     Digest
-	EvidenceContractDigest   Digest
-	GatewayGrantID           GatewayGrantID
-	GatewayGrantGeneration   GatewayGrantGeneration
-	LeaseGeneration          LeaseGeneration
-	LeaseFence               LeaseFence
+	RuntimeRunID               RuntimeRunID
+	OperationID                OperationID
+	CapsuleID                  ExecutionCapsuleID
+	CapsuleDigest              Digest
+	RuntimeBindingID           RuntimeBindingID
+	RuntimeBindingDigest       Digest
+	CapabilityContractDigest   Digest
+	IntentReference            AgentIntentReference
+	PromptReference            AgentPromptReference
+	EntrypointDigest           Digest
+	ImmutableInputManifest     ResolvedImmutableInputManifest
+	OutputContractDigest       Digest
+	EvidenceContractDigest     Digest
+	GatewayGrantID             GatewayGrantID
+	GatewayGrantGeneration     GatewayGrantGeneration
+	GatewayGrantDigest         Digest
+	QuotaReservationID         QuotaReservationID
+	QuotaReservationGeneration QuotaReservationGeneration
+	LeaseGeneration            LeaseGeneration
+	LeaseFence                 LeaseFence
 }
 
 type agentWorkerBackend interface {
@@ -254,7 +285,8 @@ func newAgentWorkerCapabilityAdapter(plan agentCapabilityPlan, backend agentWork
 		!validOpaqueReferenceID(plan.PromptReference.value) || plan.EntrypointDigest == (Digest{}) ||
 		plan.AllowedPlatformImagesDigest == (Digest{}) || plan.ExecutorContractDigest == (Digest{}) ||
 		plan.ActualImageDigest == (Digest{}) || plan.ActualExecutorDigest == (Digest{}) ||
-		plan.EntrypointDigest != plan.ActualExecutorDigest {
+		plan.EntrypointDigest != plan.ActualExecutorDigest ||
+		plan.CapabilityContractDigest != canonicalAgentCapabilityContractDigest(plan) {
 		return nil, newError(ErrorInvalidRequest)
 	}
 	return &agentWorkerCapabilityAdapter{plan: plan, backend: backend}, nil
@@ -262,11 +294,14 @@ func newAgentWorkerCapabilityAdapter(plan agentCapabilityPlan, backend agentWork
 
 func (*agentWorkerCapabilityAdapter) workerClass() WorkerClass { return WorkerAgent }
 
-func (adapter *agentWorkerCapabilityAdapter) current(capsule executionCapsule) bool {
+func (adapter *agentWorkerCapabilityAdapter) matchesCapsuleBinding(capsule executionCapsule) bool {
 	plan := adapter.plan
-	provider := capsule.GatewayGrantID != (GatewayGrantID{})
+	provider := capsule.GatewayGrantID != (GatewayGrantID{}) && capsule.GatewayGrantGeneration > 0 &&
+		capsule.GatewayGrantDigest != (Digest{}) && validOpaqueID(capsule.QuotaReservationID.String()) &&
+		capsule.QuotaReservationGeneration > 0
 	return capsule.WorkerClass == WorkerAgent && plan.RuntimeBindingID == capsule.RuntimeBindingID &&
 		plan.RuntimeBindingDigest == capsule.RuntimeBindingDigest &&
+		plan.CapabilityContractDigest == canonicalAgentCapabilityContractDigest(plan) &&
 		plan.CapabilityContractDigest == capsule.CapabilityContractDigest &&
 		plan.AllowedPlatformImagesDigest == capsule.AllowedPlatformImagesDigest &&
 		plan.ExecutorContractDigest == capsule.ExecutorContractDigest &&
@@ -280,7 +315,7 @@ func (adapter *agentWorkerCapabilityAdapter) acceptCapability(
 	command workerAccept,
 	capsule executionCapsule,
 ) (workerOperationAck, error) {
-	if !adapter.current(capsule) {
+	if !adapter.matchesCapsuleBinding(capsule) {
 		return workerOperationAck{}, newError(ErrorAuthorizationDenied)
 	}
 	ack, err := adapter.backend.acceptAgent(ctx, agentInvocation(adapter.plan, capsule, command.CapsuleDigest), command)
@@ -295,7 +330,7 @@ func (adapter *agentWorkerCapabilityAdapter) observeCapability(
 	request workerObserve,
 	capsule executionCapsule,
 ) (workerObservation, error) {
-	if !adapter.current(capsule) {
+	if !adapter.matchesCapsuleBinding(capsule) {
 		return workerObservation{}, newError(ErrorAuthorizationDenied)
 	}
 	invocation := agentInvocation(adapter.plan, capsule, request.Ref.CapsuleDigest)
@@ -312,7 +347,7 @@ func (adapter *agentWorkerCapabilityAdapter) stopCapability(
 	intent workerStopIntent,
 	capsule executionCapsule,
 ) (workerStopAck, error) {
-	if !adapter.current(capsule) {
+	if !adapter.matchesCapsuleBinding(capsule) {
 		return workerStopAck{}, newError(ErrorAuthorizationDenied)
 	}
 	invocation := agentInvocation(adapter.plan, capsule, intent.CapsuleDigest)
@@ -333,8 +368,9 @@ func agentInvocation(plan agentCapabilityPlan, capsule executionCapsule, capsule
 		PromptReference: plan.PromptReference, EntrypointDigest: plan.EntrypointDigest,
 		ImmutableInputManifest: capsule.Inputs, OutputContractDigest: capsule.OutputContractDigest,
 		EvidenceContractDigest: capsule.EvidenceContractDigest, GatewayGrantID: capsule.GatewayGrantID,
-		GatewayGrantGeneration: capsule.GatewayGrantGeneration,
-		LeaseGeneration:        capsule.LeaseGeneration, LeaseFence: capsule.LeaseFence,
+		GatewayGrantGeneration: capsule.GatewayGrantGeneration, GatewayGrantDigest: capsule.GatewayGrantDigest,
+		QuotaReservationID: capsule.QuotaReservationID, QuotaReservationGeneration: capsule.QuotaReservationGeneration,
+		LeaseGeneration: capsule.LeaseGeneration, LeaseFence: capsule.LeaseFence,
 	}
 }
 
@@ -471,7 +507,7 @@ func (adapter *toolWorkerCapabilityAdapter) invocation(capsule executionCapsule,
 	}
 }
 
-func (adapter *toolWorkerCapabilityAdapter) current(capsule executionCapsule) bool {
+func (adapter *toolWorkerCapabilityAdapter) matchesCapsuleBinding(capsule executionCapsule) bool {
 	plan := adapter.plan
 	provider := capsule.GatewayGrantID != (GatewayGrantID{}) && capsule.GatewayGrantGeneration > 0 &&
 		capsule.GatewayGrantDigest != (Digest{})
@@ -492,7 +528,7 @@ func (adapter *toolWorkerCapabilityAdapter) acceptCapability(
 	command workerAccept,
 	capsule executionCapsule,
 ) (workerOperationAck, error) {
-	if !adapter.current(capsule) {
+	if !adapter.matchesCapsuleBinding(capsule) {
 		return workerOperationAck{}, newError(ErrorAuthorizationDenied)
 	}
 	ack, err := adapter.backend.acceptTool(ctx, adapter.invocation(capsule, command.CapsuleDigest), command)
@@ -507,7 +543,7 @@ func (adapter *toolWorkerCapabilityAdapter) observeCapability(
 	request workerObserve,
 	capsule executionCapsule,
 ) (workerObservation, error) {
-	if !adapter.current(capsule) {
+	if !adapter.matchesCapsuleBinding(capsule) {
 		return workerObservation{}, newError(ErrorAuthorizationDenied)
 	}
 	invocation := adapter.invocation(capsule, request.Ref.CapsuleDigest)
@@ -524,7 +560,7 @@ func (adapter *toolWorkerCapabilityAdapter) stopCapability(
 	intent workerStopIntent,
 	capsule executionCapsule,
 ) (workerStopAck, error) {
-	if !adapter.current(capsule) {
+	if !adapter.matchesCapsuleBinding(capsule) {
 		return workerStopAck{}, newError(ErrorAuthorizationDenied)
 	}
 	invocation := adapter.invocation(capsule, intent.CapsuleDigest)
@@ -556,7 +592,7 @@ func (engine *invariantEngine) accept(ctx context.Context, command workerAccept)
 		}
 		return retained, nil
 	}
-	adapter := engine.workerAdapter(command.WorkerClass)
+	adapter := selectWorkerCapabilityAdapter(command.WorkerClass, engine.agentWorker, engine.toolWorker)
 	if record == nil || adapter == nil || !workerAcceptCurrent(record, command, capsule, engine.clock.current()) {
 		engine.store.mu.Unlock()
 		return workerOperationAck{}, newError(ErrorAuthorizationDenied)
@@ -584,24 +620,17 @@ func (engine *invariantEngine) accept(ctx context.Context, command workerAccept)
 	if record == nil || !workerAcceptCurrent(record, command, capsule, engine.clock.current()) {
 		return workerOperationAck{}, newError(ErrorAuthorizationDenied)
 	}
+	applyWorkerAcceptance(record, command, ack)
+	return ack, nil
+}
+
+func applyWorkerAcceptance(record *runtimeRecord, command workerAccept, ack workerOperationAck) {
 	record.capsule.disposition = DispatchAcknowledged
 	record.capsule.ackDigest = ack.CanonicalDigest
 	record.fixture.RuntimeRevision++
 	record.fixture.State = RuntimeStarting
 	record.worker = workerSnapshotFromAcceptance(command, ack)
 	record.workerAcceptance = &ack
-	return ack, nil
-}
-
-func (engine *invariantEngine) workerAdapter(class WorkerClass) workerCapabilityAdapter {
-	switch class {
-	case WorkerAgent:
-		return engine.agentWorker
-	case WorkerTool:
-		return engine.toolWorker
-	default:
-		return nil
-	}
 }
 
 func workerAcceptCurrent(record *runtimeRecord, command workerAccept, capsule executionCapsule, now time.Time) bool {
@@ -694,6 +723,10 @@ type workerHeartbeat struct {
 }
 
 func newWorkerHeartbeat(input workerHeartbeatInput) (workerHeartbeat, error) {
+	input.Lease.ExpiresAt = input.Lease.ExpiresAt.UTC()
+	input.Lease.AuthorizationExpiresAt = input.Lease.AuthorizationExpiresAt.UTC()
+	input.Node.AttestedAt = input.Node.AttestedAt.UTC()
+	input.Node.ExpiresAt = input.Node.ExpiresAt.UTC()
 	input.RequestedExpiresAt = input.RequestedExpiresAt.UTC()
 	input.OccurredAt = input.OccurredAt.UTC()
 	heartbeat := workerHeartbeat{workerHeartbeatInput: input}
@@ -706,18 +739,39 @@ func newWorkerHeartbeat(input workerHeartbeatInput) (workerHeartbeat, error) {
 
 func canonicalWorkerHeartbeatDigest(heartbeat workerHeartbeat) Digest {
 	input := heartbeat.workerHeartbeatInput
-	return digestBytes([]byte(strings.Join([]string{
+	canonical := []string{
 		"slidesmith.runtime-execution.worker-heartbeat/v1", fmt.Sprint(input.SchemaVersion),
 		input.OperationID.String(), input.PersonalWorkspaceID.String(), input.RuntimeRunID.String(),
 		input.StartOperationID.String(), input.CapsuleID.String(), input.CapsuleDigest.String(),
-		fmt.Sprint(input.RuntimeFence), input.Lease.LeaseID.String(), fmt.Sprint(input.Lease.Generation),
-		fmt.Sprint(input.Lease.Fence), input.Lease.WorkerAuthorityID.String(), fmt.Sprint(input.Lease.WorkerGeneration),
-		input.Lease.NodeAuthorityID.String(), fmt.Sprint(input.Lease.AuthorizationGeneration),
-		input.Node.ExecutionNodeID.String(), fmt.Sprint(input.Node.Generation), input.Node.AttestationID.String(),
-		fmt.Sprint(input.Node.AttestationGeneration), fmt.Sprint(input.ReleaseSafetyEpoch),
-		fmt.Sprint(input.CatalogSafetyEpoch), input.RequestedExpiresAt.Format(time.RFC3339Nano),
-		input.OccurredAt.Format(time.RFC3339Nano),
-	}, "\n")))
+		fmt.Sprint(input.RuntimeFence),
+	}
+	canonical = append(canonical, canonicalRuntimeLeaseSnapshot(input.Lease)...)
+	canonical = append(canonical, canonicalRuntimeNodeSnapshot(input.Node)...)
+	canonical = append(canonical, fmt.Sprint(input.ReleaseSafetyEpoch),
+		fmt.Sprint(input.CatalogSafetyEpoch), input.RequestedExpiresAt.UTC().Format(time.RFC3339Nano),
+		input.OccurredAt.UTC().Format(time.RFC3339Nano),
+	)
+	return digestBytes([]byte(strings.Join(canonical, "\n")))
+}
+
+func canonicalRuntimeLeaseSnapshot(lease RuntimeLeaseSnapshot) []string {
+	return []string{
+		fmt.Sprint(lease.AcquireStatus), lease.AcquireOperationID.String(), lease.AcquireDigest.String(),
+		lease.LeaseID.String(), fmt.Sprint(lease.Generation), fmt.Sprint(lease.Fence), fmt.Sprint(lease.Disposition),
+		lease.ExpiresAt.UTC().Format(time.RFC3339Nano), lease.SandboxID.String(), fmt.Sprint(lease.SandboxGeneration),
+		fmt.Sprint(lease.SandboxFence), lease.WorkerAuthorityID.String(), fmt.Sprint(lease.WorkerGeneration),
+		lease.NodeAuthorityID.String(), fmt.Sprint(lease.AuthorizationGeneration),
+		lease.AuthorizationExpiresAt.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func canonicalRuntimeNodeSnapshot(node RuntimeNodeSnapshot) []string {
+	return []string{
+		node.ExecutionNodeID.String(), fmt.Sprint(node.Generation), fmt.Sprint(node.Readiness),
+		node.AttestationID.String(), fmt.Sprint(node.AttestationGeneration),
+		node.AttestedAt.UTC().Format(time.RFC3339Nano), node.ExpiresAt.UTC().Format(time.RFC3339Nano),
+		fmt.Sprint(node.Occupancy), fmt.Sprint(node.Quarantined), fmt.Sprint(node.Containment), fmt.Sprint(node.Reset),
+	}
 }
 
 func validWorkerHeartbeat(heartbeat workerHeartbeat) bool {
@@ -726,23 +780,67 @@ func validWorkerHeartbeat(heartbeat workerHeartbeat) bool {
 		validOpaqueID(input.PersonalWorkspaceID.String()) && validOpaqueID(input.RuntimeRunID.String()) &&
 		validOpaqueID(input.StartOperationID.String()) && validOpaqueID(input.CapsuleID.String()) &&
 		input.CapsuleDigest != (Digest{}) && input.RuntimeFence > 0 &&
-		input.Lease.AcquireStatus == LeaseGranted && input.Lease.Disposition == LeaseActive &&
+		knownLeaseLifecycleSnapshot(input.Lease) && input.Lease.AcquireStatus == LeaseGranted &&
+		validOpaqueID(input.Lease.AcquireOperationID.String()) && input.Lease.AcquireDigest != (Digest{}) &&
+		input.Lease.Disposition == LeaseActive &&
 		validOpaqueID(input.Lease.LeaseID.String()) && input.Lease.Generation > 0 && input.Lease.Fence > 0 &&
 		validOpaqueID(input.Lease.WorkerAuthorityID.String()) && input.Lease.WorkerGeneration > 0 &&
 		validOpaqueID(input.Lease.NodeAuthorityID.String()) && input.Lease.AuthorizationGeneration > 0 &&
-		validOpaqueID(input.Node.ExecutionNodeID.String()) && input.Node.Generation > 0 &&
+		knownNodeSnapshot(input.Node) && input.Node.Readiness == NodeReady && !input.Node.Quarantined &&
+		input.Node.Occupancy == NodeOccupied && validOpaqueID(input.Node.ExecutionNodeID.String()) && input.Node.Generation > 0 &&
 		validOpaqueID(input.Node.AttestationID.String()) && input.Node.AttestationGeneration > 0 &&
 		input.ReleaseSafetyEpoch > 0 && !input.RequestedExpiresAt.IsZero() && !input.OccurredAt.IsZero() &&
+		!input.OccurredAt.Before(input.Node.AttestedAt) && input.OccurredAt.Before(input.Lease.ExpiresAt) &&
+		input.OccurredAt.Before(input.Lease.AuthorizationExpiresAt) && input.OccurredAt.Before(input.Node.ExpiresAt) &&
+		input.RequestedExpiresAt.After(input.Lease.ExpiresAt) &&
+		!input.RequestedExpiresAt.After(input.Lease.AuthorizationExpiresAt) &&
+		!input.RequestedExpiresAt.After(input.Node.ExpiresAt) &&
 		heartbeat.CanonicalDigest == canonicalWorkerHeartbeatDigest(heartbeat)
 }
 
 type workerLeaseDecision struct {
-	OperationID     OperationID
-	CanonicalDigest Digest
-	RuntimeRevision RuntimeRevision
-	RuntimeFence    RuntimeFence
-	Lease           RuntimeLeaseSnapshot
-	Replayed        bool
+	SchemaVersion          SchemaVersion
+	OperationID            OperationID
+	CanonicalRequestDigest Digest
+	RuntimeRevision        RuntimeRevision
+	RuntimeFence           RuntimeFence
+	Lease                  RuntimeLeaseSnapshot
+	CanonicalDigest        Digest
+	Replayed               bool
+}
+
+func newWorkerLeaseDecision(
+	heartbeat workerHeartbeat,
+	runtimeRevision RuntimeRevision,
+	runtimeFence RuntimeFence,
+	lease RuntimeLeaseSnapshot,
+	replayed bool,
+) workerLeaseDecision {
+	decision := workerLeaseDecision{
+		SchemaVersion: SchemaV1, OperationID: heartbeat.OperationID,
+		CanonicalRequestDigest: heartbeat.CanonicalDigest, RuntimeRevision: runtimeRevision,
+		RuntimeFence: runtimeFence, Lease: lease, Replayed: replayed,
+	}
+	decision.CanonicalDigest = canonicalWorkerLeaseDecisionDigest(decision)
+	return decision
+}
+
+func canonicalWorkerLeaseDecisionDigest(decision workerLeaseDecision) Digest {
+	canonical := []string{
+		"slidesmith.runtime-execution.worker-lease-decision/v1", fmt.Sprint(decision.SchemaVersion),
+		decision.OperationID.String(), decision.CanonicalRequestDigest.String(),
+		fmt.Sprint(decision.RuntimeRevision), fmt.Sprint(decision.RuntimeFence),
+	}
+	canonical = append(canonical, canonicalRuntimeLeaseSnapshot(decision.Lease)...)
+	return digestBytes([]byte(strings.Join(canonical, "\n")))
+}
+
+func validWorkerLeaseDecision(decision workerLeaseDecision) bool {
+	return decision.SchemaVersion == SchemaV1 && validOpaqueID(decision.OperationID.String()) &&
+		decision.CanonicalRequestDigest != (Digest{}) && decision.RuntimeRevision > 0 && decision.RuntimeFence > 0 &&
+		knownLeaseLifecycleSnapshot(decision.Lease) && decision.Lease.AcquireStatus == LeaseGranted &&
+		decision.Lease.Disposition == LeaseActive && decision.CanonicalDigest != (Digest{}) &&
+		decision.CanonicalDigest == canonicalWorkerLeaseDecisionDigest(decision)
 }
 
 type retainedWorkerHeartbeat struct {
@@ -798,11 +896,9 @@ func (engine *invariantEngine) heartbeat(
 	if err != nil {
 		return workerLeaseDecision{}, err
 	}
-	decision := workerLeaseDecision{
-		OperationID: heartbeat.OperationID, CanonicalDigest: heartbeat.CanonicalDigest,
-		RuntimeRevision: maintained.RuntimeRevision, RuntimeFence: maintained.RuntimeFence,
-		Lease: maintained.Lease, Replayed: maintained.Replayed,
-	}
+	decision := newWorkerLeaseDecision(
+		heartbeat, maintained.RuntimeRevision, maintained.RuntimeFence, maintained.Lease, maintained.Replayed,
+	)
 	engine.store.mu.Lock()
 	defer engine.store.mu.Unlock()
 	if retained, exists := engine.store.workerHeartbeats[heartbeat.OperationID]; exists {
@@ -1160,7 +1256,7 @@ func (engine *invariantEngine) observe(ctx context.Context, request workerObserv
 			return retained, nil
 		}
 	}
-	adapter := engine.workerAdapter(request.Ref.WorkerClass)
+	adapter := selectWorkerCapabilityAdapter(request.Ref.WorkerClass, engine.agentWorker, engine.toolWorker)
 	if adapter == nil || !workerObserveCurrent(record, request, engine.clock.current()) {
 		engine.store.mu.Unlock()
 		return workerObservationResult{}, newError(ErrorAuthorizationDenied)
@@ -1452,7 +1548,7 @@ func (engine *invariantEngine) stop(ctx context.Context, intent workerStopIntent
 			return retained.ack, nil
 		}
 	}
-	adapter := engine.workerAdapter(intent.WorkerClass)
+	adapter := selectWorkerCapabilityAdapter(intent.WorkerClass, engine.agentWorker, engine.toolWorker)
 	if adapter == nil || !workerStopCurrent(record, intent, engine.clock.current()) {
 		engine.store.mu.Unlock()
 		return workerStopAck{}, newError(ErrorAuthorizationDenied)
@@ -1486,13 +1582,17 @@ func (engine *invariantEngine) stop(ctx context.Context, intent workerStopIntent
 		record.workerStops = make(map[OperationID]retainedWorkerStop)
 	}
 	record.workerStops[intent.OperationID] = retainedWorkerStop{digest: intent.CanonicalDigest, ack: ack}
+	applyWorkerStopAcceptance(record, intent, ack)
+	return ack, nil
+}
+
+func applyWorkerStopAcceptance(record *runtimeRecord, intent workerStopIntent, ack workerStopAck) {
 	record.fixture.RuntimeRevision++
 	record.worker.Stop = WorkerStopSnapshot{
 		Status: WorkerStopAccepted, OperationID: intent.OperationID, AckID: ack.AckID,
 		AckDigest: ack.CanonicalDigest, Reason: intent.Reason, RuntimeFence: intent.RuntimeFence,
 		LeaseGeneration: intent.LeaseGeneration, LeaseFence: intent.LeaseFence,
 	}
-	return ack, nil
 }
 
 func workerStopCurrent(record *runtimeRecord, intent workerStopIntent, now time.Time) bool {

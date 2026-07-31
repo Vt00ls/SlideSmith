@@ -43,6 +43,48 @@ func TestPostgresWorkerProtocolContextFailuresAreDependencyUnavailable(t *testin
 	}
 }
 
+func TestPostgresWorkerHeartbeatNormalizesRuntimeLoadFailureSeparatelyFromStaleState(t *testing.T) {
+	now := time.Date(2026, time.July, 31, 12, 55, 0, 0, time.UTC)
+	db, schema, store, _, start, command, _ := newPostgresWorkerProtocolHarness(
+		t, "worker_hb_load", now, nil,
+	)
+	if _, err := store.accept(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.Inspect(context.Background(), runtimeRef(start, start.Authority))
+	if err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, err := newWorkerHeartbeat(workerHeartbeatInput{
+		SchemaVersion: SchemaV1, OperationID: mustOperationID(t, "worker-heartbeat-load-failure-operation"),
+		PersonalWorkspaceID: start.PersonalWorkspaceID, RuntimeRunID: start.RuntimeRunID,
+		StartOperationID: start.OperationID, CapsuleID: current.Capsule.CapsuleID,
+		CapsuleDigest: current.Capsule.Digest, RuntimeFence: current.RuntimeFence,
+		Lease: current.Lease, Node: current.Node, ReleaseSafetyEpoch: start.ReleaseSafetyEpoch,
+		CatalogSafetyEpoch: startCatalogSafetyEpoch(start),
+		RequestedExpiresAt: current.Lease.ExpiresAt.Add(time.Second), OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	blocker, err := db.BeginTx(context.Background(), &sql.TxOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blocker.Rollback() }()
+	if _, err := blocker.ExecContext(context.Background(), `SELECT 1 FROM `+schema+`.runtime_execution_runtimes
+		WHERE runtime_run_id=$1 FOR UPDATE`, start.RuntimeRunID.String()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	_, err = store.heartbeat(ctx, heartbeat)
+	if errorCode(err) != ErrorDependencyUnavailable {
+		t.Fatalf("runtime load failure code=%v err=%v, want dependency unavailable", errorCode(err), err)
+	}
+}
+
 func TestPostgresWorkerAcceptIsAtomicAcrossFaultsAndResponseLoss(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -336,14 +378,17 @@ func TestPostgresWorkerHeartbeatAndLeaseRevokeRacePreservesSingleCurrentFence(t 
 	close(blocker.release)
 	heartbeatOutcome := <-heartbeatDone
 	if heartbeatOutcome.err != nil || heartbeatOutcome.decision.Lease.Generation != current.Lease.Generation+1 ||
-		heartbeatOutcome.decision.Lease.Fence != current.Lease.Fence+1 {
+		heartbeatOutcome.decision.Lease.Fence != current.Lease.Fence+1 ||
+		heartbeatOutcome.decision.CanonicalRequestDigest != heartbeat.CanonicalDigest ||
+		!validWorkerLeaseDecision(heartbeatOutcome.decision) {
 		t.Fatalf("heartbeat race result: %+v err=%v", heartbeatOutcome.decision, heartbeatOutcome.err)
 	}
 	if err := <-fenceDone; errorCode(err) != ErrorIntegrityConflict {
 		t.Fatalf("stale concurrent fence=%v", err)
 	}
 	replayed, err := store.heartbeat(context.Background(), heartbeat)
-	if err != nil || !replayed.Replayed || replayed.Lease != heartbeatOutcome.decision.Lease {
+	if err != nil || !replayed.Replayed || replayed.Lease != heartbeatOutcome.decision.Lease ||
+		replayed.CanonicalDigest != heartbeatOutcome.decision.CanonicalDigest || !validWorkerLeaseDecision(replayed) {
 		t.Fatalf("heartbeat restart-safe replay: %+v err=%v", replayed, err)
 	}
 	renewed, err := store.Inspect(context.Background(), runtimeRef(start, start.Authority))
