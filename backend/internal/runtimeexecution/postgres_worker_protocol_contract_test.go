@@ -154,6 +154,69 @@ func TestPostgresWorkerObserveResamplesTimeAndAuthorityAfterBackendCall(t *testi
 	}
 }
 
+func TestPostgresWorkerAcceptAndStopRevalidateAuthorityAfterBackendCall(t *testing.T) {
+	t.Run("Accept expires during call", func(t *testing.T) {
+		now := time.Date(2026, time.July, 31, 12, 58, 0, 0, time.UTC)
+		db, schema, _, config, start, command, control := newPostgresWorkerProtocolHarness(
+			t, "worker_accept_exp", now, nil,
+		)
+		backend := control.(*contractToolWorkerBackend)
+		currentTime := now
+		config.Now = func() time.Time { return currentTime }
+		store, err := NewPostgresAuthority(db, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend.beforeNextAccept(func() { currentTime = command.Deadline })
+		_, err = store.accept(context.Background(), command)
+		if errorCode(err) != ErrorAuthorizationDenied {
+			t.Fatalf("expired post-call Accept code=%v err=%v", errorCode(err), err)
+		}
+		inspected, inspectErr := store.Inspect(context.Background(), runtimeRef(start, start.Authority))
+		if inspectErr != nil || inspected.Worker != (RuntimeWorkerSnapshot{}) ||
+			inspected.State != RuntimePreparingPrerequisites {
+			t.Fatalf("expired Accept mutated projection: %+v err=%v", inspected, inspectErr)
+		}
+		var acceptances int
+		if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM `+schema+
+			`.runtime_execution_worker_acceptances`).Scan(&acceptances); err != nil || acceptances != 0 {
+			t.Fatalf("expired Accept journal=%d err=%v", acceptances, err)
+		}
+	})
+
+	t.Run("Stop expires during call", func(t *testing.T) {
+		now := time.Date(2026, time.July, 31, 12, 59, 0, 0, time.UTC)
+		db, schema, store, config, start, command, control := newPostgresWorkerProtocolHarness(
+			t, "worker_stop_exp", now, nil,
+		)
+		backend := control.(*contractToolWorkerBackend)
+		if _, err := store.accept(context.Background(), command); err != nil {
+			t.Fatal(err)
+		}
+		intent := cancelPostgresWorkerForStop(t, store, start, now, "worker-stop-expired")
+		currentTime := now
+		config.Now = func() time.Time { return currentTime }
+		restarted, err := NewPostgresAuthority(db, config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		backend.beforeNextStop(func() { currentTime = intent.Deadline })
+		_, err = restarted.stop(context.Background(), intent)
+		if errorCode(err) != ErrorAuthorizationDenied {
+			t.Fatalf("expired post-call Stop code=%v err=%v", errorCode(err), err)
+		}
+		inspected, inspectErr := restarted.Inspect(context.Background(), runtimeRef(start, start.Authority))
+		if inspectErr != nil || inspected.Worker.Stop != (WorkerStopSnapshot{}) {
+			t.Fatalf("expired Stop mutated projection: %+v err=%v", inspected.Worker.Stop, inspectErr)
+		}
+		var stops int
+		if err := db.QueryRowContext(context.Background(), `SELECT count(*) FROM `+schema+
+			`.runtime_execution_worker_stops`).Scan(&stops); err != nil || stops != 0 {
+			t.Fatalf("expired Stop journal=%d err=%v", stops, err)
+		}
+	})
+}
+
 func TestPostgresWorkerAcceptIsAtomicAcrossFaultsAndResponseLoss(t *testing.T) {
 	for _, test := range []struct {
 		name       string

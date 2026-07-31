@@ -1430,7 +1430,9 @@ type contractToolWorkerBackend struct {
 	stops            int
 	observations     []contractWorkerObservation
 	nextObserveError error
+	beforeAccept     func()
 	beforeObserve    func()
+	beforeStop       func()
 }
 
 func newContractToolWorkerBackend() *contractToolWorkerBackend { return &contractToolWorkerBackend{} }
@@ -1443,12 +1445,23 @@ func (backend *contractToolWorkerBackend) acceptTool(
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	backend.accepts++
+	if backend.beforeAccept != nil {
+		beforeAccept := backend.beforeAccept
+		backend.beforeAccept = nil
+		beforeAccept()
+	}
 	if invocation.RuntimeRunID != command.RuntimeRunID || invocation.CapsuleID != command.CapsuleID ||
 		invocation.CapsuleDigest != command.CapsuleDigest || invocation.LeaseGeneration != command.LeaseGeneration ||
 		invocation.LeaseFence != command.LeaseFence {
 		return workerOperationAck{}, newError(ErrorIntegrityConflict)
 	}
 	return newWorkerOperationAck(command), nil
+}
+
+func (backend *contractToolWorkerBackend) beforeNextAccept(before func()) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	backend.beforeAccept = before
 }
 
 func (backend *contractToolWorkerBackend) observeTool(
@@ -1498,12 +1511,23 @@ func (backend *contractToolWorkerBackend) stopTool(
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	backend.stops++
+	if backend.beforeStop != nil {
+		beforeStop := backend.beforeStop
+		backend.beforeStop = nil
+		beforeStop()
+	}
 	if invocation.RuntimeRunID != intent.RuntimeRunID || invocation.CapsuleID != intent.CapsuleID ||
 		invocation.CapsuleDigest != intent.CapsuleDigest || invocation.LeaseGeneration != intent.LeaseGeneration ||
 		invocation.LeaseFence != intent.LeaseFence {
 		return workerStopAck{}, newError(ErrorIntegrityConflict)
 	}
 	return newWorkerStopAck(intent), nil
+}
+
+func (backend *contractToolWorkerBackend) beforeNextStop(before func()) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	backend.beforeStop = before
 }
 
 func (backend *contractToolWorkerBackend) acceptCount() int {

@@ -143,6 +143,10 @@ func (authority *PostgresAuthority) accept(ctx context.Context, command workerAc
 	if !validWorkerOperationAck(command, ack) {
 		return workerOperationAck{}, newError(ErrorIntegrityConflict)
 	}
+	now = postgresTimestamp(authority.now())
+	if !workerAcceptCurrent(record, command, capsule, now) {
+		return workerOperationAck{}, newError(ErrorAuthorizationDenied)
+	}
 	previousRevision, previousFence, previousState := record.fixture.RuntimeRevision, record.fixture.RuntimeFence, record.fixture.State
 	applyWorkerAcceptance(record, command, ack)
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
@@ -430,6 +434,10 @@ func (authority *PostgresAuthority) stop(ctx context.Context, intent workerStopI
 	}
 	if !validWorkerStopAck(intent, ack) {
 		return workerStopAck{}, newError(ErrorIntegrityConflict)
+	}
+	now = postgresTimestamp(authority.now())
+	if !workerStopCurrent(record, intent, now) {
+		return workerStopAck{}, newError(ErrorAuthorizationDenied)
 	}
 	previousRevision, previousFence, previousState := record.fixture.RuntimeRevision, record.fixture.RuntimeFence, record.fixture.State
 	applyWorkerStopAcceptance(record, intent, ack)
