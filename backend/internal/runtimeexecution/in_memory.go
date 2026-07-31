@@ -87,6 +87,7 @@ type RuntimeFixture struct {
 	RuntimeViewBinding     RuntimeViewBindingSnapshot
 	Gateway                GatewayPrerequisiteSnapshot
 	Usage                  RuntimeUsageEvidenceSnapshot
+	Worker                 RuntimeWorkerSnapshot
 }
 
 type AdmissionGrantFixture struct {
@@ -176,12 +177,15 @@ type HarnessConfig struct {
 	GatewayCallAuthority     GatewayCallExternalAuthority
 	GatewayGrantLifetime     time.Duration
 	UsageReceipts            UsageReceiptEvidenceSource
+	agentWorker              workerCapabilityAdapter
+	toolWorker               workerCapabilityAdapter
 }
 
 type DeterministicHarness struct {
 	Runtime                  RuntimeExecution
 	Maintenance              RuntimeMaintenance
 	Dispatch                 OwnedDispatch
+	workers                  workerProtocol
 	store                    *memoryStore
 	clock                    *controlledClock
 	controls                 *harnessControls
@@ -195,6 +199,8 @@ type DeterministicHarness struct {
 	gatewayCallAuthority     GatewayCallExternalAuthority
 	grantLifetime            time.Duration
 	usageReceipts            UsageReceiptEvidenceSource
+	agentWorker              workerCapabilityAdapter
+	toolWorker               workerCapabilityAdapter
 }
 
 func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error) {
@@ -211,6 +217,7 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		nodes:                  make(map[ExecutionNodeID]*ExecutionNodeFixture),
 		reservations:           make(map[QuotaReservationID]*QuotaReservationFixture),
 		maintenance:            make(map[OperationID]RuntimeMaintenanceDecision),
+		workerHeartbeats:       make(map[OperationID]retainedWorkerHeartbeat),
 		maintenanceAuthorities: make(map[maintenanceAuthorityKey]maintenanceCallerAuthority),
 	}
 	if store.nextDecision == 0 {
@@ -251,7 +258,7 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 			cleanup: fixture.Cleanup, catalogSafetyEpoch: fixture.CatalogSafetyEpoch,
 			preLeaseTerminalReason: fixture.PreLeaseTerminalReason, reconciliation: reconciliation,
 			readiness: fixture.Readiness, runtimeViewBinding: fixture.RuntimeViewBinding,
-			gateway: fixture.Gateway, usage: fixture.Usage,
+			gateway: fixture.Gateway, usage: fixture.Usage, worker: fixture.Worker,
 		}
 	}
 	for _, grant := range config.AdmissionGrants {
@@ -331,6 +338,7 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		store, clock, config.LeaseAcquisition, config.RuntimeBindingValidator,
 		config.ImmutableInputValidator, capsuleResolver, config.RuntimeViewPrerequisite,
 		config.GatewayGrants, config.GatewayRecovery, config.GatewayCallAuthority, grantLifetime, usageReceipts,
+		config.agentWorker, config.toolWorker,
 	), nil
 }
 
@@ -347,6 +355,8 @@ func newHarness(
 	gatewayCallAuthority GatewayCallExternalAuthority,
 	grantLifetime time.Duration,
 	usageReceipts UsageReceiptEvidenceSource,
+	agentWorker workerCapabilityAdapter,
+	toolWorker workerCapabilityAdapter,
 ) *DeterministicHarness {
 	controls := &harnessControls{}
 	engine := &invariantEngine{
@@ -356,16 +366,16 @@ func newHarness(
 		runtimeViewPrerequisite:  runtimeViewPrerequisite,
 		gatewayGrants:            gatewayGrants, gatewayRecovery: gatewayRecovery,
 		gatewayCallAuthority: gatewayCallAuthority, grantLifetime: grantLifetime,
-		usageReceipts: usageReceipts,
+		usageReceipts: usageReceipts, agentWorker: agentWorker, toolWorker: toolWorker,
 	}
 	return &DeterministicHarness{
-		Runtime: engine, Maintenance: engine, Dispatch: engine, store: store, clock: clock, controls: controls,
+		Runtime: engine, Maintenance: engine, Dispatch: engine, workers: engine, store: store, clock: clock, controls: controls,
 		leaseAcquisition: leaseAcquisition, runtimeBindingValidator: runtimeBindingValidator,
 		immutableInputValidator: immutableInputValidator, executionCapsuleResolver: executionCapsuleResolver,
 		runtimeViewPrerequisite: runtimeViewPrerequisite,
 		gatewayGrants:           gatewayGrants, gatewayRecovery: gatewayRecovery,
 		gatewayCallAuthority: gatewayCallAuthority, grantLifetime: grantLifetime,
-		usageReceipts: usageReceipts,
+		usageReceipts: usageReceipts, agentWorker: agentWorker, toolWorker: toolWorker,
 	}
 }
 
@@ -414,7 +424,7 @@ func (harness *DeterministicHarness) Restart() *DeterministicHarness {
 		harness.runtimeBindingValidator, harness.immutableInputValidator, harness.executionCapsuleResolver,
 		harness.runtimeViewPrerequisite,
 		harness.gatewayGrants, harness.gatewayRecovery, harness.gatewayCallAuthority,
-		harness.grantLifetime, harness.usageReceipts,
+		harness.grantLifetime, harness.usageReceipts, harness.agentWorker, harness.toolWorker,
 	)
 }
 
@@ -509,6 +519,7 @@ type memoryStore struct {
 	nodes                  map[ExecutionNodeID]*ExecutionNodeFixture
 	reservations           map[QuotaReservationID]*QuotaReservationFixture
 	maintenance            map[OperationID]RuntimeMaintenanceDecision
+	workerHeartbeats       map[OperationID]retainedWorkerHeartbeat
 	maintenanceAuthorities map[maintenanceAuthorityKey]maintenanceCallerAuthority
 }
 
@@ -530,32 +541,37 @@ type decisionAttemptKey struct {
 }
 
 type runtimeRecord struct {
-	fixture                RuntimeFixture
-	bindings               map[OperationID]Digest
-	decisions              map[decisionAttemptKey]RuntimeDecisionFact
-	acceptedStart          RuntimeDecisionFact
-	acceptedStartDigest    Digest
-	operation              RuntimeOperationBinding
-	deadline               time.Time
-	leaseAcquireBy         time.Time
-	lease                  RuntimeLeaseSnapshot
-	cancellation           RuntimeCancellationSnapshot
-	evidenceRoot           EvidenceRootSnapshot
-	capacity               RuntimeCapacitySnapshot
-	capacityEvidence       RuntimeCapacityEvidenceSnapshot
-	preLeaseTerminalReason PreLeaseTerminalReason
-	reconciliation         ReconciliationStatus
-	node                   RuntimeNodeSnapshot
-	catalogSafetyEpoch     CatalogSafetyEpoch
-	cleanup                RuntimeLeaseCleanupSnapshot
-	readiness              RuntimeReadinessSnapshot
-	runtimeViewBinding     RuntimeViewBindingSnapshot
-	runtimeViewOpen        *retainedRuntimeViewOpen
-	runtimeViewTerminal    *retainedRuntimeViewTerminal
-	gateway                GatewayPrerequisiteSnapshot
-	gatewayRequest         *GatewayGrantRequest
-	usage                  RuntimeUsageEvidenceSnapshot
-	capsule                retainedExecutionCapsule
+	fixture                  RuntimeFixture
+	bindings                 map[OperationID]Digest
+	decisions                map[decisionAttemptKey]RuntimeDecisionFact
+	acceptedStart            RuntimeDecisionFact
+	acceptedStartDigest      Digest
+	operation                RuntimeOperationBinding
+	deadline                 time.Time
+	leaseAcquireBy           time.Time
+	lease                    RuntimeLeaseSnapshot
+	cancellation             RuntimeCancellationSnapshot
+	evidenceRoot             EvidenceRootSnapshot
+	capacity                 RuntimeCapacitySnapshot
+	capacityEvidence         RuntimeCapacityEvidenceSnapshot
+	preLeaseTerminalReason   PreLeaseTerminalReason
+	reconciliation           ReconciliationStatus
+	node                     RuntimeNodeSnapshot
+	catalogSafetyEpoch       CatalogSafetyEpoch
+	cleanup                  RuntimeLeaseCleanupSnapshot
+	readiness                RuntimeReadinessSnapshot
+	runtimeViewBinding       RuntimeViewBindingSnapshot
+	runtimeViewOpen          *retainedRuntimeViewOpen
+	runtimeViewTerminal      *retainedRuntimeViewTerminal
+	gateway                  GatewayPrerequisiteSnapshot
+	gatewayRequest           *GatewayGrantRequest
+	usage                    RuntimeUsageEvidenceSnapshot
+	capsule                  retainedExecutionCapsule
+	worker                   RuntimeWorkerSnapshot
+	workerAcceptance         *workerOperationAck
+	workerObservationQueries map[Digest]workerObservationResult
+	workerObservations       map[WorkerObservationID]workerObservation
+	workerStops              map[OperationID]retainedWorkerStop
 }
 
 type invariantEngine struct {
@@ -572,6 +588,8 @@ type invariantEngine struct {
 	gatewayCallAuthority     GatewayCallExternalAuthority
 	grantLifetime            time.Duration
 	usageReceipts            UsageReceiptEvidenceSource
+	agentWorker              workerCapabilityAdapter
+	toolWorker               workerCapabilityAdapter
 }
 
 func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeCommand) (RuntimeDecision, error) {
@@ -1251,6 +1269,7 @@ func (engine *invariantEngine) Inspect(ctx context.Context, ref RuntimeRunRef) (
 	}
 	if ref.SchemaVersion.Major() != SchemaV1.Major() ||
 		(ref.ProjectionVersion != SnapshotSchemaCurrent &&
+			ref.ProjectionVersion != SnapshotSchemaCapsule &&
 			ref.ProjectionVersion != SnapshotSchemaLeaseLifecycle && ref.ProjectionVersion != SnapshotSchemaV1) {
 		engine.observeIngress(IngressUnsupportedSchema)
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
@@ -1302,6 +1321,7 @@ type snapshotRenderer func(*runtimeRecord) (RuntimeSnapshot, bool)
 var snapshotRenderers = map[SchemaVersion]snapshotRenderer{
 	SnapshotSchemaV1:             renderSnapshotV1,
 	SnapshotSchemaLeaseLifecycle: renderSnapshotLeaseLifecycle,
+	SnapshotSchemaCapsule:        renderSnapshotCapsule,
 	SnapshotSchemaCurrent:        renderSnapshotCurrent,
 }
 
@@ -1323,10 +1343,17 @@ func renderSnapshotCurrent(record *runtimeRecord) (RuntimeSnapshot, bool) {
 func renderSnapshotLeaseLifecycle(record *runtimeRecord) (RuntimeSnapshot, bool) {
 	if !snapshotVariantsKnown(record) || record.readiness != (RuntimeReadinessSnapshot{}) ||
 		record.runtimeViewBinding != (RuntimeViewBindingSnapshot{}) ||
-		record.capsule.snapshot != (RuntimeCapsuleSnapshot{}) {
+		record.capsule.snapshot != (RuntimeCapsuleSnapshot{}) || record.worker != (RuntimeWorkerSnapshot{}) {
 		return RuntimeSnapshot{}, false
 	}
 	return buildSnapshot(record, SnapshotSchemaLeaseLifecycle), true
+}
+
+func renderSnapshotCapsule(record *runtimeRecord) (RuntimeSnapshot, bool) {
+	if !snapshotVariantsKnown(record) || record.worker != (RuntimeWorkerSnapshot{}) {
+		return RuntimeSnapshot{}, false
+	}
+	return buildSnapshot(record, SnapshotSchemaCapsule), true
 }
 
 func renderSnapshotV1(record *runtimeRecord) (RuntimeSnapshot, bool) {
@@ -1335,7 +1362,7 @@ func renderSnapshotV1(record *runtimeRecord) (RuntimeSnapshot, bool) {
 		record.node != (RuntimeNodeSnapshot{}) || record.cleanup != (RuntimeLeaseCleanupSnapshot{}) ||
 		record.capacityEvidence.PhysicalCapacityReleaseReady != (PhysicalCapacityReleaseReadyEvidence{}) ||
 		record.readiness != (RuntimeReadinessSnapshot{}) || record.runtimeViewBinding != (RuntimeViewBindingSnapshot{}) ||
-		record.capsule.snapshot != (RuntimeCapsuleSnapshot{}) {
+		record.capsule.snapshot != (RuntimeCapsuleSnapshot{}) || record.worker != (RuntimeWorkerSnapshot{}) {
 		return RuntimeSnapshot{}, false
 	}
 	return buildSnapshot(record, SnapshotSchemaV1), true
@@ -1356,6 +1383,7 @@ func buildSnapshot(record *runtimeRecord, version SchemaVersion) RuntimeSnapshot
 		Gateway:                record.gateway,
 		Usage:                  record.usage,
 		Capsule:                record.capsule.snapshot,
+		Worker:                 record.worker,
 	}
 }
 
@@ -1378,6 +1406,7 @@ func snapshotVariantsKnown(record *runtimeRecord) bool {
 		!knownGatewayPrerequisite(record.gateway) ||
 		!knownRuntimeUsageEvidence(record.usage) ||
 		!knownRuntimeCapsuleSnapshot(record.capsule.snapshot) ||
+		!knownRuntimeWorkerSnapshot(record.worker) ||
 		!knownPhysicalReleaseEvidence(record.capacityEvidence.PhysicalCapacityReleaseReady) ||
 		!knownPreLeaseTerminalReason(record.preLeaseTerminalReason) ||
 		!knownReconciliation(record.reconciliation) || !knownEvidenceRoot(record.evidenceRoot) ||

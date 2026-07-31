@@ -90,6 +90,8 @@ type PostgresConfig struct {
 	GatewayGrantLifetime                time.Duration
 	UsageReceipts                       UsageReceiptEvidenceSource
 	MaintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
+	agentWorker                         workerCapabilityAdapter
+	toolWorker                          workerCapabilityAdapter
 }
 
 // PostgresAuthority owns C03 persistence behind the RuntimeExecution seam.
@@ -120,12 +122,15 @@ type PostgresAuthority struct {
 	gatewayGrantLifetime                time.Duration
 	usageReceipts                       UsageReceiptEvidenceSource
 	maintenanceAuthorities              []RuntimeMaintenanceAuthorityBinding
+	agentWorker                         workerCapabilityAdapter
+	toolWorker                          workerCapabilityAdapter
 }
 
 var _ RuntimeExecution = (*PostgresAuthority)(nil)
 var _ RuntimeMaintenance = (*PostgresAuthority)(nil)
 var _ GatewayCallAuthorityValidator = (*PostgresAuthority)(nil)
 var _ OwnedDispatch = (*PostgresAuthority)(nil)
+var _ workerProtocol = (*PostgresAuthority)(nil)
 
 func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority, error) {
 	if db == nil {
@@ -195,6 +200,8 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 		gatewayGrantLifetime:                grantLifetime,
 		usageReceipts:                       usageReceipts,
 		maintenanceAuthorities:              append([]RuntimeMaintenanceAuthorityBinding(nil), config.MaintenanceAuthorities...),
+		agentWorker:                         config.agentWorker,
+		toolWorker:                          config.toolWorker,
 	}, nil
 }
 
@@ -281,6 +288,10 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	capsuleAudit := authority.table("runtime_execution_capsule_audit")
 	dispatchOutbox := authority.table("runtime_execution_dispatch_outbox")
 	dispatchDelivery := authority.table("runtime_execution_dispatch_delivery")
+	workerAcceptances := authority.table("runtime_execution_worker_acceptances")
+	workerObservations := authority.table("runtime_execution_worker_observations")
+	workerStops := authority.table("runtime_execution_worker_stops")
+	workerHeartbeatRequests := authority.table("runtime_execution_worker_heartbeat_requests")
 	capacityOutbox := authority.table("runtime_execution_capacity_outbox")
 	preLeaseLeases := authority.table("runtime_execution_prelease_leases")
 	prerequisiteOperations := authority.table("runtime_execution_prerequisite_operations")
@@ -500,6 +511,43 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			ack_digest bytea CHECK (ack_digest IS NULL OR octet_length(ack_digest) = 32),
 			acknowledged_at timestamptz
 		)`, dispatchDelivery, dispatchOutbox),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			runtime_run_id text NOT NULL UNIQUE REFERENCES %s(runtime_run_id),
+			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			capsule_digest bytea NOT NULL CHECK (octet_length(capsule_digest) = 32),
+			ack_id text NOT NULL UNIQUE,
+			ack_digest bytea NOT NULL CHECK (octet_length(ack_digest) = 32),
+			accepted_at timestamptz NOT NULL
+		)`, workerAcceptances, dispatchOutbox, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			observation_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			operation_id text NOT NULL REFERENCES %s(operation_id),
+			query_digest bytea NOT NULL CHECK (octet_length(query_digest) = 32),
+			observation_digest bytea NOT NULL CHECK (octet_length(observation_digest) = 32),
+			stream_generation bigint NOT NULL CHECK (stream_generation > 0),
+			position bigint NOT NULL CHECK (position > 0),
+			observation_state jsonb NOT NULL,
+			observed_at timestamptz NOT NULL,
+			UNIQUE (runtime_run_id, query_digest),
+			UNIQUE (runtime_run_id, stream_generation, position)
+		)`, workerObservations, runtimes, workerAcceptances),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			original_operation_id text NOT NULL REFERENCES %s(operation_id),
+			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			ack_id text NOT NULL UNIQUE,
+			ack_digest bytea NOT NULL CHECK (octet_length(ack_digest) = 32),
+			accepted_at timestamptz NOT NULL
+		)`, workerStops, runtimes, workerAcceptances),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			request_digest bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+			created_at timestamptz NOT NULL
+		)`, workerHeartbeatRequests, runtimes),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			terminal_decision_id text PRIMARY KEY REFERENCES %s(decision_id),
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
@@ -1089,6 +1137,14 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", dispatchOutbox, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS validate_dispatch_delivery_update ON %s", dispatchDelivery),
 		fmt.Sprintf("CREATE TRIGGER validate_dispatch_delivery_update BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", dispatchDelivery, dispatchDeliveryFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", workerAcceptances),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", workerAcceptances, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", workerObservations),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", workerObservations, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", workerStops),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", workerStops, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", workerHeartbeatRequests),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", workerHeartbeatRequests, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", gatewayOutbox),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", gatewayOutbox, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", gatewayAcceptances),
@@ -1500,6 +1556,7 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref RuntimeRunR
 	}
 	if ref.SchemaVersion.Major() != SchemaV1.Major() ||
 		(ref.ProjectionVersion != SnapshotSchemaCurrent &&
+			ref.ProjectionVersion != SnapshotSchemaCapsule &&
 			ref.ProjectionVersion != SnapshotSchemaLeaseLifecycle && ref.ProjectionVersion != SnapshotSchemaV1) {
 		return RuntimeSnapshot{}, newError(ErrorUnsupportedSchema)
 	}

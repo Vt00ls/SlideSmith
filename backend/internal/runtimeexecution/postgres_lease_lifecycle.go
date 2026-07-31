@@ -383,6 +383,12 @@ func (authority *PostgresAuthority) validatePostgresMaintenanceCaller(
 	executionNodeID ExecutionNodeID,
 	caller maintenanceCallerAuthority,
 ) error {
+	// Worker renewal authority is lease-scoped and rotates with the lease; it
+	// is validated by validLeaseRenewalTransition against the locked lease and
+	// node records rather than installed as a static maintenance authority.
+	if caller.kind == MaintenanceAuthorityWorker {
+		return nil
+	}
 	var authorityID string
 	var generation AuthorizationGeneration
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT authority_id, authority_generation FROM %s

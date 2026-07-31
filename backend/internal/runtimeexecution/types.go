@@ -22,7 +22,8 @@ func (version SchemaVersion) Minor() uint16 { return uint16(version) }
 const (
 	SnapshotSchemaV1             SchemaVersion = SchemaV1
 	SnapshotSchemaLeaseLifecycle SchemaVersion = SchemaVersion(1<<16 | 1)
-	SnapshotSchemaCurrent        SchemaVersion = SchemaVersion(1<<16 | 2)
+	SnapshotSchemaCapsule        SchemaVersion = SchemaVersion(1<<16 | 2)
+	SnapshotSchemaCurrent        SchemaVersion = SchemaVersion(1<<16 | 3)
 )
 
 type (
@@ -932,6 +933,7 @@ type RuntimeSnapshot struct {
 	Gateway                GatewayPrerequisiteSnapshot
 	Usage                  RuntimeUsageEvidenceSnapshot
 	Capsule                RuntimeCapsuleSnapshot
+	Worker                 RuntimeWorkerSnapshot
 }
 
 type RetryDisposition uint8

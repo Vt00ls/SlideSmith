@@ -37,6 +37,15 @@ const (
 	PersistenceFaultBeforeCapsuleCommit
 	PersistenceFaultAfterCapsuleCommit
 	PersistenceFaultBeforeCapsuleResponse
+	PersistenceFaultBeforeWorkerAcceptCommit
+	PersistenceFaultAfterWorkerAcceptCommit
+	PersistenceFaultBeforeWorkerAcceptResponse
+	PersistenceFaultBeforeWorkerObservationCommit
+	PersistenceFaultAfterWorkerObservationCommit
+	PersistenceFaultBeforeWorkerObservationResponse
+	PersistenceFaultBeforeWorkerStopCommit
+	PersistenceFaultAfterWorkerStopCommit
+	PersistenceFaultBeforeWorkerStopResponse
 )
 
 func (point PersistenceFaultPoint) String() string {
@@ -89,6 +98,24 @@ func (point PersistenceFaultPoint) String() string {
 		return "after_capsule_commit"
 	case PersistenceFaultBeforeCapsuleResponse:
 		return "before_capsule_response"
+	case PersistenceFaultBeforeWorkerAcceptCommit:
+		return "before_worker_accept_commit"
+	case PersistenceFaultAfterWorkerAcceptCommit:
+		return "after_worker_accept_commit"
+	case PersistenceFaultBeforeWorkerAcceptResponse:
+		return "before_worker_accept_response"
+	case PersistenceFaultBeforeWorkerObservationCommit:
+		return "before_worker_observation_commit"
+	case PersistenceFaultAfterWorkerObservationCommit:
+		return "after_worker_observation_commit"
+	case PersistenceFaultBeforeWorkerObservationResponse:
+		return "before_worker_observation_response"
+	case PersistenceFaultBeforeWorkerStopCommit:
+		return "before_worker_stop_commit"
+	case PersistenceFaultAfterWorkerStopCommit:
+		return "after_worker_stop_commit"
+	case PersistenceFaultBeforeWorkerStopResponse:
+		return "before_worker_stop_response"
 	default:
 		return "unknown"
 	}
@@ -106,7 +133,7 @@ type PersistenceFaultController struct {
 }
 
 func (controller *PersistenceFaultController) FailNextAt(point PersistenceFaultPoint) error {
-	if point < PersistenceFaultBeforeRequestLookup || point > PersistenceFaultBeforeCapsuleResponse {
+	if point < PersistenceFaultBeforeRequestLookup || point > PersistenceFaultBeforeWorkerStopResponse {
 		return newPersistenceError(PersistenceInvalidConfiguration)
 	}
 	controller.mu.Lock()
@@ -497,6 +524,7 @@ func fixtureFromRuntimeRecord(record *runtimeRecord) RuntimeFixture {
 	fixture.RuntimeViewBinding = record.runtimeViewBinding
 	fixture.Gateway = record.gateway
 	fixture.Usage = record.usage
+	fixture.Worker = record.worker
 	return fixture
 }
 
