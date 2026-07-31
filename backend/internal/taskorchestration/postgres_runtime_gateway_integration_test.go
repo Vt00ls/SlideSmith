@@ -674,6 +674,7 @@ func newPostgresProviderRuntime(
 				EvidenceID:  inputEvidenceID, EvidenceDigest: runtimeexecution.Digest{31: 78},
 			}, nil
 		}),
+		ExecutionCapsuleResolver:    runtimeexecution.NewDeterministicCapsuleResolver(),
 		QuotaReservationParticipant: quotaParticipant,
 		QuotaReservationFunction:    quotaFunction,
 		GatewayGrants:               gateway,

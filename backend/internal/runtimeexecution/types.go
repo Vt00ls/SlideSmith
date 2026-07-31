@@ -87,6 +87,25 @@ func newOpaqueID(value string) (string, error) {
 	return value, nil
 }
 
+func newOpaqueReferenceID(value string) (string, error) {
+	if !validOpaqueReferenceID(value) {
+		return "", newError(ErrorInvalidRequest)
+	}
+	return value, nil
+}
+
+func validOpaqueReferenceID(value string) bool {
+	if !validOpaqueID(value) {
+		return false
+	}
+	for _, character := range value {
+		if character == ':' || character == '/' {
+			return false
+		}
+	}
+	return true
+}
+
 func NewPersonalWorkspaceID(value string) (PersonalWorkspaceID, error) {
 	value, err := newOpaqueID(value)
 	return PersonalWorkspaceID{value: value}, err
@@ -912,6 +931,7 @@ type RuntimeSnapshot struct {
 	RuntimeViewBinding     RuntimeViewBindingSnapshot
 	Gateway                GatewayPrerequisiteSnapshot
 	Usage                  RuntimeUsageEvidenceSnapshot
+	Capsule                RuntimeCapsuleSnapshot
 }
 
 type RetryDisposition uint8

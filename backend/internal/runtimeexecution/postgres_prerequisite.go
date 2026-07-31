@@ -580,7 +580,7 @@ func (authority *PostgresAuthority) preparePostgresRuntimeViewOpen(
 		Failure: PrerequisiteFailureDependencyUnavailable,
 	}
 	record.readiness.RuntimeView = fact
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	aggregate, err := encodePostgresRuntimeFixture(fixtureFromRuntimeRecord(record))
 	if err != nil {
 		return taskworkspace.OpenRuntimeViewRequest{}, Digest{}, newError(ErrorIntegrityConflict)
@@ -705,7 +705,7 @@ func (authority *PostgresAuthority) persistPostgresPrerequisiteFact(
 	default:
 		return newError(ErrorIntegrityConflict)
 	}
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	factState, _ := json.Marshal(postgresPrerequisiteFactFromSnapshot(fact))
 	viewState, _ := json.Marshal(postgresRuntimeViewBindingFromSnapshot(binding))
 	now := postgresTimestamp(authority.now())

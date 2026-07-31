@@ -310,7 +310,7 @@ func (authority *PostgresAuthority) commitPostgresPreLease(
 		record.readiness = initialRuntimeReadiness(start)
 	}
 	record.readiness.Lease = leasePrerequisiteFact(record.lease)
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	fact := RuntimeDecisionFact{
 		DecisionID: decisionID, Disposition: DecisionAccepted,
 		OperationID: request.OperationID, CanonicalRequestDigest: request.Digest,

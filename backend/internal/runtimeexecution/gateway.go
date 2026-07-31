@@ -608,7 +608,7 @@ func synchronizeGatewayReadiness(record *runtimeRecord, now time.Time) {
 		return
 	}
 	record.readiness.LLMGateway = gatewayPrerequisiteFactAt(record.gateway, now)
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 }
 
 func (engine *invariantEngine) advanceGatewayPrerequisite(
