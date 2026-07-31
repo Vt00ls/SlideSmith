@@ -32,6 +32,11 @@ const (
 	PersistenceFaultAfterGatewayAcceptanceCommit
 	PersistenceFaultBeforeUsageEvidenceCommit
 	PersistenceFaultAfterUsageEvidenceCommit
+	PersistenceFaultBeforeCapsuleAudit
+	PersistenceFaultBeforeCapsuleOutbox
+	PersistenceFaultBeforeCapsuleCommit
+	PersistenceFaultAfterCapsuleCommit
+	PersistenceFaultBeforeCapsuleResponse
 )
 
 func (point PersistenceFaultPoint) String() string {
@@ -74,6 +79,16 @@ func (point PersistenceFaultPoint) String() string {
 		return "before_usage_evidence_commit"
 	case PersistenceFaultAfterUsageEvidenceCommit:
 		return "after_usage_evidence_commit"
+	case PersistenceFaultBeforeCapsuleAudit:
+		return "before_capsule_audit"
+	case PersistenceFaultBeforeCapsuleOutbox:
+		return "before_capsule_outbox"
+	case PersistenceFaultBeforeCapsuleCommit:
+		return "before_capsule_commit"
+	case PersistenceFaultAfterCapsuleCommit:
+		return "after_capsule_commit"
+	case PersistenceFaultBeforeCapsuleResponse:
+		return "before_capsule_response"
 	default:
 		return "unknown"
 	}
@@ -91,7 +106,7 @@ type PersistenceFaultController struct {
 }
 
 func (controller *PersistenceFaultController) FailNextAt(point PersistenceFaultPoint) error {
-	if point < PersistenceFaultBeforeRequestLookup || point > PersistenceFaultAfterUsageEvidenceCommit {
+	if point < PersistenceFaultBeforeRequestLookup || point > PersistenceFaultBeforeCapsuleResponse {
 		return newPersistenceError(PersistenceInvalidConfiguration)
 	}
 	controller.mu.Lock()
@@ -411,7 +426,14 @@ func (authority *PostgresAuthority) loadRuntimeForUpdate(
 		task_revision, runtime_revision, operation_generation, runtime_fence,
 		safety_epoch, runtime_state, runtime_outcome, terminal_evidence_id, aggregate_state
 		FROM %s WHERE runtime_run_id=$1 FOR UPDATE`, authority.table("runtime_execution_runtimes")), runtimeRunID.String())
-	return scanPostgresRuntimeRecord(row, runtimeRunID)
+	record, err := scanPostgresRuntimeRecord(row, runtimeRunID)
+	if err != nil {
+		return nil, err
+	}
+	if err := authority.loadPostgresExecutionCapsule(ctx, tx, record); err != nil {
+		return nil, err
+	}
+	return record, nil
 }
 
 func (authority *PostgresAuthority) lookupFoundationReplay(

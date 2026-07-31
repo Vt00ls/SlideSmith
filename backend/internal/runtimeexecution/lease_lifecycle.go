@@ -609,7 +609,7 @@ func applyLeaseRenewalTransition(
 	record.lease.Fence++
 	record.lease.ExpiresAt = command.RequestedExpiresAt
 	record.node = nodeSnapshot(*node)
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	return RuntimeMaintenanceDecision{
 		OperationID: command.OperationID, CanonicalRequestDigest: command.CanonicalRequestDigest,
 		RuntimeRevision: record.fixture.RuntimeRevision, RuntimeFence: record.fixture.RuntimeFence,
@@ -678,7 +678,7 @@ func applyLeaseFenceTransition(
 	} else {
 		record.lease.Disposition = LeaseRevoked
 	}
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	node.Occupancy = NodeOccupancyUnknown
 	node.Quarantined = true
 	node.Containment = ContainmentPending
@@ -777,7 +777,7 @@ func applySandboxResetTransition(
 	record.lease.Fence++
 	record.lease.SandboxFence++
 	record.lease.Disposition = LeaseReleased
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	node.Occupancy = NodeUnoccupied
 	node.Containment = ContainmentEstablished
 	node.Reset = ResetCompleted

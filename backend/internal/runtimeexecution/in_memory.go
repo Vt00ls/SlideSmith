@@ -159,39 +159,42 @@ type QuotaReservationFixture struct {
 }
 
 type HarnessConfig struct {
-	Now                     time.Time
-	IDs                     DeterministicIDConfig
-	Runtimes                []RuntimeFixture
-	AdmissionGrants         []AdmissionGrantFixture
-	Nodes                   []ExecutionNodeFixture
-	QuotaReservations       []QuotaReservationFixture
-	MaintenanceAuthorities  []RuntimeMaintenanceAuthorityBinding
-	LeaseAcquisition        LeaseAcquisitionAdapter
-	RuntimeBindingValidator RuntimeBindingValidator
-	ImmutableInputValidator ImmutableInputValidator
-	RuntimeViewPrerequisite RuntimeViewPrerequisitePort
-	GatewayGrants           GatewayGrantAdapter
-	GatewayRecovery         GatewayRecoveryAuthority
-	GatewayCallAuthority    GatewayCallExternalAuthority
-	GatewayGrantLifetime    time.Duration
-	UsageReceipts           UsageReceiptEvidenceSource
+	Now                      time.Time
+	IDs                      DeterministicIDConfig
+	Runtimes                 []RuntimeFixture
+	AdmissionGrants          []AdmissionGrantFixture
+	Nodes                    []ExecutionNodeFixture
+	QuotaReservations        []QuotaReservationFixture
+	MaintenanceAuthorities   []RuntimeMaintenanceAuthorityBinding
+	LeaseAcquisition         LeaseAcquisitionAdapter
+	RuntimeBindingValidator  RuntimeBindingValidator
+	ImmutableInputValidator  ImmutableInputValidator
+	ExecutionCapsuleResolver ExecutionCapsuleResolver
+	RuntimeViewPrerequisite  RuntimeViewPrerequisitePort
+	GatewayGrants            GatewayGrantAdapter
+	GatewayRecovery          GatewayRecoveryAuthority
+	GatewayCallAuthority     GatewayCallExternalAuthority
+	GatewayGrantLifetime     time.Duration
+	UsageReceipts            UsageReceiptEvidenceSource
 }
 
 type DeterministicHarness struct {
-	Runtime                 RuntimeExecution
-	Maintenance             RuntimeMaintenance
-	store                   *memoryStore
-	clock                   *controlledClock
-	controls                *harnessControls
-	leaseAcquisition        LeaseAcquisitionAdapter
-	runtimeBindingValidator RuntimeBindingValidator
-	immutableInputValidator ImmutableInputValidator
-	runtimeViewPrerequisite RuntimeViewPrerequisitePort
-	gatewayGrants           GatewayGrantAdapter
-	gatewayRecovery         GatewayRecoveryAuthority
-	gatewayCallAuthority    GatewayCallExternalAuthority
-	grantLifetime           time.Duration
-	usageReceipts           UsageReceiptEvidenceSource
+	Runtime                  RuntimeExecution
+	Maintenance              RuntimeMaintenance
+	Dispatch                 OwnedDispatch
+	store                    *memoryStore
+	clock                    *controlledClock
+	controls                 *harnessControls
+	leaseAcquisition         LeaseAcquisitionAdapter
+	runtimeBindingValidator  RuntimeBindingValidator
+	immutableInputValidator  ImmutableInputValidator
+	executionCapsuleResolver ExecutionCapsuleResolver
+	runtimeViewPrerequisite  RuntimeViewPrerequisitePort
+	gatewayGrants            GatewayGrantAdapter
+	gatewayRecovery          GatewayRecoveryAuthority
+	gatewayCallAuthority     GatewayCallExternalAuthority
+	grantLifetime            time.Duration
+	usageReceipts            UsageReceiptEvidenceSource
 }
 
 func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error) {
@@ -320,9 +323,13 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 	if usageReceipts == nil {
 		usageReceipts, _ = config.GatewayGrants.(UsageReceiptEvidenceSource)
 	}
+	capsuleResolver := config.ExecutionCapsuleResolver
+	if capsuleResolver == nil {
+		capsuleResolver = deterministicCapsuleResolver{}
+	}
 	return newHarness(
 		store, clock, config.LeaseAcquisition, config.RuntimeBindingValidator,
-		config.ImmutableInputValidator, config.RuntimeViewPrerequisite,
+		config.ImmutableInputValidator, capsuleResolver, config.RuntimeViewPrerequisite,
 		config.GatewayGrants, config.GatewayRecovery, config.GatewayCallAuthority, grantLifetime, usageReceipts,
 	), nil
 }
@@ -333,6 +340,7 @@ func newHarness(
 	leaseAcquisition LeaseAcquisitionAdapter,
 	runtimeBindingValidator RuntimeBindingValidator,
 	immutableInputValidator ImmutableInputValidator,
+	executionCapsuleResolver ExecutionCapsuleResolver,
 	runtimeViewPrerequisite RuntimeViewPrerequisitePort,
 	gatewayGrants GatewayGrantAdapter,
 	gatewayRecovery GatewayRecoveryAuthority,
@@ -344,16 +352,18 @@ func newHarness(
 	engine := &invariantEngine{
 		store: store, clock: clock, controls: controls, leaseAcquisition: leaseAcquisition,
 		runtimeBindingValidator: runtimeBindingValidator, immutableInputValidator: immutableInputValidator,
-		runtimeViewPrerequisite: runtimeViewPrerequisite,
-		gatewayGrants:           gatewayGrants, gatewayRecovery: gatewayRecovery,
+		executionCapsuleResolver: executionCapsuleResolver,
+		runtimeViewPrerequisite:  runtimeViewPrerequisite,
+		gatewayGrants:            gatewayGrants, gatewayRecovery: gatewayRecovery,
 		gatewayCallAuthority: gatewayCallAuthority, grantLifetime: grantLifetime,
 		usageReceipts: usageReceipts,
 	}
 	return &DeterministicHarness{
-		Runtime: engine, Maintenance: engine, store: store, clock: clock, controls: controls,
+		Runtime: engine, Maintenance: engine, Dispatch: engine, store: store, clock: clock, controls: controls,
 		leaseAcquisition: leaseAcquisition, runtimeBindingValidator: runtimeBindingValidator,
-		immutableInputValidator: immutableInputValidator, runtimeViewPrerequisite: runtimeViewPrerequisite,
-		gatewayGrants: gatewayGrants, gatewayRecovery: gatewayRecovery,
+		immutableInputValidator: immutableInputValidator, executionCapsuleResolver: executionCapsuleResolver,
+		runtimeViewPrerequisite: runtimeViewPrerequisite,
+		gatewayGrants:           gatewayGrants, gatewayRecovery: gatewayRecovery,
 		gatewayCallAuthority: gatewayCallAuthority, grantLifetime: grantLifetime,
 		usageReceipts: usageReceipts,
 	}
@@ -401,7 +411,7 @@ func (harness *DeterministicHarness) Restart() *DeterministicHarness {
 	harness.controls.mu.Unlock()
 	return newHarness(
 		harness.store, harness.clock, harness.leaseAcquisition,
-		harness.runtimeBindingValidator, harness.immutableInputValidator,
+		harness.runtimeBindingValidator, harness.immutableInputValidator, harness.executionCapsuleResolver,
 		harness.runtimeViewPrerequisite,
 		harness.gatewayGrants, harness.gatewayRecovery, harness.gatewayCallAuthority,
 		harness.grantLifetime, harness.usageReceipts,
@@ -545,21 +555,23 @@ type runtimeRecord struct {
 	gateway                GatewayPrerequisiteSnapshot
 	gatewayRequest         *GatewayGrantRequest
 	usage                  RuntimeUsageEvidenceSnapshot
+	capsule                retainedExecutionCapsule
 }
 
 type invariantEngine struct {
-	store                   *memoryStore
-	clock                   *controlledClock
-	controls                *harnessControls
-	leaseAcquisition        LeaseAcquisitionAdapter
-	runtimeBindingValidator RuntimeBindingValidator
-	immutableInputValidator ImmutableInputValidator
-	runtimeViewPrerequisite RuntimeViewPrerequisitePort
-	gatewayGrants           GatewayGrantAdapter
-	gatewayRecovery         GatewayRecoveryAuthority
-	gatewayCallAuthority    GatewayCallExternalAuthority
-	grantLifetime           time.Duration
-	usageReceipts           UsageReceiptEvidenceSource
+	store                    *memoryStore
+	clock                    *controlledClock
+	controls                 *harnessControls
+	leaseAcquisition         LeaseAcquisitionAdapter
+	runtimeBindingValidator  RuntimeBindingValidator
+	immutableInputValidator  ImmutableInputValidator
+	executionCapsuleResolver ExecutionCapsuleResolver
+	runtimeViewPrerequisite  RuntimeViewPrerequisitePort
+	gatewayGrants            GatewayGrantAdapter
+	gatewayRecovery          GatewayRecoveryAuthority
+	gatewayCallAuthority     GatewayCallExternalAuthority
+	grantLifetime            time.Duration
+	usageReceipts            UsageReceiptEvidenceSource
 }
 
 func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeCommand) (RuntimeDecision, error) {
@@ -606,6 +618,10 @@ func (engine *invariantEngine) Execute(ctx context.Context, command RuntimeComma
 			return RuntimeDecision{}, err
 		}
 		decision, err = engine.advanceGatewayPrerequisite(ctx, typed, decision)
+		if err != nil {
+			return RuntimeDecision{}, err
+		}
+		decision, err = engine.ensureInMemoryExecutionCapsule(ctx, typed, decision)
 		if err != nil {
 			return RuntimeDecision{}, err
 		}
@@ -730,7 +746,7 @@ func (engine *invariantEngine) executeCancel(command CancelRuntimeRun) (RuntimeD
 		record.lease.Fence++
 		record.lease.SandboxFence++
 		record.lease.Disposition = LeaseRevoked
-		updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+		updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 		leasedNode.Occupancy = NodeOccupancyUnknown
 		leasedNode.Quarantined = true
 		leasedNode.Containment = ContainmentPending
@@ -1306,7 +1322,8 @@ func renderSnapshotCurrent(record *runtimeRecord) (RuntimeSnapshot, bool) {
 
 func renderSnapshotLeaseLifecycle(record *runtimeRecord) (RuntimeSnapshot, bool) {
 	if !snapshotVariantsKnown(record) || record.readiness != (RuntimeReadinessSnapshot{}) ||
-		record.runtimeViewBinding != (RuntimeViewBindingSnapshot{}) {
+		record.runtimeViewBinding != (RuntimeViewBindingSnapshot{}) ||
+		record.capsule.snapshot != (RuntimeCapsuleSnapshot{}) {
 		return RuntimeSnapshot{}, false
 	}
 	return buildSnapshot(record, SnapshotSchemaLeaseLifecycle), true
@@ -1317,7 +1334,8 @@ func renderSnapshotV1(record *runtimeRecord) (RuntimeSnapshot, bool) {
 		record.reconciliation == ReconciliationRequiredStatus || record.lease.Disposition != LeaseDispositionNone ||
 		record.node != (RuntimeNodeSnapshot{}) || record.cleanup != (RuntimeLeaseCleanupSnapshot{}) ||
 		record.capacityEvidence.PhysicalCapacityReleaseReady != (PhysicalCapacityReleaseReadyEvidence{}) ||
-		record.readiness != (RuntimeReadinessSnapshot{}) || record.runtimeViewBinding != (RuntimeViewBindingSnapshot{}) {
+		record.readiness != (RuntimeReadinessSnapshot{}) || record.runtimeViewBinding != (RuntimeViewBindingSnapshot{}) ||
+		record.capsule.snapshot != (RuntimeCapsuleSnapshot{}) {
 		return RuntimeSnapshot{}, false
 	}
 	return buildSnapshot(record, SnapshotSchemaV1), true
@@ -1337,6 +1355,7 @@ func buildSnapshot(record *runtimeRecord, version SchemaVersion) RuntimeSnapshot
 		RuntimeViewBinding:     record.runtimeViewBinding,
 		Gateway:                record.gateway,
 		Usage:                  record.usage,
+		Capsule:                record.capsule.snapshot,
 	}
 }
 
@@ -1358,6 +1377,7 @@ func snapshotVariantsKnown(record *runtimeRecord) bool {
 		!knownRuntimeLeaseCleanupSnapshot(record) ||
 		!knownGatewayPrerequisite(record.gateway) ||
 		!knownRuntimeUsageEvidence(record.usage) ||
+		!knownRuntimeCapsuleSnapshot(record.capsule.snapshot) ||
 		!knownPhysicalReleaseEvidence(record.capacityEvidence.PhysicalCapacityReleaseReady) ||
 		!knownPreLeaseTerminalReason(record.preLeaseTerminalReason) ||
 		!knownReconciliation(record.reconciliation) || !knownEvidenceRoot(record.evidenceRoot) ||

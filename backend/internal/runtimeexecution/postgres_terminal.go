@@ -307,7 +307,7 @@ func (authority *PostgresAuthority) executePostgresRuntimeTerminal(
 		record.lease.Fence++
 		record.lease.SandboxFence++
 		record.lease.Disposition = LeaseRevoked
-		updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+		updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 		leasedNode.Occupancy = NodeOccupancyUnknown
 		leasedNode.Quarantined = true
 		leasedNode.Containment = ContainmentPending

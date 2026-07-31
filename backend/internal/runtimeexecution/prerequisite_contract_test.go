@@ -1745,7 +1745,7 @@ func TestPostgresPrerequisiteFactsOutboxAndReadinessSurviveRestart(t *testing.T)
 		},
 	}
 	config := PostgresConfig{
-		Schema: schema, Now: func() time.Time { return now },
+		Schema: schema, Now: func() time.Time { return now }, ExecutionCapsuleResolver: deterministicCapsuleResolver{},
 		RuntimeBindingValidator: RuntimeBindingValidatorFunc(func(
 			context.Context,
 			RuntimeBindingValidationRequest,
@@ -1895,7 +1895,7 @@ func TestPostgresPostOpenCancelCommitsC04FenceOutboxBeforeDeliveryAndSurvivesRes
 		},
 	}
 	config := PostgresConfig{
-		Schema: schema, Now: func() time.Time { return now },
+		Schema: schema, Now: func() time.Time { return now }, ExecutionCapsuleResolver: deterministicCapsuleResolver{},
 		RuntimeBindingValidator: RuntimeBindingValidatorFunc(func(
 			context.Context,
 			RuntimeBindingValidationRequest,
@@ -2912,7 +2912,7 @@ func newPostgresReadyMutatingPrerequisiteRuntime(
 		})
 	}
 	config := PostgresConfig{
-		Schema: schema, Now: nowFunc,
+		Schema: schema, Now: nowFunc, ExecutionCapsuleResolver: deterministicCapsuleResolver{},
 		RuntimeBindingValidator: RuntimeBindingValidatorFunc(func(
 			context.Context,
 			RuntimeBindingValidationRequest,

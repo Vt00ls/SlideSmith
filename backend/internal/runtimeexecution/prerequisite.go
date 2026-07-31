@@ -343,8 +343,10 @@ func updateCapsuleReadiness(
 	readiness *RuntimeReadinessSnapshot,
 	binding RuntimeViewBindingSnapshot,
 	lease RuntimeLeaseSnapshot,
+	capsule RuntimeCapsuleSnapshot,
 ) {
-	readiness.CapsuleReady = lease.AcquireStatus == LeaseGranted && lease.Disposition == LeaseActive &&
+	readiness.CapsuleReady = capsule.State == CapsulePrepared &&
+		lease.AcquireStatus == LeaseGranted && lease.Disposition == LeaseActive &&
 		prerequisiteSatisfied(readiness.Lease) &&
 		prerequisiteSatisfied(readiness.RuntimeBinding) &&
 		runtimeViewPrerequisiteSatisfied(readiness.RuntimeView, binding, lease) &&
@@ -359,13 +361,18 @@ func projectCapsuleReadinessAt(snapshot *RuntimeSnapshot, now time.Time) {
 	if snapshot.Gateway != (GatewayPrerequisiteSnapshot{}) {
 		snapshot.Readiness.LLMGateway = gatewayPrerequisiteFactAt(snapshot.Gateway, now)
 	}
+	snapshot.Readiness.CapsuleReady = capsulePrerequisitesReadyAt(*snapshot, now) &&
+		snapshot.Capsule.State == CapsulePrepared
+}
+
+func capsulePrerequisitesReadyAt(snapshot RuntimeSnapshot, now time.Time) bool {
 	want := snapshot.Readiness
-	updateCapsuleReadiness(&want, snapshot.RuntimeViewBinding, snapshot.Lease)
+	updateCapsuleReadiness(&want, snapshot.RuntimeViewBinding, snapshot.Lease, RuntimeCapsuleSnapshot{State: CapsulePrepared})
 	currentLeaseAuthority := now.Before(snapshot.Lease.ExpiresAt) &&
 		now.Before(snapshot.Lease.AuthorizationExpiresAt)
 	currentRuntimeViewAuthority := snapshot.RuntimeViewBinding == (RuntimeViewBindingSnapshot{}) ||
 		now.Before(snapshot.RuntimeViewBinding.ExpiresAt)
-	snapshot.Readiness.CapsuleReady = want.CapsuleReady && currentLeaseAuthority && currentRuntimeViewAuthority
+	return want.CapsuleReady && currentLeaseAuthority && currentRuntimeViewAuthority
 }
 
 func gatewayRequestPrerequisitesSatisfiedAt(snapshot RuntimeSnapshot, now time.Time) bool {
@@ -423,8 +430,8 @@ func knownRuntimeReadiness(
 		}
 	}
 	want := readiness
-	updateCapsuleReadiness(&want, binding, lease)
-	return want.CapsuleReady == readiness.CapsuleReady
+	updateCapsuleReadiness(&want, binding, lease, RuntimeCapsuleSnapshot{State: CapsulePrepared})
+	return !readiness.CapsuleReady || want.CapsuleReady
 }
 
 func knownPrerequisiteFact(fact PrerequisiteFact) bool {
@@ -754,7 +761,7 @@ func (engine *invariantEngine) advancePostLeasePrerequisites(
 		record.readiness = initialRuntimeReadiness(start)
 	}
 	record.readiness.Lease = leasePrerequisiteFact(record.lease)
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	engine.store.mu.Unlock()
 
 	engine.store.mu.Lock()
@@ -883,7 +890,7 @@ func (engine *invariantEngine) advancePostLeasePrerequisites(
 		engine.store.mu.Unlock()
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
 	}
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	decision.Snapshot = snapshot(record, SnapshotSchemaCurrent)
 	engine.store.mu.Unlock()
 	return decision, nil
@@ -1017,7 +1024,7 @@ func (engine *invariantEngine) finishInMemoryPostLeaseTerminalLocked(
 	record.lease.Fence++
 	record.lease.SandboxFence++
 	record.lease.Disposition = LeaseRevoked
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	node.Occupancy = NodeOccupancyUnknown
 	node.Quarantined = true
 	node.Containment = ContainmentPending
@@ -1101,7 +1108,7 @@ func (engine *invariantEngine) persistInMemoryPrerequisiteFact(
 		return nil
 	}
 	*retained = fact
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	return nil
 }
 
@@ -1146,7 +1153,7 @@ func (engine *invariantEngine) prepareInMemoryRuntimeViewOpen(
 		State: PrerequisiteReconciliationRequired, OperationID: OperationID{value: string(request.Operation.ID)},
 		RequestDigest: requestDigest, Failure: PrerequisiteFailureDependencyUnavailable,
 	}
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	return request, requestDigest, nil
 }
 
@@ -1197,7 +1204,7 @@ func (engine *invariantEngine) persistInMemoryRuntimeViewFact(
 	if lateTerminal != nil {
 		record.runtimeViewTerminal = lateTerminal
 	}
-	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease)
+	updateCapsuleReadiness(&record.readiness, record.runtimeViewBinding, record.lease, record.capsule.snapshot)
 	return nil
 }
 

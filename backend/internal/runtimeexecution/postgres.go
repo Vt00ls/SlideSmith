@@ -80,6 +80,7 @@ type PostgresConfig struct {
 	LeaseAcquisition                    LeaseAcquisitionAdapter
 	RuntimeBindingValidator             RuntimeBindingValidator
 	ImmutableInputValidator             ImmutableInputValidator
+	ExecutionCapsuleResolver            ExecutionCapsuleResolver
 	RuntimeViewPrerequisite             RuntimeViewPrerequisitePort
 	QuotaReservationParticipant         QuotaReservationParticipant
 	QuotaReservationFunction            string
@@ -109,6 +110,7 @@ type PostgresAuthority struct {
 	leaseAcquisition                    LeaseAcquisitionAdapter
 	runtimeBindingValidator             RuntimeBindingValidator
 	immutableInputValidator             ImmutableInputValidator
+	executionCapsuleResolver            ExecutionCapsuleResolver
 	runtimeViewPrerequisite             RuntimeViewPrerequisitePort
 	quotaReservationParticipant         QuotaReservationParticipant
 	quotaReservationFunction            string
@@ -123,6 +125,7 @@ type PostgresAuthority struct {
 var _ RuntimeExecution = (*PostgresAuthority)(nil)
 var _ RuntimeMaintenance = (*PostgresAuthority)(nil)
 var _ GatewayCallAuthorityValidator = (*PostgresAuthority)(nil)
+var _ OwnedDispatch = (*PostgresAuthority)(nil)
 
 func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority, error) {
 	if db == nil {
@@ -182,6 +185,7 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 		leaseAcquisition:                    config.LeaseAcquisition,
 		runtimeBindingValidator:             config.RuntimeBindingValidator,
 		immutableInputValidator:             config.ImmutableInputValidator,
+		executionCapsuleResolver:            config.ExecutionCapsuleResolver,
 		runtimeViewPrerequisite:             config.RuntimeViewPrerequisite,
 		quotaReservationParticipant:         config.QuotaReservationParticipant,
 		quotaReservationFunction:            config.QuotaReservationFunction,
@@ -273,6 +277,10 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	revisions := authority.table("runtime_execution_revisions")
 	audit := authority.table("runtime_execution_mandatory_audit")
 	outbox := authority.table("runtime_execution_outbox")
+	capsules := authority.table("runtime_execution_capsules")
+	capsuleAudit := authority.table("runtime_execution_capsule_audit")
+	dispatchOutbox := authority.table("runtime_execution_dispatch_outbox")
+	dispatchDelivery := authority.table("runtime_execution_dispatch_delivery")
 	capacityOutbox := authority.table("runtime_execution_capacity_outbox")
 	preLeaseLeases := authority.table("runtime_execution_prelease_leases")
 	prerequisiteOperations := authority.table("runtime_execution_prerequisite_operations")
@@ -308,6 +316,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	heartbeats := authority.table("runtime_execution_heartbeat_history")
 	compaction := authority.table("runtime_execution_heartbeat_compaction")
 	immutableFunction := authority.table("runtime_execution_reject_immutable_mutation")
+	dispatchDeliveryFunction := authority.table("runtime_execution_validate_dispatch_delivery_update")
 	cleanupRebindingFunction := authority.table("runtime_execution_reject_cleanup_rebinding")
 	prerequisiteRebindingFunction := authority.table("runtime_execution_reject_prerequisite_operation_rebinding")
 	runtimeViewTerminalRebindingFunction := authority.table("runtime_execution_reject_runtime_view_terminal_operation_rebinding")
@@ -458,6 +467,39 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			last_attempt_at timestamptz,
 			acknowledged_at timestamptz
 		)`, delivery, outbox),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			capsule_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL UNIQUE REFERENCES %s(runtime_run_id),
+			capsule_digest bytea NOT NULL CHECK (octet_length(capsule_digest) = 32),
+			capsule bytea NOT NULL,
+			dispatch_operation_id text NOT NULL UNIQUE,
+			committed_at timestamptz NOT NULL
+		)`, capsules, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			capsule_id text PRIMARY KEY REFERENCES %s(capsule_id),
+			runtime_run_id text NOT NULL UNIQUE REFERENCES %s(runtime_run_id),
+			audit_digest bytea NOT NULL CHECK (octet_length(audit_digest) = 32),
+			audit_state jsonb NOT NULL,
+			committed_at timestamptz NOT NULL
+		)`, capsuleAudit, capsules, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY,
+			runtime_run_id text NOT NULL UNIQUE REFERENCES %s(runtime_run_id),
+			capsule_id text NOT NULL UNIQUE REFERENCES %s(capsule_id),
+			capsule_digest bytea NOT NULL CHECK (octet_length(capsule_digest) = 32),
+			payload bytea NOT NULL,
+			payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
+			committed_at timestamptz NOT NULL
+		)`, dispatchOutbox, runtimes, capsules),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			disposition smallint NOT NULL,
+			delivery_count bigint NOT NULL DEFAULT 0 CHECK (delivery_count >= 0),
+			first_attempt_at timestamptz,
+			last_attempt_at timestamptz,
+			ack_digest bytea CHECK (ack_digest IS NULL OR octet_length(ack_digest) = 32),
+			acknowledged_at timestamptz
+		)`, dispatchDelivery, dispatchOutbox),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			terminal_decision_id text PRIMARY KEY REFERENCES %s(decision_id),
 			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
@@ -953,6 +995,30 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		BEGIN RAISE EXCEPTION 'immutable runtime execution fact'; END $$`, immutableFunction),
 		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
+			IF TG_OP = 'DELETE' OR OLD.operation_id IS DISTINCT FROM NEW.operation_id THEN
+				RAISE EXCEPTION USING ERRCODE = '23000', MESSAGE = 'immutable dispatch delivery binding';
+			END IF;
+			IF NEW.disposition = %d AND OLD.disposition IN (%d,%d)
+				AND NEW.delivery_count = OLD.delivery_count + 1
+				AND NEW.first_attempt_at IS NOT NULL AND NEW.last_attempt_at IS NOT NULL
+				AND (OLD.first_attempt_at IS NULL OR NEW.first_attempt_at IS NOT DISTINCT FROM OLD.first_attempt_at)
+				AND NEW.ack_digest IS NOT DISTINCT FROM OLD.ack_digest
+				AND NEW.acknowledged_at IS NOT DISTINCT FROM OLD.acknowledged_at THEN
+				RETURN NEW;
+			END IF;
+			IF OLD.disposition = %d AND NEW.disposition = %d
+				AND NEW.delivery_count = OLD.delivery_count
+				AND NEW.first_attempt_at IS NOT DISTINCT FROM OLD.first_attempt_at
+				AND NEW.last_attempt_at IS NOT DISTINCT FROM OLD.last_attempt_at
+				AND OLD.ack_digest IS NULL AND NEW.ack_digest IS NOT NULL
+				AND OLD.acknowledged_at IS NULL AND NEW.acknowledged_at IS NOT NULL THEN
+				RETURN NEW;
+			END IF;
+			RAISE EXCEPTION USING ERRCODE = '23000', MESSAGE = 'invalid dispatch delivery transition';
+		END $$`, dispatchDeliveryFunction, DispatchClaimed, DispatchPending, DispatchClaimed,
+			DispatchClaimed, DispatchAcknowledged),
+		fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
 			IF TG_OP = 'DELETE' THEN
 				RAISE EXCEPTION USING ERRCODE = '23000', MESSAGE = 'immutable cleanup authority';
 			END IF;
@@ -1015,6 +1081,14 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", audit, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", outbox),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", outbox, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", capsules),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", capsules, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", capsuleAudit),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", capsuleAudit, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", dispatchOutbox),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", dispatchOutbox, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS validate_dispatch_delivery_update ON %s", dispatchDelivery),
+		fmt.Sprintf("CREATE TRIGGER validate_dispatch_delivery_update BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", dispatchDelivery, dispatchDeliveryFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", gatewayOutbox),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", gatewayOutbox, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", gatewayAcceptances),
@@ -1124,6 +1198,10 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 			return RuntimeDecision{}, executeErr
 		}
 		decision, executeErr = authority.advancePostgresGatewayPrerequisite(ctx, start, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		decision, executeErr = authority.ensurePostgresExecutionCapsule(ctx, start, decision)
 		if executeErr != nil {
 			return RuntimeDecision{}, executeErr
 		}
@@ -1448,6 +1526,9 @@ func (authority *PostgresAuthority) Inspect(ctx context.Context, ref RuntimeRunR
 	}
 	if !authorized(record, ref.PersonalWorkspaceID, ref.Authority) {
 		return RuntimeSnapshot{}, newError(ErrorAuthorizationDenied)
+	}
+	if err := authority.loadPostgresExecutionCapsule(ctx, tx, record); err != nil {
+		return RuntimeSnapshot{}, err
 	}
 	now := postgresTimestamp(authority.now())
 	currentGatewayAuthority := true
