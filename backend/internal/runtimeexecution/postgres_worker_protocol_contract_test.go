@@ -10,6 +10,39 @@ import (
 	"github.com/slidesmith/slidesmith/backend/internal/taskworkspace"
 )
 
+func TestPostgresWorkerProtocolContextFailuresAreDependencyUnavailable(t *testing.T) {
+	now := time.Date(2026, time.July, 31, 12, 50, 0, 0, time.UTC)
+	_, _, store, _, _, _, _ := newPostgresWorkerProtocolHarness(t, "worker_context", now, nil)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for _, test := range []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{name: "heartbeat", call: func(ctx context.Context) error {
+			_, err := store.heartbeat(ctx, workerHeartbeat{})
+			return err
+		}},
+		{name: "observe", call: func(ctx context.Context) error {
+			_, err := store.observe(ctx, workerObserve{})
+			return err
+		}},
+		{name: "stop", call: func(ctx context.Context) error {
+			_, err := store.stop(ctx, workerStopIntent{})
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, ctx := range []context.Context{nil, cancelled} {
+				if err := test.call(ctx); errorCode(err) != ErrorDependencyUnavailable {
+					t.Fatalf("context failure code=%v err=%v, want %v", errorCode(err), err, ErrorDependencyUnavailable)
+				}
+			}
+		})
+	}
+}
+
 func TestPostgresWorkerAcceptIsAtomicAcrossFaultsAndResponseLoss(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -164,6 +197,13 @@ func TestPostgresWorkerObservationPersistsCursorReplayOrderingAndConflictsAcross
 		t.Fatal(err)
 	}
 	backend.enqueueObservation(contractWorkerObservation{
+		ObservationID: first.Observation.ObservationID, Kind: WorkerObservedRunning, ObservedAt: now,
+	})
+	_, err = store.observe(context.Background(), gapRequest)
+	if errorCode(err) != ErrorIntegrityConflict {
+		t.Fatalf("same running observation identity with different digest=%v", err)
+	}
+	backend.enqueueObservation(contractWorkerObservation{
 		Kind: WorkerObservedRunning, StreamGeneration: running.Worker.Cursor.StreamGeneration,
 		Position: running.Worker.Cursor.Position + 2, ObservedAt: now,
 	})
@@ -215,9 +255,11 @@ func TestPostgresWorkerObservationPersistsCursorReplayOrderingAndConflictsAcross
 		EvidenceID:     mustEvidenceID(t, "postgres-worker-conflicting-evidence"),
 		EvidenceDigest: digest(248), InternalCallCount: 1, SafeFailure: WorkerFailureAmbiguous,
 	})
+	beforeTerminalReplacement := backend.observeCount()
 	_, err = restarted.observe(context.Background(), conflictRequest)
-	if errorCode(err) != ErrorIntegrityConflict {
-		t.Fatalf("same observation identity with different digest=%v", err)
+	if errorCode(err) != ErrorAuthorizationDenied || backend.observeCount() != beforeTerminalReplacement {
+		t.Fatalf("terminal observation replacement reached backend: err=%v before=%d after=%d",
+			err, beforeTerminalReplacement, backend.observeCount())
 	}
 	if first.Observation.Position != 1 {
 		t.Fatalf("first observation changed after restart: %+v", first)

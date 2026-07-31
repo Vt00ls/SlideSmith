@@ -220,7 +220,10 @@ func (authority *PostgresAuthority) replayPostgresWorkerAccept(
 }
 
 func (authority *PostgresAuthority) heartbeat(ctx context.Context, heartbeat workerHeartbeat) (workerLeaseDecision, error) {
-	if ctx == nil || ctx.Err() != nil || !validWorkerHeartbeat(heartbeat) {
+	if ctx == nil || ctx.Err() != nil {
+		return workerLeaseDecision{}, newError(ErrorDependencyUnavailable)
+	}
+	if !validWorkerHeartbeat(heartbeat) {
 		return workerLeaseDecision{}, newError(ErrorIntegrityConflict)
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -282,7 +285,10 @@ func (authority *PostgresAuthority) heartbeat(ctx context.Context, heartbeat wor
 }
 
 func (authority *PostgresAuthority) observe(ctx context.Context, request workerObserve) (workerObservationResult, error) {
-	if ctx == nil || ctx.Err() != nil || !validWorkerObserve(request) {
+	if ctx == nil || ctx.Err() != nil {
+		return workerObservationResult{}, newError(ErrorDependencyUnavailable)
+	}
+	if !validWorkerObserve(request) {
 		return workerObservationResult{}, newError(ErrorIntegrityConflict)
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
@@ -364,26 +370,6 @@ func (authority *PostgresAuthority) observe(ctx context.Context, request workerO
 	return workerObservationResult{Disposition: WorkerObservationAccepted, Observation: observation}, nil
 }
 
-func applyWorkerObservation(record *runtimeRecord, observation workerObservation) {
-	record.fixture.RuntimeRevision++
-	record.worker.Cursor = WorkerCursorSnapshot{
-		OperationID: observation.OperationID, ProducerAuthority: observation.ProducerAuthority,
-		ProducerGeneration: observation.ProducerGeneration, StreamGeneration: observation.StreamGeneration,
-		Position: observation.Position,
-	}
-	record.worker.LastObservationID, record.worker.LastObservationDigest = observation.ObservationID, observation.CanonicalDigest
-	record.worker.LastObservationKind, record.worker.EvidenceCandidate = observation.Kind, observation.Evidence
-	record.worker.SafeFailure = observation.SafeFailure
-	switch observation.Kind {
-	case WorkerObservedRunning:
-		record.worker.Status, record.fixture.State = WorkerOperationRunning, RuntimeRunning
-	case WorkerObservedSucceeded:
-		record.worker.Status, record.fixture.State = WorkerOperationSuccessObserved, RuntimeReconciling
-	case WorkerObservedFailed:
-		record.worker.Status, record.fixture.State = WorkerOperationFailureObserved, RuntimeReconciling
-	}
-}
-
 func (authority *PostgresAuthority) replayPostgresWorkerObservation(
 	ctx context.Context,
 	tx *sql.Tx,
@@ -407,7 +393,10 @@ func (authority *PostgresAuthority) replayPostgresWorkerObservation(
 }
 
 func (authority *PostgresAuthority) stop(ctx context.Context, intent workerStopIntent) (workerStopAck, error) {
-	if ctx == nil || ctx.Err() != nil || !validWorkerStopIntent(intent) {
+	if ctx == nil || ctx.Err() != nil {
+		return workerStopAck{}, newError(ErrorDependencyUnavailable)
+	}
+	if !validWorkerStopIntent(intent) {
 		return workerStopAck{}, newError(ErrorIntegrityConflict)
 	}
 	tx, err := authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})

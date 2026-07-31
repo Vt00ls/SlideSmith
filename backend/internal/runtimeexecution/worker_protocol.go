@@ -262,34 +262,28 @@ func newAgentWorkerCapabilityAdapter(plan agentCapabilityPlan, backend agentWork
 
 func (*agentWorkerCapabilityAdapter) workerClass() WorkerClass { return WorkerAgent }
 
+func (adapter *agentWorkerCapabilityAdapter) current(capsule executionCapsule) bool {
+	plan := adapter.plan
+	provider := capsule.GatewayGrantID != (GatewayGrantID{})
+	return capsule.WorkerClass == WorkerAgent && plan.RuntimeBindingID == capsule.RuntimeBindingID &&
+		plan.RuntimeBindingDigest == capsule.RuntimeBindingDigest &&
+		plan.CapabilityContractDigest == capsule.CapabilityContractDigest &&
+		plan.AllowedPlatformImagesDigest == capsule.AllowedPlatformImagesDigest &&
+		plan.ExecutorContractDigest == capsule.ExecutorContractDigest &&
+		plan.ActualImageDigest == capsule.SecurityAcceptance.ActualImageDigest &&
+		plan.ActualExecutorDigest == capsule.SecurityAcceptance.ActualExecutorDigest &&
+		plan.ProviderRequired == provider
+}
+
 func (adapter *agentWorkerCapabilityAdapter) acceptCapability(
 	ctx context.Context,
 	command workerAccept,
 	capsule executionCapsule,
 ) (workerOperationAck, error) {
-	plan := adapter.plan
-	provider := capsule.GatewayGrantID != (GatewayGrantID{})
-	if capsule.WorkerClass != WorkerAgent || plan.RuntimeBindingID != capsule.RuntimeBindingID ||
-		plan.RuntimeBindingDigest != capsule.RuntimeBindingDigest ||
-		plan.CapabilityContractDigest != capsule.CapabilityContractDigest ||
-		plan.AllowedPlatformImagesDigest != capsule.AllowedPlatformImagesDigest ||
-		plan.ExecutorContractDigest != capsule.ExecutorContractDigest ||
-		plan.ActualImageDigest != capsule.SecurityAcceptance.ActualImageDigest ||
-		plan.ActualExecutorDigest != capsule.SecurityAcceptance.ActualExecutorDigest ||
-		plan.ProviderRequired != provider {
+	if !adapter.current(capsule) {
 		return workerOperationAck{}, newError(ErrorAuthorizationDenied)
 	}
-	ack, err := adapter.backend.acceptAgent(ctx, agentCapabilityInvocation{
-		RuntimeRunID: capsule.RuntimeRunID, OperationID: capsule.OperationID,
-		CapsuleID: capsule.CapsuleID, CapsuleDigest: command.CapsuleDigest,
-		RuntimeBindingID: capsule.RuntimeBindingID, RuntimeBindingDigest: capsule.RuntimeBindingDigest,
-		CapabilityContractDigest: capsule.CapabilityContractDigest, IntentReference: plan.IntentReference,
-		PromptReference: plan.PromptReference, EntrypointDigest: plan.EntrypointDigest,
-		ImmutableInputManifest: capsule.Inputs, OutputContractDigest: capsule.OutputContractDigest,
-		EvidenceContractDigest: capsule.EvidenceContractDigest, GatewayGrantID: capsule.GatewayGrantID,
-		GatewayGrantGeneration: capsule.GatewayGrantGeneration,
-		LeaseGeneration:        capsule.LeaseGeneration, LeaseFence: capsule.LeaseFence,
-	}, command)
+	ack, err := adapter.backend.acceptAgent(ctx, agentInvocation(adapter.plan, capsule, command.CapsuleDigest), command)
 	if err != nil {
 		return workerOperationAck{}, newError(ErrorDependencyUnavailable)
 	}
@@ -301,19 +295,10 @@ func (adapter *agentWorkerCapabilityAdapter) observeCapability(
 	request workerObserve,
 	capsule executionCapsule,
 ) (workerObservation, error) {
-	plan := adapter.plan
-	provider := capsule.GatewayGrantID != (GatewayGrantID{})
-	if capsule.WorkerClass != WorkerAgent || plan.RuntimeBindingID != capsule.RuntimeBindingID ||
-		plan.RuntimeBindingDigest != capsule.RuntimeBindingDigest ||
-		plan.CapabilityContractDigest != capsule.CapabilityContractDigest ||
-		plan.AllowedPlatformImagesDigest != capsule.AllowedPlatformImagesDigest ||
-		plan.ExecutorContractDigest != capsule.ExecutorContractDigest ||
-		plan.ActualImageDigest != capsule.SecurityAcceptance.ActualImageDigest ||
-		plan.ActualExecutorDigest != capsule.SecurityAcceptance.ActualExecutorDigest ||
-		plan.ProviderRequired != provider {
+	if !adapter.current(capsule) {
 		return workerObservation{}, newError(ErrorAuthorizationDenied)
 	}
-	invocation := agentInvocation(plan, capsule, request.Ref.CapsuleDigest)
+	invocation := agentInvocation(adapter.plan, capsule, request.Ref.CapsuleDigest)
 	invocation.LeaseGeneration, invocation.LeaseFence = request.Ref.LeaseGeneration, request.Ref.LeaseFence
 	raw, err := adapter.backend.observeAgent(ctx, invocation, request)
 	if err != nil {
@@ -327,19 +312,10 @@ func (adapter *agentWorkerCapabilityAdapter) stopCapability(
 	intent workerStopIntent,
 	capsule executionCapsule,
 ) (workerStopAck, error) {
-	plan := adapter.plan
-	provider := capsule.GatewayGrantID != (GatewayGrantID{})
-	if capsule.WorkerClass != WorkerAgent || plan.RuntimeBindingID != capsule.RuntimeBindingID ||
-		plan.RuntimeBindingDigest != capsule.RuntimeBindingDigest ||
-		plan.CapabilityContractDigest != capsule.CapabilityContractDigest ||
-		plan.AllowedPlatformImagesDigest != capsule.AllowedPlatformImagesDigest ||
-		plan.ExecutorContractDigest != capsule.ExecutorContractDigest ||
-		plan.ActualImageDigest != capsule.SecurityAcceptance.ActualImageDigest ||
-		plan.ActualExecutorDigest != capsule.SecurityAcceptance.ActualExecutorDigest ||
-		plan.ProviderRequired != provider {
+	if !adapter.current(capsule) {
 		return workerStopAck{}, newError(ErrorAuthorizationDenied)
 	}
-	invocation := agentInvocation(plan, capsule, intent.CapsuleDigest)
+	invocation := agentInvocation(adapter.plan, capsule, intent.CapsuleDigest)
 	invocation.LeaseGeneration, invocation.LeaseFence = intent.LeaseGeneration, intent.LeaseFence
 	ack, err := adapter.backend.stopAgent(ctx, invocation, intent)
 	if err != nil {
@@ -422,6 +398,14 @@ type toolCapabilityPlan struct {
 	ProviderRequired            bool
 }
 
+func canonicalToolCapabilityContractDigest(plan toolCapabilityPlan) Digest {
+	return digestBytes([]byte(strings.Join([]string{
+		"slidesmith.runtime-execution.tool-capability-contract/v1",
+		plan.RuntimeBindingID.String(), plan.RuntimeBindingDigest.String(), fmt.Sprint(plan.CapabilityKey),
+		plan.Parameters.CanonicalDigest.String(), plan.EntrypointDigest.String(),
+	}, "\n")))
+}
+
 type toolCapabilityInvocation struct {
 	RuntimeRunID             RuntimeRunID
 	OperationID              OperationID
@@ -456,16 +440,17 @@ type toolWorkerCapabilityAdapter struct {
 
 func newToolWorkerCapabilityAdapter(plan toolCapabilityPlan, backend toolWorkerBackend) (workerCapabilityAdapter, error) {
 	parameters, err := canonicalizeToolParameters(plan.Parameters)
+	plan.Parameters = parameters
 	if err != nil || backend == nil || !validOpaqueID(plan.RuntimeBindingID.String()) ||
 		plan.RuntimeBindingDigest == (Digest{}) || plan.CapabilityContractDigest == (Digest{}) ||
 		plan.AllowedPlatformImagesDigest == (Digest{}) || plan.ExecutorContractDigest == (Digest{}) ||
 		plan.CapabilityKey < ToolCapabilityDocumentRender || plan.CapabilityKey > ToolCapabilityMediaInspect ||
 		!toolCapabilityMatchesParameters(plan.CapabilityKey, parameters) || plan.EntrypointDigest == (Digest{}) ||
 		plan.ActualImageDigest == (Digest{}) || plan.ActualExecutorDigest == (Digest{}) ||
-		plan.EntrypointDigest != plan.ActualExecutorDigest {
+		plan.EntrypointDigest != plan.ActualExecutorDigest ||
+		plan.CapabilityContractDigest != canonicalToolCapabilityContractDigest(plan) {
 		return nil, newError(ErrorInvalidRequest)
 	}
-	plan.Parameters = parameters
 	return &toolWorkerCapabilityAdapter{plan: plan, backend: backend}, nil
 }
 
@@ -492,6 +477,7 @@ func (adapter *toolWorkerCapabilityAdapter) current(capsule executionCapsule) bo
 		capsule.GatewayGrantDigest != (Digest{})
 	return capsule.WorkerClass == WorkerTool && plan.RuntimeBindingID == capsule.RuntimeBindingID &&
 		plan.RuntimeBindingDigest == capsule.RuntimeBindingDigest &&
+		plan.CapabilityContractDigest == canonicalToolCapabilityContractDigest(plan) &&
 		plan.CapabilityContractDigest == capsule.CapabilityContractDigest &&
 		plan.AllowedPlatformImagesDigest == capsule.AllowedPlatformImagesDigest &&
 		plan.ExecutorContractDigest == capsule.ExecutorContractDigest &&
@@ -907,8 +893,10 @@ type workerOperationRef struct {
 	SchemaVersion           SchemaVersion
 	PersonalWorkspaceID     PersonalWorkspaceID
 	TaskID                  TaskID
+	TaskRevision            TaskRevision
 	PhaseRunID              PhaseRunID
 	RuntimeRunID            RuntimeRunID
+	RuntimeRevision         RuntimeRevision
 	StartOperationID        OperationID
 	AcceptOperationID       OperationID
 	CapsuleID               ExecutionCapsuleID
@@ -934,7 +922,8 @@ type workerOperationRef struct {
 func workerOperationRefFromSnapshot(start StartRuntimeRun, snapshot RuntimeSnapshot) workerOperationRef {
 	return workerOperationRef{
 		SchemaVersion: SchemaV1, PersonalWorkspaceID: start.PersonalWorkspaceID,
-		TaskID: start.TaskID, PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID,
+		TaskID: start.TaskID, TaskRevision: start.ExpectedTaskRevision,
+		PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID, RuntimeRevision: snapshot.RuntimeRevision,
 		StartOperationID: start.OperationID, AcceptOperationID: snapshot.Worker.AcceptOperationID,
 		CapsuleID: snapshot.Worker.CapsuleID, CapsuleDigest: snapshot.Worker.CapsuleDigest,
 		OperationAckID: snapshot.Worker.OperationAckID, OperationAckDigest: snapshot.Worker.OperationAckDigest,
@@ -986,8 +975,9 @@ func canonicalWorkerObserveDigest(request workerObserve) Digest {
 	ref, cursor := request.Ref, request.Cursor
 	return digestBytes([]byte(strings.Join([]string{
 		"slidesmith.runtime-execution.worker-observe/v1", fmt.Sprint(request.SchemaVersion),
-		fmt.Sprint(ref.SchemaVersion), ref.PersonalWorkspaceID.String(), ref.TaskID.String(), ref.PhaseRunID.String(),
-		ref.RuntimeRunID.String(), ref.StartOperationID.String(), ref.AcceptOperationID.String(),
+		fmt.Sprint(ref.SchemaVersion), ref.PersonalWorkspaceID.String(), ref.TaskID.String(), fmt.Sprint(ref.TaskRevision),
+		ref.PhaseRunID.String(), ref.RuntimeRunID.String(), fmt.Sprint(ref.RuntimeRevision),
+		ref.StartOperationID.String(), ref.AcceptOperationID.String(),
 		ref.CapsuleID.String(), ref.CapsuleDigest.String(), ref.OperationAckID.String(), ref.OperationAckDigest.String(),
 		fmt.Sprint(ref.WorkerClass), ref.WorkerAuthorityID.String(), fmt.Sprint(ref.WorkerGeneration),
 		ref.NodeAuthorityID.String(), ref.ExecutionNodeID.String(), fmt.Sprint(ref.NodeGeneration),
@@ -1003,7 +993,8 @@ func validWorkerObserve(request workerObserve) bool {
 	ref, cursor := request.Ref, request.Cursor
 	return request.SchemaVersion == SchemaV1 && ref.SchemaVersion == SchemaV1 &&
 		validOpaqueID(ref.PersonalWorkspaceID.String()) && validOpaqueID(ref.TaskID.String()) &&
-		validOpaqueID(ref.PhaseRunID.String()) && validOpaqueID(ref.RuntimeRunID.String()) &&
+		ref.TaskRevision > 0 && validOpaqueID(ref.PhaseRunID.String()) && validOpaqueID(ref.RuntimeRunID.String()) &&
+		ref.RuntimeRevision > 0 &&
 		validOpaqueID(ref.StartOperationID.String()) && validOpaqueID(ref.AcceptOperationID.String()) &&
 		validOpaqueID(ref.CapsuleID.String()) && ref.CapsuleDigest != (Digest{}) &&
 		validOpaqueID(ref.OperationAckID.String()) && ref.OperationAckDigest != (Digest{}) &&
@@ -1211,6 +1202,11 @@ func (engine *invariantEngine) observe(ctx context.Context, request workerObserv
 	}
 	record.workerObservationQueries[request.CanonicalDigest] = result
 	record.workerObservations[observation.ObservationID] = observation
+	applyWorkerObservation(record, observation)
+	return result, nil
+}
+
+func applyWorkerObservation(record *runtimeRecord, observation workerObservation) {
 	record.fixture.RuntimeRevision++
 	record.worker.Cursor = WorkerCursorSnapshot{
 		OperationID: observation.OperationID, ProducerAuthority: observation.ProducerAuthority,
@@ -1230,17 +1226,17 @@ func (engine *invariantEngine) observe(ctx context.Context, request workerObserv
 		record.worker.Status = WorkerOperationSuccessObserved
 		record.fixture.State = RuntimeReconciling
 	case WorkerObservedFailed:
-		record.worker.Status = WorkerOperationFailureObserved
-		record.fixture.State = RuntimeReconciling
+		record.worker.Status, record.fixture.State = WorkerOperationFailureObserved, RuntimeReconciling
 	}
-	return result, nil
 }
 
 func workerObserveCurrent(record *runtimeRecord, request workerObserve, now time.Time) bool {
-	if record == nil || record.worker.Status < WorkerOperationAccepted || record.fixture.Outcome != RuntimeOutcomeNone ||
+	if record == nil || (record.worker.Status != WorkerOperationAccepted && record.worker.Status != WorkerOperationRunning) ||
+		record.fixture.Outcome != RuntimeOutcomeNone ||
 		record.fixture.State == RuntimeTerminal || record.fixture.State == RuntimeStopping || !now.UTC().Before(record.deadline) ||
 		record.fixture.PersonalWorkspaceID != request.Ref.PersonalWorkspaceID || record.fixture.TaskID != request.Ref.TaskID ||
-		record.fixture.PhaseRunID != request.Ref.PhaseRunID || record.fixture.RuntimeRunID != request.Ref.RuntimeRunID ||
+		record.fixture.TaskRevision != request.Ref.TaskRevision || record.fixture.PhaseRunID != request.Ref.PhaseRunID ||
+		record.fixture.RuntimeRunID != request.Ref.RuntimeRunID || record.fixture.RuntimeRevision != request.Ref.RuntimeRevision ||
 		record.operation.OperationID != request.Ref.StartOperationID || record.capsule.dispatchOperationID != request.Ref.AcceptOperationID ||
 		record.capsule.snapshot.CapsuleID != request.Ref.CapsuleID || record.capsule.snapshot.Digest != request.Ref.CapsuleDigest ||
 		record.worker.OperationAckID != request.Ref.OperationAckID || record.worker.OperationAckDigest != request.Ref.OperationAckDigest ||
@@ -1252,6 +1248,7 @@ func workerObserveCurrent(record *runtimeRecord, request workerObserve, now time
 		record.lease.AuthorizationGeneration != request.Ref.AuthorizationGeneration ||
 		record.fixture.SafetyEpoch != request.Ref.ReleaseSafetyEpoch || record.catalogSafetyEpoch != request.Ref.CatalogSafetyEpoch ||
 		!record.deadline.Equal(request.Ref.Deadline) || record.lease.Disposition != LeaseActive ||
+		!now.UTC().Before(record.lease.ExpiresAt) || !now.UTC().Before(record.lease.AuthorizationExpiresAt) ||
 		record.node.Readiness != NodeReady || record.node.Quarantined {
 		return false
 	}
@@ -1511,7 +1508,7 @@ func workerStopCurrent(record *runtimeRecord, intent workerStopIntent, now time.
 		record.lease.Fence != intent.LeaseFence || record.fixture.RuntimeFence != intent.RuntimeFence ||
 		record.lease.AuthorizationGeneration != intent.AuthorizationGeneration ||
 		record.fixture.SafetyEpoch != intent.ReleaseSafetyEpoch || record.catalogSafetyEpoch != intent.CatalogSafetyEpoch ||
-		!record.deadline.Equal(intent.RuntimeDeadline) || record.lease.Disposition != LeaseRevoked {
+		!record.deadline.Equal(intent.RuntimeDeadline) {
 		return false
 	}
 	terminalOrStopping := record.fixture.State == RuntimeStopping && record.fixture.Outcome == RuntimeOutcomeNone ||
@@ -1519,10 +1516,21 @@ func workerStopCurrent(record *runtimeRecord, intent workerStopIntent, now time.
 	if !terminalOrStopping {
 		return false
 	}
-	if intent.Reason == WorkerStopCancellation {
-		return record.cancellation.Status == CancellationAccepted
+	switch intent.Reason {
+	case WorkerStopCancellation:
+		return record.cancellation.Status == CancellationAccepted && record.lease.Disposition == LeaseRevoked
+	case WorkerStopLeaseRevoked:
+		return record.cancellation.Status != CancellationAccepted && record.lease.Disposition == LeaseRevoked &&
+			record.node.Readiness == NodeReady && record.node.Quarantined
+	case WorkerStopDeadline:
+		return record.cancellation.Status != CancellationAccepted && record.lease.Disposition == LeaseExpired &&
+			!now.UTC().Before(record.lease.ExpiresAt)
+	case WorkerStopNodeLost:
+		return record.cancellation.Status != CancellationAccepted && record.lease.Disposition == LeaseRevoked &&
+			record.node.Readiness == NodeUnavailable && record.node.Quarantined
+	default:
+		return false
 	}
-	return true
 }
 
 func knownWorkerStopSnapshot(stop WorkerStopSnapshot) bool {

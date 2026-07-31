@@ -3,6 +3,7 @@ package runtimeexecution
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -193,6 +194,227 @@ func TestWorkerObserveOrdersCursorAndKeepsTerminalClaimsAsEvidenceCandidates(t *
 	}
 }
 
+func TestWorkerObserveBindsCurrentTaskAndRuntimeRevisions(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 31, 11, 50, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name   string
+		mutate func(*workerOperationRef)
+	}{
+		{name: "Task revision", mutate: func(ref *workerOperationRef) { ref.TaskRevision++ }},
+		{name: "Runtime revision", mutate: func(ref *workerOperationRef) { ref.RuntimeRevision++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newContractAgentWorkerBackend()
+			harness, start, prepared := newReadyWorkerProtocolHarness(
+				t, now, "observe-revision-"+strings.ToLower(strings.ReplaceAll(test.name, " ", "-")),
+				WorkerAgent, backend, nil,
+			)
+			delivery, err := harness.Dispatch.ClaimDispatch(context.Background(), DispatchClaimRequest{
+				RuntimeRunID: start.RuntimeRunID, CapsuleID: prepared.Snapshot.Capsule.CapsuleID,
+				Digest: prepared.Snapshot.Capsule.Digest,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			accept, err := newWorkerAccept(delivery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.workers.accept(context.Background(), accept); err != nil {
+				t.Fatal(err)
+			}
+			current, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if err != nil {
+				t.Fatal(err)
+			}
+			ref := workerOperationRefFromSnapshot(start, current)
+			test.mutate(&ref)
+			request, err := newWorkerObserve(ref, initialWorkerCursor(current))
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend.enqueueObservation(contractWorkerObservation{Kind: WorkerObservedRunning, ObservedAt: now})
+			if _, err := harness.workers.observe(context.Background(), request); errorCode(err) != ErrorAuthorizationDenied {
+				t.Fatalf("stale revision Observe err=%v, want authorization denied", err)
+			}
+			if backend.observeCount() != 0 {
+				t.Fatalf("stale revision reached worker backend %d times", backend.observeCount())
+			}
+		})
+	}
+}
+
+func TestWorkerObserveRejectsExpiredLeaseOrAuthorization(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 31, 11, 55, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name    string
+		expires func(RuntimeSnapshot) time.Time
+		prepare func(*invariantEngine, RuntimeRunID)
+	}{
+		{name: "lease", expires: func(snapshot RuntimeSnapshot) time.Time { return snapshot.Lease.ExpiresAt }},
+		{
+			name: "authorization",
+			expires: func(snapshot RuntimeSnapshot) time.Time {
+				return snapshot.Lease.AuthorizationExpiresAt
+			},
+			prepare: func(engine *invariantEngine, runtimeRunID RuntimeRunID) {
+				engine.store.mu.Lock()
+				defer engine.store.mu.Unlock()
+				record := engine.store.runtimes[runtimeRunID]
+				record.lease.ExpiresAt = record.lease.AuthorizationExpiresAt.Add(time.Minute)
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newContractAgentWorkerBackend()
+			harness, start, prepared := newReadyWorkerProtocolHarness(
+				t, now, "observe-expiry-"+test.name, WorkerAgent, backend, nil,
+			)
+			delivery, err := harness.Dispatch.ClaimDispatch(context.Background(), DispatchClaimRequest{
+				RuntimeRunID: start.RuntimeRunID, CapsuleID: prepared.Snapshot.Capsule.CapsuleID,
+				Digest: prepared.Snapshot.Capsule.Digest,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			accept, err := newWorkerAccept(delivery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.workers.accept(context.Background(), accept); err != nil {
+				t.Fatal(err)
+			}
+			current, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err := newWorkerObserve(workerOperationRefFromSnapshot(start, current), initialWorkerCursor(current))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.prepare != nil {
+				test.prepare(harness.workers.(*invariantEngine), start.RuntimeRunID)
+			}
+			if err := harness.AdvanceClock(test.expires(current).Sub(now)); err != nil {
+				t.Fatal(err)
+			}
+			backend.enqueueObservation(contractWorkerObservation{Kind: WorkerObservedRunning, ObservedAt: now})
+			if _, err := harness.workers.observe(context.Background(), request); errorCode(err) != ErrorAuthorizationDenied {
+				t.Fatalf("expired %s Observe err=%v, want authorization denied", test.name, err)
+			}
+			if backend.observeCount() != 0 {
+				t.Fatalf("expired %s reached worker backend %d times", test.name, backend.observeCount())
+			}
+		})
+	}
+}
+
+func TestWorkerTerminalObservationIsImmutableExceptForExactReplay(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 31, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name        string
+		terminal    contractWorkerObservation
+		replacement WorkerObservationKind
+	}{
+		{
+			name: "success cannot become running", replacement: WorkerObservedRunning,
+			terminal: contractWorkerObservation{
+				Kind: WorkerObservedSucceeded, ObservedAt: now,
+				EvidenceID:     mustEvidenceID(t, "immutable-success-evidence"),
+				EvidenceDigest: digest(251), InternalCallCount: 1,
+			},
+		},
+		{
+			name: "success cannot become failure", replacement: WorkerObservedFailed,
+			terminal: contractWorkerObservation{
+				Kind: WorkerObservedSucceeded, ObservedAt: now,
+				EvidenceID:     mustEvidenceID(t, "immutable-success-opposite-evidence"),
+				EvidenceDigest: digest(252), InternalCallCount: 1,
+			},
+		},
+		{
+			name: "failure cannot become success", replacement: WorkerObservedSucceeded,
+			terminal: contractWorkerObservation{
+				Kind: WorkerObservedFailed, ObservedAt: now,
+				EvidenceID:     mustEvidenceID(t, "immutable-failure-evidence"),
+				EvidenceDigest: digest(253), InternalCallCount: 1, SafeFailure: WorkerFailureCapability,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newContractAgentWorkerBackend()
+			harness, start, prepared := newReadyWorkerProtocolHarness(
+				t, now, "terminal-"+strings.ReplaceAll(test.name, " ", "-"), WorkerAgent, backend, nil,
+			)
+			delivery, err := harness.Dispatch.ClaimDispatch(context.Background(), DispatchClaimRequest{
+				RuntimeRunID: start.RuntimeRunID, CapsuleID: prepared.Snapshot.Capsule.CapsuleID,
+				Digest: prepared.Snapshot.Capsule.Digest,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			accept, err := newWorkerAccept(delivery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.workers.accept(context.Background(), accept); err != nil {
+				t.Fatal(err)
+			}
+			starting, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err := newWorkerObserve(workerOperationRefFromSnapshot(start, starting), initialWorkerCursor(starting))
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend.enqueueObservation(test.terminal)
+			accepted, err := harness.workers.observe(context.Background(), request)
+			if err != nil || accepted.Disposition != WorkerObservationAccepted {
+				t.Fatalf("terminal observation: %+v err=%v", accepted, err)
+			}
+			replayed, err := harness.workers.observe(context.Background(), request)
+			if err != nil || !replayed.Replayed || replayed.Observation != accepted.Observation {
+				t.Fatalf("terminal exact replay: %+v err=%v", replayed, err)
+			}
+			terminal, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement, err := newWorkerObserve(workerOperationRefFromSnapshot(start, terminal), terminal.Worker.Cursor)
+			if err != nil {
+				t.Fatal(err)
+			}
+			next := contractWorkerObservation{Kind: test.replacement, ObservedAt: now}
+			if test.replacement != WorkerObservedRunning {
+				next.EvidenceID = mustEvidenceID(t, "replacement-"+strings.ReplaceAll(test.name, " ", "-"))
+				next.EvidenceDigest, next.InternalCallCount = digest(254), 1
+				if test.replacement == WorkerObservedFailed {
+					next.SafeFailure = WorkerFailureCapability
+				}
+			}
+			backend.enqueueObservation(next)
+			beforeCalls := backend.observeCount()
+			if _, err := harness.workers.observe(context.Background(), replacement); errorCode(err) != ErrorAuthorizationDenied {
+				t.Fatalf("terminal replacement err=%v, want authorization denied", err)
+			}
+			if backend.observeCount() != beforeCalls {
+				t.Fatalf("terminal replacement reached backend: before=%d after=%d", beforeCalls, backend.observeCount())
+			}
+			after, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if err != nil || after.Worker != terminal.Worker {
+				t.Fatalf("terminal worker evidence was overwritten: before=%+v after=%+v err=%v", terminal.Worker, after.Worker, err)
+			}
+		})
+	}
+}
+
 func TestWorkerStopIsExactIdempotentAndClaimsOnlyBestEffortAcceptance(t *testing.T) {
 	t.Parallel()
 
@@ -266,6 +488,121 @@ func TestWorkerStopIsExactIdempotentAndClaimsOnlyBestEffortAcceptance(t *testing
 	}
 }
 
+func TestWorkerStopReasonMustMatchAuthoritativeCause(t *testing.T) {
+	t.Parallel()
+
+	baseNow := time.Date(2026, time.July, 31, 12, 10, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name       string
+		wantReason WorkerStopReason
+		fence      LeaseFenceReason
+		cancel     bool
+	}{
+		{name: "cancellation", wantReason: WorkerStopCancellation, cancel: true},
+		{name: "lease revoked", wantReason: WorkerStopLeaseRevoked, fence: LeaseFenceRevoked},
+		{name: "lease expired", wantReason: WorkerStopDeadline, fence: LeaseFenceExpired},
+		{name: "node lost", wantReason: WorkerStopNodeLost, fence: LeaseFenceNodeLost},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			suffix := "stop-reason-" + strings.ReplaceAll(test.name, " ", "-")
+			backend := newContractAgentWorkerBackend()
+			harness, start, prepared := newReadyWorkerProtocolHarness(
+				t, baseNow, suffix, WorkerAgent, backend, nil,
+			)
+			delivery, err := harness.Dispatch.ClaimDispatch(context.Background(), DispatchClaimRequest{
+				RuntimeRunID: start.RuntimeRunID, CapsuleID: prepared.Snapshot.Capsule.CapsuleID,
+				Digest: prepared.Snapshot.Capsule.Digest,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			accept, err := newWorkerAccept(delivery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := harness.workers.accept(context.Background(), accept); err != nil {
+				t.Fatal(err)
+			}
+			current, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if err != nil {
+				t.Fatal(err)
+			}
+			occurredAt := baseNow
+			if test.cancel {
+				cancel, err := NewCancelRuntimeRun(CancelRuntimeRunInput{
+					SchemaVersion: SchemaV1, OperationID: mustOperationID(t, suffix+"-cancel"),
+					PersonalWorkspaceID: start.PersonalWorkspaceID, TaskID: start.TaskID,
+					PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID,
+					ExpectedRuntimeRevision: current.RuntimeRevision, ExpectedStartOperationID: start.OperationID,
+					ExpectedOperationGeneration: current.Operation.Generation, ExpectedRuntimeFence: current.RuntimeFence,
+					Authority: start.Authority, Reason: CancellationUserRequested,
+					SafetyEpoch: start.ReleaseSafetyEpoch, OccurredAt: occurredAt,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := harness.Runtime.Execute(context.Background(), cancel); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if test.fence == LeaseFenceExpired {
+					occurredAt = current.Lease.ExpiresAt
+					if err := harness.AdvanceClock(occurredAt.Sub(baseNow)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				fence, err := NewFenceSandboxLease(FenceSandboxLeaseInput{
+					SchemaVersion: SchemaV1, OperationID: mustOperationID(t, suffix+"-fence"),
+					PersonalWorkspaceID: start.PersonalWorkspaceID, RuntimeRunID: start.RuntimeRunID,
+					ExpectedRuntimeFence: current.RuntimeFence, SandboxLeaseID: current.Lease.LeaseID,
+					LeaseGeneration: current.Lease.Generation, LeaseFence: current.Lease.Fence,
+					ExecutionNodeID: current.Node.ExecutionNodeID, NodeGeneration: current.Node.Generation,
+					Reason: test.fence, Authority: workerTestFencingAuthority(t, suffix),
+					ReleaseSafetyEpoch: start.ReleaseSafetyEpoch, OccurredAt: occurredAt,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := harness.Maintenance.Maintain(context.Background(), fence); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stopping, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for reason := WorkerStopCancellation; reason <= WorkerStopNodeLost; reason++ {
+				if reason == test.wantReason {
+					continue
+				}
+				intent, err := newWorkerStopIntentFromSnapshot(
+					start, stopping, mustOperationID(t, suffix+"-mismatch-"+fmt.Sprint(reason)),
+					reason, occurredAt.Add(time.Minute),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := harness.workers.stop(context.Background(), intent); errorCode(err) != ErrorAuthorizationDenied {
+					t.Fatalf("state %s accepted mismatched reason %v: %v", test.name, reason, err)
+				}
+			}
+			if backend.stopCount() != 0 {
+				t.Fatalf("mismatched reasons reached backend %d times", backend.stopCount())
+			}
+			intent, err := newWorkerStopIntentFromSnapshot(
+				start, stopping, mustOperationID(t, suffix+"-matching"), test.wantReason, occurredAt.Add(time.Minute),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ack, err := harness.workers.stop(context.Background(), intent)
+			if err != nil || !ack.BestEffortAccepted || backend.stopCount() != 1 {
+				t.Fatalf("truthful %s Stop: %+v err=%v calls=%d", test.name, ack, err, backend.stopCount())
+			}
+		})
+	}
+}
+
 func TestToolWorkerUsesIndependentBackendAndClosedTypedCapabilityPayload(t *testing.T) {
 	t.Parallel()
 
@@ -291,14 +628,102 @@ func TestToolWorkerUsesIndependentBackendAndClosedTypedCapabilityPayload(t *test
 		t.Fatalf("Tool backend independence: snapshot=%+v calls=%d err=%v", inspected, backend.acceptCount(), err)
 	}
 
-	parameterType := reflect.TypeOf(toolTypedParameters{})
-	for index := 0; index < parameterType.NumField(); index++ {
-		field := parameterType.Field(index)
-		name := strings.ToLower(field.Name)
-		if field.Type.Kind() == reflect.String || strings.Contains(name, "shell") || strings.Contains(name, "command") ||
-			strings.Contains(name, "exec") || strings.Contains(name, "path") || strings.Contains(name, "host") {
-			t.Fatalf("arbitrary execution surface leaked into typed Tool parameters: %s %s", field.Name, field.Type)
-		}
+	for _, envelope := range []reflect.Type{
+		reflect.TypeOf(toolTypedParameters{}), reflect.TypeOf(toolCapabilityPlan{}),
+		reflect.TypeOf(toolCapabilityInvocation{}), reflect.TypeOf(agentCapabilityPlan{}),
+		reflect.TypeOf(agentCapabilityInvocation{}),
+	} {
+		assertNoArbitraryExecutionFields(t, envelope)
+	}
+	for _, backendInterface := range []reflect.Type{
+		reflect.TypeOf((*toolWorkerBackend)(nil)).Elem(),
+		reflect.TypeOf((*agentWorkerBackend)(nil)).Elem(),
+	} {
+		assertNoArbitraryExecutionBackend(t, backendInterface)
+	}
+}
+
+func TestProviderCapableToolWorkerLifecyclePreservesGatewayLineage(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.July, 31, 12, 30, 0, 0, time.UTC)
+	backend := newContractToolWorkerBackend()
+	harness, start, prepared := newReadyProviderToolWorkerProtocolHarness(t, now, "provider-tool-worker", backend)
+	delivery, err := harness.Dispatch.ClaimDispatch(context.Background(), DispatchClaimRequest{
+		RuntimeRunID: start.RuntimeRunID, CapsuleID: prepared.Snapshot.Capsule.CapsuleID,
+		Digest: prepared.Snapshot.Capsule.Digest,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accept, err := newWorkerAccept(delivery)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.workers.accept(context.Background(), accept); err != nil {
+		t.Fatalf("provider Tool Accept: %v", err)
+	}
+	starting, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+	if err != nil || !starting.Gateway.Ready || starting.Gateway.CurrentGrant.GatewayGrantID == (GatewayGrantID{}) {
+		t.Fatalf("provider Tool missing current Gateway grant: %+v err=%v", starting.Gateway, err)
+	}
+	backend.enqueueObservation(contractWorkerObservation{Kind: WorkerObservedRunning, ObservedAt: now})
+	runningRequest, err := newWorkerObserve(workerOperationRefFromSnapshot(start, starting), initialWorkerCursor(starting))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.workers.observe(context.Background(), runningRequest); err != nil {
+		t.Fatalf("provider Tool running: %v", err)
+	}
+	running, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.enqueueObservation(contractWorkerObservation{
+		Kind: WorkerObservedSucceeded, ObservedAt: now,
+		EvidenceID:     mustEvidenceID(t, "provider-tool-worker-evidence"),
+		EvidenceDigest: digest(249), InternalCallCount: 2,
+	})
+	successRequest, err := newWorkerObserve(workerOperationRefFromSnapshot(start, running), running.Worker.Cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.workers.observe(context.Background(), successRequest); err != nil {
+		t.Fatalf("provider Tool success evidence: %v", err)
+	}
+	candidate, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+	grant := candidate.Gateway.CurrentGrant
+	evidence := candidate.Worker.EvidenceCandidate
+	if err != nil || candidate.Worker.Status != WorkerOperationSuccessObserved ||
+		evidence.GatewayGrantID != grant.GatewayGrantID || evidence.GatewayGrantGeneration != grant.Generation ||
+		evidence.GatewayGrantDigest != grant.CanonicalDigest || evidence.InternalCallCount != 2 {
+		t.Fatalf("provider Tool Gateway lineage/evidence: candidate=%+v grant=%+v err=%v", evidence, grant, err)
+	}
+	cancel, err := NewCancelRuntimeRun(CancelRuntimeRunInput{
+		SchemaVersion: SchemaV1, OperationID: mustOperationID(t, "provider-tool-worker-cancel"),
+		PersonalWorkspaceID: start.PersonalWorkspaceID, TaskID: start.TaskID,
+		PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID,
+		ExpectedRuntimeRevision: candidate.RuntimeRevision, ExpectedStartOperationID: start.OperationID,
+		ExpectedOperationGeneration: candidate.Operation.Generation, ExpectedRuntimeFence: candidate.RuntimeFence,
+		Authority: start.Authority, Reason: CancellationUserRequested,
+		SafetyEpoch: start.ReleaseSafetyEpoch, OccurredAt: now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := harness.Runtime.Execute(context.Background(), cancel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop, err := newWorkerStopIntentFromSnapshot(
+		start, cancelled.Snapshot, mustOperationID(t, "provider-tool-worker-stop"),
+		WorkerStopCancellation, now.Add(time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := harness.workers.stop(context.Background(), stop); err != nil || backend.stopCount() != 1 {
+		t.Fatalf("provider Tool Stop: err=%v calls=%d", err, backend.stopCount())
 	}
 }
 
@@ -461,14 +886,16 @@ func TestToolWorkerFailsClosedForCapabilityEntrypointParameterSchemaAndGatewayMi
 	engine := harness.workers.(*invariantEngine)
 
 	wrongCapability := validToolPlanForStart(start)
-	wrongCapability.CapabilityContractDigest = digest(220)
-	engine.toolWorker, err = newToolWorkerCapabilityAdapter(wrongCapability, backend)
-	if err != nil {
-		t.Fatal(err)
+	wrongCapability.CapabilityKey = ToolCapabilityMediaInspect
+	wrongCapability.Parameters.Kind = ToolParametersMediaInspect
+	if _, err := newToolWorkerCapabilityAdapter(wrongCapability, backend); errorCode(err) != ErrorInvalidRequest {
+		t.Fatalf("capability key substitution retained copied contract digest: %v", err)
 	}
-	_, err = harness.workers.accept(context.Background(), command)
-	if errorCode(err) != ErrorAuthorizationDenied || backend.acceptCount() != 0 {
-		t.Fatalf("wrong capability reached Tool backend: err=%v calls=%d", err, backend.acceptCount())
+
+	wrongOptions := validToolPlanForStart(start)
+	wrongOptions.Parameters.OptionsDigest = digest(220)
+	if _, err := newToolWorkerCapabilityAdapter(wrongOptions, backend); errorCode(err) != ErrorInvalidRequest {
+		t.Fatalf("Tool options substitution retained copied contract digest: %v", err)
 	}
 
 	wrongEntrypoint := validToolPlanForStart(start)
@@ -507,6 +934,43 @@ func startCatalogSafetyEpoch(start StartRuntimeRun) CatalogSafetyEpoch {
 		return 0
 	}
 	return start.CatalogBinding.SafetyEpoch
+}
+
+func assertNoArbitraryExecutionFields(t *testing.T, envelope reflect.Type) {
+	t.Helper()
+	for index := 0; index < envelope.NumField(); index++ {
+		field := envelope.Field(index)
+		name := strings.ToLower(field.Name)
+		digestBinding := field.Type == reflect.TypeOf(Digest{}) &&
+			(strings.Contains(name, "entrypoint") || strings.Contains(name, "executor"))
+		unsafeName := strings.Contains(name, "shell") || strings.Contains(name, "command") ||
+			strings.Contains(name, "path") || strings.Contains(name, "rawexec") ||
+			strings.Contains(name, "executable")
+		rawValue := field.Type.Kind() == reflect.String ||
+			field.Type.Kind() == reflect.Slice && field.Type.Elem().Kind() == reflect.Uint8
+		if rawValue || unsafeName && !digestBinding {
+			t.Fatalf("arbitrary execution surface leaked into %s: %s %s", envelope, field.Name, field.Type)
+		}
+	}
+}
+
+func assertNoArbitraryExecutionBackend(t *testing.T, backend reflect.Type) {
+	t.Helper()
+	for index := 0; index < backend.NumMethod(); index++ {
+		method := backend.Method(index)
+		name := strings.ToLower(method.Name)
+		if strings.Contains(name, "shell") || strings.Contains(name, "command") ||
+			strings.Contains(name, "rawexec") || strings.Contains(name, "executable") {
+			t.Fatalf("arbitrary execution method leaked into %s: %s", backend, method.Name)
+		}
+		for argument := 0; argument < method.Type.NumIn(); argument++ {
+			typeOfArgument := method.Type.In(argument)
+			if typeOfArgument.Kind() == reflect.String ||
+				typeOfArgument.Kind() == reflect.Slice && typeOfArgument.Elem().Kind() == reflect.Uint8 {
+				t.Fatalf("raw execution argument leaked into %s.%s: %s", backend, method.Name, typeOfArgument)
+			}
+		}
+	}
 }
 
 type contractAgentWorkerBackend struct {
@@ -785,6 +1249,9 @@ func newReadyWorkerProtocolHarness(
 		Now: now, IDs: DeterministicIDConfig{DecisionStart: 1, LeaseStart: 1, SandboxStart: 1},
 		Runtimes:        []RuntimeFixture{runtimeFixtureForStart(start, authority)},
 		AdmissionGrants: []AdmissionGrantFixture{grant}, Nodes: []ExecutionNodeFixture{node},
+		MaintenanceAuthorities: []RuntimeMaintenanceAuthorityBinding{
+			BindLeaseFencingAuthority(node.ExecutionNodeID, workerTestFencingAuthority(t, suffix)),
+		},
 		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
 			context.Context, LeaseAcquisitionRequest,
 		) (LeaseAcquisitionObservation, error) {
@@ -808,18 +1275,78 @@ func newReadyWorkerProtocolHarness(
 	return harness, start, accepted
 }
 
+func workerTestFencingAuthority(t *testing.T, suffix string) LeaseFencingAuthority {
+	t.Helper()
+	return NewSecurityLeaseFencingAuthority(mustAuthorityID(t, suffix+"-worker-fencing"), 3)
+}
+
+func newReadyProviderToolWorkerProtocolHarness(
+	t *testing.T,
+	now time.Time,
+	suffix string,
+	backend toolWorkerBackend,
+) (*DeterministicHarness, StartRuntimeRun, RuntimeDecision) {
+	t.Helper()
+	authority := mustTaskOrchestrationAuthority(t, suffix+"-authority", 7)
+	start, reservation, admission, node := providerGatewayFixture(t, now, authority, suffix)
+	plan := validToolPlanForStart(start)
+	plan.ProviderRequired = true
+	adapter, err := newToolWorkerCapabilityAdapter(plan, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindingValidator, inputValidator := acceptedGatewayPrerequisiteValidators(t, suffix)
+	recovery := writableGatewayRecoveryAuthority(now)
+	var harness *DeterministicHarness
+	gateway, err := NewDeterministicGateway(func() time.Time {
+		if harness == nil {
+			return now
+		}
+		return harness.clock.current()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	harness, err = NewDeterministicHarness(HarnessConfig{
+		Now: now, IDs: DeterministicIDConfig{DecisionStart: 1, LeaseStart: 1, SandboxStart: 1},
+		Runtimes:        []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants: []AdmissionGrantFixture{admission}, QuotaReservations: []QuotaReservationFixture{reservation},
+		Nodes: []ExecutionNodeFixture{node},
+		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
+			context.Context, LeaseAcquisitionRequest,
+		) (LeaseAcquisitionObservation, error) {
+			return LeaseAcquisitionObservation{Disposition: LeaseAcquisitionReady}, nil
+		}),
+		RuntimeBindingValidator: bindingValidator, ImmutableInputValidator: inputValidator,
+		GatewayGrants: gateway, GatewayRecovery: recovery,
+		GatewayCallAuthority: gatewayCallExternalAuthorityForStart(recovery, start),
+		toolWorker:           adapter,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := harness.Runtime.Execute(context.Background(), start)
+	if err != nil || !prepared.Snapshot.Readiness.CapsuleReady {
+		t.Fatalf("prepare provider Tool Capsule: %+v err=%v", prepared, err)
+	}
+	return harness, start, prepared
+}
+
 func validToolPlanForStart(start StartRuntimeRun) toolCapabilityPlan {
-	return toolCapabilityPlan{
+	parameters := toolTypedParameters{
+		SchemaVersion: SchemaV1, Kind: ToolParametersDocumentRender,
+		InputManifestIdentity: start.ImmutableInputManifest.Identity, OptionsDigest: digest(244),
+	}
+	parameters.CanonicalDigest = canonicalToolParametersDigest(parameters)
+	plan := toolCapabilityPlan{
 		RuntimeBindingID: start.RuntimeBindingID, RuntimeBindingDigest: start.RuntimeBindingDigest,
-		CapabilityContractDigest:    start.CapabilityContractDigest,
 		AllowedPlatformImagesDigest: start.AllowedPlatformImagesDigest,
 		ExecutorContractDigest:      start.ExecutorContractDigest,
 		CapabilityKey:               ToolCapabilityDocumentRender,
-		Parameters: toolTypedParameters{
-			SchemaVersion: SchemaV1, Kind: ToolParametersDocumentRender,
-			InputManifestIdentity: start.ImmutableInputManifest.Identity, OptionsDigest: digest(244),
-		},
-		EntrypointDigest:  digestBytes([]byte("actual-executor")),
-		ActualImageDigest: digestBytes([]byte("actual-image")), ActualExecutorDigest: digestBytes([]byte("actual-executor")),
+		Parameters:                  parameters,
+		EntrypointDigest:            digestBytes([]byte("actual-executor")),
+		ActualImageDigest:           digestBytes([]byte("actual-image")), ActualExecutorDigest: digestBytes([]byte("actual-executor")),
 	}
+	plan.CapabilityContractDigest = canonicalToolCapabilityContractDigest(plan)
+	return plan
 }
