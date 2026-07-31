@@ -1283,7 +1283,10 @@ func (engine *invariantEngine) observe(ctx context.Context, request workerObserv
 		if retained.CanonicalDigest != observation.CanonicalDigest {
 			return workerObservationResult{}, newError(ErrorIntegrityConflict)
 		}
-		return workerObservationResult{}, newError(ErrorIntegrityConflict)
+		result := workerObservationResult{
+			Disposition: WorkerObservationAccepted, Observation: retained, Replayed: true,
+		}
+		return result, nil
 	}
 	wantPosition := request.Cursor.Position + 1
 	if observation.Position > wantPosition {

@@ -308,17 +308,29 @@ func (authority *PostgresAuthority) observe(ctx context.Context, request workerO
 	if err != nil {
 		return workerObservationResult{}, err
 	}
-	if !validWorkerObservation(request, observation) || observation.ObservedAt.After(now) {
+	now = postgresTimestamp(authority.now())
+	if !workerObserveCurrent(record, request, now) ||
+		!validWorkerObservation(request, observation) || observation.ObservedAt.After(now) {
 		return workerObservationResult{}, newError(ErrorAuthorizationDenied)
 	}
-	var retainedDigest []byte
-	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT observation_digest FROM %s WHERE observation_id=$1`,
-		authority.table("runtime_execution_worker_observations")), observation.ObservationID.String()).Scan(&retainedDigest)
+	var retainedState, retainedDigest []byte
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT observation_state, observation_digest FROM %s WHERE observation_id=$1`,
+		authority.table("runtime_execution_worker_observations")), observation.ObservationID.String()).Scan(
+		&retainedState, &retainedDigest,
+	)
 	if err == nil {
-		if !bytes.Equal(retainedDigest, observation.CanonicalDigest[:]) {
+		retained, decodeErr := decodePostgresWorkerObservation(retainedState)
+		if decodeErr != nil || !validWorkerObservation(request, retained) ||
+			!bytes.Equal(retainedDigest, retained.CanonicalDigest[:]) ||
+			retained.CanonicalDigest != observation.CanonicalDigest {
 			return workerObservationResult{}, newError(ErrorIntegrityConflict)
 		}
-		return workerObservationResult{}, newError(ErrorIntegrityConflict)
+		if err := tx.Commit(); err != nil {
+			return workerObservationResult{}, normalizeRuntimePersistenceFailure(err)
+		}
+		return workerObservationResult{
+			Disposition: WorkerObservationAccepted, Observation: retained, Replayed: true,
+		}, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return workerObservationResult{}, normalizeRuntimePersistenceFailure(err)

@@ -85,6 +85,75 @@ func TestPostgresWorkerHeartbeatNormalizesRuntimeLoadFailureSeparatelyFromStaleS
 	}
 }
 
+func TestPostgresWorkerObserveResamplesTimeAndAuthorityAfterBackendCall(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		prefix       string
+		advanceTo    func(StartRuntimeRun, time.Time) time.Time
+		observedAt   func(StartRuntimeRun, time.Time) time.Time
+		wantCode     ErrorCode
+		wantAccepted bool
+	}{
+		{
+			name: "observation produced during call", prefix: "worker_obs_during",
+			advanceTo:    func(_ StartRuntimeRun, now time.Time) time.Time { return now.Add(time.Second) },
+			observedAt:   func(_ StartRuntimeRun, now time.Time) time.Time { return now.Add(time.Second) },
+			wantAccepted: true,
+		},
+		{
+			name: "deadline expires during call", prefix: "worker_obs_expired",
+			advanceTo:  func(start StartRuntimeRun, _ time.Time) time.Time { return start.Deadline },
+			observedAt: func(_ StartRuntimeRun, now time.Time) time.Time { return now },
+			wantCode:   ErrorAuthorizationDenied,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Date(2026, time.July, 31, 12, 57, 0, 0, time.UTC)
+			db, _, store, config, start, command, control := newPostgresWorkerProtocolHarness(
+				t, test.prefix, now, nil,
+			)
+			backend := control.(*contractToolWorkerBackend)
+			if _, err := store.accept(context.Background(), command); err != nil {
+				t.Fatal(err)
+			}
+			accepted, err := store.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err := newWorkerObserve(
+				workerOperationRefFromSnapshot(start, accepted), initialWorkerCursor(accepted),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			currentTime := now
+			config.Now = func() time.Time { return currentTime }
+			restarted, err := NewPostgresAuthority(db, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend.enqueueObservation(contractWorkerObservation{
+				Kind: WorkerObservedRunning, ObservedAt: test.observedAt(start, now),
+			})
+			backend.beforeNextObserve(func() { currentTime = test.advanceTo(start, now) })
+			result, err := restarted.observe(context.Background(), request)
+			if test.wantAccepted {
+				if err != nil || result.Disposition != WorkerObservationAccepted {
+					t.Fatalf("observation produced during call: %+v err=%v", result, err)
+				}
+				return
+			}
+			if errorCode(err) != test.wantCode {
+				t.Fatalf("post-call authority code=%v err=%v, want %v", errorCode(err), err, test.wantCode)
+			}
+			inspected, inspectErr := restarted.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if inspectErr != nil || inspected.Worker.Status != WorkerOperationAccepted {
+				t.Fatalf("expired observation mutated projection: %+v err=%v", inspected.Worker, inspectErr)
+			}
+		})
+	}
+}
+
 func TestPostgresWorkerAcceptIsAtomicAcrossFaultsAndResponseLoss(t *testing.T) {
 	for _, test := range []struct {
 		name       string
@@ -237,6 +306,21 @@ func TestPostgresWorkerObservationPersistsCursorReplayOrderingAndConflictsAcross
 	gapRequest, err := newWorkerObserve(workerOperationRefFromSnapshot(start, running), running.Worker.Cursor)
 	if err != nil {
 		t.Fatal(err)
+	}
+	backend.enqueueObservation(contractWorkerObservation{
+		ObservationID: first.Observation.ObservationID, Kind: first.Observation.Kind,
+		StreamGeneration: first.Observation.StreamGeneration, Position: first.Observation.Position,
+		ObservedAt: first.Observation.ObservedAt,
+	})
+	exactRedelivery, err := store.observe(context.Background(), gapRequest)
+	if err != nil || !exactRedelivery.Replayed || exactRedelivery.Disposition != WorkerObservationAccepted ||
+		exactRedelivery.Observation != first.Observation {
+		t.Fatalf("PostgreSQL exact observation redelivery: %+v err=%v first=%+v", exactRedelivery, err, first)
+	}
+	afterExactRedelivery, err := store.Inspect(context.Background(), runtimeRef(start, start.Authority))
+	if err != nil || afterExactRedelivery.RuntimeRevision != running.RuntimeRevision ||
+		afterExactRedelivery.Worker != running.Worker {
+		t.Fatalf("PostgreSQL exact redelivery mutated projection: %+v err=%v", afterExactRedelivery, err)
 	}
 	backend.enqueueObservation(contractWorkerObservation{
 		ObservationID: first.Observation.ObservationID, Kind: WorkerObservedRunning, ObservedAt: now,

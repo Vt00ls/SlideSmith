@@ -306,6 +306,27 @@ func TestWorkerObserveOrdersCursorAndKeepsTerminalClaimsAsEvidenceCandidates(t *
 	if err != nil || !replayed.Replayed || replayed.Observation != first.Observation {
 		t.Fatalf("observation replay: %+v err=%v first=%+v", replayed, err, first)
 	}
+	exactRedeliveryRequest, err := newWorkerObserve(
+		workerOperationRefFromSnapshot(start, running), running.Worker.Cursor,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.enqueueObservation(contractWorkerObservation{
+		ObservationID: first.Observation.ObservationID, Kind: first.Observation.Kind,
+		StreamGeneration: first.Observation.StreamGeneration, Position: first.Observation.Position,
+		ObservedAt: first.Observation.ObservedAt,
+	})
+	exactRedelivery, err := harness.workers.observe(context.Background(), exactRedeliveryRequest)
+	if err != nil || !exactRedelivery.Replayed || exactRedelivery.Disposition != WorkerObservationAccepted ||
+		exactRedelivery.Observation != first.Observation {
+		t.Fatalf("exact observation redelivery: %+v err=%v first=%+v", exactRedelivery, err, first)
+	}
+	afterExactRedelivery, err := harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+	if err != nil || afterExactRedelivery.RuntimeRevision != running.RuntimeRevision ||
+		afterExactRedelivery.Worker != running.Worker {
+		t.Fatalf("exact observation redelivery mutated projection: %+v err=%v", afterExactRedelivery, err)
+	}
 
 	backend.enqueueObservation(contractWorkerObservation{
 		Kind: WorkerObservedSucceeded, ObservedAt: now,
@@ -1022,6 +1043,38 @@ func TestAgentAndToolWorkersShareLifecycleFenceEvidenceReplayAndSafeErrorContrac
 			if err != nil {
 				t.Fatal(err)
 			}
+			heartbeat, err := newWorkerHeartbeat(workerHeartbeatInput{
+				SchemaVersion:       SchemaV1,
+				OperationID:         mustOperationID(t, "shared-heartbeat-"+strings.ToLower(test.name)),
+				PersonalWorkspaceID: start.PersonalWorkspaceID, RuntimeRunID: start.RuntimeRunID,
+				StartOperationID: start.OperationID, CapsuleID: starting.Capsule.CapsuleID,
+				CapsuleDigest: starting.Capsule.Digest, RuntimeFence: starting.RuntimeFence,
+				Lease: starting.Lease, Node: starting.Node, ReleaseSafetyEpoch: start.ReleaseSafetyEpoch,
+				CatalogSafetyEpoch: startCatalogSafetyEpoch(start),
+				RequestedExpiresAt: starting.Lease.ExpiresAt.Add(time.Second), OccurredAt: now,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			heartbeatDecision, err := harness.workers.heartbeat(context.Background(), heartbeat)
+			if err != nil || !validWorkerLeaseDecision(heartbeatDecision) {
+				t.Fatalf("shared Heartbeat: %+v err=%v", heartbeatDecision, err)
+			}
+			heartbeatReplay, err := harness.workers.heartbeat(context.Background(), heartbeat)
+			if err != nil || !heartbeatReplay.Replayed ||
+				heartbeatReplay.CanonicalDigest != heartbeatDecision.CanonicalDigest {
+				t.Fatalf("shared Heartbeat replay: %+v err=%v", heartbeatReplay, err)
+			}
+			staleHeartbeat := heartbeat
+			staleHeartbeat.OperationID = mustOperationID(t, "shared-heartbeat-stale-"+strings.ToLower(test.name))
+			staleHeartbeat.CanonicalDigest = canonicalWorkerHeartbeatDigest(staleHeartbeat)
+			if _, err := harness.workers.heartbeat(context.Background(), staleHeartbeat); errorCode(err) != ErrorIntegrityConflict {
+				t.Fatalf("shared stale Heartbeat: %v", err)
+			}
+			starting, err = harness.Runtime.Inspect(context.Background(), runtimeRef(start, start.Authority))
+			if err != nil || starting.Lease != heartbeatDecision.Lease {
+				t.Fatalf("shared renewed lease projection: %+v err=%v", starting.Lease, err)
+			}
 			observe, err := newWorkerObserve(workerOperationRefFromSnapshot(start, starting), initialWorkerCursor(starting))
 			if err != nil {
 				t.Fatal(err)
@@ -1377,6 +1430,7 @@ type contractToolWorkerBackend struct {
 	stops            int
 	observations     []contractWorkerObservation
 	nextObserveError error
+	beforeObserve    func()
 }
 
 func newContractToolWorkerBackend() *contractToolWorkerBackend { return &contractToolWorkerBackend{} }
@@ -1405,6 +1459,11 @@ func (backend *contractToolWorkerBackend) observeTool(
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 	backend.observes++
+	if backend.beforeObserve != nil {
+		beforeObserve := backend.beforeObserve
+		backend.beforeObserve = nil
+		beforeObserve()
+	}
 	if backend.nextObserveError != nil {
 		err := backend.nextObserveError
 		backend.nextObserveError = nil
@@ -1423,6 +1482,12 @@ func (backend *contractToolWorkerBackend) observeTool(
 		EvidenceDigest: next.EvidenceDigest, InternalCallCount: next.InternalCallCount,
 		SafeFailure: next.SafeFailure,
 	}, nil
+}
+
+func (backend *contractToolWorkerBackend) beforeNextObserve(before func()) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	backend.beforeObserve = before
 }
 
 func (backend *contractToolWorkerBackend) stopTool(
