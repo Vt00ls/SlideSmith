@@ -60,6 +60,53 @@ type postgresRuntimeState struct {
 	RuntimeViewBinding       postgresRuntimeViewBindingState `json:"runtime_view_binding"`
 	Gateway                  postgresGatewayState            `json:"gateway"`
 	Usage                    postgresUsageEvidenceState      `json:"usage"`
+	Worker                   postgresWorkerState             `json:"worker"`
+}
+
+type postgresWorkerState struct {
+	Status                    WorkerOperationStatus  `json:"status"`
+	WorkerClass               WorkerClass            `json:"worker_class"`
+	AcceptOperationID         string                 `json:"accept_operation_id"`
+	OperationAckID            string                 `json:"operation_ack_id"`
+	OperationAckDigest        Digest                 `json:"operation_ack_digest"`
+	WorkerAuthorityID         string                 `json:"worker_authority_id"`
+	WorkerGeneration          WorkerGeneration       `json:"worker_generation"`
+	NodeAuthorityID           string                 `json:"node_authority_id"`
+	ExecutionNodeID           string                 `json:"execution_node_id"`
+	NodeGeneration            NodeGeneration         `json:"node_generation"`
+	CapsuleID                 string                 `json:"capsule_id"`
+	CapsuleDigest             Digest                 `json:"capsule_digest"`
+	AcceptedRuntimeFence      RuntimeFence           `json:"accepted_runtime_fence"`
+	AcceptedLeaseGeneration   LeaseGeneration        `json:"accepted_lease_generation"`
+	AcceptedLeaseFence        LeaseFence             `json:"accepted_lease_fence"`
+	CursorOperationID         string                 `json:"cursor_operation_id"`
+	CursorProducerAuthority   string                 `json:"cursor_producer_authority"`
+	CursorProducerGeneration  WorkerGeneration       `json:"cursor_producer_generation"`
+	CursorStreamGeneration    uint64                 `json:"cursor_stream_generation"`
+	CursorPosition            uint64                 `json:"cursor_position"`
+	LastObservationID         string                 `json:"last_observation_id"`
+	LastObservationDigest     Digest                 `json:"last_observation_digest"`
+	LastObservationKind       WorkerObservationKind  `json:"last_observation_kind"`
+	EvidenceID                string                 `json:"evidence_id"`
+	EvidenceDigest            Digest                 `json:"worker_evidence_digest"`
+	OutputContractDigest      Digest                 `json:"output_contract_digest"`
+	EvidenceContractDigest    Digest                 `json:"evidence_contract_digest"`
+	EvidenceSandboxLeaseID    string                 `json:"evidence_sandbox_lease_id"`
+	EvidenceLeaseGeneration   LeaseGeneration        `json:"evidence_lease_generation"`
+	EvidenceLeaseFence        LeaseFence             `json:"evidence_lease_fence"`
+	EvidenceGatewayGrantID    string                 `json:"evidence_gateway_grant_id"`
+	EvidenceGatewayGeneration GatewayGrantGeneration `json:"evidence_gateway_generation"`
+	EvidenceGatewayDigest     Digest                 `json:"evidence_gateway_digest"`
+	InternalCallCount         uint64                 `json:"internal_call_count"`
+	SafeFailure               WorkerSafeFailure      `json:"safe_failure"`
+	StopStatus                WorkerStopStatus       `json:"stop_status"`
+	StopOperationID           string                 `json:"stop_operation_id"`
+	StopAckID                 string                 `json:"stop_ack_id"`
+	StopAckDigest             Digest                 `json:"stop_ack_digest"`
+	StopReason                WorkerStopReason       `json:"stop_reason"`
+	StopRuntimeFence          RuntimeFence           `json:"stop_runtime_fence"`
+	StopLeaseGeneration       LeaseGeneration        `json:"stop_lease_generation"`
+	StopLeaseFence            LeaseFence             `json:"stop_lease_fence"`
 }
 
 type postgresPrerequisiteFactState struct {
@@ -320,8 +367,71 @@ func encodePostgresRuntimeFixture(fixture RuntimeFixture) ([]byte, error) {
 		RuntimeViewBinding:     postgresRuntimeViewBindingFromSnapshot(fixture.RuntimeViewBinding),
 		Gateway:                postgresGatewayStateFromSnapshot(fixture.Gateway),
 		Usage:                  postgresUsageStateFromSnapshot(fixture.Usage),
+		Worker:                 postgresWorkerStateFromSnapshot(fixture.Worker),
 	}
 	return json.Marshal(state)
+}
+
+func postgresWorkerStateFromSnapshot(worker RuntimeWorkerSnapshot) postgresWorkerState {
+	evidence, cursor, stop := worker.EvidenceCandidate, worker.Cursor, worker.Stop
+	return postgresWorkerState{
+		Status: worker.Status, WorkerClass: worker.WorkerClass,
+		AcceptOperationID: worker.AcceptOperationID.String(), OperationAckID: worker.OperationAckID.String(),
+		OperationAckDigest: worker.OperationAckDigest, WorkerAuthorityID: worker.WorkerAuthorityID.String(),
+		WorkerGeneration: worker.WorkerGeneration, NodeAuthorityID: worker.NodeAuthorityID.String(),
+		ExecutionNodeID: worker.ExecutionNodeID.String(), NodeGeneration: worker.NodeGeneration,
+		CapsuleID: worker.CapsuleID.String(), CapsuleDigest: worker.CapsuleDigest,
+		AcceptedRuntimeFence: worker.AcceptedRuntimeFence, AcceptedLeaseGeneration: worker.AcceptedLeaseGeneration,
+		AcceptedLeaseFence: worker.AcceptedLeaseFence, CursorOperationID: cursor.OperationID.String(),
+		CursorProducerAuthority: cursor.ProducerAuthority.String(), CursorProducerGeneration: cursor.ProducerGeneration,
+		CursorStreamGeneration: cursor.StreamGeneration, CursorPosition: cursor.Position,
+		LastObservationID: worker.LastObservationID.String(), LastObservationDigest: worker.LastObservationDigest,
+		LastObservationKind: worker.LastObservationKind, EvidenceID: evidence.EvidenceID.String(),
+		EvidenceDigest: evidence.EvidenceDigest, OutputContractDigest: evidence.OutputContractDigest,
+		EvidenceContractDigest: evidence.EvidenceContractDigest, EvidenceSandboxLeaseID: evidence.SandboxLeaseID.String(),
+		EvidenceLeaseGeneration: evidence.LeaseGeneration, EvidenceLeaseFence: evidence.LeaseFence,
+		EvidenceGatewayGrantID: evidence.GatewayGrantID.String(), EvidenceGatewayGeneration: evidence.GatewayGrantGeneration,
+		EvidenceGatewayDigest: evidence.GatewayGrantDigest, InternalCallCount: evidence.InternalCallCount,
+		SafeFailure: worker.SafeFailure, StopStatus: stop.Status, StopOperationID: stop.OperationID.String(),
+		StopAckID: stop.AckID.String(), StopAckDigest: stop.AckDigest, StopReason: stop.Reason,
+		StopRuntimeFence: stop.RuntimeFence, StopLeaseGeneration: stop.LeaseGeneration, StopLeaseFence: stop.LeaseFence,
+	}
+}
+
+func workerSnapshotFromPostgres(state postgresWorkerState) RuntimeWorkerSnapshot {
+	return RuntimeWorkerSnapshot{
+		Status: state.Status, WorkerClass: state.WorkerClass,
+		AcceptOperationID: OperationID{value: state.AcceptOperationID},
+		OperationAckID:    WorkerOperationAckID{value: state.OperationAckID}, OperationAckDigest: state.OperationAckDigest,
+		WorkerAuthorityID: WorkerAuthorityID{value: state.WorkerAuthorityID}, WorkerGeneration: state.WorkerGeneration,
+		NodeAuthorityID: NodeAuthorityID{value: state.NodeAuthorityID}, ExecutionNodeID: ExecutionNodeID{value: state.ExecutionNodeID},
+		NodeGeneration: state.NodeGeneration, CapsuleID: ExecutionCapsuleID{value: state.CapsuleID},
+		CapsuleDigest: state.CapsuleDigest, AcceptedRuntimeFence: state.AcceptedRuntimeFence,
+		AcceptedLeaseGeneration: state.AcceptedLeaseGeneration, AcceptedLeaseFence: state.AcceptedLeaseFence,
+		Cursor: WorkerCursorSnapshot{
+			OperationID:        OperationID{value: state.CursorOperationID},
+			ProducerAuthority:  WorkerAuthorityID{value: state.CursorProducerAuthority},
+			ProducerGeneration: state.CursorProducerGeneration, StreamGeneration: state.CursorStreamGeneration,
+			Position: state.CursorPosition,
+		},
+		LastObservationID:     WorkerObservationID{value: state.LastObservationID},
+		LastObservationDigest: state.LastObservationDigest, LastObservationKind: state.LastObservationKind,
+		EvidenceCandidate: WorkerEvidenceCandidateSnapshot{
+			EvidenceID: EvidenceID{value: state.EvidenceID}, EvidenceDigest: state.EvidenceDigest,
+			OutputContractDigest: state.OutputContractDigest, EvidenceContractDigest: state.EvidenceContractDigest,
+			SandboxLeaseID:  SandboxLeaseID{value: state.EvidenceSandboxLeaseID},
+			LeaseGeneration: state.EvidenceLeaseGeneration, LeaseFence: state.EvidenceLeaseFence,
+			GatewayGrantID:         GatewayGrantID{value: state.EvidenceGatewayGrantID},
+			GatewayGrantGeneration: state.EvidenceGatewayGeneration, GatewayGrantDigest: state.EvidenceGatewayDigest,
+			InternalCallCount: state.InternalCallCount,
+		},
+		SafeFailure: state.SafeFailure,
+		Stop: WorkerStopSnapshot{
+			Status: state.StopStatus, OperationID: OperationID{value: state.StopOperationID},
+			AckID: WorkerStopAckID{value: state.StopAckID}, AckDigest: state.StopAckDigest, Reason: state.StopReason,
+			RuntimeFence: state.StopRuntimeFence, LeaseGeneration: state.StopLeaseGeneration, LeaseFence: state.StopLeaseFence,
+		},
+	}
 }
 
 func postgresGatewayStateFromSnapshot(snapshot GatewayPrerequisiteSnapshot) postgresGatewayState {
@@ -622,6 +732,7 @@ func scanPostgresRuntimeRecord(row rowScanner, runtimeRunID RuntimeRunID) (*runt
 		runtimeViewBinding:     runtimeViewBindingSnapshotFromPostgres(persisted.RuntimeViewBinding),
 		gateway:                gatewaySnapshotFromPostgres(persisted.Gateway),
 		usage:                  usageSnapshotFromPostgres(persisted.Usage),
+		worker:                 workerSnapshotFromPostgres(persisted.Worker),
 	}
 	record.acceptedStart.OperationID = record.operation.OperationID
 	record.acceptedStartDigest = record.operation.Digest

@@ -164,8 +164,8 @@ func TestRuntimeSnapshotClosedSchemaAndLosslessProjectionRules(t *testing.T) {
 	if current.SchemaVersion != SnapshotSchemaCurrent {
 		t.Fatalf("optional request minor changed projection: %v", current.SchemaVersion)
 	}
-	if SnapshotSchemaCurrent != NewSchemaVersion(1, 2) {
-		t.Fatalf("prerequisite projection schema = %v, want 1.2", SnapshotSchemaCurrent)
+	if SnapshotSchemaCapsule != NewSchemaVersion(1, 2) || SnapshotSchemaCurrent != NewSchemaVersion(1, 3) {
+		t.Fatalf("worker protocol projection schema = %v, want 1.3 (capsule=%v)", SnapshotSchemaCurrent, SnapshotSchemaCapsule)
 	}
 	legacyLeaseProjection := NewSchemaVersion(1, 1)
 	leaseProjection := inspectRuntime(t, harness, normal, authority, SchemaV1, legacyLeaseProjection)

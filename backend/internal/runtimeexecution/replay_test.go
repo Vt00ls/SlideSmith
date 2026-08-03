@@ -126,7 +126,7 @@ func TestStaleCancelReplayAfterLaterRevisionReturnsOriginalRejectionAndCurrentSn
 
 func standardStart(t *testing.T, now time.Time, authority RuntimeAuthority, suffix string) StartRuntimeRun {
 	t.Helper()
-	return mustStart(t, StartRuntimeRunInput{
+	input := StartRuntimeRunInput{
 		SchemaVersion:               SchemaV1,
 		OperationID:                 mustOperationID(t, "start-"+suffix),
 		PersonalWorkspaceID:         mustPersonalWorkspaceID(t, "workspace-"+suffix),
@@ -169,7 +169,19 @@ func standardStart(t *testing.T, now time.Time, authority RuntimeAuthority, suff
 			WorkItemID:       mustWorkItemID(t, "work-"+suffix),
 			Generation:       2,
 		},
-	})
+	}
+	parameters := toolTypedParameters{
+		SchemaVersion: SchemaV1, Kind: ToolParametersDocumentRender,
+		InputManifestIdentity: input.ImmutableInputManifest.Identity, OptionsDigest: digest(244),
+	}
+	parameters.CanonicalDigest = canonicalToolParametersDigest(parameters)
+	plan := toolCapabilityPlan{
+		RuntimeBindingID: input.RuntimeBindingID, RuntimeBindingDigest: input.RuntimeBindingDigest,
+		CapabilityKey: ToolCapabilityDocumentRender, Parameters: parameters,
+		EntrypointDigest: digestBytes([]byte("actual-executor")),
+	}
+	input.CapabilityContractDigest = canonicalToolCapabilityContractDigest(plan)
+	return mustStart(t, input)
 }
 
 func harnessForStart(t *testing.T, now time.Time, authority RuntimeAuthority, start StartRuntimeRun) *DeterministicHarness {

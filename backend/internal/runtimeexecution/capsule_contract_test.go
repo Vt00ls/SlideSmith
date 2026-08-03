@@ -1034,6 +1034,15 @@ func TestPostgresConcurrentCapsuleGenerationReplaysExactContentAndRejectsIdentit
 			entered := make(chan uint64, 2)
 			firstRelease := make(chan struct{})
 			secondRelease := make(chan struct{})
+			firstReleased, secondReleased := false, false
+			t.Cleanup(func() {
+				if !firstReleased {
+					close(firstRelease)
+				}
+				if !secondReleased {
+					close(secondRelease)
+				}
+			})
 			var calls atomic.Uint64
 			config.ExecutionCapsuleResolver = ExecutionCapsuleResolverFunc(func(
 				ctx context.Context,
@@ -1073,12 +1082,31 @@ func TestPostgresConcurrentCapsuleGenerationReplaysExactContentAndRejectsIdentit
 				decision, executeErr := second.Execute(context.Background(), start)
 				results <- result{decision: decision, err: executeErr}
 			}()
-			<-entered
-			<-entered
+			for entry := 0; entry < 2; entry++ {
+				select {
+				case <-entered:
+				case early := <-results:
+					t.Fatalf("concurrent caller returned before both resolvers entered: decision=%+v err=%v", early.decision, early.err)
+				case <-time.After(5 * time.Second):
+					t.Fatal("concurrent caller did not enter Capsule resolver")
+				}
+			}
 			close(firstRelease)
-			firstResult := <-results
+			firstReleased = true
+			var firstResult result
+			select {
+			case firstResult = <-results:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first concurrent Capsule generation did not return")
+			}
 			close(secondRelease)
-			secondResult := <-results
+			secondReleased = true
+			var secondResult result
+			select {
+			case secondResult = <-results:
+			case <-time.After(5 * time.Second):
+				t.Fatal("second concurrent Capsule generation did not return")
+			}
 
 			resultValues := []result{firstResult, secondResult}
 			successes := make([]RuntimeCapsuleSnapshot, 0, 2)

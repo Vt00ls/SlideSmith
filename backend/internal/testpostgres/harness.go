@@ -31,6 +31,11 @@ func Open(t testing.TB, prefix string) (*sql.DB, string) {
 	if err != nil {
 		t.Fatal("open real PostgreSQL test database")
 	}
+	// `go test ./...` runs several PostgreSQL-heavy packages concurrently.
+	// Bound each isolated test pool so one package cannot exhaust the shared
+	// server and turn an otherwise local concurrency test into a blocked open.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(2)
 	t.Cleanup(func() { _ = db.Close() })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

@@ -89,16 +89,24 @@ type executionCapsule struct {
 	RuntimeBindingID                RuntimeBindingID
 	RuntimeBindingDigest            Digest
 	ExecutionLockDigest             Digest
+	CapabilityContractDigest        Digest
+	AllowedPlatformImagesDigest     Digest
+	ExecutorContractDigest          Digest
 	WorkerClass                     WorkerClass
 	Effect                          EffectClass
 	OutputContractDigest            Digest
 	EvidenceContractDigest          Digest
 	ExecutionNodeID                 ExecutionNodeID
+	NodeGeneration                  NodeGeneration
+	NodeAuthorityID                 NodeAuthorityID
+	WorkerAuthorityID               WorkerAuthorityID
+	WorkerGeneration                WorkerGeneration
 	SandboxLeaseID                  SandboxLeaseID
 	LeaseGeneration                 LeaseGeneration
 	LeaseFence                      LeaseFence
 	RuntimeFence                    RuntimeFence
 	AuthorizationGeneration         AuthorizationGeneration
+	AuthorizationExpiresAt          time.Time
 	ReleaseSafetyEpoch              ReleaseSafetyEpoch
 	CatalogSafetyEpoch              CatalogSafetyEpoch
 	Deadline                        time.Time
@@ -177,16 +185,24 @@ type executionCapsuleWireV1 struct {
 	RuntimeBindingID                   string                                   `json:"runtime_binding_id"`
 	RuntimeBindingDigest               string                                   `json:"runtime_binding_digest"`
 	ExecutionLockDigest                string                                   `json:"execution_lock_digest"`
+	CapabilityContractDigest           string                                   `json:"capability_contract_digest"`
+	AllowedPlatformImagesDigest        string                                   `json:"allowed_platform_images_digest"`
+	ExecutorContractDigest             string                                   `json:"executor_contract_digest"`
 	WorkerClass                        uint8                                    `json:"worker_class"`
 	Effect                             uint8                                    `json:"effect"`
 	OutputContractDigest               string                                   `json:"output_contract_digest"`
 	EvidenceContractDigest             string                                   `json:"evidence_contract_digest"`
 	ExecutionNodeID                    string                                   `json:"execution_node_id"`
+	NodeGeneration                     uint64                                   `json:"node_generation"`
+	NodeAuthorityID                    string                                   `json:"node_authority_id"`
+	WorkerAuthorityID                  string                                   `json:"worker_authority_id"`
+	WorkerGeneration                   uint64                                   `json:"worker_generation"`
 	SandboxLeaseID                     string                                   `json:"sandbox_lease_id"`
 	LeaseGeneration                    uint64                                   `json:"lease_generation"`
 	LeaseFence                         uint64                                   `json:"lease_fence"`
 	RuntimeFence                       uint64                                   `json:"runtime_fence"`
 	AuthorizationGeneration            uint64                                   `json:"authorization_generation"`
+	AuthorizationExpiresAt             string                                   `json:"authorization_expires_at"`
 	ReleaseSafetyEpoch                 uint64                                   `json:"release_safety_epoch"`
 	CatalogSafetyEpoch                 uint64                                   `json:"catalog_safety_epoch"`
 	Deadline                           string                                   `json:"deadline"`
@@ -221,7 +237,6 @@ type executionCapsuleWireV1 struct {
 	ExecutionPolicyDigest              string                                   `json:"execution_policy_digest"`
 	SandboxDriverDigest                string                                   `json:"sandbox_driver_digest"`
 	HostGeneration                     uint64                                   `json:"host_generation"`
-	NodeGeneration                     uint64                                   `json:"node_generation"`
 	KernelRuntimeDigest                string                                   `json:"kernel_runtime_digest"`
 	ActualImageDigest                  string                                   `json:"actual_image_digest"`
 	ActualExecutorDigest               string                                   `json:"actual_executor_digest"`
@@ -287,12 +302,19 @@ func buildExecutionCapsule(
 		RuntimeRunID: start.RuntimeRunID, OperationID: start.OperationID,
 		CanonicalRequestDigest: start.CanonicalRequestDigest, RuntimeBindingID: start.RuntimeBindingID,
 		RuntimeBindingDigest: start.RuntimeBindingDigest, ExecutionLockDigest: start.ExecutionLockDigest,
-		WorkerClass: start.WorkerClass, Effect: start.Effect,
+		CapabilityContractDigest:    start.CapabilityContractDigest,
+		AllowedPlatformImagesDigest: start.AllowedPlatformImagesDigest,
+		ExecutorContractDigest:      start.ExecutorContractDigest,
+		WorkerClass:                 start.WorkerClass, Effect: start.Effect,
 		OutputContractDigest: start.OutputContractDigest, EvidenceContractDigest: start.EvidenceContractDigest,
-		ExecutionNodeID: snapshot.Node.ExecutionNodeID, SandboxLeaseID: snapshot.Lease.LeaseID,
+		ExecutionNodeID: snapshot.Node.ExecutionNodeID, NodeGeneration: snapshot.Node.Generation,
+		NodeAuthorityID:   snapshot.Lease.NodeAuthorityID,
+		WorkerAuthorityID: snapshot.Lease.WorkerAuthorityID, WorkerGeneration: snapshot.Lease.WorkerGeneration,
+		SandboxLeaseID:  snapshot.Lease.LeaseID,
 		LeaseGeneration: snapshot.Lease.Generation, LeaseFence: snapshot.Lease.Fence,
 		RuntimeFence: snapshot.RuntimeFence, AuthorizationGeneration: start.Authority.AuthorizationGeneration(),
-		ReleaseSafetyEpoch: start.ReleaseSafetyEpoch, Deadline: start.Deadline.UTC(),
+		AuthorizationExpiresAt: snapshot.Lease.AuthorizationExpiresAt,
+		ReleaseSafetyEpoch:     start.ReleaseSafetyEpoch, Deadline: start.Deadline.UTC(),
 		NetworkPolicyID: start.NetworkPolicyID, SecretPolicyID: start.SecretPolicyID, Trace: start.Trace,
 		ResolutionEvidenceID: resolution.EvidenceID, ResolutionEvidenceDigest: resolution.EvidenceDigest,
 		Inputs: resolution.Inputs, Outputs: resolution.Outputs, Security: resolution.Security,
@@ -362,13 +384,20 @@ func buildExecutionCapsule(
 		PhaseRunID: capsule.PhaseRunID.String(), RuntimeRunID: capsule.RuntimeRunID.String(),
 		OperationID: capsule.OperationID.String(), CanonicalRequestDigest: capsule.CanonicalRequestDigest.String(),
 		RuntimeBindingID: capsule.RuntimeBindingID.String(), RuntimeBindingDigest: capsule.RuntimeBindingDigest.String(),
-		ExecutionLockDigest: capsule.ExecutionLockDigest.String(), WorkerClass: uint8(capsule.WorkerClass),
+		ExecutionLockDigest:         capsule.ExecutionLockDigest.String(),
+		CapabilityContractDigest:    capsule.CapabilityContractDigest.String(),
+		AllowedPlatformImagesDigest: capsule.AllowedPlatformImagesDigest.String(),
+		ExecutorContractDigest:      capsule.ExecutorContractDigest.String(), WorkerClass: uint8(capsule.WorkerClass),
 		Effect: uint8(capsule.Effect), OutputContractDigest: capsule.OutputContractDigest.String(),
 		EvidenceContractDigest: capsule.EvidenceContractDigest.String(), ExecutionNodeID: capsule.ExecutionNodeID.String(),
+		NodeGeneration: uint64(capsule.NodeGeneration), NodeAuthorityID: capsule.NodeAuthorityID.String(),
+		WorkerAuthorityID: capsule.WorkerAuthorityID.String(), WorkerGeneration: uint64(capsule.WorkerGeneration),
 		SandboxLeaseID: capsule.SandboxLeaseID.String(), LeaseGeneration: uint64(capsule.LeaseGeneration),
 		LeaseFence: uint64(capsule.LeaseFence), RuntimeFence: uint64(capsule.RuntimeFence),
-		AuthorizationGeneration: uint64(capsule.AuthorizationGeneration), ReleaseSafetyEpoch: uint64(capsule.ReleaseSafetyEpoch),
-		CatalogSafetyEpoch: uint64(capsule.CatalogSafetyEpoch), Deadline: capsule.Deadline.Format(time.RFC3339Nano),
+		AuthorizationGeneration: uint64(capsule.AuthorizationGeneration),
+		AuthorizationExpiresAt:  capsule.AuthorizationExpiresAt.Format(time.RFC3339Nano),
+		ReleaseSafetyEpoch:      uint64(capsule.ReleaseSafetyEpoch),
+		CatalogSafetyEpoch:      uint64(capsule.CatalogSafetyEpoch), Deadline: capsule.Deadline.Format(time.RFC3339Nano),
 		NetworkPolicyID: capsule.NetworkPolicyID.String(), SecretPolicyID: capsule.SecretPolicyID.String(),
 		ExecutionPolicyID:               policy.ExecutionPolicyID.String(),
 		RuntimeViewID:                   capsule.RuntimeViewID.String(),
@@ -391,7 +420,7 @@ func buildExecutionCapsule(
 		OutputChannels:     outputWires,
 		SecurityEvidenceID: capsule.Security.EvidenceID.String(), SecurityEvidenceDigest: capsule.Security.EvidenceDigest.String(),
 		ExecutionPolicyDigest: policy.PolicyDigest.String(), SandboxDriverDigest: policy.SandboxDriverDigest.String(),
-		HostGeneration: policy.HostGeneration, NodeGeneration: uint64(policy.NodeGeneration),
+		HostGeneration:      policy.HostGeneration,
 		KernelRuntimeDigest: policy.KernelRuntimeDigest.String(), ActualImageDigest: policy.ActualImageDigest.String(),
 		ActualExecutorDigest: policy.ActualExecutorDigest.String(), ImageAuthorizationDigest: policy.ImageAuthorizationDigest.String(),
 		ExecutorAuthorizationDigest: policy.ExecutorAuthorizationDigest.String(), MountPolicyDigest: policy.MountPolicyDigest.String(),
@@ -486,6 +515,18 @@ func decodeExecutionCapsule(canonical []byte) (executionCapsule, error) {
 		return executionCapsule{}, err
 	}
 	lockDigest, err := digestFromCanonicalText(wire.ExecutionLockDigest)
+	if err != nil {
+		return executionCapsule{}, err
+	}
+	capabilityContractDigest, err := digestFromCanonicalText(wire.CapabilityContractDigest)
+	if err != nil {
+		return executionCapsule{}, err
+	}
+	allowedPlatformImagesDigest, err := digestFromCanonicalText(wire.AllowedPlatformImagesDigest)
+	if err != nil {
+		return executionCapsule{}, err
+	}
+	executorContractDigest, err := digestFromCanonicalText(wire.ExecutorContractDigest)
 	if err != nil {
 		return executionCapsule{}, err
 	}
@@ -589,6 +630,10 @@ func decodeExecutionCapsule(canonical []byte) (executionCapsule, error) {
 	if err != nil {
 		return executionCapsule{}, newError(ErrorIntegrityConflict)
 	}
+	authorizationExpiresAt, err := time.Parse(time.RFC3339Nano, wire.AuthorizationExpiresAt)
+	if err != nil {
+		return executionCapsule{}, newError(ErrorIntegrityConflict)
+	}
 	trace := TraceMetadata{}
 	if wire.TraceID != "" {
 		if len(wire.TraceID) != hex.EncodedLen(len(trace.TraceID)) {
@@ -688,13 +733,21 @@ func decodeExecutionCapsule(canonical []byte) (executionCapsule, error) {
 		PersonalWorkspaceID: workspaceID, TaskID: taskID, PhaseRunID: phaseRunID,
 		RuntimeRunID: runtimeRunID, OperationID: operationID, CanonicalRequestDigest: requestDigest,
 		RuntimeBindingID: runtimeBindingID, RuntimeBindingDigest: bindingDigest, ExecutionLockDigest: lockDigest,
-		WorkerClass: WorkerClass(wire.WorkerClass), Effect: EffectClass(wire.Effect),
+		CapabilityContractDigest:    capabilityContractDigest,
+		AllowedPlatformImagesDigest: allowedPlatformImagesDigest,
+		ExecutorContractDigest:      executorContractDigest,
+		WorkerClass:                 WorkerClass(wire.WorkerClass), Effect: EffectClass(wire.Effect),
 		OutputContractDigest: outputDigest, EvidenceContractDigest: evidenceDigest,
-		ExecutionNodeID: nodeID, SandboxLeaseID: SandboxLeaseID{value: wire.SandboxLeaseID},
-		LeaseGeneration: LeaseGeneration(wire.LeaseGeneration), LeaseFence: LeaseFence(wire.LeaseFence),
+		ExecutionNodeID: nodeID, NodeGeneration: NodeGeneration(wire.NodeGeneration),
+		NodeAuthorityID:   NodeAuthorityID{value: wire.NodeAuthorityID},
+		WorkerAuthorityID: WorkerAuthorityID{value: wire.WorkerAuthorityID},
+		WorkerGeneration:  WorkerGeneration(wire.WorkerGeneration),
+		SandboxLeaseID:    SandboxLeaseID{value: wire.SandboxLeaseID},
+		LeaseGeneration:   LeaseGeneration(wire.LeaseGeneration), LeaseFence: LeaseFence(wire.LeaseFence),
 		RuntimeFence: RuntimeFence(wire.RuntimeFence), AuthorizationGeneration: AuthorizationGeneration(wire.AuthorizationGeneration),
-		ReleaseSafetyEpoch: ReleaseSafetyEpoch(wire.ReleaseSafetyEpoch),
-		CatalogSafetyEpoch: CatalogSafetyEpoch(wire.CatalogSafetyEpoch), Deadline: deadline.UTC(),
+		AuthorizationExpiresAt: authorizationExpiresAt.UTC(),
+		ReleaseSafetyEpoch:     ReleaseSafetyEpoch(wire.ReleaseSafetyEpoch),
+		CatalogSafetyEpoch:     CatalogSafetyEpoch(wire.CatalogSafetyEpoch), Deadline: deadline.UTC(),
 		NetworkPolicyID: networkPolicyID, SecretPolicyID: secretPolicyID,
 		Trace:         trace,
 		RuntimeViewID: RuntimeViewID{value: wire.RuntimeViewID}, GatewayGrantID: GatewayGrantID{value: wire.GatewayGrantID},
@@ -794,6 +847,10 @@ func decodeExecutionCapsule(canonical []byte) (executionCapsule, error) {
 		}
 	}
 	if !validOpaqueID(capsule.CapsuleID.String()) || !validOpaqueID(capsule.SandboxLeaseID.String()) ||
+		capsule.CapabilityContractDigest == (Digest{}) || capsule.AllowedPlatformImagesDigest == (Digest{}) ||
+		capsule.ExecutorContractDigest == (Digest{}) || capsule.NodeGeneration == 0 ||
+		!validOpaqueID(capsule.NodeAuthorityID.String()) || !validOpaqueID(capsule.WorkerAuthorityID.String()) ||
+		capsule.WorkerGeneration == 0 || capsule.AuthorizationExpiresAt.IsZero() ||
 		capsule.LeaseGeneration == 0 || capsule.LeaseFence == 0 || capsule.RuntimeFence == 0 ||
 		capsule.AuthorizationGeneration == 0 || capsule.ReleaseSafetyEpoch == 0 ||
 		capsule.WorkerClass < WorkerAgent || capsule.WorkerClass > WorkerTool ||
@@ -1076,6 +1133,10 @@ func executionCapsuleDispatchCurrent(record *runtimeRecord, now time.Time) bool 
 		capsule.PhaseRunID != record.fixture.PhaseRunID || capsule.RuntimeRunID != record.fixture.RuntimeRunID ||
 		capsule.OperationID != record.operation.OperationID || capsule.CanonicalRequestDigest != record.operation.Digest ||
 		capsule.ExecutionNodeID != record.node.ExecutionNodeID ||
+		capsule.NodeGeneration != record.node.Generation ||
+		capsule.NodeAuthorityID != record.lease.NodeAuthorityID ||
+		capsule.WorkerAuthorityID != record.lease.WorkerAuthorityID ||
+		capsule.WorkerGeneration != record.lease.WorkerGeneration ||
 		capsule.Security.Policy.NodeGeneration != record.node.Generation ||
 		capsule.Security.Policy.AttestationID != record.node.AttestationID ||
 		capsule.Security.Policy.AttestationGeneration != record.node.AttestationGeneration ||
@@ -1083,6 +1144,7 @@ func executionCapsuleDispatchCurrent(record *runtimeRecord, now time.Time) bool 
 		capsule.SandboxLeaseID != record.lease.LeaseID || capsule.LeaseGeneration != record.lease.Generation ||
 		capsule.LeaseFence != record.lease.Fence || capsule.RuntimeFence != record.fixture.RuntimeFence ||
 		capsule.AuthorizationGeneration != record.fixture.Owner.AuthorizationGeneration() ||
+		!capsule.AuthorizationExpiresAt.Equal(record.lease.AuthorizationExpiresAt) ||
 		capsule.ReleaseSafetyEpoch != record.fixture.SafetyEpoch || capsule.CatalogSafetyEpoch != record.catalogSafetyEpoch ||
 		capsule.Security.Policy.ExecutionPolicyID != record.operation.ExecutionPolicyID ||
 		capsule.NetworkPolicyID != capsule.Security.Network.NetworkPolicyID ||
