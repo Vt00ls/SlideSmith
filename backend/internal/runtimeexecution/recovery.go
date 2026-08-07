@@ -192,10 +192,12 @@ func (recovery *RecoveryPointRestore) classifyRuntimes(
 }
 
 // IsReadOnly returns true when the recovery state denies new mutations.
+// On persistence errors it returns false and the error so callers can
+// distinguish "confirmed writable" from "unknown".
 func (recovery *RecoveryPointRestore) IsReadOnly(ctx context.Context) (bool, error) {
 	state, err := recovery.store.LoadRecoveryState(ctx)
 	if err != nil {
-		return true, err
+		return false, err
 	}
 	if state == nil {
 		return false, nil
@@ -204,7 +206,8 @@ func (recovery *RecoveryPointRestore) IsReadOnly(ctx context.Context) (bool, err
 }
 
 // RejectNewStart returns an error if the platform is in read-only mode and
-// should reject new start requests.
+// should reject new start requests. Persistence failures propagate so the
+// caller can distinguish "rejected because read-only" from "unknown".
 func (recovery *RecoveryPointRestore) RejectNewStart(ctx context.Context) error {
 	readOnly, err := recovery.IsReadOnly(ctx)
 	if err != nil {

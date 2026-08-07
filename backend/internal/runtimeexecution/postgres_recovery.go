@@ -107,11 +107,13 @@ func (store *PostgresRecoveryStore) ListActiveLeaseRuntimes(
 ) ([]RuntimeRunID, error) {
 	table := store.authority.table("runtime_execution_runtimes")
 
+	// Only list post-lease active states (exclude Reconciling which is
+	// already covered by ListReconcilingRuntimes).
 	rows, err := store.authority.db.QueryContext(ctx, fmt.Sprintf(`SELECT runtime_run_id
-		FROM %s WHERE runtime_state IN ($1,$2,$3,$4,$5) AND runtime_fence < $6`, table),
+		FROM %s WHERE runtime_state IN ($1,$2,$3,$4) AND runtime_fence < $5`, table),
 		int16(RuntimePreparingPrerequisites), int16(RuntimeStarting),
 		int16(RuntimeRunning), int16(RuntimeStopping),
-		int16(RuntimeReconciling), beforeFence,
+		beforeFence,
 	)
 	if err != nil {
 		return nil, normalizeRuntimePersistenceFailure(err)
@@ -135,18 +137,34 @@ func (store *PostgresRecoveryStore) ClassifyRuntimeAfterRestore(
 	runtimeRunID RuntimeRunID,
 	decision RestoreDecision,
 ) (*RestoreRuntimeClassification, error) {
-	stateResult, err := store.authority.Inspect(ctx, RuntimeRunRef{
-		SchemaVersion:       SchemaV1,
-		ProjectionVersion:   SnapshotSchemaCurrent,
-		PersonalWorkspaceID: PersonalWorkspaceID{value: ""},
-		RuntimeRunID:        runtimeRunID,
-		Authority:           RuntimeAuthority{kind: AuthorityTaskOrchestration},
-	})
+	// Direct internal load: bypass authorization since this is called during
+	// recovery when old authority bindings may be invalid.
+	tx, err := store.authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
 	if err != nil {
-		return nil, err
+		return nil, normalizeRuntimePersistenceFailure(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT personal_workspace_id, task_id, phase_run_id,
+		owner_authority_id, owner_authority_generation, owner_authority_kind,
+		task_revision, runtime_revision, operation_generation, runtime_fence,
+		safety_epoch, runtime_state, runtime_outcome, terminal_evidence_id, aggregate_state
+		FROM %s WHERE runtime_run_id=$1`, store.authority.table("runtime_execution_runtimes")), runtimeRunID.String())
+	record, err := scanPostgresRuntimeRecord(row, runtimeRunID)
+	if err == sql.ErrNoRows {
+		return nil, nil // runtime doesn't exist, skip classification
+	}
+	if err != nil {
+		return nil, normalizeRuntimePersistenceFailure(err)
+	}
+	snapshot, representable := renderSnapshot(record, SnapshotSchemaCurrent)
+	if !representable {
+		return nil, newError(ErrorIntegrityConflict)
+	}
+	if err := tx.Rollback(); err != nil {
+		return nil, normalizeRuntimePersistenceFailure(err)
 	}
 
-	snapshot := stateResult
 	classification := ClassifyPostRestore(
 		snapshot.State,
 		snapshot.Outcome,

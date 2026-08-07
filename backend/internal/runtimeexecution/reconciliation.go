@@ -62,11 +62,16 @@ type ReconciliationStore interface {
 	ResolveReconciliation(ctx context.Context, obligation ReconciliationObligation, result ReconcilingResult) error
 
 	// LoadRuntimeSnapshot loads the current runtime snapshot for Inspect.
+	// The store is responsible for resolving the correct authority scope.
 	LoadRuntimeSnapshot(ctx context.Context, runtimeRunID RuntimeRunID) (RuntimeSnapshot, error)
 
 	// ReplayExactCommand replays an exact previously-accepted command and
 	// returns the original decision and current snapshot.
 	ReplayExactCommand(ctx context.Context, command RuntimeCommand) (RuntimeDecision, error)
+
+	// LoadRuntimeSnapshotForInspect loads a runtime snapshot using the
+	// provided authority scope (workspace + authority).
+	LoadRuntimeSnapshotForInspect(ctx context.Context, ref RuntimeRunRef) (RuntimeSnapshot, error)
 }
 
 // ReconciliationObserver is an external adapter that inspects the original
@@ -97,6 +102,7 @@ type ReconciliationObligation struct {
 	RuntimeRunID           RuntimeRunID
 	OperationID            OperationID
 	DecisionID             RuntimeDecisionID
+	StartDigest            Digest // canonical request digest of the original start
 	AuthorityKind          AuthorityKind
 	AuthorityID            AuthorityID
 	AuthorityGeneration    AuthorizationGeneration
@@ -135,19 +141,20 @@ func NewReconciliationStateMachine(
 }
 
 // Inspect loads the current runtime snapshot and reconciliation obligation
-// without executing any transition.
+// without executing any transition. The ref carries the authority scope needed
+// for authorization.
 func (machine *ReconciliationStateMachine) Inspect(
 	ctx context.Context,
-	runtimeRunID RuntimeRunID,
+	ref RuntimeRunRef,
 ) (RuntimeSnapshot, *ReconciliationObligation, error) {
 	if ctx == nil || ctx.Err() != nil {
 		return RuntimeSnapshot{}, nil, newError(ErrorDependencyUnavailable)
 	}
-	snapshot, err := machine.store.LoadRuntimeSnapshot(ctx, runtimeRunID)
+	snapshot, err := machine.store.LoadRuntimeSnapshotForInspect(ctx, ref)
 	if err != nil {
 		return RuntimeSnapshot{}, nil, err
 	}
-	obligation, err := machine.store.LoadReconciliationObligation(ctx, runtimeRunID)
+	obligation, err := machine.store.LoadReconciliationObligation(ctx, ref.RuntimeRunID)
 	if err != nil {
 		return RuntimeSnapshot{}, nil, err
 	}
@@ -196,7 +203,10 @@ func (machine *ReconciliationStateMachine) Reconcile(
 
 	// Zero-lease evidence check: if PG proves no lease or process effect
 	// ever committed, we can finalize as Rejected + NoLeasePhysicalDisposition.
-	if obligation.Reason == ReconciliationTransportAmbiguous {
+	// This applies to all pre-lease ambiguity reasons (transport timeout,
+	// callback loss, poll interruption, queue claim loss, worker response
+	// loss, lease transaction ambiguous).
+	if isPreLeaseAmbiguityReason(obligation.Reason) {
 		// If there is no lease committed AND no process evidence, it's a
 		// zero-lease run that should terminate as Rejected.
 		if snapshot.Lease.AcquireStatus != LeaseGranted &&
@@ -294,8 +304,12 @@ func (machine *ReconciliationStateMachine) evaluateObservation(
 	observation ReconciliationObservation,
 ) ReconcilingResult {
 	// Integrity check: if the observed digest doesn't match the original
-	// start digest, it's an integrity incident.
-	if observation.ObservedDigest != (Digest{}) && observation.ObservedDigest != obligation.DecisionID.valueAsDigest() {
+	// canonical start digest, it's an integrity incident. A zero digest
+	// means the observer didn't report a digest (e.g., it only observed
+	// state), which is not treated as a mismatch.
+	if observation.ObservedDigest != (Digest{}) &&
+		obligation.StartDigest != (Digest{}) &&
+		!CompareReconciliationDigests(observation.ObservedDigest, obligation.StartDigest) {
 		return ReconcilingResultIntegrityIncident
 	}
 
@@ -372,9 +386,14 @@ const (
 	maxReconciliationAttempts = 10
 )
 
-// valueAsDigest extracts a digest from a decision ID for integrity comparison.
-func (id RuntimeDecisionID) valueAsDigest() Digest {
-	return Digest(sha256.Sum256([]byte("slidesmith.runtime-decision-id/" + id.String())))
+// isPreLeaseAmbiguityReason returns true when the reconciliation reason
+// indicates a pre-lease ambiguity where zero-lease proof may apply.
+func isPreLeaseAmbiguityReason(reason ReconciliationReason) bool {
+	// ReconciliationTransportAmbiguous is the primary pre-lease ambiguity
+	// reason. Pre-lease terminal and lease-commit ambiguity reasons also
+	// qualify for zero-lease evaluation.
+	return reason == ReconciliationTransportAmbiguous ||
+		reason == ReconciliationProjectionDelivery
 }
 
 // validReconciliationRef checks that a ReconciliationRef has all required fields.
@@ -394,13 +413,15 @@ type ReconciliationDecision struct {
 	IntegrityIncident   bool
 }
 
-// reconcileCommand attempts to reconcile a runtime run by first inspecting,
-// then replaying if applicable, then reconciling through the observer.
-func (machine *ReconciliationStateMachine) reconcileCommand(
+// ReconcileCommand is the top-level entry point for the reconciling loop.
+// It drives Inspect→Replay→Reconcile for a runtime run in Reconciling state
+// and returns the unified decision. This is the method wired into Execute
+// when a runtime is in Reconciling state.
+func (machine *ReconciliationStateMachine) ReconcileCommand(
 	ctx context.Context,
-	runtimeRunID RuntimeRunID,
+	ref RuntimeRunRef,
 ) (*ReconciliationDecision, error) {
-	snapshot, obligation, err := machine.Inspect(ctx, runtimeRunID)
+	snapshot, obligation, err := machine.Inspect(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
@@ -412,12 +433,12 @@ func (machine *ReconciliationStateMachine) reconcileCommand(
 		}, nil
 	}
 
-	result, finalSnapshot, err := machine.Reconcile(ctx, runtimeRunID)
+	result, finalSnapshot, err := machine.Reconcile(ctx, ref.RuntimeRunID)
 	if err != nil {
 		return nil, err
 	}
 
-	obligation, _ = machine.store.LoadReconciliationObligation(ctx, runtimeRunID)
+	obligation, _ = machine.store.LoadReconciliationObligation(ctx, ref.RuntimeRunID)
 
 	return &ReconciliationDecision{
 		Result:              result,
@@ -431,7 +452,7 @@ func (machine *ReconciliationStateMachine) reconcileCommand(
 
 // EnsureReconciliationInterface checks compile-time interface satisfaction.
 var _ interface {
-	Inspect(ctx context.Context, runtimeRunID RuntimeRunID) (RuntimeSnapshot, *ReconciliationObligation, error)
+	Inspect(ctx context.Context, ref RuntimeRunRef) (RuntimeSnapshot, *ReconciliationObligation, error)
 	Replay(ctx context.Context, command RuntimeCommand) (RuntimeDecision, error)
 	Reconcile(ctx context.Context, runtimeRunID RuntimeRunID) (ReconcilingResult, RuntimeSnapshot, error)
 } = (*ReconciliationStateMachine)(nil)

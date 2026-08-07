@@ -212,13 +212,45 @@ func (store *PostgresReconciliationStore) LoadRuntimeSnapshot(
 	ctx context.Context,
 	runtimeRunID RuntimeRunID,
 ) (RuntimeSnapshot, error) {
-	return store.authority.Inspect(ctx, RuntimeRunRef{
-		SchemaVersion:       SchemaV1,
-		ProjectionVersion:   SnapshotSchemaCurrent,
-		PersonalWorkspaceID: PersonalWorkspaceID{value: ""},
-		RuntimeRunID:        runtimeRunID,
-		Authority:           RuntimeAuthority{kind: AuthorityTaskOrchestration},
-	})
+	// Direct internal load: query the aggregate state and render a snapshot
+	// without the authorization check needed for external Inspect callers.
+	tx, err := store.authority.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead})
+	if err != nil {
+		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	row := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT personal_workspace_id, task_id, phase_run_id,
+		owner_authority_id, owner_authority_generation, owner_authority_kind,
+		task_revision, runtime_revision, operation_generation, runtime_fence,
+		safety_epoch, runtime_state, runtime_outcome, terminal_evidence_id, aggregate_state
+		FROM %s WHERE runtime_run_id=$1`, store.authority.table("runtime_execution_runtimes")), runtimeRunID.String())
+	record, err := scanPostgresRuntimeRecord(row, runtimeRunID)
+	if err == sql.ErrNoRows {
+		return RuntimeSnapshot{}, newError(ErrorAuthorizationDenied)
+	}
+	if err != nil {
+		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
+	}
+	if err := store.authority.loadPostgresExecutionCapsule(ctx, tx, record); err != nil {
+		return RuntimeSnapshot{}, err
+	}
+	projected, representable := renderSnapshot(record, SnapshotSchemaCurrent)
+	if !representable {
+		return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
+	}
+	projectCapsuleReadinessAt(&projected, postgresTimestamp(store.authority.now()))
+	if err := tx.Rollback(); err != nil {
+		return RuntimeSnapshot{}, normalizeRuntimePersistenceFailure(err)
+	}
+	return projected, nil
+}
+
+func (store *PostgresReconciliationStore) LoadRuntimeSnapshotForInspect(
+	ctx context.Context,
+	ref RuntimeRunRef,
+) (RuntimeSnapshot, error) {
+	return store.authority.Inspect(ctx, ref)
 }
 
 func (store *PostgresReconciliationStore) ReplayExactCommand(
