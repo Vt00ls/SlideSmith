@@ -331,6 +331,9 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	cleanupRebindingFunction := authority.table("runtime_execution_reject_cleanup_rebinding")
 	prerequisiteRebindingFunction := authority.table("runtime_execution_reject_prerequisite_operation_rebinding")
 	runtimeViewTerminalRebindingFunction := authority.table("runtime_execution_reject_runtime_view_terminal_operation_rebinding")
+	taskEvidenceOutbox := authority.table("runtime_execution_task_evidence_outbox")
+	taskEvidenceOutboxDelivery := authority.table("runtime_execution_task_evidence_outbox_delivery")
+	diagnosticEvidence := authority.table("runtime_execution_diagnostic_evidence")
 	return []string{
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_decision_sequence")),
 		fmt.Sprintf("CREATE SEQUENCE IF NOT EXISTS %s", authority.table("runtime_execution_sandbox_lease_sequence")),
@@ -1189,6 +1192,39 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", runtimeViewTerminalAudit, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", runtimeViewTerminalOutbox),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", runtimeViewTerminalOutbox, immutableFunction),
+		// Evidence terminal ingestion tables (issue 82)
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY,
+			decision_id text NOT NULL REFERENCES %s(decision_id),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			evidence_id text NOT NULL,
+			payload bytea NOT NULL,
+			payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
+			committed_at timestamptz NOT NULL
+		)`, taskEvidenceOutbox, decisions, runtimes),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text PRIMARY KEY REFERENCES %s(operation_id),
+			disposition smallint NOT NULL,
+			delivery_count bigint NOT NULL DEFAULT 0 CHECK (delivery_count >= 0),
+			first_attempt_at timestamptz,
+			last_attempt_at timestamptz,
+			acknowledged_at timestamptz
+		)`, taskEvidenceOutboxDelivery, taskEvidenceOutbox),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			operation_id text NOT NULL,
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			evidence_id text NOT NULL,
+			evidence_root_id text NOT NULL,
+			payload bytea NOT NULL,
+			payload_digest bytea NOT NULL CHECK (octet_length(payload_digest) = 32),
+			diagnostic_only boolean NOT NULL DEFAULT TRUE,
+			committed_at timestamptz NOT NULL,
+			PRIMARY KEY (runtime_run_id, operation_id)
+		)`, diagnosticEvidence, runtimes),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", taskEvidenceOutbox),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", taskEvidenceOutbox, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", diagnosticEvidence),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", diagnosticEvidence, immutableFunction),
 	}
 }
 
@@ -1226,6 +1262,21 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 		decision, executeErr := authority.executePostgresStart(ctx, start, binding)
 		if executeErr != nil {
 			return RuntimeDecision{}, executeErr
+		}
+		// Evidence-terminal fast path (#82): when a runtime is already in
+		// Reconciling state with a leased worker observation, skip the
+		// prerequisite/lease pipeline and ingest terminal evidence directly.
+		if decision.Snapshot.State == RuntimeReconciling &&
+			decision.Snapshot.Lease.AcquireStatus == LeaseGranted &&
+			decision.Snapshot.Lease.Disposition == LeaseActive &&
+			(decision.Snapshot.Worker.Status == WorkerOperationSuccessObserved ||
+				decision.Snapshot.Worker.Status == WorkerOperationFailureObserved) {
+			decision, executeErr = authority.advancePostgresEvidenceTerminal(ctx, start, decision.Snapshot)
+			if executeErr != nil {
+				return RuntimeDecision{}, executeErr
+			}
+			projectCapsuleReadinessAt(&decision.Snapshot, postgresTimestamp(authority.now()))
+			return decision, nil
 		}
 		decision, executeErr = authority.advancePostgresRuntimeBindingPrerequisite(ctx, start, decision)
 		if executeErr != nil {
@@ -1265,6 +1316,10 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 		if executeErr != nil {
 			return RuntimeDecision{}, executeErr
 		}
+		decision, executeErr = authority.advancePostgresEvidenceTerminal(ctx, start, decision.Snapshot)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
 		projectCapsuleReadinessAt(&decision.Snapshot, postgresTimestamp(authority.now()))
 		return decision, nil
 	}
@@ -1279,6 +1334,19 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 			return RuntimeDecision{}, err
 		}
 		decision, executeErr = authority.advancePostgresUsageEvidence(ctx, cancel.RuntimeRunID, decision)
+		if executeErr != nil {
+			return RuntimeDecision{}, executeErr
+		}
+		decision, executeErr = authority.advancePostgresEvidenceTerminal(ctx,
+			StartRuntimeRun{StartRuntimeRunInput: StartRuntimeRunInput{
+				PersonalWorkspaceID: cancel.PersonalWorkspaceID, TaskID: cancel.TaskID,
+				PhaseRunID: cancel.PhaseRunID, RuntimeRunID: cancel.RuntimeRunID,
+				OperationID: cancel.ExpectedStartOperationID,
+				ExpectedRuntimeRevision: cancel.ExpectedRuntimeRevision,
+				ExpectedOperationGeneration: cancel.ExpectedOperationGeneration,
+				ExpectedRuntimeFence: cancel.ExpectedRuntimeFence,
+				Authority: cancel.Authority, ReleaseSafetyEpoch: cancel.SafetyEpoch,
+			}}, decision.Snapshot)
 		if executeErr != nil {
 			return RuntimeDecision{}, executeErr
 		}

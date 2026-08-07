@@ -27,6 +27,7 @@ const (
 	postgresAuditLeaseCommitted
 	postgresAuditPostLeaseDeadline
 	postgresAuditPostLeasePrerequisiteRejected
+	postgresAuditEvidenceTerminal
 )
 
 type postgresMandatoryAuditResult uint8
@@ -296,7 +297,7 @@ func validPostgresMandatoryAuditState(state postgresMandatoryAuditState) bool {
 		!validOpaqueID(state.DecisionID) || !validOpaqueID(state.RuntimeRunID) ||
 		!validOpaqueID(state.OperationID) || !validDigestText(state.RequestDigest) ||
 		!validAuthority(RuntimeAuthority{id: AuthorityID{value: state.AuthorityID}, generation: state.AuthorityGeneration, kind: state.AuthorityKind}) ||
-		state.Action < postgresAuditStartAccepted || state.Action > postgresAuditPostLeasePrerequisiteRejected ||
+		state.Action < postgresAuditStartAccepted || state.Action > postgresAuditEvidenceTerminal ||
 		state.Result != postgresAuditAccepted || state.BeforeRevision == 0 || state.AfterRevision == 0 ||
 		!knownRuntimeState(state.BeforeState) || !knownRuntimeState(state.AfterState) ||
 		state.BeforeOperationGeneration == 0 || state.AfterOperationGeneration == 0 ||
@@ -338,6 +339,10 @@ func validPostgresMandatoryAuditState(state postgresMandatoryAuditState) bool {
 	case postgresAuditPostLeasePrerequisiteRejected:
 		if postLeaseTerminalCause(state.ReasonCode) < postLeaseRuntimeBindingRejected ||
 			postLeaseTerminalCause(state.ReasonCode) > postLeaseImmutableInputsRejected {
+			return false
+		}
+	case postgresAuditEvidenceTerminal:
+		if RuntimeOutcome(state.ReasonCode) != RuntimeSucceeded && RuntimeOutcome(state.ReasonCode) != RuntimeFailed {
 			return false
 		}
 	}
