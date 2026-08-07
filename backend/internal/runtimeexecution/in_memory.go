@@ -1625,3 +1625,146 @@ func validAdmissionGrantFixture(fixture AdmissionGrantFixture) bool {
 		validOpaqueID(fixture.PersonalWorkspaceID.String()) && validOpaqueID(fixture.RuntimeRunID.String()) &&
 		validOpaqueID(fixture.OperationID.String()) && fixture.CanonicalStartDigest != (Digest{}) && !fixture.ExpiresAt.IsZero()
 }
+
+// InMemoryReconciliationStore implements ReconciliationStore backed by the
+// deterministic in-memory harness store. It provides the reconciliation state
+// machine with access to runtime snapshots and exact replay.
+type InMemoryReconciliationStore struct {
+	harness *DeterministicHarness
+}
+
+func (store *InMemoryReconciliationStore) LoadReconciliationObligation(
+	_ context.Context,
+	runtimeRunID RuntimeRunID,
+) (*ReconciliationObligation, error) {
+	store.harness.store.mu.Lock()
+	defer store.harness.store.mu.Unlock()
+
+	record, ok := store.harness.store.runtimes[runtimeRunID]
+	if !ok || record.reconciliation != ReconciliationRequiredStatus {
+		return nil, nil
+	}
+
+	// Build an obligation from the in-memory record.
+	return &ReconciliationObligation{
+		RuntimeRunID:        runtimeRunID,
+		OperationID:         record.operation.OperationID,
+		DecisionID:          record.acceptedStart.DecisionID,
+		StartDigest:         record.acceptedStartDigest,
+		AuthorityKind:        record.fixture.Owner.kind,
+		AuthorityID:          record.fixture.Owner.id,
+		AuthorityGeneration:  record.fixture.Owner.generation,
+		RuntimeRevision:      record.fixture.RuntimeRevision,
+		OperationGeneration:  record.fixture.OperationGeneration,
+		RuntimeFence:         record.fixture.RuntimeFence,
+		Reason:               ReconciliationTransportAmbiguous,
+		Status:               record.reconciliation,
+		Unresolved:           true,
+		FirstRecordedAt:      store.harness.clock.current(),
+		LastRecordedAt:       store.harness.clock.current(),
+	}, nil
+}
+
+func (store *InMemoryReconciliationStore) RecordReconciliationObservation(
+	_ context.Context,
+	obligation ReconciliationObligation,
+	_ ReconciliationObservation,
+) error {
+	store.harness.store.mu.Lock()
+	defer store.harness.store.mu.Unlock()
+
+	record, ok := store.harness.store.runtimes[obligation.RuntimeRunID]
+	if !ok {
+		return newError(ErrorIntegrityConflict)
+	}
+	record.reconciliation = obligation.Status
+	return nil
+}
+
+func (store *InMemoryReconciliationStore) ResolveReconciliation(
+	_ context.Context,
+	obligation ReconciliationObligation,
+	result ReconcilingResult,
+) error {
+	store.harness.store.mu.Lock()
+	defer store.harness.store.mu.Unlock()
+
+	record, ok := store.harness.store.runtimes[obligation.RuntimeRunID]
+	if !ok {
+		return newError(ErrorIntegrityConflict)
+	}
+	record.reconciliation = ReconciliationStable
+
+	switch result {
+	case ReconcilingResultTerminalRejected:
+		record.fixture.State = RuntimeTerminal
+		record.fixture.Outcome = RuntimeRejected
+		record.capacity.NoLease = NoLeaseDispositionRecorded
+		record.capacity.LogicalRelease = LogicalCapacityReleaseReady
+	case ReconcilingResultTerminalLost:
+		record.fixture.State = RuntimeTerminal
+		record.fixture.Outcome = RuntimeLost
+	case ReconcilingResultTerminalTimedOut:
+		record.fixture.State = RuntimeTerminal
+		record.fixture.Outcome = RuntimeTimedOut
+	}
+	return nil
+}
+
+func (store *InMemoryReconciliationStore) LoadRuntimeSnapshot(
+	_ context.Context,
+	runtimeRunID RuntimeRunID,
+) (RuntimeSnapshot, error) {
+	store.harness.store.mu.Lock()
+	defer store.harness.store.mu.Unlock()
+
+	record, ok := store.harness.store.runtimes[runtimeRunID]
+	if !ok {
+		return RuntimeSnapshot{}, newError(ErrorAuthorizationDenied)
+	}
+	projected, representable := renderSnapshot(record, SnapshotSchemaCurrent)
+	if !representable {
+		return RuntimeSnapshot{}, newError(ErrorIntegrityConflict)
+	}
+	projectCapsuleReadinessAt(&projected, store.harness.clock.current())
+	return projected, nil
+}
+
+func (store *InMemoryReconciliationStore) LoadRuntimeSnapshotForInspect(
+	ctx context.Context,
+	ref RuntimeRunRef,
+) (RuntimeSnapshot, error) {
+	return store.harness.Runtime.Inspect(ctx, ref)
+}
+
+func (store *InMemoryReconciliationStore) ReplayExactCommand(
+	ctx context.Context,
+	command RuntimeCommand,
+) (RuntimeDecision, error) {
+	return store.harness.Runtime.Execute(ctx, command)
+}
+
+// Reconciler returns a ReconciliationStateMachine backed by the in-memory
+// harness store. It satisfies the reconciliation adapter requirement.
+func (harness *DeterministicHarness) Reconciler() *ReconciliationStateMachine {
+	return NewReconciliationStateMachine(
+		&InMemoryReconciliationStore{harness: harness},
+		harness.clock.current,
+		nil, // observer is nil by default; inject via harness config for tests
+	)
+}
+
+// ReconcilerWithObserver returns a ReconciliationStateMachine with an
+// external observer adapter for worker/node observation.
+func (harness *DeterministicHarness) ReconcilerWithObserver(
+	observer ReconciliationObserver,
+) *ReconciliationStateMachine {
+	return NewReconciliationStateMachine(
+		&InMemoryReconciliationStore{harness: harness},
+		harness.clock.current,
+		observer,
+	)
+}
+
+// Ensure interface conformance.
+var _ ReconciliationStore = (*InMemoryReconciliationStore)(nil)

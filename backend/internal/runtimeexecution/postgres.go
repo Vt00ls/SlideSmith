@@ -1225,6 +1225,20 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", taskEvidenceOutbox, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", diagnosticEvidence),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", diagnosticEvidence, immutableFunction),
+		// Reconciliation diagnostic observations (issue #83).
+		fmt.Sprintf("ALTER TABLE %s ADD COLUMN IF NOT EXISTS diagnostic_observations jsonb", reconciliation),
+		// Recovery state singleton (issue #83).
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			generation bigint PRIMARY KEY CHECK (generation > 0),
+			fence bigint NOT NULL CHECK (fence > 0),
+			safety_epoch bigint NOT NULL CHECK (safety_epoch > 0),
+			mode smallint NOT NULL,
+			restored_at timestamptz NOT NULL,
+			recovery_point_id text NOT NULL,
+			previous_generation bigint NOT NULL DEFAULT 0 CHECK (previous_generation >= 0),
+			previous_fence bigint NOT NULL DEFAULT 0 CHECK (previous_fence >= 0),
+			previous_safety_epoch bigint NOT NULL DEFAULT 0 CHECK (previous_safety_epoch >= 0)
+		)`, authority.table("runtime_execution_recovery_state")),
 	}
 }
 
