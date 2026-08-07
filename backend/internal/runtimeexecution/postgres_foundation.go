@@ -168,6 +168,7 @@ const (
 	postgresLeaseCommitCommandKind        int16 = 102
 	postgresPostLeaseDeadlineCommandKind  int16 = 103
 	postgresPostLeaseRejectionCommandKind int16 = 104
+	postgresEvidenceTerminalCommandKind   int16 = 105
 )
 
 type reconciliationFoundationIntent struct {
