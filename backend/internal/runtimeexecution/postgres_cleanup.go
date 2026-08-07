@@ -15,6 +15,8 @@ const (
 	cleanupMutationCreate cleanupMutationKind = iota + 1
 	cleanupMutationAttempt
 	cleanupMutationResolve
+	cleanupMutationExpire
+	cleanupMutationReopen
 )
 
 type cleanupDebtRef struct {
@@ -44,6 +46,8 @@ type cleanupDebtCreation struct {
 	Estimation             cleanupEstimation
 	Blockers               cleanupBlockerSummary
 	Uncontained            bool
+	SeamDigest             Digest
+	SeamReason             uint8
 }
 
 type cleanupDebtAttempt struct {
@@ -66,6 +70,7 @@ type cleanupDebtAttempt struct {
 	Estimation                 cleanupEstimation
 	Blockers                   cleanupBlockerSummary
 	Uncontained                bool
+	SeamDigest                 Digest
 }
 
 type cleanupDebtResolution struct {
@@ -84,6 +89,10 @@ type cleanupDebtResolution struct {
 	RemainingBlockers   cleanupBlockerSummary
 	Uncontained         bool
 	ExceptionUntil      time.Time
+	IncidentReference   string
+	TicketReference     string
+	ApprovalReference   string
+	SeamDigest          Digest
 }
 
 type canonicalCleanupCreation struct {
@@ -168,6 +177,9 @@ type canonicalCleanupResolution struct {
 	RemainingBlockerDigest  string                  `json:"remaining_blocker_digest"`
 	Uncontained             bool                    `json:"uncontained"`
 	ExceptionUntil          string                  `json:"exception_until"`
+	IncidentReference       string                  `json:"incident_reference,omitempty"`
+	TicketReference         string                  `json:"ticket_reference,omitempty"`
+	ApprovalReference       string                  `json:"approval_reference,omitempty"`
 }
 
 func (authority *PostgresAuthority) createCleanupDebt(
@@ -197,7 +209,7 @@ func (authority *PostgresAuthority) createCleanupDebt(
 		return cleanupDebtRecord{}, err
 	}
 	if replay, found, err := authority.loadCleanupMutationReplay(
-		ctx, tx, creation.DebtID, creation.MutationID, mutationDigest,
+		ctx, tx, creation.DebtID, creation.MutationID, mutationDigest, creation.SeamDigest,
 	); err != nil {
 		return cleanupDebtRecord{}, err
 	} else if found {
@@ -259,8 +271,18 @@ func (authority *PostgresAuthority) createCleanupDebt(
 		return cleanupDebtRecord{}, normalizeRuntimePersistenceFailure(err)
 	}
 	if err := authority.insertCleanupMutation(ctx, tx, cleanupMutationCreate, creation.MutationID,
-		record, mutationDigest, recordDigest, state); err != nil {
+		record, mutationDigest, creation.SeamDigest, recordDigest, state); err != nil {
 		return cleanupDebtRecord{}, err
+	}
+	if authority.failAt(PersistenceFaultBeforeMandatoryAudit) {
+		return cleanupDebtRecord{}, newError(ErrorDependencyUnavailable)
+	}
+	if err := authority.insertCleanupMutationAudit(ctx, tx, cleanupAuditCreate, creation.SeamReason,
+		creation.SeamDigest, cleanupDebtRecord{}, record, mutationDigest, creation.CreatedAt); err != nil {
+		return cleanupDebtRecord{}, err
+	}
+	if authority.failAt(PersistenceFaultAfterMandatoryAudit) {
+		return cleanupDebtRecord{}, newError(ErrorDependencyUnavailable)
 	}
 	if err := tx.Commit(); err != nil {
 		return cleanupDebtRecord{}, normalizeRuntimePersistenceFailure(err)
@@ -294,7 +316,7 @@ func (authority *PostgresAuthority) recordCleanupDebtAttempt(
 		return cleanupDebtRecord{}, err
 	}
 	if replay, found, err := authority.loadCleanupMutationReplay(
-		ctx, tx, attempt.DebtID, attempt.MutationID, mutationDigest,
+		ctx, tx, attempt.DebtID, attempt.MutationID, mutationDigest, attempt.SeamDigest,
 	); err != nil {
 		return cleanupDebtRecord{}, err
 	} else if found {
@@ -315,6 +337,7 @@ func (authority *PostgresAuthority) recordCleanupDebtAttempt(
 		record.Status == cleanupDebtResolved || attempt.AttemptedAt.Before(record.CreatedAt) {
 		return cleanupDebtRecord{}, newError(ErrorIntegrityConflict)
 	}
+	before := record
 	record.Revision++
 	if record.AttemptCount == 0 {
 		record.FirstAttemptAt = attempt.AttemptedAt
@@ -338,8 +361,18 @@ func (authority *PostgresAuthority) recordCleanupDebtAttempt(
 	} else {
 		record.Status = cleanupDebtBlocked
 	}
+	if authority.failAt(PersistenceFaultBeforeMandatoryAudit) {
+		return cleanupDebtRecord{}, newError(ErrorDependencyUnavailable)
+	}
+	if err := authority.insertCleanupMutationAudit(ctx, tx, cleanupAuditAttempt, uint8(attempt.FailureCategory),
+		attempt.SeamDigest, before, record, mutationDigest, attempt.AttemptedAt); err != nil {
+		return cleanupDebtRecord{}, err
+	}
+	if authority.failAt(PersistenceFaultAfterMandatoryAudit) {
+		return cleanupDebtRecord{}, newError(ErrorDependencyUnavailable)
+	}
 	return authority.commitCleanupDebtMutation(ctx, tx, cleanupMutationAttempt, attempt.MutationID,
-		attempt.ExpectedRevision, record, mutationDigest)
+		attempt.ExpectedRevision, record, mutationDigest, attempt.SeamDigest)
 }
 
 func (authority *PostgresAuthority) resolveCleanupDebt(
@@ -368,7 +401,7 @@ func (authority *PostgresAuthority) resolveCleanupDebt(
 		return cleanupDebtRecord{}, err
 	}
 	if replay, found, err := authority.loadCleanupMutationReplay(
-		ctx, tx, resolution.DebtID, resolution.MutationID, mutationDigest,
+		ctx, tx, resolution.DebtID, resolution.MutationID, mutationDigest, resolution.SeamDigest,
 	); err != nil {
 		return cleanupDebtRecord{}, err
 	} else if found {
@@ -407,10 +440,16 @@ func (authority *PostgresAuthority) resolveCleanupDebt(
 	record.ResolutionAuditFactID = cleanupResolutionAuditFactID(mutationDigest)
 	record.ResolutionEvidenceRoot = resolution.EvidenceRoot
 	record.ResolutionExpiresAt = resolution.ExceptionUntil
+	record.ResolutionIncidentReference = resolution.IncidentReference
+	record.ResolutionTicketReference = resolution.TicketReference
+	record.ResolutionApprovalReference = resolution.ApprovalReference
 	record.LastMutationID = resolution.MutationID
-	proof, err := authority.verifyRetainedCleanupResolutionProof(ctx, tx, record)
-	if err != nil {
-		return cleanupDebtRecord{}, err
+	var proof cleanupResolutionProofView
+	if record.ResolutionClass != cleanupResolutionAcceptedException {
+		proof, err = authority.verifyRetainedCleanupResolutionProof(ctx, tx, record)
+		if err != nil {
+			return cleanupDebtRecord{}, err
+		}
 	}
 	if authority.failAt(PersistenceFaultBeforeMandatoryAudit) {
 		return cleanupDebtRecord{}, newError(ErrorDependencyUnavailable)
@@ -429,7 +468,7 @@ func (authority *PostgresAuthority) resolveCleanupDebt(
 		return cleanupDebtRecord{}, err
 	}
 	return authority.commitCleanupDebtMutation(ctx, tx, cleanupMutationResolve, resolution.MutationID,
-		resolution.ExpectedRevision, record, mutationDigest)
+		resolution.ExpectedRevision, record, mutationDigest, resolution.SeamDigest)
 }
 
 func (authority *PostgresAuthority) loadCleanupDebt(
@@ -534,6 +573,7 @@ func (authority *PostgresAuthority) commitCleanupDebtMutation(
 	expectedRevision uint64,
 	record cleanupDebtRecord,
 	mutationDigest Digest,
+	seamDigest Digest,
 ) (cleanupDebtRecord, error) {
 	state, recordDigest, err := encodeCleanupDebtRecord(record)
 	if err != nil {
@@ -551,7 +591,7 @@ func (authority *PostgresAuthority) commitCleanupDebtMutation(
 		return cleanupDebtRecord{}, newError(ErrorIntegrityConflict)
 	}
 	if err := authority.insertCleanupMutation(ctx, tx, kind, mutationID, record,
-		mutationDigest, recordDigest, state); err != nil {
+		mutationDigest, seamDigest, recordDigest, state); err != nil {
 		return cleanupDebtRecord{}, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -567,14 +607,19 @@ func (authority *PostgresAuthority) insertCleanupMutation(
 	mutationID string,
 	record cleanupDebtRecord,
 	mutationDigest Digest,
+	seamDigest Digest,
 	recordDigest Digest,
 	state []byte,
 ) error {
+	var seam []byte
+	if seamDigest != (Digest{}) {
+		seam = seamDigest[:]
+	}
 	_, err := tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
-		debt_id, mutation_id, mutation_kind, mutation_digest, result_revision,
+		debt_id, mutation_id, mutation_kind, mutation_digest, seam_digest, result_revision,
 		result_digest, result_state, committed_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, authority.table("runtime_execution_cleanup_mutations")),
-		record.DebtID, mutationID, kind, mutationDigest[:], record.Revision,
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, authority.table("runtime_execution_cleanup_mutations")),
+		record.DebtID, mutationID, kind, mutationDigest[:], seam, record.Revision,
 		recordDigest[:], state, postgresTimestamp(authority.now()))
 	if err != nil {
 		return normalizeRuntimePersistenceFailure(err)
@@ -588,13 +633,14 @@ func (authority *PostgresAuthority) loadCleanupMutationReplay(
 	debtID string,
 	mutationID string,
 	mutationDigest Digest,
+	seamDigest Digest,
 ) (cleanupDebtRecord, bool, error) {
-	var retainedMutationDigest, retainedResultDigest, retainedState []byte
+	var retainedMutationDigest, retainedSeamDigest, retainedResultDigest, retainedState []byte
 	var retainedRevision uint64
-	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT mutation_digest, result_revision,
+	err := tx.QueryRowContext(ctx, fmt.Sprintf(`SELECT mutation_digest, seam_digest, result_revision,
 		result_digest, result_state FROM %s WHERE debt_id=$1 AND mutation_id=$2`,
 		authority.table("runtime_execution_cleanup_mutations")), debtID, mutationID).Scan(
-		&retainedMutationDigest, &retainedRevision, &retainedResultDigest, &retainedState)
+		&retainedMutationDigest, &retainedSeamDigest, &retainedRevision, &retainedResultDigest, &retainedState)
 	if err == sql.ErrNoRows {
 		return cleanupDebtRecord{}, false, nil
 	}
@@ -602,6 +648,13 @@ func (authority *PostgresAuthority) loadCleanupMutationReplay(
 		return cleanupDebtRecord{}, false, normalizeRuntimePersistenceFailure(err)
 	}
 	if !bytes.Equal(retainedMutationDigest, mutationDigest[:]) {
+		return cleanupDebtRecord{}, false, newError(ErrorIntegrityConflict)
+	}
+	if seamDigest != (Digest{}) {
+		if len(retainedSeamDigest) == 0 || !bytes.Equal(retainedSeamDigest, seamDigest[:]) {
+			return cleanupDebtRecord{}, false, newError(ErrorIntegrityConflict)
+		}
+	} else if len(retainedSeamDigest) != 0 {
 		return cleanupDebtRecord{}, false, newError(ErrorIntegrityConflict)
 	}
 	record, recordDigest, err := decodeCleanupDebtRecord(retainedState)
@@ -753,12 +806,30 @@ func cleanupResolutionDigest(resolution cleanupDebtResolution) (Digest, error) {
 	if resolution.Class == cleanupResolutionAcceptedException && resolution.Authority.kind != AuthorityAdministrator {
 		return Digest{}, newError(ErrorAuthorizationDenied)
 	}
+	if resolution.Class == cleanupResolutionAcceptedException &&
+		(!validOpaqueID(resolution.ApprovalReference) || resolution.ExceptionUntil.IsZero() ||
+			!resolution.ExceptionUntil.After(resolution.ResolvedAt)) {
+		return Digest{}, newError(ErrorInvalidRequest)
+	}
+	if resolution.Class != cleanupResolutionAcceptedException &&
+		(resolution.ApprovalReference != "" || resolution.IncidentReference != "" || resolution.TicketReference != "") {
+		return Digest{}, newError(ErrorInvalidRequest)
+	}
+	if resolution.IncidentReference != "" && !validOpaqueID(resolution.IncidentReference) {
+		return Digest{}, newError(ErrorInvalidRequest)
+	}
+	if resolution.TicketReference != "" && !validOpaqueID(resolution.TicketReference) {
+		return Digest{}, newError(ErrorInvalidRequest)
+	}
 	candidate := cleanupDebtRecord{
 		Status: cleanupDebtResolved, Unresolved: false, RetryDisposition: cleanupRetryNone,
 		ResolvedAt: resolution.ResolvedAt, ResolutionClass: resolution.Class, ResolutionReason: resolution.Reason,
 		ResolutionAuthority: resolution.Authority, ResolutionAuditFactID: "pending-cleanup-resolution-audit",
 		ResolutionEvidenceRoot: resolution.EvidenceRoot, ResolutionExpiresAt: resolution.ExceptionUntil,
 		Blockers: resolution.RemainingBlockers, Uncontained: resolution.Uncontained,
+		ResolutionIncidentReference: resolution.IncidentReference,
+		ResolutionTicketReference:   resolution.TicketReference,
+		ResolutionApprovalReference: resolution.ApprovalReference,
 	}
 	if !validCleanupResolutionDisposition(candidate) {
 		return Digest{}, newError(ErrorInvalidRequest)
@@ -777,6 +848,9 @@ func cleanupResolutionDigest(resolution cleanupDebtResolution) (Digest, error) {
 		RemainingBlockerClasses: resolution.RemainingBlockers.Classes,
 		RemainingBlockerDigest:  formatOptionalCleanupDigest(resolution.RemainingBlockers.Digest),
 		Uncontained:             resolution.Uncontained, ExceptionUntil: formatOptionalCleanupTime(resolution.ExceptionUntil),
+		IncidentReference:       resolution.IncidentReference,
+		TicketReference:         resolution.TicketReference,
+		ApprovalReference:       resolution.ApprovalReference,
 	}
 	return cleanupMutationDigest(payload.Schema, payload)
 }

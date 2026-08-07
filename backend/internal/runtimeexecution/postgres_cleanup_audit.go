@@ -99,7 +99,7 @@ func newCleanupResolutionAuditState(
 	operationDigest Digest,
 	proof cleanupResolutionProofView,
 ) cleanupResolutionAuditState {
-	return cleanupResolutionAuditState{
+	state := cleanupResolutionAuditState{
 		AuditFactID: after.ResolutionAuditFactID, SchemaVersion: SchemaV1,
 		IntegrityVersion: postgresCleanupResolutionAuditIntegrityVersion,
 		OwningModule:     postgresCleanupOwnerModule,
@@ -134,8 +134,6 @@ func newCleanupResolutionAuditState(
 		EvidenceSchemaVersion:         after.ResolutionEvidenceRoot.SchemaVersion,
 		EvidenceRootID:                after.ResolutionEvidenceRoot.EvidenceRootID.String(),
 		EvidenceRootDigest:            after.ResolutionEvidenceRoot.Digest.String(),
-		ResolutionProofID:             proof.State.ProofID,
-		ResolutionProofDigest:         proof.CanonicalDigest.String(),
 		BlockerClasses:                after.Blockers.Classes,
 		BlockerDigest:                 formatOptionalCleanupDigest(after.Blockers.Digest),
 		Uncontained:                   after.Uncontained,
@@ -143,10 +141,18 @@ func newCleanupResolutionAuditState(
 		RecordedAt:                    formatCleanupTime(after.ResolvedAt),
 		SourceClockID:                 postgresMandatoryAuditSourceClock,
 		ExceptionUntil:                formatOptionalCleanupTime(after.ResolutionExpiresAt),
+		IncidentReference:             after.ResolutionIncidentReference,
+		TicketReference:               after.ResolutionTicketReference,
+		ApprovalReference:             after.ResolutionApprovalReference,
 		IdempotencyReference:          after.LastMutationID,
 		RetryDisposition:              RetryNever,
 		ReconciliationDisposition:     ReconciliationNotRequired,
 	}
+	if proof.State.ProofID != "" {
+		state.ResolutionProofID = proof.State.ProofID
+		state.ResolutionProofDigest = proof.CanonicalDigest.String()
+	}
+	return state
 }
 
 func encodeCleanupResolutionAudit(state cleanupResolutionAuditState) ([]byte, Digest, error) {
@@ -208,8 +214,9 @@ func validCleanupResolutionAuditState(state cleanupResolutionAuditState) bool {
 		state.AuthorizationEpoch != state.ResolutionAuthorityGeneration ||
 		state.BeforeSafetyEpoch == 0 || state.AfterSafetyEpoch != state.BeforeSafetyEpoch ||
 		state.EvidenceSchemaVersion != SchemaV1 || !validOpaqueID(state.EvidenceRootID) ||
-		!validDigestText(state.EvidenceRootDigest) || !validOpaqueID(state.ResolutionProofID) ||
-		!validDigestText(state.ResolutionProofDigest) || state.SourceClockID != postgresMandatoryAuditSourceClock ||
+		!validDigestText(state.EvidenceRootDigest) ||
+		!validOptionalCleanupAuditProof(state.ResolutionProofID, state.ResolutionProofDigest) ||
+		state.SourceClockID != postgresMandatoryAuditSourceClock ||
 		!validOptionalCleanupAuditReference(state.IncidentReference) ||
 		!validOptionalCleanupAuditReference(state.TicketReference) ||
 		!validOptionalCleanupAuditReference(state.ApprovalReference) ||
@@ -240,14 +247,26 @@ func validCleanupResolutionAuditState(state cleanupResolutionAuditState) bool {
 		ResolutionReason: state.ResolutionReason, Uncontained: state.Uncontained,
 		Blockers:   cleanupBlockerSummary{Classes: state.BlockerClasses, Digest: blockerDigest},
 		ResolvedAt: occurredAt, ResolutionExpiresAt: exceptionUntil,
+		ResolutionIncidentReference: state.IncidentReference,
+		ResolutionTicketReference:   state.TicketReference,
+		ResolutionApprovalReference: state.ApprovalReference,
 	}
 	if !validCleanupResolutionDisposition(record) {
 		return false
 	}
 	if state.ResolutionClass == cleanupResolutionAcceptedException {
-		return state.ResolutionAuthorityKind == AuthorityAdministrator && state.ApprovalReference != ""
+		return state.ResolutionAuthorityKind == AuthorityAdministrator && state.ApprovalReference != "" &&
+			state.ResolutionProofID == "" && state.ResolutionProofDigest == ""
 	}
-	return state.ApprovalReference == ""
+	return state.ApprovalReference == "" && validOpaqueID(state.ResolutionProofID) &&
+		validDigestText(state.ResolutionProofDigest)
+}
+
+func validOptionalCleanupAuditProof(proofID, proofDigest string) bool {
+	if proofID == "" {
+		return proofDigest == ""
+	}
+	return validOpaqueID(proofID) && validDigestText(proofDigest)
 }
 
 func validOptionalCleanupAuditReference(value string) bool {
@@ -311,6 +330,14 @@ func (authority *PostgresAuthority) insertCleanupResolutionAudit(
 	if err != nil {
 		return newError(ErrorIntegrityConflict)
 	}
+	var proofID any
+	if proof.State.ProofID != "" {
+		proofID = proof.State.ProofID
+	}
+	var proofDigest any
+	if proof.CanonicalDigest != (Digest{}) {
+		proofDigest = proof.CanonicalDigest[:]
+	}
 	_, err = tx.ExecContext(ctx, fmt.Sprintf(`INSERT INTO %s (
 		audit_fact_id, debt_id, runtime_run_id, operation_id, operation_digest, resource_identity_digest,
 		resource_generation, resource_fence, resolution_class, resolution_reason,
@@ -326,7 +353,7 @@ func (authority *PostgresAuthority) insertCleanupResolutionAudit(
 		after.ResolutionAuthority.id.String(), after.ResolutionAuthority.generation,
 		before.Revision, after.Revision, before.Status, after.Status,
 		after.ResolutionEvidenceRoot.EvidenceRootID.String(), after.ResolutionEvidenceRoot.Digest[:],
-		proof.State.ProofID, proof.CanonicalDigest[:], after.ResolvedAt, after.ResolvedAt,
+		proofID, proofDigest, after.ResolvedAt, after.ResolvedAt,
 		state.SourceClockID, digest[:], encoded)
 	if err != nil {
 		return normalizeRuntimePersistenceFailure(err)
@@ -421,11 +448,16 @@ func (authority *PostgresAuthority) verifyPendingCleanupResolutionAuthority(
 	); err != nil {
 		return err
 	}
-	proof, err := authority.verifyRetainedCleanupResolutionProof(ctx, tx, after)
-	if err != nil {
-		return err
+	var proof cleanupResolutionProofView
+	var err error
+	if after.ResolutionClass != cleanupResolutionAcceptedException {
+		proof, err = authority.verifyRetainedCleanupResolutionProof(ctx, tx, after)
+		if err != nil {
+			return err
+		}
 	}
-	var debtID, runtimeRunID, operationID, authorityID, evidenceRootID, proofID, sourceClockID string
+	var debtID, runtimeRunID, operationID, authorityID, evidenceRootID, sourceClockID string
+	var proofID sql.NullString
 	var retainedOperationDigest, resourceIdentityDigest, evidenceRootDigest, proofDigest []byte
 	var canonicalDigest, encoded []byte
 	var resourceGeneration, resourceFence, beforeDebtRevision, afterDebtRevision uint64
@@ -455,6 +487,14 @@ func (authority *PostgresAuthority) verifyPendingCleanupResolutionAuthority(
 		}
 		return normalizeRuntimePersistenceFailure(err)
 	}
+	if after.ResolutionClass == cleanupResolutionAcceptedException {
+		if proofID.Valid || len(proofDigest) != 0 {
+			return newError(ErrorIntegrityConflict)
+		}
+	} else if !proofID.Valid || proofID.String != proof.State.ProofID ||
+		!bytes.Equal(proofDigest, proof.CanonicalDigest[:]) {
+		return newError(ErrorIntegrityConflict)
+	}
 	state, wantDigest, err := decodeCleanupResolutionAudit(encoded)
 	if err != nil || debtID != after.DebtID || runtimeRunID != after.RuntimeRunID.String() ||
 		operationID != after.LastMutationID || !bytes.Equal(retainedOperationDigest, operationDigest[:]) ||
@@ -466,7 +506,6 @@ func (authority *PostgresAuthority) verifyPendingCleanupResolutionAuthority(
 		afterDebtRevision != after.Revision || beforeDebtStatus != before.Status || afterDebtStatus != after.Status ||
 		evidenceRootID != after.ResolutionEvidenceRoot.EvidenceRootID.String() ||
 		!bytes.Equal(evidenceRootDigest, after.ResolutionEvidenceRoot.Digest[:]) ||
-		proofID != proof.State.ProofID || !bytes.Equal(proofDigest, proof.CanonicalDigest[:]) ||
 		!occurredAt.Equal(after.ResolvedAt) || !recordedAt.Equal(after.ResolvedAt) ||
 		sourceClockID != postgresMandatoryAuditSourceClock || !bytes.Equal(canonicalDigest, wantDigest[:]) ||
 		!cleanupResolutionAuditMatchesRecord(state, before, after, runtime, operationDigest, proof) {

@@ -159,6 +159,13 @@ type QuotaReservationFixture struct {
 	ExpiresAt                    time.Time
 }
 
+type RetainedStartFactFixture struct {
+	RuntimeRunID RuntimeRunID
+	DecisionID   RuntimeDecisionID
+	OperationID  OperationID
+	Digest       Digest
+}
+
 type HarnessConfig struct {
 	Now                      time.Time
 	IDs                      DeterministicIDConfig
@@ -177,6 +184,9 @@ type HarnessConfig struct {
 	GatewayCallAuthority     GatewayCallExternalAuthority
 	GatewayGrantLifetime     time.Duration
 	UsageReceipts            UsageReceiptEvidenceSource
+	CleanupDebts             []cleanupDebtRecord
+	CleanupProofs            []cleanupResolutionProofState
+	RetainedStartFacts       []RetainedStartFactFixture
 	agentWorker              workerCapabilityAdapter
 	toolWorker               workerCapabilityAdapter
 }
@@ -185,6 +195,7 @@ type DeterministicHarness struct {
 	Runtime                  RuntimeExecution
 	Maintenance              RuntimeMaintenance
 	Dispatch                 OwnedDispatch
+	Diagnostics              OperationalDiagnostics
 	workers                  workerProtocol
 	store                    *memoryStore
 	clock                    *controlledClock
@@ -219,6 +230,8 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		maintenance:            make(map[OperationID]RuntimeMaintenanceDecision),
 		workerHeartbeats:       make(map[OperationID]retainedWorkerHeartbeat),
 		maintenanceAuthorities: make(map[maintenanceAuthorityKey]maintenanceCallerAuthority),
+		cleanupDebts:           make(map[string]*cleanupDebtRecord),
+		cleanupProofs:          make(map[cleanupProofKey]cleanupResolutionProofState),
 	}
 	if store.nextDecision == 0 {
 		store.nextDecision = 1
@@ -318,6 +331,48 @@ func NewDeterministicHarness(config HarnessConfig) (*DeterministicHarness, error
 		}
 		store.maintenanceAuthorities[key] = binding.caller
 	}
+	for _, record := range config.CleanupDebts {
+		record = normalizeCleanupDebtRecord(record)
+		validated := record
+		validated.OwnerModule = postgresCleanupOwnerModule
+		if !validCleanupDebtRecord(validated) || store.cleanupDebts[record.DebtID] != nil {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		runtime := store.runtimes[record.RuntimeRunID]
+		if runtime == nil || runtime.fixture.PersonalWorkspaceID != record.PersonalWorkspaceID ||
+			runtime.fixture.Owner != record.OwnerAuthority {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		copyRecord := record
+		store.cleanupDebts[record.DebtID] = &copyRecord
+	}
+	for _, proof := range config.CleanupProofs {
+		if !validCleanupResolutionProofState(proof) {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		key := cleanupProofKey{debtID: proof.DebtID, resolutionClass: proof.ResolutionClass, evidenceRootID: proof.EvidenceRootID}
+		if _, exists := store.cleanupProofs[key]; exists {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		store.cleanupProofs[key] = proof
+	}
+	for _, fact := range config.RetainedStartFacts {
+		if !validOpaqueID(fact.DecisionID.String()) || !validOpaqueID(fact.OperationID.String()) ||
+			fact.Digest == (Digest{}) {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		record := store.runtimes[fact.RuntimeRunID]
+		if record == nil {
+			return nil, newError(ErrorInvalidRequest)
+		}
+		attempt := decisionAttemptKey{kind: CommandStartRuntimeRun, operationID: fact.OperationID}
+		retained := RuntimeDecisionFact{
+			DecisionID: fact.DecisionID, OperationID: fact.OperationID, CanonicalRequestDigest: fact.Digest,
+		}
+		record.decisions[attempt] = retained
+		record.acceptedStart = retained
+		record.acceptedStartDigest = fact.Digest
+	}
 	clock := &controlledClock{now: config.Now.UTC()}
 	grantLifetime := config.GatewayGrantLifetime
 	if grantLifetime == 0 {
@@ -369,7 +424,7 @@ func newHarness(
 		usageReceipts: usageReceipts, agentWorker: agentWorker, toolWorker: toolWorker,
 	}
 	return &DeterministicHarness{
-		Runtime: engine, Maintenance: engine, Dispatch: engine, workers: engine, store: store, clock: clock, controls: controls,
+		Runtime: engine, Maintenance: engine, Dispatch: engine, Diagnostics: engine, workers: engine, store: store, clock: clock, controls: controls,
 		leaseAcquisition: leaseAcquisition, runtimeBindingValidator: runtimeBindingValidator,
 		immutableInputValidator: immutableInputValidator, executionCapsuleResolver: executionCapsuleResolver,
 		runtimeViewPrerequisite: runtimeViewPrerequisite,
@@ -521,11 +576,19 @@ type memoryStore struct {
 	maintenance            map[OperationID]RuntimeMaintenanceDecision
 	workerHeartbeats       map[OperationID]retainedWorkerHeartbeat
 	maintenanceAuthorities map[maintenanceAuthorityKey]maintenanceCallerAuthority
+	cleanupDebts           map[string]*cleanupDebtRecord
+	cleanupProofs          map[cleanupProofKey]cleanupResolutionProofState
 }
 
 type maintenanceAuthorityKey struct {
 	executionNodeID ExecutionNodeID
 	kind            RuntimeMaintenanceAuthorityKind
+}
+
+type cleanupProofKey struct {
+	debtID          string
+	resolutionClass cleanupResolutionClass
+	evidenceRootID  string
 }
 
 type grantKey struct {
