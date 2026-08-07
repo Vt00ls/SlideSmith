@@ -50,6 +50,22 @@ type postgresMaintenanceDecisionState struct {
 	Node                         postgresRuntimeNodeState             `json:"node"`
 	Cleanup                      postgresLeaseCleanupState            `json:"cleanup"`
 	PhysicalCapacityReleaseReady postgresPhysicalReleaseEvidenceState `json:"physical_capacity_release_ready"`
+	CleanupDebt                  postgresCleanupDebtDecisionState     `json:"cleanup_debt"`
+}
+
+type postgresCleanupDebtDecisionState struct {
+	DebtID           string                  `json:"debt_id"`
+	DebtRevision     uint64                  `json:"debt_revision"`
+	Status           cleanupDebtStatus       `json:"status"`
+	Unresolved       bool                    `json:"unresolved"`
+	Uncontained      bool                    `json:"uncontained"`
+	RetryDisposition cleanupRetryDisposition `json:"retry_disposition"`
+	ResolutionClass  cleanupResolutionClass  `json:"resolution_class"`
+	ResolutionReason cleanupResolutionReason `json:"resolution_reason"`
+	ExceptionUntil   time.Time               `json:"exception_until"`
+	CapacityReleased bool                    `json:"capacity_released"`
+	Expired          bool                    `json:"expired"`
+	Reopened         bool                    `json:"reopened"`
 }
 
 type postgresMaintenanceAuditState struct {
@@ -168,11 +184,20 @@ func encodePostgresMaintenanceDecision(decision RuntimeMaintenanceDecision) ([]b
 	physical := postgresCapacityEvidenceFromSnapshot(RuntimeCapacityEvidenceSnapshot{
 		PhysicalCapacityReleaseReady: decision.PhysicalCapacityReleaseReady,
 	}).PhysicalCapacityReleaseReady
+	debt := postgresCleanupDebtDecisionState{
+		DebtID: decision.CleanupDebt.DebtID, DebtRevision: decision.CleanupDebt.DebtRevision,
+		Status: decision.CleanupDebt.Status, Unresolved: decision.CleanupDebt.Unresolved,
+		Uncontained: decision.CleanupDebt.Uncontained, RetryDisposition: decision.CleanupDebt.RetryDisposition,
+		ResolutionClass: decision.CleanupDebt.ResolutionClass, ResolutionReason: decision.CleanupDebt.ResolutionReason,
+		ExceptionUntil: decision.CleanupDebt.ExceptionUntil.UTC(), CapacityReleased: decision.CleanupDebt.CapacityReleased,
+		Expired: decision.CleanupDebt.Expired, Reopened: decision.CleanupDebt.Reopened,
+	}
 	return json.Marshal(postgresMaintenanceDecisionState{
 		OperationID: decision.OperationID.String(), CanonicalRequestDigest: decision.CanonicalRequestDigest,
 		RuntimeRevision: decision.RuntimeRevision, RuntimeFence: decision.RuntimeFence,
 		Lease: maintenanceLeaseState(decision.Lease), Node: postgresNodeState(decision.Node),
 		Cleanup: postgresCleanupState(decision.Cleanup), PhysicalCapacityReleaseReady: physical,
+		CleanupDebt: debt,
 	})
 }
 
@@ -191,6 +216,14 @@ func decodePostgresMaintenanceDecision(encoded []byte) (RuntimeMaintenanceDecisi
 		RuntimeRevision: state.RuntimeRevision, RuntimeFence: state.RuntimeFence,
 		Lease: leaseSnapshotFromMaintenance(state.Lease), Node: nodeSnapshotFromPostgres(state.Node),
 		Cleanup: cleanupSnapshotFromPostgres(state.Cleanup), PhysicalCapacityReleaseReady: physical,
+		CleanupDebt: CleanupDebtRuntimeDecision{
+			DebtID: state.CleanupDebt.DebtID, DebtRevision: state.CleanupDebt.DebtRevision,
+			Status: state.CleanupDebt.Status, Unresolved: state.CleanupDebt.Unresolved,
+			Uncontained: state.CleanupDebt.Uncontained, RetryDisposition: state.CleanupDebt.RetryDisposition,
+			ResolutionClass: state.CleanupDebt.ResolutionClass, ResolutionReason: state.CleanupDebt.ResolutionReason,
+			ExceptionUntil: state.CleanupDebt.ExceptionUntil.UTC(), CapacityReleased: state.CleanupDebt.CapacityReleased,
+			Expired: state.CleanupDebt.Expired, Reopened: state.CleanupDebt.Reopened,
+		},
 	}
 	if !validPostgresMaintenanceDecision(decision) {
 		return RuntimeMaintenanceDecision{}, newPersistenceError(PersistenceStateCorrupt)
@@ -201,6 +234,13 @@ func decodePostgresMaintenanceDecision(encoded []byte) (RuntimeMaintenanceDecisi
 func validPostgresMaintenanceDecision(decision RuntimeMaintenanceDecision) bool {
 	if !validOpaqueID(decision.OperationID.String()) || decision.CanonicalRequestDigest == (Digest{}) {
 		return false
+	}
+	if decision.CleanupDebt.DebtID != "" {
+		return decision.RuntimeRevision != 0 && decision.RuntimeFence != 0 &&
+			decision.Lease == (RuntimeLeaseSnapshot{}) && decision.Cleanup == (RuntimeLeaseCleanupSnapshot{}) &&
+			decision.Node == (RuntimeNodeSnapshot{}) &&
+			decision.PhysicalCapacityReleaseReady == (PhysicalCapacityReleaseReadyEvidence{}) &&
+			validCleanupDebtDecisionState(decision.CleanupDebt)
 	}
 	if decision.RuntimeRevision == 0 || decision.RuntimeFence == 0 {
 		return decision.RuntimeRevision == 0 && decision.RuntimeFence == 0 &&
@@ -343,6 +383,36 @@ func (authority *PostgresAuthority) Maintain(
 			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 		}
 		return authority.attestPostgresExecutionNode(ctx, typed, canonical)
+	case CreateCleanupObligation:
+		canonical, valid := canonicalCreateCleanupObligation(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return authority.createCleanupObligationMaintenance(ctx, typed)
+	case RecordCleanupAttempt:
+		canonical, valid := canonicalRecordCleanupAttempt(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return authority.recordCleanupAttemptMaintenance(ctx, typed)
+	case ResolveCleanupDebt:
+		canonical, valid := canonicalResolveCleanupDebt(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return authority.resolveCleanupDebtMaintenance(ctx, typed)
+	case ExpireCleanupDebtException:
+		canonical, valid := canonicalExpireCleanupDebtException(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return authority.expireCleanupDebtExceptionMaintenance(ctx, typed)
+	case ReopenCleanupDebt:
+		canonical, valid := canonicalReopenCleanupDebt(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return authority.reopenCleanupDebtMaintenance(ctx, typed)
 	default:
 		return RuntimeMaintenanceDecision{}, newError(ErrorInvalidRequest)
 	}

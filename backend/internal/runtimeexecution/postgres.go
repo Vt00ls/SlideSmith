@@ -324,6 +324,7 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 	cleanupMutations := authority.table("runtime_execution_cleanup_mutations")
 	cleanupResolutionProofs := authority.table("runtime_execution_cleanup_resolution_proofs")
 	cleanupResolutionAudit := authority.table("runtime_execution_cleanup_resolution_audit")
+	cleanupMutationAudit := authority.table("runtime_execution_cleanup_mutation_audit")
 	heartbeats := authority.table("runtime_execution_heartbeat_history")
 	compaction := authority.table("runtime_execution_heartbeat_compaction")
 	immutableFunction := authority.table("runtime_execution_reject_immutable_mutation")
@@ -941,12 +942,44 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			mutation_id text NOT NULL,
 			mutation_kind smallint NOT NULL,
 			mutation_digest bytea NOT NULL CHECK (octet_length(mutation_digest) = 32),
+			seam_digest bytea CHECK (seam_digest IS NULL OR octet_length(seam_digest) = 32),
 			result_revision bigint NOT NULL CHECK (result_revision > 0),
 			result_digest bytea NOT NULL CHECK (octet_length(result_digest) = 32),
 			result_state jsonb NOT NULL,
 			committed_at timestamptz NOT NULL,
 			PRIMARY KEY (debt_id, mutation_id)
 		)`, cleanupMutations, cleanup),
+		fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS seam_digest bytea CHECK (seam_digest IS NULL OR octet_length(seam_digest) = 32)`, cleanupMutations),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			audit_fact_id text PRIMARY KEY,
+			debt_id text NOT NULL REFERENCES %s(debt_id),
+			runtime_run_id text NOT NULL REFERENCES %s(runtime_run_id),
+			operation_id text NOT NULL,
+			operation_digest bytea NOT NULL CHECK (octet_length(operation_digest) = 32),
+			seam_digest bytea CHECK (seam_digest IS NULL OR octet_length(seam_digest) = 32),
+			mutation_kind smallint NOT NULL,
+			before_debt_revision bigint NOT NULL CHECK (before_debt_revision >= 0),
+			after_debt_revision bigint NOT NULL CHECK (after_debt_revision > 0),
+			before_debt_status smallint NOT NULL,
+			after_debt_status smallint NOT NULL,
+			resource_identity_digest bytea NOT NULL CHECK (octet_length(resource_identity_digest) = 32),
+			resource_generation bigint NOT NULL CHECK (resource_generation > 0),
+			resource_fence bigint NOT NULL CHECK (resource_fence > 0),
+			retry_disposition smallint NOT NULL,
+			failure_category smallint NOT NULL,
+			blocker_classes bigint NOT NULL,
+			uncontained boolean NOT NULL,
+			estimate_state smallint NOT NULL,
+			estimated_bytes bigint NOT NULL,
+			estimated_inodes bigint NOT NULL,
+			resolution_class smallint NOT NULL,
+			resolution_reason smallint NOT NULL,
+			occurred_at timestamptz NOT NULL,
+			recorded_at timestamptz NOT NULL,
+			source_clock_id text NOT NULL,
+			canonical_digest bytea NOT NULL CHECK (octet_length(canonical_digest) = 32),
+			audit_state jsonb NOT NULL
+		)`, cleanupMutationAudit, cleanup, runtimes),
 		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
 			proof_id text PRIMARY KEY,
 			debt_id text NOT NULL REFERENCES %s(debt_id),
@@ -986,8 +1019,8 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 			after_debt_status smallint NOT NULL,
 			evidence_root_id text NOT NULL REFERENCES %s(evidence_root_id),
 			evidence_root_digest bytea NOT NULL CHECK (octet_length(evidence_root_digest) = 32),
-			resolution_proof_id text NOT NULL REFERENCES %s(proof_id),
-			resolution_proof_digest bytea NOT NULL CHECK (octet_length(resolution_proof_digest) = 32),
+			resolution_proof_id text REFERENCES %s(proof_id),
+			resolution_proof_digest bytea CHECK (resolution_proof_digest IS NULL OR octet_length(resolution_proof_digest) = 32),
 			occurred_at timestamptz NOT NULL,
 			recorded_at timestamptz NOT NULL,
 			source_clock_id text NOT NULL,
@@ -1168,6 +1201,8 @@ func (authority *PostgresAuthority) migrationStatements() []string {
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanupResolutionProofs, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", cleanupResolutionAudit),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanupResolutionAudit, immutableFunction),
+		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", cleanupMutationAudit),
+		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", cleanupMutationAudit, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", maintenance),
 		fmt.Sprintf("CREATE TRIGGER reject_immutable_mutation BEFORE UPDATE OR DELETE ON %s FOR EACH ROW EXECUTE FUNCTION %s()", maintenance, immutableFunction),
 		fmt.Sprintf("DROP TRIGGER IF EXISTS reject_immutable_mutation ON %s", maintenanceAudit),

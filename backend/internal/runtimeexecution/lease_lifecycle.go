@@ -140,6 +140,7 @@ type RuntimeMaintenanceDecision struct {
 	Node                         RuntimeNodeSnapshot
 	Cleanup                      RuntimeLeaseCleanupSnapshot
 	PhysicalCapacityReleaseReady PhysicalCapacityReleaseReadyEvidence
+	CleanupDebt                  CleanupDebtRuntimeDecision
 	Replayed                     bool
 }
 
@@ -507,6 +508,36 @@ func (engine *invariantEngine) Maintain(
 			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
 		}
 		return engine.attestExecutionNode(typed)
+	case CreateCleanupObligation:
+		canonical, valid := canonicalCreateCleanupObligation(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return engine.createCleanupObligation(typed)
+	case RecordCleanupAttempt:
+		canonical, valid := canonicalRecordCleanupAttempt(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return engine.recordCleanupAttempt(typed)
+	case ResolveCleanupDebt:
+		canonical, valid := canonicalResolveCleanupDebt(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return engine.resolveCleanupDebt(typed)
+	case ExpireCleanupDebtException:
+		canonical, valid := canonicalExpireCleanupDebtException(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return engine.expireCleanupDebtException(typed)
+	case ReopenCleanupDebt:
+		canonical, valid := canonicalReopenCleanupDebt(typed)
+		if !valid || Digest(sha256.Sum256(canonical)) != typed.CanonicalRequestDigest {
+			return RuntimeMaintenanceDecision{}, newError(ErrorIntegrityConflict)
+		}
+		return engine.reopenCleanupDebt(typed)
 	default:
 		return RuntimeMaintenanceDecision{}, newError(ErrorInvalidRequest)
 	}
@@ -531,6 +562,9 @@ func (engine *invariantEngine) replayMaintenanceLocked(
 		return RuntimeMaintenanceDecision{}, true, newError(ErrorIntegrityConflict)
 	}
 	retained.Replayed = true
+	if retained.CleanupDebt.DebtID != "" {
+		retained.CleanupDebt.Replayed = true
+	}
 	return retained, true, nil
 }
 

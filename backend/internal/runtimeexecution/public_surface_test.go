@@ -167,9 +167,33 @@ func TestLeaseLifecycleUsesIndependentClosedMaintenanceSurface(t *testing.T) {
 	}
 	for _, variant := range []RuntimeMaintenanceCommand{
 		RenewSandboxLease{}, FenceSandboxLease{}, ConfirmSandboxReset{}, AttestExecutionNode{},
+		CreateCleanupObligation{}, RecordCleanupAttempt{}, ResolveCleanupDebt{},
+		ExpireCleanupDebtException{}, ReopenCleanupDebt{},
 	} {
 		if variant == nil {
 			t.Fatal("maintenance variant is nil")
+		}
+		if _, isPublic := any(variant).(RuntimeCommand); isPublic {
+			t.Fatalf("maintenance variant %T leaked into the public Execute/Inspect union", variant)
+		}
+	}
+}
+
+func TestOperationalDiagnosticsIsReadOnlyAndNonEnumerating(t *testing.T) {
+	t.Parallel()
+	diagnostics := reflect.TypeOf((*OperationalDiagnostics)(nil)).Elem()
+	if diagnostics.NumMethod() != 1 || diagnostics.Method(0).Name != "Diagnose" {
+		t.Fatalf("OperationalDiagnostics methods = %v, want only read-only Diagnose", diagnostics)
+	}
+	queryType := reflect.TypeOf(OperationalDiagnosticQuery{})
+	if queryType.NumField() != 9 {
+		t.Fatalf("OperationalDiagnosticQuery has %d fields, want closed 8", queryType.NumField())
+	}
+	viewType := reflect.TypeOf(OperationalDiagnosticView{})
+	for index := 0; index < viewType.NumField(); index++ {
+		field := viewType.Field(index)
+		if field.Type.Kind() == reflect.Slice || field.Type.Kind() == reflect.Map {
+			t.Fatalf("diagnostic view field %s is enumerating through %s", field.Name, field.Type)
 		}
 	}
 }

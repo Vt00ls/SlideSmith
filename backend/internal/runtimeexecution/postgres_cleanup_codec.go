@@ -161,6 +161,9 @@ type cleanupDebtRecord struct {
 	ResolutionAuditFactID      string
 	ResolutionEvidenceRoot     EvidenceRootSnapshot
 	ResolutionExpiresAt        time.Time
+	ResolutionIncidentReference string
+	ResolutionTicketReference  string
+	ResolutionApprovalReference string
 	LastMutationID             string
 }
 
@@ -219,6 +222,9 @@ type canonicalCleanupDebtState struct {
 	ResolutionEvidenceRootID      string                  `json:"resolution_evidence_root_id"`
 	ResolutionEvidenceRootDigest  string                  `json:"resolution_evidence_root_digest"`
 	ResolutionExpiresAt           string                  `json:"resolution_expires_at"`
+	ResolutionIncidentReference   string                  `json:"resolution_incident_reference,omitempty"`
+	ResolutionTicketReference     string                  `json:"resolution_ticket_reference,omitempty"`
+	ResolutionApprovalReference   string                  `json:"resolution_approval_reference,omitempty"`
 	LastMutationID                string                  `json:"last_mutation_id"`
 }
 
@@ -349,19 +355,26 @@ func validCleanupResolutionDisposition(record cleanupDebtRecord) bool {
 	switch record.ResolutionClass {
 	case cleanupResolutionReclaimed:
 		return record.ResolutionReason == cleanupResolutionCleanupProven && !record.Uncontained &&
-			record.Blockers.Classes == 0 &&
-			record.ResolutionExpiresAt.IsZero()
+			record.Blockers.Classes == 0 && record.ResolutionExpiresAt.IsZero() &&
+			record.ResolutionApprovalReference == "" && record.ResolutionIncidentReference == "" &&
+			record.ResolutionTicketReference == ""
 	case cleanupResolutionAlreadyAbsent:
 		return record.ResolutionReason == cleanupResolutionExactGenerationAbsent && !record.Uncontained &&
-			record.Blockers.Classes == 0 &&
-			record.ResolutionExpiresAt.IsZero()
+			record.Blockers.Classes == 0 && record.ResolutionExpiresAt.IsZero() &&
+			record.ResolutionApprovalReference == "" && record.ResolutionIncidentReference == "" &&
+			record.ResolutionTicketReference == ""
 	case cleanupResolutionRetainedByAuthority:
 		return record.ResolutionReason == cleanupResolutionCurrentAuthorityRetention &&
-			record.Blockers.Classes != 0 && record.ResolutionExpiresAt.IsZero()
+			record.Blockers.Classes != 0 && record.ResolutionExpiresAt.IsZero() &&
+			record.ResolutionApprovalReference == "" && record.ResolutionIncidentReference == "" &&
+			record.ResolutionTicketReference == ""
 	case cleanupResolutionAcceptedException:
 		return record.ResolutionReason == cleanupResolutionAdministratorException &&
 			!record.ResolutionExpiresAt.IsZero() && record.ResolutionExpiresAt.After(record.ResolvedAt) &&
-			record.ResolutionExpiresAt.Equal(postgresTimestamp(record.ResolutionExpiresAt))
+			record.ResolutionExpiresAt.Equal(postgresTimestamp(record.ResolutionExpiresAt)) &&
+			validOpaqueID(record.ResolutionApprovalReference) &&
+			(record.ResolutionIncidentReference == "" || validOpaqueID(record.ResolutionIncidentReference)) &&
+			(record.ResolutionTicketReference == "" || validOpaqueID(record.ResolutionTicketReference))
 	default:
 		return false
 	}
@@ -404,6 +417,9 @@ func encodeCleanupDebtRecord(record cleanupDebtRecord) ([]byte, Digest, error) {
 		ResolutionEvidenceRootID:      record.ResolutionEvidenceRoot.EvidenceRootID.String(),
 		ResolutionEvidenceRootDigest:  formatOptionalCleanupDigest(record.ResolutionEvidenceRoot.Digest),
 		ResolutionExpiresAt:           formatOptionalCleanupTime(record.ResolutionExpiresAt), LastMutationID: record.LastMutationID,
+		ResolutionIncidentReference:   record.ResolutionIncidentReference,
+		ResolutionTicketReference:     record.ResolutionTicketReference,
+		ResolutionApprovalReference:   record.ResolutionApprovalReference,
 	}
 	encoded, err := json.Marshal(state)
 	if err != nil {
@@ -468,7 +484,10 @@ func decodeCleanupDebtRecord(encoded []byte) (cleanupDebtRecord, Digest, error) 
 		ResolutionAuditFactID: state.ResolutionAuditFactID,
 		ResolutionEvidenceRoot: EvidenceRootSnapshot{SchemaVersion: state.ResolutionEvidenceSchema,
 			EvidenceRootID: EvidenceRootID{value: state.ResolutionEvidenceRootID}, Digest: resolutionEvidenceDigest},
-		LastMutationID: state.LastMutationID,
+		ResolutionIncidentReference: state.ResolutionIncidentReference,
+		ResolutionTicketReference:   state.ResolutionTicketReference,
+		ResolutionApprovalReference: state.ResolutionApprovalReference,
+		LastMutationID:              state.LastMutationID,
 	}
 	var err error
 	if record.CreatedAt, err = parseCleanupTime(state.CreatedAt, true); err != nil {
