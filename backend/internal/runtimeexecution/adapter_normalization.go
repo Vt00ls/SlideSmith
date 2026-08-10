@@ -53,7 +53,7 @@ func (kind TransportKind) String() string {
 // external operation. It is never interpreted by C03 and never enters
 // authoritative PostgreSQL business records.
 type ExternalOperationHandle struct {
-	Raw   string
+	Raw    string
 	Opaque string
 }
 
@@ -87,13 +87,13 @@ func (cursor ExternalOperationCursor) CanonicalDigest() Digest {
 // DurableAdapterBinding records the stable identity the adapter must preserve
 // across restarts, delivery loss, and reconciliation.
 type DurableAdapterBinding struct {
-	Transport          TransportKind
-	OperationID        OperationID
-	CanonicalDigest    Digest
-	ExternalHandle     ExternalOperationHandle
-	Cursor             ExternalOperationCursor
-	PersistedAt        time.Time
-	Reconcilable       bool
+	Transport       TransportKind
+	OperationID     OperationID
+	CanonicalDigest Digest
+	ExternalHandle  ExternalOperationHandle
+	Cursor          ExternalOperationCursor
+	PersistedAt     time.Time
+	Reconcilable    bool
 }
 
 // AdapterNormalizedError is the closed safe error category that every adapter
@@ -129,29 +129,29 @@ const (
 	AdapterErrorNone AdapterErrorCode = iota
 
 	// Authorization / identity
-	AdapterErrorUnauthorized        // producer or caller not authorized
-	AdapterErrorStaleIdentity       // stale worker/node/generation/fence
+	AdapterErrorUnauthorized  // producer or caller not authorized
+	AdapterErrorStaleIdentity // stale worker/node/generation/fence
 
 	// Integrity / binding
-	AdapterErrorIntegrityConflict   // digest, operation, or binding mismatch
-	AdapterErrorStaleBinding        // stale lease, fence, or safety epoch
-	AdapterErrorDuplicateOperation  // same-key operation already observed
+	AdapterErrorIntegrityConflict  // digest, operation, or binding mismatch
+	AdapterErrorStaleBinding       // stale lease, fence, or safety epoch
+	AdapterErrorDuplicateOperation // same-key operation already observed
 
 	// Transport / dependency
-	AdapterErrorTransportUnavailable // sync timeout, poll interruption, queue claim loss
-	AdapterErrorCallbackUnavailable  // callback endpoint unreachable
+	AdapterErrorTransportUnavailable  // sync timeout, poll interruption, queue claim loss
+	AdapterErrorCallbackUnavailable   // callback endpoint unreachable
 	AdapterErrorDependencyUnavailable // prerequisite not ready
 
 	// Execution
-	AdapterErrorCapabilityFailure   // agent or tool reported failure
-	AdapterErrorDeadlineExceeded    // operation exceeded deadline
-	AdapterErrorCancelled           // operation was cancelled
-	AdapterErrorAmbiguous           // operation outcome cannot be determined
+	AdapterErrorCapabilityFailure // agent or tool reported failure
+	AdapterErrorDeadlineExceeded  // operation exceeded deadline
+	AdapterErrorCancelled         // operation was cancelled
+	AdapterErrorAmbiguous         // operation outcome cannot be determined
 
 	// Evidence
-	AdapterErrorCorruptEvidence     // evidence digest, schema, or producer mismatch
-	AdapterErrorMissingEvidence     // required evidence not present
-	AdapterErrorStaleEvidence       // evidence from stale generation/fence
+	AdapterErrorCorruptEvidence // evidence digest, schema, or producer mismatch
+	AdapterErrorMissingEvidence // required evidence not present
+	AdapterErrorStaleEvidence   // evidence from stale generation/fence
 )
 
 func (code AdapterErrorCode) String() string {

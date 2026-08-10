@@ -36,15 +36,15 @@ const (
 // exact DebtID, ExecutionNodeID, or RuntimeRunID matching its Lookup is
 // rejected, so the seam can never enumerate the whole population.
 type OperationalDiagnosticQuery struct {
-	SchemaVersion    SchemaVersion
-	Reason           DiagnosticReason
-	Authority        RuntimeAuthority
-	Lookup           DiagnosticLookup
-	DebtID           string
+	SchemaVersion       SchemaVersion
+	Reason              DiagnosticReason
+	Authority           RuntimeAuthority
+	Lookup              DiagnosticLookup
+	DebtID              string
 	PersonalWorkspaceID PersonalWorkspaceID
-	ExecutionNodeID  ExecutionNodeID
-	RuntimeRunID     RuntimeRunID
-	Bounded          bool
+	ExecutionNodeID     ExecutionNodeID
+	RuntimeRunID        RuntimeRunID
+	Bounded             bool
 }
 
 type OperationalDiagnosticView struct {
@@ -84,16 +84,16 @@ type NodeDiagnosticView struct {
 }
 
 type RuntimeDiagnosticView struct {
-	RuntimeRunID      RuntimeRunID
-	RuntimeRevision   RuntimeRevision
-	State             RuntimeState
-	Outcome           RuntimeOutcome
-	LeaseDisposition  LeaseDisposition
-	Physical          PhysicalCapacityDisposition
-	Cleanup           LeaseCleanupStatus
-	Quarantined       bool
-	Containment       ContainmentStatus
-	Reset             ResetStatus
+	RuntimeRunID     RuntimeRunID
+	RuntimeRevision  RuntimeRevision
+	State            RuntimeState
+	Outcome          RuntimeOutcome
+	LeaseDisposition LeaseDisposition
+	Physical         PhysicalCapacityDisposition
+	Cleanup          LeaseCleanupStatus
+	Quarantined      bool
+	Containment      ContainmentStatus
+	Reset            ResetStatus
 }
 
 func validOperationalDiagnosticQuery(query OperationalDiagnosticQuery) bool {

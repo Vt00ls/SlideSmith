@@ -90,8 +90,10 @@ func NewCreateCleanupObligation(input CreateCleanupObligationInput) (CreateClean
 	return command, nil
 }
 
-func (CreateCleanupObligation) runtimeMaintenanceCommand()                  {}
-func (command CreateCleanupObligation) maintenanceOperationID() OperationID { return command.OperationID }
+func (CreateCleanupObligation) runtimeMaintenanceCommand() {}
+func (command CreateCleanupObligation) maintenanceOperationID() OperationID {
+	return command.OperationID
+}
 func (command CreateCleanupObligation) maintenanceDigest() Digest {
 	return command.CanonicalRequestDigest
 }
@@ -194,8 +196,10 @@ func NewExpireCleanupDebtException(input ExpireCleanupDebtExceptionInput) (Expir
 	return command, nil
 }
 
-func (ExpireCleanupDebtException) runtimeMaintenanceCommand()                  {}
-func (command ExpireCleanupDebtException) maintenanceOperationID() OperationID { return command.OperationID }
+func (ExpireCleanupDebtException) runtimeMaintenanceCommand() {}
+func (command ExpireCleanupDebtException) maintenanceOperationID() OperationID {
+	return command.OperationID
+}
 func (command ExpireCleanupDebtException) maintenanceDigest() Digest {
 	return command.CanonicalRequestDigest
 }
@@ -322,33 +326,33 @@ func canonicalReopenCleanupDebt(command ReopenCleanupDebt) ([]byte, bool) {
 }
 
 type canonicalCleanupExceptionExpiry struct {
-	Schema             string `json:"schema"`
-	OperationID        string `json:"operation_id"`
-	DebtID             string `json:"debt_id"`
-	PersonalWorkspaceID string `json:"personal_workspace_id"`
-	RuntimeRunID       string `json:"runtime_run_id"`
-	AuthorityKind      AuthorityKind           `json:"authority_kind"`
-	AuthorityID        string                  `json:"authority_id"`
+	Schema              string                  `json:"schema"`
+	OperationID         string                  `json:"operation_id"`
+	DebtID              string                  `json:"debt_id"`
+	PersonalWorkspaceID string                  `json:"personal_workspace_id"`
+	RuntimeRunID        string                  `json:"runtime_run_id"`
+	AuthorityKind       AuthorityKind           `json:"authority_kind"`
+	AuthorityID         string                  `json:"authority_id"`
 	AuthorityGeneration AuthorizationGeneration `json:"authority_generation"`
-	ExpectedRevision   uint64                  `json:"expected_revision"`
-	ResourceGeneration uint64                  `json:"resource_generation"`
-	ResourceFence      uint64                  `json:"resource_fence"`
-	ExpiredAt          string                  `json:"expired_at"`
+	ExpectedRevision    uint64                  `json:"expected_revision"`
+	ResourceGeneration  uint64                  `json:"resource_generation"`
+	ResourceFence       uint64                  `json:"resource_fence"`
+	ExpiredAt           string                  `json:"expired_at"`
 }
 
 type canonicalCleanupReopen struct {
-	Schema             string `json:"schema"`
-	OperationID        string `json:"operation_id"`
-	DebtID             string `json:"debt_id"`
-	PersonalWorkspaceID string `json:"personal_workspace_id"`
-	RuntimeRunID       string `json:"runtime_run_id"`
-	AuthorityKind      AuthorityKind           `json:"authority_kind"`
-	AuthorityID        string                  `json:"authority_id"`
+	Schema              string                  `json:"schema"`
+	OperationID         string                  `json:"operation_id"`
+	DebtID              string                  `json:"debt_id"`
+	PersonalWorkspaceID string                  `json:"personal_workspace_id"`
+	RuntimeRunID        string                  `json:"runtime_run_id"`
+	AuthorityKind       AuthorityKind           `json:"authority_kind"`
+	AuthorityID         string                  `json:"authority_id"`
 	AuthorityGeneration AuthorizationGeneration `json:"authority_generation"`
-	ExpectedRevision   uint64                  `json:"expected_revision"`
-	ResourceGeneration uint64                  `json:"resource_generation"`
-	ResourceFence      uint64                  `json:"resource_fence"`
-	ReopenedAt         string                  `json:"reopened_at"`
+	ExpectedRevision    uint64                  `json:"expected_revision"`
+	ResourceGeneration  uint64                  `json:"resource_generation"`
+	ResourceFence       uint64                  `json:"resource_fence"`
+	ReopenedAt          string                  `json:"reopened_at"`
 }
 
 func cleanupExceptionExpiryDigest(input ExpireCleanupDebtExceptionInput) (Digest, error) {

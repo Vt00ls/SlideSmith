@@ -259,12 +259,12 @@ func (adapter *agentComposeHTTPAdapter) acceptAgent(
 	// Build the v2 run request using the stable SlideSmith operation ID
 	// as the vendor client_request_id.
 	runReq := agentComposeV2RunRequest{
-		ClientRequestID:    invocation.OperationID.String(),
-		Agent:              "agent", // resolved privately from RuntimeBinding
-		Prompt:             invocation.PromptReference.value,
-		Detached:           true,
-		ProjectRef:         "", // opaque; never business authority
-		PinnedImageDigest:  invocation.ImmutableInputManifest.Identity.String(),
+		ClientRequestID:      invocation.OperationID.String(),
+		Agent:                "agent", // resolved privately from RuntimeBinding
+		Prompt:               invocation.PromptReference.value,
+		Detached:             true,
+		ProjectRef:           "", // opaque; never business authority
+		PinnedImageDigest:    invocation.ImmutableInputManifest.Identity.String(),
 		PinnedExecutorDigest: invocation.EntrypointDigest.String(),
 	}
 

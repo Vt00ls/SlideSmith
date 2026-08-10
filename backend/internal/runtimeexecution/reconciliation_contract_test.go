@@ -73,10 +73,10 @@ func TestReconciliationContract_CrashAfterLeaseCommit_EntersReconciling(t *testi
 
 	harness, err := NewDeterministicHarness(HarnessConfig{
 		Now: now, IDs: DeterministicIDConfig{DecisionStart: 1000, LeaseStart: 100},
-		Runtimes:                 []RuntimeFixture{runtimeFixtureForStart(start, authority)},
-		AdmissionGrants:          []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(15*time.Minute), true)},
-		RuntimeBindingValidator:  acceptedRuntimeBindingValidatorForTest(t),
-		LeaseAcquisition:         alwaysReadyLeaseAcquisition(),
+		Runtimes:                []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants:         []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(15*time.Minute), true)},
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
+		LeaseAcquisition:        alwaysReadyLeaseAcquisition(),
 	})
 	if err != nil {
 		t.Fatalf("new harness: %v", err)
@@ -110,9 +110,9 @@ func TestReconciliationContract_NoLeasePhysicalDisposition_TerminalRejected(t *t
 
 	harness, err := NewDeterministicHarness(HarnessConfig{
 		Now: now, IDs: DeterministicIDConfig{DecisionStart: 1100},
-		Runtimes:                 []RuntimeFixture{runtimeFixtureForStart(start, authority)},
-		AdmissionGrants:          []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(15*time.Minute), true)},
-		RuntimeBindingValidator:  acceptedRuntimeBindingValidatorForTest(t),
+		Runtimes:                []RuntimeFixture{runtimeFixtureForStart(start, authority)},
+		AdmissionGrants:         []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(15*time.Minute), true)},
+		RuntimeBindingValidator: acceptedRuntimeBindingValidatorForTest(t),
 	})
 	if err != nil {
 		t.Fatalf("new harness: %v", err)

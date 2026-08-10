@@ -848,9 +848,9 @@ func cleanupResolutionDigest(resolution cleanupDebtResolution) (Digest, error) {
 		RemainingBlockerClasses: resolution.RemainingBlockers.Classes,
 		RemainingBlockerDigest:  formatOptionalCleanupDigest(resolution.RemainingBlockers.Digest),
 		Uncontained:             resolution.Uncontained, ExceptionUntil: formatOptionalCleanupTime(resolution.ExceptionUntil),
-		IncidentReference:       resolution.IncidentReference,
-		TicketReference:         resolution.TicketReference,
-		ApprovalReference:       resolution.ApprovalReference,
+		IncidentReference: resolution.IncidentReference,
+		TicketReference:   resolution.TicketReference,
+		ApprovalReference: resolution.ApprovalReference,
 	}
 	return cleanupMutationDigest(payload.Schema, payload)
 }

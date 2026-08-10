@@ -8,18 +8,16 @@ import (
 	"time"
 )
 
-
-
 // ReconcilingResult encodes the result of one reconciliation attempt.
 type ReconcilingResult uint8
 
 const (
-	ReconcilingResultStable       ReconcilingResult = iota + 1 // runtime is no longer reconciling
-	ReconcilingResultStillReconciling                           // still waiting for an external observation
-	ReconcilingResultTerminalRejected                           // permanently rejected (zero-lease proved)
-	ReconcilingResultTerminalLost                               // unrecoverable (possible process effect, can't reconcile)
-	ReconcilingResultTerminalTimedOut                           // deadline expired, no lease
-	ReconcilingResultIntegrityIncident                          // different digest conflict with retained binding
+	ReconcilingResultStable            ReconcilingResult = iota + 1 // runtime is no longer reconciling
+	ReconcilingResultStillReconciling                               // still waiting for an external observation
+	ReconcilingResultTerminalRejected                               // permanently rejected (zero-lease proved)
+	ReconcilingResultTerminalLost                                   // unrecoverable (possible process effect, can't reconcile)
+	ReconcilingResultTerminalTimedOut                               // deadline expired, no lease
+	ReconcilingResultIntegrityIncident                              // different digest conflict with retained binding
 )
 
 // ReconciliationObservation is a portable snapshot of what the reconciliation
@@ -85,15 +83,15 @@ type ReconciliationObserver interface {
 
 // ReconciliationRef identifies the original operation for observation.
 type ReconciliationRef struct {
-	RuntimeRunID           RuntimeRunID
-	OperationID            OperationID
-	StartDigest            Digest
+	RuntimeRunID            RuntimeRunID
+	OperationID             OperationID
+	StartDigest             Digest
 	LeaseAcquireOperationID OperationID
 	LeaseAcquireDigest      Digest
-	HasLease               bool
-	SandboxLeaseID         SandboxLeaseID
-	WorkerAuthorityID      WorkerAuthorityID
-	ExecutionNodeID        ExecutionNodeID
+	HasLease                bool
+	SandboxLeaseID          SandboxLeaseID
+	WorkerAuthorityID       WorkerAuthorityID
+	ExecutionNodeID         ExecutionNodeID
 }
 
 // ReconciliationObligation is the durable record of a runtime run that must
@@ -404,13 +402,13 @@ func validReconciliationRef(ref ReconciliationRef) bool {
 
 // ReconciliationDecision encapsulates the result of a reconciliation action.
 type ReconciliationDecision struct {
-	Result              ReconcilingResult
-	RuntimeSnapshot     RuntimeSnapshot
-	Obligation          *ReconciliationObligation
-	NoLeaseDisposition  bool
+	Result               ReconcilingResult
+	RuntimeSnapshot      RuntimeSnapshot
+	Obligation           *ReconciliationObligation
+	NoLeaseDisposition   bool
 	PhysicalReleaseReady bool
-	StaleEvidence       bool
-	IntegrityIncident   bool
+	StaleEvidence        bool
+	IntegrityIncident    bool
 }
 
 // ReconcileCommand is the top-level entry point for the reconciling loop.
@@ -441,12 +439,12 @@ func (machine *ReconciliationStateMachine) ReconcileCommand(
 	obligation, _ = machine.store.LoadReconciliationObligation(ctx, ref.RuntimeRunID)
 
 	return &ReconciliationDecision{
-		Result:              result,
-		RuntimeSnapshot:     finalSnapshot,
-		Obligation:          obligation,
-		NoLeaseDisposition:  result == ReconcilingResultTerminalRejected,
+		Result:               result,
+		RuntimeSnapshot:      finalSnapshot,
+		Obligation:           obligation,
+		NoLeaseDisposition:   result == ReconcilingResultTerminalRejected,
 		PhysicalReleaseReady: result == ReconcilingResultStable && snapshot.Lease.Disposition == LeaseReleased,
-		StaleEvidence:       result == ReconcilingResultIntegrityIncident,
+		StaleEvidence:        result == ReconcilingResultIntegrityIncident,
 	}, nil
 }
 

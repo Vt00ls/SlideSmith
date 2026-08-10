@@ -190,15 +190,15 @@ func TestAgentComposeDaemonConfigValidation(t *testing.T) {
 	t.Parallel()
 
 	valid := AgentComposeDaemonConfig{
-		Endpoint:               "https://127.0.0.1:8443",
-		TLS:                    &AgentComposeTLSConfig{InsecureSkipVerify: false, CACertPEM: []byte("ca-cert")},
-		DaemonImageDigest:      digest(1),
+		Endpoint:                "https://127.0.0.1:8443",
+		TLS:                     &AgentComposeTLSConfig{InsecureSkipVerify: false, CACertPEM: []byte("ca-cert")},
+		DaemonImageDigest:       digest(1),
 		GuestRuntimeImageDigest: digest(2),
-		ExecutorContractDigest: digest(3),
-		DataRoot:               "/var/agent-compose/node-1",
-		RequestTimeout:         30 * time.Second,
-		MaxRetries:             3,
-		RetryBackoff:           2 * time.Second,
+		ExecutorContractDigest:  digest(3),
+		DataRoot:                "/var/agent-compose/node-1",
+		RequestTimeout:          30 * time.Second,
+		MaxRetries:              3,
+		RetryBackoff:            2 * time.Second,
 	}
 	if err := ValidateDaemonConfig(valid); err != nil {
 		t.Fatalf("valid config rejected: %v", err)
@@ -281,8 +281,8 @@ func TestAgentComposeObservationNormalization(t *testing.T) {
 
 	adapter := &agentComposeHTTPAdapter{}
 	invocation := agentCapabilityInvocation{
-		OperationID:  mustOperationID(t, "obs-test"),
-		CapsuleID:    ExecutionCapsuleID{value: "capsule-1"},
+		OperationID:   mustOperationID(t, "obs-test"),
+		CapsuleID:     ExecutionCapsuleID{value: "capsule-1"},
 		CapsuleDigest: digest(100),
 	}
 
@@ -332,20 +332,20 @@ func TestToolExecutorProductionQualification(t *testing.T) {
 	}
 
 	valid := ToolExecutorConfig{
-		Mode:                 ToolExecutorPinnedImage,
-		ImageDigest:          digest(1),
+		Mode:                   ToolExecutorPinnedImage,
+		ImageDigest:            digest(1),
 		ExecutorContractDigest: digest(2),
-		CapabilityKey:        ToolCapabilityDocumentRender,
+		CapabilityKey:          ToolCapabilityDocumentRender,
 	}
 	if err := ValidateToolExecutorConfig(valid); err != nil {
 		t.Fatalf("pinned-image config rejected: %v", err)
 	}
 
 	binary := ToolExecutorConfig{
-		Mode:                  ToolExecutorPinnedBinary,
-		BinaryDigest:          digest(1),
+		Mode:                   ToolExecutorPinnedBinary,
+		BinaryDigest:           digest(1),
 		ExecutorContractDigest: digest(2),
-		CapabilityKey:         ToolCapabilityDocumentRender,
+		CapabilityKey:          ToolCapabilityDocumentRender,
 	}
 	if err := ValidateToolExecutorConfig(binary); err != nil {
 		t.Fatalf("pinned-binary config rejected: %v", err)
@@ -374,9 +374,9 @@ func TestToolExecutorAgentComposeParity(t *testing.T) {
 	// the Agent Compose HTTP adapter with correctly mapped invocation.
 
 	viaCompose := ToolExecutorConfig{
-		Mode:                  ToolExecutorViaAgentCompose,
+		Mode:                   ToolExecutorViaAgentCompose,
 		ExecutorContractDigest: digest(1),
-		CapabilityKey:         ToolCapabilityDocumentRender,
+		CapabilityKey:          ToolCapabilityDocumentRender,
 		// AgentComposeAdapter is intentionally nil here — the config
 		// validation will reject it. In production it would be wired to
 		// a real adapter.
@@ -390,10 +390,10 @@ func TestToolExecutorCapabilityContractDigest(t *testing.T) {
 	t.Parallel()
 
 	config := ToolExecutorConfig{
-		Mode:                 ToolExecutorPinnedImage,
-		ImageDigest:          digest(10),
+		Mode:                   ToolExecutorPinnedImage,
+		ImageDigest:            digest(10),
 		ExecutorContractDigest: digest(20),
-		CapabilityKey:        ToolCapabilityDocumentRender,
+		CapabilityKey:          ToolCapabilityDocumentRender,
 	}
 	digest1, err := ToolExecutorCapabilityContractDigest(config)
 	if err != nil {

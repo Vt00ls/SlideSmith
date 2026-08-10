@@ -13,21 +13,21 @@ import (
 
 // evidenceTerminalCommand captures the validated evidence state for terminal CAS.
 type evidenceTerminalCommand struct {
-	OperationID             OperationID
-	PersonalWorkspaceID     PersonalWorkspaceID
-	TaskID                  TaskID
-	PhaseRunID              PhaseRunID
-	RuntimeRunID            RuntimeRunID
-	ExpectedRuntimeRevision RuntimeRevision
-	ExpectedStartOperationID OperationID
+	OperationID                 OperationID
+	PersonalWorkspaceID         PersonalWorkspaceID
+	TaskID                      TaskID
+	PhaseRunID                  PhaseRunID
+	RuntimeRunID                RuntimeRunID
+	ExpectedRuntimeRevision     RuntimeRevision
+	ExpectedStartOperationID    OperationID
 	ExpectedOperationGeneration OperationGeneration
-	ExpectedRuntimeFence    RuntimeFence
-	Authority               RuntimeAuthority
-	SafetyEpoch             ReleaseSafetyEpoch
-	OccurredAt              time.Time
-	CanonicalRequestDigest  Digest
-	Evidence                ValidatedRuntimeEvidence
-	Outcome                 RuntimeOutcome
+	ExpectedRuntimeFence        RuntimeFence
+	Authority                   RuntimeAuthority
+	SafetyEpoch                 ReleaseSafetyEpoch
+	OccurredAt                  time.Time
+	CanonicalRequestDigest      Digest
+	Evidence                    ValidatedRuntimeEvidence
+	Outcome                     RuntimeOutcome
 }
 
 // ValidatedRuntimeEvidence holds evidence that has passed trust validation.
@@ -53,22 +53,23 @@ type ValidatedRuntimeEvidence struct {
 type evidenceTerminalDisposition uint8
 
 const (
-	evidenceTerminalAccepted      evidenceTerminalDisposition = iota + 1
-	evidenceTerminalFenced        // cancel/timeout fence already committed
-	evidenceTerminalDiagnosticOnly // late success stored as diagnostic only
+	evidenceTerminalAccepted       evidenceTerminalDisposition = iota + 1
+	evidenceTerminalFenced                                     // cancel/timeout fence already committed
+	evidenceTerminalDiagnosticOnly                             // late success stored as diagnostic only
 )
 
 func (authority *PostgresAuthority) advancePostgresEvidenceTerminal(
 	ctx context.Context,
 	start StartRuntimeRun,
-	snapshot RuntimeSnapshot,
+	decision RuntimeDecision,
 ) (RuntimeDecision, error) {
+	snapshot := decision.Snapshot
 	if !candidateForEvidenceTerminal(snapshot) {
-		return RuntimeDecision{Snapshot: snapshot}, nil
+		return decision, nil
 	}
 	evidence, outcome, err := validateEvidenceForTerminalIngestion(snapshot)
 	if err != nil {
-		return RuntimeDecision{Snapshot: snapshot}, nil
+		return decision, nil
 	}
 	operationID, digest, canonical := stableEvidenceTerminalBinding(snapshot, start.OperationID, evidence, outcome)
 	binding := retainedCommandBindingValue{
@@ -82,10 +83,10 @@ func (authority *PostgresAuthority) advancePostgresEvidenceTerminal(
 		auditAction:                 postgresAuditEvidenceTerminal,
 		auditReasonCode:             uint8(outcome),
 	}
-	return authority.executePostgresEvidenceTerminal(ctx, evidenceTerminalCommand{
+	terminal, err := authority.executePostgresEvidenceTerminal(ctx, evidenceTerminalCommand{
 		OperationID: operationID, PersonalWorkspaceID: start.PersonalWorkspaceID,
 		TaskID: start.TaskID, PhaseRunID: start.PhaseRunID, RuntimeRunID: start.RuntimeRunID,
-		ExpectedRuntimeRevision: snapshot.RuntimeRevision,
+		ExpectedRuntimeRevision:     snapshot.RuntimeRevision,
 		ExpectedStartOperationID:    start.OperationID,
 		ExpectedOperationGeneration: snapshot.Operation.Generation,
 		ExpectedRuntimeFence:        snapshot.RuntimeFence,
@@ -96,6 +97,14 @@ func (authority *PostgresAuthority) advancePostgresEvidenceTerminal(
 		Evidence:                    evidence,
 		Outcome:                     outcome,
 	}, binding)
+	if err != nil {
+		return RuntimeDecision{}, err
+	}
+	// The Execute caller's command fact is authoritative for the returned
+	// decision; the evidence-terminal ingestion is an internal transition
+	// whose snapshot replaces the current view.
+	terminal.Fact = decision.Fact
+	return terminal, nil
 }
 
 func candidateForEvidenceTerminal(snapshot RuntimeSnapshot) bool {
@@ -553,21 +562,21 @@ func (authority *PostgresAuthority) executePostgresEvidenceTerminal(
 
 	// Task evidence outbox — bridge for Task Orchestration consumption
 	evidenceOutboxBytes, err := json.Marshal(TaskEvidenceOutboxRecord{
-		TaskID:                  command.TaskID.String(),
-		PhaseRunID:              command.PhaseRunID.String(),
-		RuntimeRunID:            command.RuntimeRunID.String(),
-		EvidenceID:              command.Evidence.EvidenceID.String(),
-		EvidenceDigest:          command.Evidence.EvidenceDigest.String(),
-		EvidenceRootID:          command.Evidence.EvidenceRootID.String(),
-		EvidenceRootDigest:      command.Evidence.EvidenceRootDigest.String(),
-		Outcome:                 command.Outcome,
-		RuntimeRevision:         record.fixture.RuntimeRevision,
-		RuntimeFence:            record.fixture.RuntimeFence,
-		LeaseID:                 record.lease.LeaseID.String(),
-		LeaseGeneration:         record.lease.Generation,
-		LeaseFence:              record.lease.Fence,
-		ObservedAt:              command.Evidence.ObservedAt,
-		DecisionID:              decisionID.String(),
+		TaskID:             command.TaskID.String(),
+		PhaseRunID:         command.PhaseRunID.String(),
+		RuntimeRunID:       command.RuntimeRunID.String(),
+		EvidenceID:         command.Evidence.EvidenceID.String(),
+		EvidenceDigest:     command.Evidence.EvidenceDigest.String(),
+		EvidenceRootID:     command.Evidence.EvidenceRootID.String(),
+		EvidenceRootDigest: command.Evidence.EvidenceRootDigest.String(),
+		Outcome:            command.Outcome,
+		RuntimeRevision:    record.fixture.RuntimeRevision,
+		RuntimeFence:       record.fixture.RuntimeFence,
+		LeaseID:            record.lease.LeaseID.String(),
+		LeaseGeneration:    record.lease.Generation,
+		LeaseFence:         record.lease.Fence,
+		ObservedAt:         command.Evidence.ObservedAt,
+		DecisionID:         decisionID.String(),
 	})
 	if err != nil {
 		return RuntimeDecision{}, newError(ErrorIntegrityConflict)
@@ -645,13 +654,13 @@ func (authority *PostgresAuthority) storeDiagnosticOnlyEvidence(
 	committedAt time.Time,
 ) error {
 	payload := map[string]any{
-		"evidence_id":         command.Evidence.EvidenceID.String(),
-		"evidence_digest":     command.Evidence.EvidenceDigest.String(),
-		"evidence_root_id":    command.Evidence.EvidenceRootID.String(),
+		"evidence_id":          command.Evidence.EvidenceID.String(),
+		"evidence_digest":      command.Evidence.EvidenceDigest.String(),
+		"evidence_root_id":     command.Evidence.EvidenceRootID.String(),
 		"evidence_root_digest": command.Evidence.EvidenceRootDigest.String(),
-		"outcome":             command.Outcome,
-		"observed_at":         command.Evidence.ObservedAt,
-		"diagnostic_only":     true,
+		"outcome":              command.Outcome,
+		"observed_at":          command.Evidence.ObservedAt,
+		"diagnostic_only":      true,
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
@@ -760,19 +769,19 @@ func (authority *PostgresAuthority) ensurePostgresEvidenceRoot(
 // TaskEvidenceOutboxRecord is the typed bridge record the Task Orchestration
 // consumer uses to observe evidence without copying C03 state machine logic.
 type TaskEvidenceOutboxRecord struct {
-	TaskID             string         `json:"task_id"`
-	PhaseRunID         string         `json:"phase_run_id"`
-	RuntimeRunID       string         `json:"runtime_run_id"`
-	EvidenceID         string         `json:"evidence_id"`
-	EvidenceDigest     string         `json:"evidence_digest"`
-	EvidenceRootID     string         `json:"evidence_root_id"`
-	EvidenceRootDigest  string         `json:"evidence_root_digest"`
-	Outcome            RuntimeOutcome `json:"outcome"`
+	TaskID             string          `json:"task_id"`
+	PhaseRunID         string          `json:"phase_run_id"`
+	RuntimeRunID       string          `json:"runtime_run_id"`
+	EvidenceID         string          `json:"evidence_id"`
+	EvidenceDigest     string          `json:"evidence_digest"`
+	EvidenceRootID     string          `json:"evidence_root_id"`
+	EvidenceRootDigest string          `json:"evidence_root_digest"`
+	Outcome            RuntimeOutcome  `json:"outcome"`
 	RuntimeRevision    RuntimeRevision `json:"runtime_revision"`
 	RuntimeFence       RuntimeFence    `json:"runtime_fence"`
-	LeaseID            string         `json:"lease_id"`
+	LeaseID            string          `json:"lease_id"`
 	LeaseGeneration    LeaseGeneration `json:"lease_generation"`
-	LeaseFence         LeaseFence     `json:"lease_fence"`
-	ObservedAt         time.Time      `json:"observed_at"`
-	DecisionID         string         `json:"decision_id"`
+	LeaseFence         LeaseFence      `json:"lease_fence"`
+	ObservedAt         time.Time       `json:"observed_at"`
+	DecisionID         string          `json:"decision_id"`
 }
