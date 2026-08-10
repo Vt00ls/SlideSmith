@@ -332,6 +332,11 @@ func (m *inMemory) reject(
 	case OperationRejected:
 		return PublicationDecision{}, &Error{Code: ErrorTerminalConflict}
 	}
+	// Reject, like cancel, accepts only the exact current operation
+	// generation and fence; a stale reject fails closed.
+	if header.Generation != record.generation || header.Fence != record.fence {
+		return PublicationDecision{}, &Error{Code: ErrorStaleAuthority}
+	}
 	record.rejectReason = intent.Reason
 	record.state = OperationRejected
 	record.residue = m.releaseResidue(record, header)
