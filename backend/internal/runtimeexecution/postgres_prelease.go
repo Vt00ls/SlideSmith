@@ -488,7 +488,7 @@ func (authority *PostgresAuthority) commitPostgresPreLease(
 		DecisionID: decisionID, RuntimeRunID: start.RuntimeRunID, OperationID: request.OperationID,
 		CanonicalDigest: request.Digest, RuntimeRevision: record.fixture.RuntimeRevision,
 		AuditFactID: auditID, AuditCanonicalDigest: auditDigest, ProjectionSchemaVersion: SchemaV1,
-	})
+	}, auditState)
 	if authority.failAt(PersistenceFaultBeforeResponse) {
 		return RuntimeSnapshot{}, newError(ErrorReconciliationRequired)
 	}

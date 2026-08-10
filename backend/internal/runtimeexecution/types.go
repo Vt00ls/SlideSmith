@@ -952,6 +952,12 @@ const (
 	ReconciliationRequired
 )
 
+type Error struct {
+	code           ErrorCode
+	retry          RetryDisposition
+	reconciliation ReconciliationDisposition
+}
+
 type ErrorCode uint8
 
 const (
@@ -961,12 +967,61 @@ const (
 	ErrorUnsupportedSchema
 	ErrorDependencyUnavailable
 	ErrorReconciliationRequired
+	ErrorStaleState
+	ErrorBindingUnavailable
+	ErrorEvidenceIntegrity
+	ErrorAdmissionDeferred
+	ErrorAdapterUnavailable
+	ErrorAgentToolFailure
+	ErrorCancelOrDeadline
+	ErrorWorkerOrNodeLost
+	ErrorCleanupPending
 )
 
-type Error struct {
-	code           ErrorCode
-	retry          RetryDisposition
-	reconciliation ReconciliationDisposition
+// String returns the closed safe category name. A safe error never retains a
+// raw cause, message, locator, or cross-Workspace existence.
+func (code ErrorCode) String() string {
+	switch code {
+	case ErrorAuthorizationDenied:
+		return "authorization_denied"
+	case ErrorInvalidRequest:
+		return "invalid_request"
+	case ErrorIntegrityConflict:
+		return "integrity_conflict"
+	case ErrorUnsupportedSchema:
+		return "unsupported_schema"
+	case ErrorDependencyUnavailable:
+		return "dependency_unavailable"
+	case ErrorReconciliationRequired:
+		return "reconciliation_required"
+	case ErrorStaleState:
+		return "stale_state"
+	case ErrorBindingUnavailable:
+		return "binding_unavailable"
+	case ErrorEvidenceIntegrity:
+		return "evidence_integrity"
+	case ErrorAdmissionDeferred:
+		return "admission_deferred"
+	case ErrorAdapterUnavailable:
+		return "adapter_unavailable"
+	case ErrorAgentToolFailure:
+		return "agent_tool_failure"
+	case ErrorCancelOrDeadline:
+		return "cancel_or_deadline"
+	case ErrorWorkerOrNodeLost:
+		return "worker_or_node_lost"
+	case ErrorCleanupPending:
+		return "cleanup_pending"
+	default:
+		return "invalid_request"
+	}
+}
+
+// validSafeErrorCode reports whether code is a member of the closed Decision
+// 88 taxonomy. Retryability never weakens authorization, integrity, deadline,
+// or fencing.
+func validSafeErrorCode(code ErrorCode) bool {
+	return code >= ErrorAuthorizationDenied && code <= ErrorCleanupPending
 }
 
 func (failure *Error) Error() string {
@@ -984,6 +1039,24 @@ func (failure *Error) Error() string {
 		return "runtime execution dependency is unavailable"
 	case ErrorReconciliationRequired:
 		return "runtime execution result requires reconciliation"
+	case ErrorStaleState:
+		return "runtime execution state is stale"
+	case ErrorBindingUnavailable:
+		return "runtime execution binding is unavailable"
+	case ErrorEvidenceIntegrity:
+		return "runtime execution evidence is invalid"
+	case ErrorAdmissionDeferred:
+		return "runtime execution admission is deferred"
+	case ErrorAdapterUnavailable:
+		return "runtime execution adapter is unavailable"
+	case ErrorAgentToolFailure:
+		return "runtime execution agent or tool failed"
+	case ErrorCancelOrDeadline:
+		return "runtime execution was cancelled or exceeded its deadline"
+	case ErrorWorkerOrNodeLost:
+		return "runtime execution worker or node was lost"
+	case ErrorCleanupPending:
+		return "runtime execution cleanup is pending"
 	default:
 		return "runtime execution request is invalid"
 	}
@@ -1013,9 +1086,9 @@ func (failure *Error) ReconciliationDisposition() ReconciliationDisposition {
 func newError(code ErrorCode) *Error {
 	failure := &Error{code: code}
 	switch code {
-	case ErrorDependencyUnavailable:
+	case ErrorDependencyUnavailable, ErrorAdapterUnavailable, ErrorAdmissionDeferred:
 		failure.retry = RetryAfterDependency
-	case ErrorReconciliationRequired:
+	case ErrorReconciliationRequired, ErrorWorkerOrNodeLost:
 		failure.retry = RetrySameRequest
 		failure.reconciliation = ReconciliationRequired
 	}

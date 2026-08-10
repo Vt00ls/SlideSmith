@@ -433,7 +433,7 @@ func (authority *PostgresAuthority) persistReconciliationFoundation(
 		DecisionID: decisionID, RuntimeRunID: intent.RuntimeRunID, OperationID: intent.OperationID,
 		CanonicalDigest: intent.CanonicalDigest, RuntimeRevision: record.fixture.RuntimeRevision,
 		AuditFactID: auditID, AuditCanonicalDigest: auditDigest, ProjectionSchemaVersion: SchemaV1,
-	})
+	}, auditState)
 	if authority.failAt(PersistenceFaultBeforeResponse) {
 		return RuntimeDecision{}, newError(ErrorReconciliationRequired)
 	}
@@ -676,31 +676,50 @@ func (function ProjectionDeliveryFunc) Deliver(ctx context.Context, fact Project
 	return function(ctx, fact)
 }
 
-func (authority *PostgresAuthority) deliverProjection(ctx context.Context, fact ProjectionFact) {
-	if authority.projection == nil {
+func (authority *PostgresAuthority) deliverProjection(
+	ctx context.Context,
+	fact ProjectionFact,
+	auditState postgresMandatoryAuditState,
+) {
+	if authority.projection == nil && authority.telemetry == nil {
 		return
 	}
-	deliveryError := authority.projection.Deliver(ctx, fact)
-	status := ProjectionDelivered
+	now := postgresTimestamp(authority.now())
+	auditStatus := ProjectionPending
+	telemetryStatus := ProjectionPending
 	safeFailure := ProjectionFailureNone
 	degraded := false
-	if deliveryError != nil {
-		status = ProjectionFailed
-		safeFailure = ProjectionFailureUnavailable
-		degraded = true
+	if authority.projection != nil {
+		auditStatus = ProjectionDelivered
+		if deliveryError := authority.projection.Deliver(ctx, fact); deliveryError != nil {
+			auditStatus = ProjectionFailed
+			safeFailure = ProjectionFailureUnavailable
+			degraded = true
+		}
 	}
-	now := postgresTimestamp(authority.now())
+	telemetryStatus = auditStatus
+	if authority.telemetry != nil {
+		telemetryStatus = ProjectionDelivered
+		projection, projectionErr := telemetryProjectionFromAudit(fact, auditState)
+		if projectionErr != nil {
+			telemetryStatus = ProjectionFailed
+			degraded = true
+		} else if deliveryError := authority.telemetry.ProjectTelemetry(ctx, projection); deliveryError != nil {
+			telemetryStatus = ProjectionFailed
+			degraded = true
+		}
+	}
 	var deliveredAt any
-	if status == ProjectionDelivered {
+	if auditStatus == ProjectionDelivered && telemetryStatus == ProjectionDelivered {
 		deliveredAt = now
 	}
 	_, _ = authority.db.ExecContext(ctx, fmt.Sprintf(`UPDATE %s SET
-		audit_delivery_status=$1, telemetry_delivery_status=$1,
-		attempt_count=attempt_count+1, last_safe_failure=$2, degraded=$3,
-		first_attempt_at=COALESCE(first_attempt_at,$4), last_attempt_at=$4,
-		delivered_at=COALESCE($5,delivered_at)
-		WHERE fact_id=$6 AND audit_fact_id=$7 AND audit_canonical_digest=$8
-		AND fact_revision=$9 AND projection_schema_version=$10`, authority.table("runtime_execution_projection_backlog")),
-		status, safeFailure, degraded, now, deliveredAt, fact.DecisionID.String(), fact.AuditFactID,
+		audit_delivery_status=$1, telemetry_delivery_status=$2,
+		attempt_count=attempt_count+1, last_safe_failure=$3, degraded=$4,
+		first_attempt_at=COALESCE(first_attempt_at,$5), last_attempt_at=$5,
+		delivered_at=COALESCE($6,delivered_at)
+		WHERE fact_id=$7 AND audit_fact_id=$8 AND audit_canonical_digest=$9
+		AND fact_revision=$10 AND projection_schema_version=$11`, authority.table("runtime_execution_projection_backlog")),
+		auditStatus, telemetryStatus, safeFailure, degraded, now, deliveredAt, fact.DecisionID.String(), fact.AuditFactID,
 		fact.AuditCanonicalDigest[:], fact.RuntimeRevision, fact.ProjectionSchemaVersion)
 }

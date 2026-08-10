@@ -552,7 +552,7 @@ func (authority *PostgresAuthority) executePostgresRuntimeTerminal(
 		DecisionID: decisionID, RuntimeRunID: command.RuntimeRunID, OperationID: command.OperationID,
 		CanonicalDigest: command.CanonicalRequestDigest, RuntimeRevision: record.fixture.RuntimeRevision,
 		AuditFactID: auditID, AuditCanonicalDigest: auditDigest, ProjectionSchemaVersion: SchemaV1,
-	})
+	}, auditState)
 	if authority.failAt(PersistenceFaultBeforeResponse) {
 		return RuntimeDecision{}, newError(ErrorReconciliationRequired)
 	}
