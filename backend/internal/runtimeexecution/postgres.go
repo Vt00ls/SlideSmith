@@ -71,6 +71,7 @@ type PostgresConfig struct {
 	Now                                 func() time.Time
 	Faults                              PersistenceFaultInjector
 	ProjectionDelivery                  ProjectionDelivery
+	Telemetry                           TelemetrySink
 	SchedulerParticipant                SchedulerAcceptanceParticipant
 	SchedulerAcceptanceFunction         string
 	SchedulerLeaseAttachmentParticipant SchedulerLeaseAttachmentParticipant
@@ -103,6 +104,7 @@ type PostgresAuthority struct {
 	now                                 func() time.Time
 	faults                              PersistenceFaultInjector
 	projection                          ProjectionDelivery
+	telemetry                           TelemetrySink
 	schedulerParticipant                SchedulerAcceptanceParticipant
 	schedulerAcceptanceFunction         string
 	schedulerLeaseAttachmentParticipant SchedulerLeaseAttachmentParticipant
@@ -181,6 +183,7 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 	}
 	return &PostgresAuthority{
 		db: db, schema: schema, now: now, faults: config.Faults, projection: config.ProjectionDelivery,
+		telemetry:                           config.Telemetry,
 		schedulerParticipant:                config.SchedulerParticipant,
 		schedulerAcceptanceFunction:         config.SchedulerAcceptanceFunction,
 		schedulerLeaseAttachmentParticipant: config.SchedulerLeaseAttachmentParticipant,
