@@ -11,14 +11,14 @@ func TestRecoveryContract_ClassifyZeroLease_Rejected(t *testing.T) {
 	t.Parallel()
 
 	classification := ClassifyPostRestore(
-		RuntimeWaitingForLease,       // state
-		RuntimeOutcomeNone,           // outcome
-		LeaseNotRequested,            // leaseStatus
-		LeaseDispositionNone,         // leaseDisposition
-		false,                        // hasProcessEvidence
-		true,                         // hasNoLeaseDisposition
-		RuntimeFence(5),              // preRestoreFence
-		RuntimeFence(100),            // newFence
+		RuntimeWaitingForLease, // state
+		RuntimeOutcomeNone,     // outcome
+		LeaseNotRequested,      // leaseStatus
+		LeaseDispositionNone,   // leaseDisposition
+		false,                  // hasProcessEvidence
+		true,                   // hasNoLeaseDisposition
+		RuntimeFence(5),        // preRestoreFence
+		RuntimeFence(100),      // newFence
 	)
 
 	if classification != RestoreClassificationZeroLeaseRejected {
@@ -34,7 +34,7 @@ func TestRecoveryContract_ClassifyAmbiguousLease_Reconcile(t *testing.T) {
 	classification := ClassifyPostRestore(
 		RuntimeWaitingForLease,
 		RuntimeOutcomeNone,
-		LeaseAcquirePending,           // lease in progress
+		LeaseAcquirePending, // lease in progress
 		LeaseDispositionNone,
 		false,
 		false,

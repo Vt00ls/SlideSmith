@@ -12,8 +12,8 @@ import (
 // runs. It never restores live sandbox, Runtime View, session, node DB, queue
 // projection, or secret/cache state.
 type RecoveryPointRestore struct {
-	store    RecoveryStore
-	clock    func() time.Time
+	store RecoveryStore
+	clock func() time.Time
 }
 
 // RecoveryStore is the persistence contract for recovery operations.
@@ -43,11 +43,11 @@ type RecoveryStore interface {
 
 // RecoveryState is the singleton recovery authority record.
 type RecoveryState struct {
-	Generation    RecoveryGeneration
-	Fence         RecoveryFence
-	SafetyEpoch   SafetyEpoch
-	Mode          OperationalMode
-	RestoredAt    time.Time
+	Generation      RecoveryGeneration
+	Fence           RecoveryFence
+	SafetyEpoch     SafetyEpoch
+	Mode            OperationalMode
+	RestoredAt      time.Time
 	RecoveryPointID string
 }
 
@@ -65,48 +65,48 @@ type SafetyEpoch uint64
 type OperationalMode uint8
 
 const (
-	OperationalReadOnly  OperationalMode = iota + 1
+	OperationalReadOnly OperationalMode = iota + 1
 	OperationalFullReady
 )
 
 // RestoreDecision records the authoritative outcome of a restore.
 type RestoreDecision struct {
-	RecoveryPointID           string
-	NewGeneration             RecoveryGeneration
-	NewFence                  RecoveryFence
-	NewSafetyEpoch            SafetyEpoch
-	PreviousGeneration        RecoveryGeneration
-	PreviousFence             RecoveryFence
-	PreviousSafetyEpoch       SafetyEpoch
-	Mode                      OperationalMode
-	FencedRuntimeRuns         []RuntimeRunID
-	RejectedRuntimeRuns       []RuntimeRunID
-	LostRuntimeRuns           []RuntimeRunID
-	DecidedAt                 time.Time
+	RecoveryPointID     string
+	NewGeneration       RecoveryGeneration
+	NewFence            RecoveryFence
+	NewSafetyEpoch      SafetyEpoch
+	PreviousGeneration  RecoveryGeneration
+	PreviousFence       RecoveryFence
+	PreviousSafetyEpoch SafetyEpoch
+	Mode                OperationalMode
+	FencedRuntimeRuns   []RuntimeRunID
+	RejectedRuntimeRuns []RuntimeRunID
+	LostRuntimeRuns     []RuntimeRunID
+	DecidedAt           time.Time
 }
 
 // RestoreRuntimeClassification is the result of classifying one runtime run
 // after a restore.
 type RestoreRuntimeClassification struct {
-	RuntimeRunID         RuntimeRunID
-	Classification       RestoreClassification
-	PreRestoreState      RuntimeState
-	PostRestoreState     RuntimeState
-	PostRestoreOutcome   RuntimeOutcome
-	NoLeaseDisposition   bool
-	CapacityReleased     bool
+	RuntimeRunID       RuntimeRunID
+	Classification     RestoreClassification
+	PreRestoreState    RuntimeState
+	PostRestoreState   RuntimeState
+	PostRestoreOutcome RuntimeOutcome
+	NoLeaseDisposition bool
+	CapacityReleased   bool
 }
 
 // RestoreClassification categorises what happens to a runtime run after restore.
 type RestoreClassification uint8
 
 const (
-	RestoreClassificationNone          RestoreClassification = iota
-	RestoreClassificationZeroLeaseRejected                          // no lease committed → Rejected
-	RestoreClassificationAmbiguousReconcile                         // lease transaction ambiguous → reconcile
-	RestoreClassificationPossibleEffectLost                         // possible process effect → Lost
-	RestoreClassificationAlreadyTerminal                            // already terminal, no change
-	RestoreClassificationFenced                                     // fenced by recovery
+	RestoreClassificationNone               RestoreClassification = iota
+	RestoreClassificationZeroLeaseRejected                        // no lease committed → Rejected
+	RestoreClassificationAmbiguousReconcile                       // lease transaction ambiguous → reconcile
+	RestoreClassificationPossibleEffectLost                       // possible process effect → Lost
+	RestoreClassificationAlreadyTerminal                          // already terminal, no change
+	RestoreClassificationFenced                                   // fenced by recovery
 )
 
 // NewRecoveryPointRestore creates a new recovery point restore state machine.

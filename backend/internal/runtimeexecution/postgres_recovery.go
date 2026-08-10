@@ -177,8 +177,8 @@ func (store *PostgresRecoveryStore) ClassifyRuntimeAfterRestore(
 	)
 
 	runtimeClassification := &RestoreRuntimeClassification{
-		RuntimeRunID:   runtimeRunID,
-		Classification: classification,
+		RuntimeRunID:    runtimeRunID,
+		Classification:  classification,
 		PreRestoreState: snapshot.State,
 	}
 

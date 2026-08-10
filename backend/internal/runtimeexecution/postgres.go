@@ -1323,7 +1323,7 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 			decision.Snapshot.Lease.Disposition == LeaseActive &&
 			(decision.Snapshot.Worker.Status == WorkerOperationSuccessObserved ||
 				decision.Snapshot.Worker.Status == WorkerOperationFailureObserved) {
-			decision, executeErr = authority.advancePostgresEvidenceTerminal(ctx, start, decision.Snapshot)
+			decision, executeErr = authority.advancePostgresEvidenceTerminal(ctx, start, decision)
 			if executeErr != nil {
 				return RuntimeDecision{}, executeErr
 			}
@@ -1368,7 +1368,7 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 		if executeErr != nil {
 			return RuntimeDecision{}, executeErr
 		}
-		decision, executeErr = authority.advancePostgresEvidenceTerminal(ctx, start, decision.Snapshot)
+		decision, executeErr = authority.advancePostgresEvidenceTerminal(ctx, start, decision)
 		if executeErr != nil {
 			return RuntimeDecision{}, executeErr
 		}
@@ -1393,12 +1393,12 @@ func (authority *PostgresAuthority) Execute(ctx context.Context, command Runtime
 			StartRuntimeRun{StartRuntimeRunInput: StartRuntimeRunInput{
 				PersonalWorkspaceID: cancel.PersonalWorkspaceID, TaskID: cancel.TaskID,
 				PhaseRunID: cancel.PhaseRunID, RuntimeRunID: cancel.RuntimeRunID,
-				OperationID: cancel.ExpectedStartOperationID,
-				ExpectedRuntimeRevision: cancel.ExpectedRuntimeRevision,
+				OperationID:                 cancel.ExpectedStartOperationID,
+				ExpectedRuntimeRevision:     cancel.ExpectedRuntimeRevision,
 				ExpectedOperationGeneration: cancel.ExpectedOperationGeneration,
-				ExpectedRuntimeFence: cancel.ExpectedRuntimeFence,
-				Authority: cancel.Authority, ReleaseSafetyEpoch: cancel.SafetyEpoch,
-			}}, decision.Snapshot)
+				ExpectedRuntimeFence:        cancel.ExpectedRuntimeFence,
+				Authority:                   cancel.Authority, ReleaseSafetyEpoch: cancel.SafetyEpoch,
+			}}, decision)
 		if executeErr != nil {
 			return RuntimeDecision{}, executeErr
 		}

@@ -119,52 +119,52 @@ type cleanupBlockerSummary struct {
 }
 
 type cleanupDebtRecord struct {
-	DebtID                     string
-	Revision                   uint64
-	OwnerModule                string
-	PersonalWorkspaceID        PersonalWorkspaceID
-	TaskID                     TaskID
-	PhaseRunID                 PhaseRunID
-	RuntimeRunID               RuntimeRunID
-	OwnerAuthority             RuntimeAuthority
-	ResourceClass              cleanupResourceClass
-	ResourceIdentityDigest     Digest
-	ResourceGeneration         uint64
-	ResourceFence              uint64
-	CleanupIntent              cleanupIntent
-	CauseDecisionID            RuntimeDecisionID
-	CauseOperationID           OperationID
-	RetentionFactDigest        Digest
-	EligibilityFactDigest      Digest
-	Status                     cleanupDebtStatus
-	Unresolved                 bool
-	Uncontained                bool
-	CreatedAt                  time.Time
-	EligibleAt                 time.Time
-	FirstAttemptAt             time.Time
-	LastAttemptAt              time.Time
-	NextRetryAt                time.Time
-	AttemptCount               uint64
-	ConsecutiveFailureCount    uint64
-	ClaimGeneration            uint64
-	ClaimFence                 uint64
-	RetryDisposition           cleanupRetryDisposition
-	LastErrorCategory          cleanupFailureCategory
-	LastErrorDigest            Digest
-	LastErrorEvidenceReference string
-	Estimation                 cleanupEstimation
-	Blockers                   cleanupBlockerSummary
-	ResolvedAt                 time.Time
-	ResolutionClass            cleanupResolutionClass
-	ResolutionReason           cleanupResolutionReason
-	ResolutionAuthority        RuntimeAuthority
-	ResolutionAuditFactID      string
-	ResolutionEvidenceRoot     EvidenceRootSnapshot
-	ResolutionExpiresAt        time.Time
+	DebtID                      string
+	Revision                    uint64
+	OwnerModule                 string
+	PersonalWorkspaceID         PersonalWorkspaceID
+	TaskID                      TaskID
+	PhaseRunID                  PhaseRunID
+	RuntimeRunID                RuntimeRunID
+	OwnerAuthority              RuntimeAuthority
+	ResourceClass               cleanupResourceClass
+	ResourceIdentityDigest      Digest
+	ResourceGeneration          uint64
+	ResourceFence               uint64
+	CleanupIntent               cleanupIntent
+	CauseDecisionID             RuntimeDecisionID
+	CauseOperationID            OperationID
+	RetentionFactDigest         Digest
+	EligibilityFactDigest       Digest
+	Status                      cleanupDebtStatus
+	Unresolved                  bool
+	Uncontained                 bool
+	CreatedAt                   time.Time
+	EligibleAt                  time.Time
+	FirstAttemptAt              time.Time
+	LastAttemptAt               time.Time
+	NextRetryAt                 time.Time
+	AttemptCount                uint64
+	ConsecutiveFailureCount     uint64
+	ClaimGeneration             uint64
+	ClaimFence                  uint64
+	RetryDisposition            cleanupRetryDisposition
+	LastErrorCategory           cleanupFailureCategory
+	LastErrorDigest             Digest
+	LastErrorEvidenceReference  string
+	Estimation                  cleanupEstimation
+	Blockers                    cleanupBlockerSummary
+	ResolvedAt                  time.Time
+	ResolutionClass             cleanupResolutionClass
+	ResolutionReason            cleanupResolutionReason
+	ResolutionAuthority         RuntimeAuthority
+	ResolutionAuditFactID       string
+	ResolutionEvidenceRoot      EvidenceRootSnapshot
+	ResolutionExpiresAt         time.Time
 	ResolutionIncidentReference string
-	ResolutionTicketReference  string
+	ResolutionTicketReference   string
 	ResolutionApprovalReference string
-	LastMutationID             string
+	LastMutationID              string
 }
 
 type canonicalCleanupDebtState struct {
@@ -417,9 +417,9 @@ func encodeCleanupDebtRecord(record cleanupDebtRecord) ([]byte, Digest, error) {
 		ResolutionEvidenceRootID:      record.ResolutionEvidenceRoot.EvidenceRootID.String(),
 		ResolutionEvidenceRootDigest:  formatOptionalCleanupDigest(record.ResolutionEvidenceRoot.Digest),
 		ResolutionExpiresAt:           formatOptionalCleanupTime(record.ResolutionExpiresAt), LastMutationID: record.LastMutationID,
-		ResolutionIncidentReference:   record.ResolutionIncidentReference,
-		ResolutionTicketReference:     record.ResolutionTicketReference,
-		ResolutionApprovalReference:   record.ResolutionApprovalReference,
+		ResolutionIncidentReference: record.ResolutionIncidentReference,
+		ResolutionTicketReference:   record.ResolutionTicketReference,
+		ResolutionApprovalReference: record.ResolutionApprovalReference,
 	}
 	encoded, err := json.Marshal(state)
 	if err != nil {

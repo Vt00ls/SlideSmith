@@ -36,35 +36,35 @@ type RepairStore interface {
 
 // RepairEvidence is the retained authoritative evidence for exact matching.
 type RepairEvidence struct {
-	RuntimeRunID     RuntimeRunID
-	SchemaVersion    SchemaVersion
-	EvidenceID       EvidenceID
-	EvidenceRootID   EvidenceRootID
-	Digest           Digest
-	Signature        Digest
-	ManifestDigest     Digest
-	ScopeDigest        Digest
-	Generation       OperationGeneration
-	Fence            RuntimeFence
-	WorkerClass      WorkerClass
-	CanonicalDigest  Digest
+	RuntimeRunID    RuntimeRunID
+	SchemaVersion   SchemaVersion
+	EvidenceID      EvidenceID
+	EvidenceRootID  EvidenceRootID
+	Digest          Digest
+	Signature       Digest
+	ManifestDigest  Digest
+	ScopeDigest     Digest
+	Generation      OperationGeneration
+	Fence           RuntimeFence
+	WorkerClass     WorkerClass
+	CanonicalDigest Digest
 }
 
 // RepairCandidate is a proposed repair that must exactly match the retained
 // evidence.
 type RepairCandidate struct {
-	RuntimeRunID     RuntimeRunID
-	SchemaVersion    SchemaVersion
-	EvidenceID       EvidenceID
-	EvidenceRootID   EvidenceRootID
-	Digest           Digest
-	Signature        Digest
-	ManifestDigest     Digest
-	ScopeDigest        Digest
-	Generation       OperationGeneration
-	Fence            RuntimeFence
-	WorkerClass      WorkerClass
-	Source           RepairSource
+	RuntimeRunID   RuntimeRunID
+	SchemaVersion  SchemaVersion
+	EvidenceID     EvidenceID
+	EvidenceRootID EvidenceRootID
+	Digest         Digest
+	Signature      Digest
+	ManifestDigest Digest
+	ScopeDigest    Digest
+	Generation     OperationGeneration
+	Fence          RuntimeFence
+	WorkerClass    WorkerClass
+	Source         RepairSource
 }
 
 // RepairSource describes where the candidate came from (must never be
@@ -73,26 +73,26 @@ type RepairSource uint8
 
 const (
 	RepairSourceBackup           RepairSource = iota + 1 // exact backup copy
-	RepairSourceControlledSource                          // controlled external source with exact match
-	RepairSourceRecoveryPoint                             // from a verified Recovery Point
+	RepairSourceControlledSource                         // controlled external source with exact match
+	RepairSourceRecoveryPoint                            // from a verified Recovery Point
 )
 
 // RepairRejectionReason explains why an exact repair was rejected.
 type RepairRejectionReason uint8
 
 const (
-	RepairRejectionNone                  RepairRejectionReason = iota
-	RepairRejectionOrphan                                      // no retained evidence for this identity
-	RepairRejectionDigestMismatch                              // digest doesn't match retained
-	RepairRejectionSchemaMismatch                              // schema version doesn't match
-	RepairRejectionIdentityMismatch                            // identity doesn't match
-	RepairRejectionScopeMismatch                               // scope/personal workspace doesn't match
-	RepairRejectionGenerationMismatch                          // generation doesn't match
-	RepairRejectionFenceMismatch                               // fence doesn't match
-	RepairRejectionSignatureMismatch                           // signature doesn't match
-	RepairRejectionManifestMismatch                              // manifest digest doesn't match
-	RepairRejectionInvalidSource                               // source is path/session/log/process
-	RepairRejectionNoRetainedEvidence                          // no authoritative retained evidence
+	RepairRejectionNone               RepairRejectionReason = iota
+	RepairRejectionOrphan                                   // no retained evidence for this identity
+	RepairRejectionDigestMismatch                           // digest doesn't match retained
+	RepairRejectionSchemaMismatch                           // schema version doesn't match
+	RepairRejectionIdentityMismatch                         // identity doesn't match
+	RepairRejectionScopeMismatch                            // scope/personal workspace doesn't match
+	RepairRejectionGenerationMismatch                       // generation doesn't match
+	RepairRejectionFenceMismatch                            // fence doesn't match
+	RepairRejectionSignatureMismatch                        // signature doesn't match
+	RepairRejectionManifestMismatch                         // manifest digest doesn't match
+	RepairRejectionInvalidSource                            // source is path/session/log/process
+	RepairRejectionNoRetainedEvidence                       // no authoritative retained evidence
 )
 
 // RepairResult reports the outcome of a repair attempt.

@@ -13,34 +13,34 @@ func TestExactRepair_ExactMatch_Accepted(t *testing.T) {
 
 	store := &testRepairStore{
 		evidence: &RepairEvidence{
-			RuntimeRunID:  RuntimeRunID{value: "runtime-repair-1"},
-			SchemaVersion: SchemaV1,
-			EvidenceID:    EvidenceID{value: "evidence-repair-1"},
+			RuntimeRunID:   RuntimeRunID{value: "runtime-repair-1"},
+			SchemaVersion:  SchemaV1,
+			EvidenceID:     EvidenceID{value: "evidence-repair-1"},
 			EvidenceRootID: EvidenceRootID{value: "evidence-root-repair-1"},
-			Digest:        digest(100),
-			Signature:     digest(101),
-			ManifestDigest:  digest(102),
-			ScopeDigest:     digest(103),
-			Generation:    5,
-			Fence:         6,
-			WorkerClass:   WorkerAgent,
+			Digest:         digest(100),
+			Signature:      digest(101),
+			ManifestDigest: digest(102),
+			ScopeDigest:    digest(103),
+			Generation:     5,
+			Fence:          6,
+			WorkerClass:    WorkerAgent,
 		},
 	}
 	repair := NewExactRepair(store)
 
 	candidate := RepairCandidate{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-1"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "evidence-repair-1"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-1"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "evidence-repair-1"},
 		EvidenceRootID: EvidenceRootID{value: "evidence-root-repair-1"},
-		Digest:        digest(100),
-		Signature:     digest(101),
-		ManifestDigest:  digest(102),
-		ScopeDigest:     digest(103),
-		Generation:    5,
-		Fence:         6,
-		WorkerClass:   WorkerAgent,
-		Source:        RepairSourceBackup,
+		Digest:         digest(100),
+		Signature:      digest(101),
+		ManifestDigest: digest(102),
+		ScopeDigest:    digest(103),
+		Generation:     5,
+		Fence:          6,
+		WorkerClass:    WorkerAgent,
+		Source:         RepairSourceBackup,
 	}
 
 	result, err := repair.Repair(context.Background(), candidate)
@@ -57,34 +57,34 @@ func TestExactRepair_DigestMismatch_Rejected(t *testing.T) {
 	t.Parallel()
 
 	retained := &RepairEvidence{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-2"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "evidence-repair-2"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-2"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "evidence-repair-2"},
 		EvidenceRootID: EvidenceRootID{value: "evidence-root-repair-2"},
-		Digest:        digest(200),
-		Signature:     digest(201),
-		ManifestDigest:  digest(202),
-		ScopeDigest:     digest(203),
-		Generation:    7,
-		Fence:         8,
-		WorkerClass:   WorkerTool,
+		Digest:         digest(200),
+		Signature:      digest(201),
+		ManifestDigest: digest(202),
+		ScopeDigest:    digest(203),
+		Generation:     7,
+		Fence:          8,
+		WorkerClass:    WorkerTool,
 	}
 	store := &testRepairStore{evidence: retained}
 	repair := NewExactRepair(store)
 
 	candidate := RepairCandidate{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-2"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "evidence-repair-2"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-2"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "evidence-repair-2"},
 		EvidenceRootID: EvidenceRootID{value: "evidence-root-repair-2"},
-		Digest:        digest(255), // different digest
-		Signature:     digest(201),
-		ManifestDigest:  digest(202),
-		ScopeDigest:     digest(203),
-		Generation:    7,
-		Fence:         8,
-		WorkerClass:   WorkerTool,
-		Source:        RepairSourceRecoveryPoint,
+		Digest:         digest(255), // different digest
+		Signature:      digest(201),
+		ManifestDigest: digest(202),
+		ScopeDigest:    digest(203),
+		Generation:     7,
+		Fence:          8,
+		WorkerClass:    WorkerTool,
+		Source:         RepairSourceRecoveryPoint,
 	}
 
 	result, err := repair.Repair(context.Background(), candidate)
@@ -107,18 +107,18 @@ func TestExactRepair_OrphanCandidate_Rejected(t *testing.T) {
 	repair := NewExactRepair(store)
 
 	candidate := RepairCandidate{
-		RuntimeRunID:  RuntimeRunID{value: "orphan-runtime"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "orphan-evidence"},
+		RuntimeRunID:   RuntimeRunID{value: "orphan-runtime"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "orphan-evidence"},
 		EvidenceRootID: EvidenceRootID{value: "orphan-root"},
-		Digest:        digest(42),
-		Signature:     digest(43),
-		ManifestDigest:  digest(44),
-		ScopeDigest:     digest(45),
-		Generation:    1,
-		Fence:         1,
-		WorkerClass:   WorkerAgent,
-		Source:        RepairSourceBackup,
+		Digest:         digest(42),
+		Signature:      digest(43),
+		ManifestDigest: digest(44),
+		ScopeDigest:    digest(45),
+		Generation:     1,
+		Fence:          1,
+		WorkerClass:    WorkerAgent,
+		Source:         RepairSourceBackup,
 	}
 
 	result, err := repair.Repair(context.Background(), candidate)
@@ -141,35 +141,35 @@ func TestExactRepair_InvalidSource_Rejected(t *testing.T) {
 
 	store := &testRepairStore{
 		evidence: &RepairEvidence{
-			RuntimeRunID:  RuntimeRunID{value: "runtime-repair-3"},
-			SchemaVersion: SchemaV1,
-			EvidenceID:    EvidenceID{value: "ev-3"},
+			RuntimeRunID:   RuntimeRunID{value: "runtime-repair-3"},
+			SchemaVersion:  SchemaV1,
+			EvidenceID:     EvidenceID{value: "ev-3"},
 			EvidenceRootID: EvidenceRootID{value: "root-3"},
-			Digest:        digest(50),
-			Signature:     digest(51),
-			ManifestDigest:  digest(52),
-			ScopeDigest:     digest(53),
-			Generation:    3,
-			Fence:         3,
-			WorkerClass:   WorkerAgent,
+			Digest:         digest(50),
+			Signature:      digest(51),
+			ManifestDigest: digest(52),
+			ScopeDigest:    digest(53),
+			Generation:     3,
+			Fence:          3,
+			WorkerClass:    WorkerAgent,
 		},
 	}
 	repair := NewExactRepair(store)
 
 	// Source 99 is not a valid repair source (not Backup/ControlledSource/RecoveryPoint).
 	candidate := RepairCandidate{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-3"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "ev-3"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-3"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "ev-3"},
 		EvidenceRootID: EvidenceRootID{value: "root-3"},
-		Digest:        digest(50),
-		Signature:     digest(51),
-		ManifestDigest:  digest(52),
-		ScopeDigest:     digest(53),
-		Generation:    3,
-		Fence:         3,
-		WorkerClass:   WorkerAgent,
-		Source:        RepairSource(99),
+		Digest:         digest(50),
+		Signature:      digest(51),
+		ManifestDigest: digest(52),
+		ScopeDigest:    digest(53),
+		Generation:     3,
+		Fence:          3,
+		WorkerClass:    WorkerAgent,
+		Source:         RepairSource(99),
 	}
 
 	result, err := repair.Repair(context.Background(), candidate)
@@ -189,34 +189,34 @@ func TestExactRepair_SchemaMismatch_Rejected(t *testing.T) {
 	t.Parallel()
 
 	retained := &RepairEvidence{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-4"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "ev-4"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-4"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "ev-4"},
 		EvidenceRootID: EvidenceRootID{value: "root-4"},
-		Digest:        digest(60),
-		Signature:     digest(61),
-		ManifestDigest:  digest(62),
-		ScopeDigest:     digest(63),
-		Generation:    1,
-		Fence:         1,
-		WorkerClass:   WorkerAgent,
+		Digest:         digest(60),
+		Signature:      digest(61),
+		ManifestDigest: digest(62),
+		ScopeDigest:    digest(63),
+		Generation:     1,
+		Fence:          1,
+		WorkerClass:    WorkerAgent,
 	}
 	store := &testRepairStore{evidence: retained}
 	repair := NewExactRepair(store)
 
 	candidate := RepairCandidate{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-4"},
-		SchemaVersion: SnapshotSchemaCapsule, // different schema
-		EvidenceID:    EvidenceID{value: "ev-4"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-4"},
+		SchemaVersion:  SnapshotSchemaCapsule, // different schema
+		EvidenceID:     EvidenceID{value: "ev-4"},
 		EvidenceRootID: EvidenceRootID{value: "root-4"},
-		Digest:        digest(60),
-		Signature:     digest(61),
-		ManifestDigest:  digest(62),
-		ScopeDigest:     digest(63),
-		Generation:    1,
-		Fence:         1,
-		WorkerClass:   WorkerAgent,
-		Source:        RepairSourceControlledSource,
+		Digest:         digest(60),
+		Signature:      digest(61),
+		ManifestDigest: digest(62),
+		ScopeDigest:    digest(63),
+		Generation:     1,
+		Fence:          1,
+		WorkerClass:    WorkerAgent,
+		Source:         RepairSourceControlledSource,
 	}
 
 	result, err := repair.Repair(context.Background(), candidate)
@@ -236,34 +236,34 @@ func TestExactRepair_IdentityMismatch_Rejected(t *testing.T) {
 	t.Parallel()
 
 	retained := &RepairEvidence{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-5"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "ev-5"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-5"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "ev-5"},
 		EvidenceRootID: EvidenceRootID{value: "root-5"},
-		Digest:        digest(70),
-		Signature:     digest(71),
-		ManifestDigest:  digest(72),
-		ScopeDigest:     digest(73),
-		Generation:    1,
-		Fence:         1,
-		WorkerClass:   WorkerAgent,
+		Digest:         digest(70),
+		Signature:      digest(71),
+		ManifestDigest: digest(72),
+		ScopeDigest:    digest(73),
+		Generation:     1,
+		Fence:          1,
+		WorkerClass:    WorkerAgent,
 	}
 	store := &testRepairStore{evidence: retained}
 	repair := NewExactRepair(store)
 
 	candidate := RepairCandidate{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-DIFFERENT"}, // different
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "ev-5"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-DIFFERENT"}, // different
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "ev-5"},
 		EvidenceRootID: EvidenceRootID{value: "root-5"},
-		Digest:        digest(70),
-		Signature:     digest(71),
-		ManifestDigest:  digest(72),
-		ScopeDigest:     digest(73),
-		Generation:    1,
-		Fence:         1,
-		WorkerClass:   WorkerAgent,
-		Source:        RepairSourceBackup,
+		Digest:         digest(70),
+		Signature:      digest(71),
+		ManifestDigest: digest(72),
+		ScopeDigest:    digest(73),
+		Generation:     1,
+		Fence:          1,
+		WorkerClass:    WorkerAgent,
+		Source:         RepairSourceBackup,
 	}
 
 	result, err := repair.Repair(context.Background(), candidate)
@@ -283,34 +283,34 @@ func TestExactRepair_FenceMismatch_Rejected(t *testing.T) {
 	t.Parallel()
 
 	retained := &RepairEvidence{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-6"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "ev-6"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-6"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "ev-6"},
 		EvidenceRootID: EvidenceRootID{value: "root-6"},
-		Digest:        digest(80),
-		Signature:     digest(81),
-		ManifestDigest:  digest(82),
-		ScopeDigest:     digest(83),
-		Generation:    9,
-		Fence:         10,
-		WorkerClass:   WorkerAgent,
+		Digest:         digest(80),
+		Signature:      digest(81),
+		ManifestDigest: digest(82),
+		ScopeDigest:    digest(83),
+		Generation:     9,
+		Fence:          10,
+		WorkerClass:    WorkerAgent,
 	}
 	store := &testRepairStore{evidence: retained}
 	repair := NewExactRepair(store)
 
 	candidate := RepairCandidate{
-		RuntimeRunID:  RuntimeRunID{value: "runtime-repair-6"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "ev-6"},
+		RuntimeRunID:   RuntimeRunID{value: "runtime-repair-6"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "ev-6"},
 		EvidenceRootID: EvidenceRootID{value: "root-6"},
-		Digest:        digest(80),
-		Signature:     digest(81),
-		ManifestDigest:  digest(82),
-		ScopeDigest:     digest(83),
-		Generation:    9,
-		Fence:         99, // different fence
-		WorkerClass:   WorkerAgent,
-		Source:        RepairSourceBackup,
+		Digest:         digest(80),
+		Signature:      digest(81),
+		ManifestDigest: digest(82),
+		ScopeDigest:    digest(83),
+		Generation:     9,
+		Fence:          99, // different fence
+		WorkerClass:    WorkerAgent,
+		Source:         RepairSourceBackup,
 	}
 
 	result, err := repair.Repair(context.Background(), candidate)
@@ -392,16 +392,16 @@ func TestRepairHelpers(t *testing.T) {
 
 	// CompareRepairEvidence
 	a := RepairEvidence{
-		RuntimeRunID:  RuntimeRunID{value: "r1"},
-		SchemaVersion: SchemaV1,
-		EvidenceID:    EvidenceID{value: "e1"},
-		Digest:        digest(1),
-		Signature:     digest(2),
-		ManifestDigest:  digest(3),
-		ScopeDigest:     digest(4),
-		Generation:    1,
-		Fence:         1,
-		WorkerClass:   WorkerAgent,
+		RuntimeRunID:   RuntimeRunID{value: "r1"},
+		SchemaVersion:  SchemaV1,
+		EvidenceID:     EvidenceID{value: "e1"},
+		Digest:         digest(1),
+		Signature:      digest(2),
+		ManifestDigest: digest(3),
+		ScopeDigest:    digest(4),
+		Generation:     1,
+		Fence:          1,
+		WorkerClass:    WorkerAgent,
 	}
 	a.CanonicalDigest = canonicalRepairDigest(a)
 
@@ -428,8 +428,8 @@ func TestRepairHelpers(t *testing.T) {
 
 // testRepairStore is a minimal RepairStore for testing ExactRepair.
 type testRepairStore struct {
-	evidence    *RepairEvidence
-	rejections  []RepairCandidate
+	evidence   *RepairEvidence
+	rejections []RepairCandidate
 }
 
 func (store *testRepairStore) LoadEvidenceForRepair(_ context.Context, _ RuntimeRunID) (*RepairEvidence, error) {

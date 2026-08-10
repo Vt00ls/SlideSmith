@@ -23,37 +23,37 @@ const (
 // RecoveryPointSnapshot is the authoritative signed manifest root for a
 // joint PostgreSQL + Durable Object Recovery Point.
 type RecoveryPointSnapshot struct {
-	RecoveryPointID   RecoveryPointID
-	Status            RecoveryPointStatus
-	TargetTime        time.Time
-	ProtectedThrough  time.Time
-	PriorPointID      RecoveryPointID
-	ManifestDigest    EvidenceDigest
-	Generation        RecoveryGeneration
-	Fence             RecoveryFence
-	SafetyEpoch       SafetyEpoch
-	CreatedAt         time.Time
-	FinalizedAt       time.Time
-	RestoreStartedAt  time.Time
-	PromotedAt        time.Time
+	RecoveryPointID  RecoveryPointID
+	Status           RecoveryPointStatus
+	TargetTime       time.Time
+	ProtectedThrough time.Time
+	PriorPointID     RecoveryPointID
+	ManifestDigest   EvidenceDigest
+	Generation       RecoveryGeneration
+	Fence            RecoveryFence
+	SafetyEpoch      SafetyEpoch
+	CreatedAt        time.Time
+	FinalizedAt      time.Time
+	RestoreStartedAt time.Time
+	PromotedAt       time.Time
 }
 
 // RestoreDecision records the authoritative outcome of a restore attempt. It
 // binds the selected Recovery Point, the new environment generation, and
 // the post-restore fence and safety epoch.
 type RestoreDecision struct {
-	RecoveryPointID      RecoveryPointID
-	NewGeneration        RecoveryGeneration
-	NewFence             RecoveryFence
-	NewSafetyEpoch       SafetyEpoch
-	PreviousGeneration   RecoveryGeneration
-	PreviousFence        RecoveryFence
-	PreviousSafetyEpoch  SafetyEpoch
-	OperationalMode      OperationalMode
-	FencedRuntimeRuns    []RuntimeRunID
-	RejectedRuntimeRuns  []RuntimeRunID
-	LostRuntimeRuns      []RuntimeRunID
-	DecidedAt            time.Time
+	RecoveryPointID     RecoveryPointID
+	NewGeneration       RecoveryGeneration
+	NewFence            RecoveryFence
+	NewSafetyEpoch      SafetyEpoch
+	PreviousGeneration  RecoveryGeneration
+	PreviousFence       RecoveryFence
+	PreviousSafetyEpoch SafetyEpoch
+	OperationalMode     OperationalMode
+	FencedRuntimeRuns   []RuntimeRunID
+	RejectedRuntimeRuns []RuntimeRunID
+	LostRuntimeRuns     []RuntimeRunID
+	DecidedAt           time.Time
 }
 
 // RestoreBinding identifies the authority and scope of a restore attempt.

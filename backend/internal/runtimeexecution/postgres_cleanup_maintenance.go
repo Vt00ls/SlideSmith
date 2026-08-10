@@ -114,10 +114,10 @@ func newCleanupMutationAuditState(
 		ClaimFence: after.ClaimFence, BlockerClasses: after.Blockers.Classes,
 		BlockerDigest: formatOptionalCleanupDigest(after.Blockers.Digest), Uncontained: after.Uncontained,
 		EstimateState: after.Estimation.State, EstimatedBytes: after.Estimation.Bytes,
-		EstimatedInodes: after.Estimation.Inodes,
-		OccurredAt:      formatCleanupTime(occurredAt),
-		RecordedAt:      formatCleanupTime(occurredAt),
-		SourceClockID:    postgresMandatoryAuditSourceClock,
+		EstimatedInodes:      after.Estimation.Inodes,
+		OccurredAt:           formatCleanupTime(occurredAt),
+		RecordedAt:           formatCleanupTime(occurredAt),
+		SourceClockID:        postgresMandatoryAuditSourceClock,
 		IdempotencyReference: after.LastMutationID,
 	}
 	if kind == cleanupAuditExpire || kind == cleanupAuditReopen {
@@ -298,53 +298,53 @@ func (authority *PostgresAuthority) reopenCleanupDebt(
 }
 
 type cleanupDebtExpiry struct {
-	MutationID             string
-	DebtID                 string
-	PersonalWorkspaceID    PersonalWorkspaceID
-	RuntimeRunID           RuntimeRunID
-	Authority              RuntimeAuthority
-	ExpectedRevision       uint64
-	ResourceGeneration     uint64
-	ResourceFence          uint64
-	ExpiredAt              time.Time
-	Reason                 CleanupExceptionExpiryReason
+	MutationID              string
+	DebtID                  string
+	PersonalWorkspaceID     PersonalWorkspaceID
+	RuntimeRunID            RuntimeRunID
+	Authority               RuntimeAuthority
+	ExpectedRevision        uint64
+	ResourceGeneration      uint64
+	ResourceFence           uint64
+	ExpiredAt               time.Time
+	Reason                  CleanupExceptionExpiryReason
 	ExpectedRuntimeRevision RuntimeRevision
-	ExpectedRuntimeFence   RuntimeFence
-	SeamDigest             Digest
+	ExpectedRuntimeFence    RuntimeFence
+	SeamDigest              Digest
 }
 
 type cleanupDebtReopen struct {
-	MutationID             string
-	DebtID                 string
-	PersonalWorkspaceID    PersonalWorkspaceID
-	RuntimeRunID           RuntimeRunID
-	Authority              RuntimeAuthority
-	ExpectedRevision       uint64
-	ResourceGeneration     uint64
-	ResourceFence          uint64
-	ReopenedAt             time.Time
-	Reason                 CleanupReopenReason
+	MutationID              string
+	DebtID                  string
+	PersonalWorkspaceID     PersonalWorkspaceID
+	RuntimeRunID            RuntimeRunID
+	Authority               RuntimeAuthority
+	ExpectedRevision        uint64
+	ResourceGeneration      uint64
+	ResourceFence           uint64
+	ReopenedAt              time.Time
+	Reason                  CleanupReopenReason
 	ExpectedRuntimeRevision RuntimeRevision
-	ExpectedRuntimeFence   RuntimeFence
-	SeamDigest             Digest
+	ExpectedRuntimeFence    RuntimeFence
+	SeamDigest              Digest
 }
 
 type cleanupDebtExpiryLike struct {
-	MutationID             string
-	DebtID                 string
-	PersonalWorkspaceID    PersonalWorkspaceID
-	RuntimeRunID           RuntimeRunID
-	Authority              RuntimeAuthority
-	ExpectedRevision       uint64
-	ResourceGeneration     uint64
-	ResourceFence          uint64
-	SeamDigest             Digest
-	MutationKind           cleanupMutationKind
-	AuditKind              cleanupAuditKind
-	Reason                 uint8
-	At                     time.Time
+	MutationID              string
+	DebtID                  string
+	PersonalWorkspaceID     PersonalWorkspaceID
+	RuntimeRunID            RuntimeRunID
+	Authority               RuntimeAuthority
+	ExpectedRevision        uint64
+	ResourceGeneration      uint64
+	ResourceFence           uint64
+	SeamDigest              Digest
+	MutationKind            cleanupMutationKind
+	AuditKind               cleanupAuditKind
+	Reason                  uint8
+	At                      time.Time
 	ExpectedRuntimeRevision RuntimeRevision
-	ExpectedRuntimeFence   RuntimeFence
+	ExpectedRuntimeFence    RuntimeFence
 }
 
 func (authority *PostgresAuthority) reopenResolvedCleanupDebt(
@@ -425,7 +425,7 @@ func cleanupReopenResolutionDigest(operation cleanupDebtExpiryLike) (Digest, err
 		!validAuthority(operation.Authority) || operation.ExpectedRevision == 0 ||
 		operation.ResourceGeneration == 0 || operation.ResourceFence == 0 || operation.At.IsZero() ||
 		operation.Reason == 0 || (operation.MutationKind != cleanupMutationExpire &&
-			operation.MutationKind != cleanupMutationReopen) {
+		operation.MutationKind != cleanupMutationReopen) {
 		return Digest{}, newError(ErrorInvalidRequest)
 	}
 	domain := "slidesmith.runtime-execution.cleanup-mutation-reopen/v1"
@@ -436,7 +436,7 @@ func cleanupReopenResolutionDigest(operation cleanupDebtExpiryLike) (Digest, err
 		Schema: domain, OperationID: operation.MutationID, DebtID: operation.DebtID,
 		PersonalWorkspaceID: operation.PersonalWorkspaceID.String(),
 		RuntimeRunID:        operation.RuntimeRunID.String(), AuthorityKind: operation.Authority.kind,
-		AuthorityID: operation.Authority.id.String(),
+		AuthorityID:         operation.Authority.id.String(),
 		AuthorityGeneration: operation.Authority.generation, ExpectedRevision: operation.ExpectedRevision,
 		ResourceGeneration: operation.ResourceGeneration, ResourceFence: operation.ResourceFence,
 		Reason: operation.Reason, OccurredAt: formatCleanupTime(operation.At),
@@ -753,4 +753,3 @@ func (authority *PostgresAuthority) reopenCleanupDebtMaintenance(
 		CleanupDebt: decision,
 	}, nil
 }
-

@@ -42,7 +42,7 @@ func cleanupContractProof(
 		EvidenceSchemaVersion: SchemaV1, EvidenceRootID: "cleanup-contract-evidence",
 		EvidenceRootDigest: digest(200).String(),
 		ObservedAt:         formatCleanupTime(verifiedAt), RecordedAt: formatCleanupTime(verifiedAt),
-		SourceClockID:  postgresMandatoryAuditSourceClock,
+		SourceClockID:   postgresMandatoryAuditSourceClock,
 		ReferencesClear: true, ContainmentClear: true,
 	}
 	if class == cleanupResolutionAlreadyAbsent {
@@ -105,7 +105,7 @@ func cleanupObligationCommand(
 	creation := cleanupDebtCreation{
 		MutationID: operationID, DebtID: debtID,
 		PersonalWorkspaceID: start.PersonalWorkspaceID, RuntimeRunID: start.RuntimeRunID,
-		Authority: start.Authority,
+		Authority:     start.Authority,
 		ResourceClass: cleanupResourceContainment, ResourceIdentityDigest: digest(211),
 		ResourceGeneration: 7, ResourceFence: 9, Intent: cleanupIntentContain,
 		CauseDecisionID: accepted.Fact.DecisionID, CauseOperationID: start.OperationID,
@@ -304,7 +304,7 @@ func TestCleanupMaintenanceObligationBeforeAttemptAndRetryLifecycle(t *testing.T
 	view, err := harness.Diagnostics.Diagnose(context.Background(), OperationalDiagnosticQuery{
 		SchemaVersion: SchemaV1, Reason: DiagnosticReasonCleanupHealth,
 		Authority: mustAdministratorAuthority(t, "cleanup-diag-admin", 21),
-		Lookup: DiagnosticLookupCleanupDebt, DebtID: "cleanup-debt-lifecycle",
+		Lookup:    DiagnosticLookupCleanupDebt, DebtID: "cleanup-debt-lifecycle",
 		PersonalWorkspaceID: start.PersonalWorkspaceID, RuntimeRunID: start.RuntimeRunID, Bounded: true,
 	})
 	if err != nil {
@@ -435,7 +435,7 @@ func TestCleanupMaintenanceAcceptedExceptionExpiryAndSafeReopen(t *testing.T) {
 	acceptedFact := retainedAcceptedStartFact(start, "runtime-decision-cleanup-exception")
 	harness, err := NewDeterministicHarness(HarnessConfig{
 		Now: now, IDs: DeterministicIDConfig{DecisionStart: 1},
-		Runtimes: []RuntimeFixture{fixture},
+		Runtimes:        []RuntimeFixture{fixture},
 		AdmissionGrants: []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(15*time.Minute), true)},
 		RetainedStartFacts: []RetainedStartFactFixture{{
 			RuntimeRunID: start.RuntimeRunID, DecisionID: acceptedFact.DecisionID,
@@ -546,13 +546,13 @@ func TestCleanupMaintenanceCrossModuleDebtDuplicationRejected(t *testing.T) {
 		RetentionFactDigest: digest(220), EligibilityFactDigest: digest(221),
 		Status: cleanupDebtOpen, Unresolved: true, RetryDisposition: cleanupRetryReady,
 		Estimation: cleanupEstimation{State: cleanupEstimateUnknown},
-		CreatedAt: now.Add(-time.Hour), EligibleAt: now.Add(-time.Hour), LastMutationID: "c04-mutation",
+		CreatedAt:  now.Add(-time.Hour), EligibleAt: now.Add(-time.Hour), LastMutationID: "c04-mutation",
 	}
 	harness, err := NewDeterministicHarness(HarnessConfig{
 		Now: now, IDs: DeterministicIDConfig{DecisionStart: 1},
-		Runtimes: []RuntimeFixture{fixture},
+		Runtimes:        []RuntimeFixture{fixture},
 		AdmissionGrants: []AdmissionGrantFixture{grantFixtureForStart(start, now.Add(15*time.Minute), true)},
-		CleanupDebts: []cleanupDebtRecord{foreignDebt},
+		CleanupDebts:    []cleanupDebtRecord{foreignDebt},
 		LeaseAcquisition: LeaseAcquisitionAdapterFunc(func(
 			context.Context,
 			LeaseAcquisitionRequest,
