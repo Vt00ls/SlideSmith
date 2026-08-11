@@ -384,16 +384,12 @@ func manualEditCandidate(payload PreparePublicationPayload, set *evidenceSet) *c
 // candidate and returns the failure, if any.
 func evaluateManualEdit(t *testing.T, f *fixture, candidate *candidateRecord, payload VerifyPublicationPayload) *EvidenceFailure {
 	t.Helper()
-	authority := &inMemory{persistence: f.persistence, config: InMemoryConfig{
-		RuntimeAuthorityID:           f.runtimeAuthority,
-		ValidationAuthorityID:        f.validationAuthority,
-		C04AuthorityID:               f.c04Authority,
-		DurableObjectAuthorityID:     f.durableObjectAuthority,
-		TaskOrchestrationAuthorityID: f.taskOrchestrationAuthority,
-		RecoveryAuthorityID:          f.recoveryAuthority,
-		CurrentContentCapability:     f.registry.resolve,
-	}}
-	_, _, failure, err := authority.evaluateEvidence(candidate, f.header("op-export-unit"), VerifyPublication{
+	_, _, failure, err := evaluateEvidence(evidenceAuthority{
+		runtimeAuthorityID:       f.runtimeAuthority,
+		validationAuthorityID:    f.validationAuthority,
+		c04AuthorityID:           f.c04Authority,
+		durableObjectAuthorityID: f.durableObjectAuthority,
+	}, f.registry.resolve, candidate, f.header("op-export-unit"), VerifyPublication{
 		intentBase:          intentBase{intentHeader: f.header("op-export-unit")},
 		RuntimeEvidence:     payload.RuntimeEvidence,
 		ValidationEvidence:  payload.ValidationEvidence,
