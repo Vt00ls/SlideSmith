@@ -124,6 +124,14 @@ func TestStructuralDeletionGateCapabilitySurfaceAbsence(t *testing.T) {
 		reflect.TypeOf(ArtifactContentTarget{}),
 		reflect.TypeOf(C04ReconstructionCapability{}),
 		reflect.TypeOf(ContentScope{}),
+		reflect.TypeOf(OwnedTransportEnvelope{}),
+		reflect.TypeOf(OwnedTransportRequest{}),
+		reflect.TypeOf(OwnedTransportResponse{}),
+		reflect.TypeOf(OwnedTransportCallback{}),
+		reflect.TypeOf(OwnedTransportWireError{}),
+		reflect.TypeOf(OwnedTransportMachineAuthority{}),
+		reflect.TypeOf(OwnedTransportBinding{}),
+		reflect.TypeOf((*OwnedTransportClient)(nil)).Elem(),
 	}
 	forbiddenFieldFragments := []string{
 		"path", "object_key", "objectkey", "prefix", "bucket", "mount",
