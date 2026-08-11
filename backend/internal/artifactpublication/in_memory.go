@@ -47,6 +47,25 @@ type InMemoryConfig struct {
 	// scopes can never union. (zero, false) means the scope is unknown or
 	// revoked, which fails closed non-enumerating.
 	CurrentContentScope func(ContentScopeKey) (ContentScope, bool)
+	// CleanupAuthorityID registers the protected publication cleanup
+	// authority that records C05-owned assembly obligations, requests
+	// Durable Object residue release, resolves C05-owned Cleanup Debts and
+	// reconciles release. It can never prepare/verify/activate/reject/
+	// cancel a publication or mutate a candidate.
+	CleanupAuthorityID AuthorityID
+	// ResidueRetention computes the residue expiry instant from the residue
+	// creation instant. When nil or zero, the residue has no expiry. Passing
+	// the expiry marks the residue expired but never guesses absence; the
+	// release obligation continues until an evidence-backed receipt.
+	ResidueRetention func(createdAt Instant) Instant
+	// ReleaseStaging is the narrow black-box port to the Durable Object
+	// physical release of the exact typed staging references of one residue.
+	// It returns an evidence-backed receipt with resolved=true; resolved
+	// false means the outcome is ambiguous (in-flight, lost, or not
+	// resolvable) and the residue must stay release-requested for
+	// reconciliation. The port never accepts a path, prefix, bucket,
+	// listing or locator.
+	ReleaseStaging func(refs []stagingRecord, safetyEpoch SafetyEpoch) (ReleaseReceipt, bool, error)
 	// FaultHook injects faults at bounded points. A non-nil error aborts
 	// the mutation exactly at that point; points before persistence leave
 	// the operation absent (retry re-runs), points after persistence leave
@@ -106,6 +125,8 @@ type InMemoryPersistence struct {
 	mu            sync.Mutex
 	nextVersion   uint64
 	nextArtifact  uint64
+	nextDebt      uint64
+	nextAudit     uint64
 	operations    map[operationScope]*operationRecord
 	streams       map[taskScope]*streamRecord
 	versionFacts  map[ArtifactVersionID]contentFact
@@ -133,6 +154,14 @@ func newPersistence() *InMemoryPersistence {
 type inMemory struct {
 	persistence *InMemoryPersistence
 	config      InMemoryConfig
+}
+
+// residueExpiry computes the residue expiry from its creation instant.
+func (m *inMemory) residueExpiry(createdAt Instant) Instant {
+	if m.config.ResidueRetention == nil {
+		return 0
+	}
+	return m.config.ResidueRetention(createdAt)
 }
 
 // NewInMemory constructs an Artifact Publication authority over an optional
@@ -210,11 +239,13 @@ func (m *inMemory) Mutate(ctx context.Context, intent PublicationIntent) (Public
 	scope := operationScope{policyDomainID: header.PolicyDomainID, taskID: header.TaskID, operationID: header.Operation.ID}
 	record := m.persistence.operations[scope]
 	if record != nil {
-		if kind == IntentReconcilePublication {
-			// Reconcile always re-evaluates the original operation against
-			// current authority state; it never returns a historical
-			// snapshot, because its job is to inspect/replay the original
-			// operation after ambiguous or stale dispositions.
+		if kind == IntentReconcilePublication || kind == IntentReleaseResidue {
+			// Reconcile and residue release always re-evaluate the original
+			// operation against current authority state: reconcile's job is
+			// to inspect/replay the original operation after ambiguous or
+			// stale dispositions, and release re-consults the Durable Object
+			// registry so a lost receipt or claim never freezes a residue.
+			// Neither flow ever returns a historical snapshot.
 			return m.continueOperation(ctx, intent, header, digest, scope, record)
 		}
 		if byKind := record.outcomes[kind]; byKind != nil {
@@ -266,6 +297,12 @@ func (m *inMemory) continueOperation(
 		return m.cancel(ctx, intent.(CancelPublication), header, digest, scope, record)
 	case IntentReconcilePublication:
 		return m.reconcile(ctx, intent.(ReconcilePublication), header, digest, scope, record)
+	case IntentRecordResidueAssembly:
+		return m.recordResidueAssembly(ctx, intent.(RecordResidueAssembly), header, digest, scope, record)
+	case IntentReleaseResidue:
+		return m.releaseResidueFlow(ctx, intent.(ReleaseResidue), header, digest, scope, record)
+	case IntentResolveCleanupDebt:
+		return m.resolveCleanupDebt(ctx, intent.(ResolveCleanupDebt), header, digest, scope, record)
 	default:
 		return PublicationDecision{}, &Error{Code: ErrorInvalidIntent}
 	}
@@ -286,6 +323,15 @@ func cloneError(err *Error) *Error {
 	}
 	clone := *err
 	return &clone
+}
+
+// toError converts a plain error into the closed safe-error pointer, or nil
+// when there is no error.
+func toError(err error) *Error {
+	if err == nil {
+		return nil
+	}
+	return normalizeError(err)
 }
 
 func (m *inMemory) recordOutcome(record *operationRecord, kind PublicationIntentKind, digest Digest, state PublicationOperationState, decision PublicationDecision, err *Error) {
@@ -321,7 +367,25 @@ func decisionForRecord(record *operationRecord, replay bool, occurredAt Instant)
 		ResidueRelease:     record.residue != nil,
 		OccurredAt:         occurredAt,
 	}
+	if record.residue != nil {
+		decision.ResidueDisposition = record.residue.disposition
+		decision.ResidueExpiry = record.residue.expiry
+		decision.ReleaseReceipt = cloneReleaseReceipt(record.residue.releaseReceipt)
+		decision.CleanupDebtID = record.residue.debtID
+	}
+	if record.debt != nil {
+		decision.CleanupDebtStatus = record.debt.status
+		decision.ResolutionClass = record.debt.resolutionClass
+	}
 	return decision
+}
+
+func cloneReleaseReceipt(receipt *ReleaseReceipt) *ReleaseReceipt {
+	if receipt == nil {
+		return nil
+	}
+	clone := *receipt
+	return &clone
 }
 
 func cloneEvidence(evidence *PublicationEvidence) *PublicationEvidence {
@@ -587,6 +651,17 @@ func (m *inMemory) ensureAuthority(authority PublicationAuthority, kind Publicat
 			return &Error{Code: ErrorOwnershipDenied}
 		}
 		return nil
+	}
+	if authority.Kind == AuthorityPublicationCleanup {
+		switch kind {
+		case IntentRecordResidueAssembly, IntentReleaseResidue, IntentResolveCleanupDebt:
+			if authority.ID != m.config.CleanupAuthorityID {
+				return &Error{Code: ErrorOwnershipDenied}
+			}
+			return nil
+		default:
+			return &Error{Code: ErrorOwnershipDenied}
+		}
 	}
 	if authority.Kind != AuthorityTaskOrchestration {
 		return &Error{Code: ErrorOwnershipDenied}

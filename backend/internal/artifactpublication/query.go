@@ -35,9 +35,115 @@ func (m *inMemory) Query(ctx context.Context, query PublicationQuery) (Publicati
 		return m.queryIssueC04ReconstructionCapability(query)
 	case QueryVerifyC04ReconstructionCapability:
 		return m.queryVerifyC04ReconstructionCapability(query)
+	case QueryResidue:
+		return m.queryResidue(query)
+	case QueryCleanupDebt:
+		return m.queryCleanupDebt(query)
 	default:
 		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
 	}
+}
+
+func (m *inMemory) queryResidue(query PublicationQuery) (PublicationView, error) {
+	scope := operationScope{policyDomainID: query.PolicyDomainID, taskID: query.TaskID, operationID: query.OperationID}
+	record := m.persistence.operations[scope]
+	if record == nil || record.residue == nil {
+		// Non-enumerating: the same error is returned whether the residue
+		// exists in another scope or does not exist at all.
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	view := residueView(record.residue)
+	effectiveDisposition(view, record.residue, m.now())
+	return PublicationView{
+		Kind: QueryResidue, PolicyDomainID: query.PolicyDomainID, TaskID: query.TaskID,
+		OperationID: record.operationID, State: record.state,
+		OccurredAt: record.occurredAt, Residue: view,
+	}, nil
+}
+
+func (m *inMemory) queryCleanupDebt(query PublicationQuery) (PublicationView, error) {
+	if query.CleanupDebtID == "" && query.OperationID == "" {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if query.CleanupDebtID != "" {
+		for scope, record := range m.persistence.operations {
+			if record.debt == nil || record.debt.debtID != query.CleanupDebtID {
+				continue
+			}
+			if scope.policyDomainID != query.PolicyDomainID || scope.taskID != query.TaskID {
+				// Cross-workspace identity is never disclosed.
+				return PublicationView{}, &Error{Code: ErrorNotFound}
+			}
+			return PublicationView{
+				Kind: QueryCleanupDebt, PolicyDomainID: query.PolicyDomainID, TaskID: query.TaskID,
+				OperationID: record.operationID, State: record.state,
+				OccurredAt: record.occurredAt, CleanupDebt: debtView(record.debt),
+			}, nil
+		}
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	scope := operationScope{policyDomainID: query.PolicyDomainID, taskID: query.TaskID, operationID: query.OperationID}
+	record := m.persistence.operations[scope]
+	if record == nil || record.debt == nil {
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	return PublicationView{
+		Kind: QueryCleanupDebt, PolicyDomainID: query.PolicyDomainID, TaskID: query.TaskID,
+		OperationID: record.operationID, State: record.state,
+		OccurredAt: record.occurredAt, CleanupDebt: debtView(record.debt),
+	}, nil
+}
+
+// residueView builds the content-free inspection view of one residue.
+func residueView(residue *residueRecord) *ResidueView {
+	view := &ResidueView{
+		OperationID: residue.operationID, PolicyDomainID: residue.policyDomainID,
+		TaskID: residue.taskID, Owner: residue.owner,
+		Generation: residue.generation, Fence: residue.fence,
+		ReleaseIntent: residue.releaseIntent, OccurredAt: residue.occurredAt,
+		Expiry: residue.expiry, Disposition: residue.disposition,
+		RequiresReconciliation: residue.requiresReconciliation,
+		AttemptCount:           residue.attemptCount, ConsecutiveFailures: residue.consecutiveFailures,
+		NextRetryAt: residue.nextRetryAt, ClaimGeneration: residue.claimGeneration,
+		ClaimFence: residue.claimFence, LastErrorCategory: residue.lastErrorCategory,
+		ReleaseReceipt: cloneReleaseReceipt(residue.releaseReceipt),
+		DebtID:         residue.debtID,
+	}
+	if residue.assembly != nil {
+		view.AssemblyReference = residue.assembly.Reference
+		view.AssemblyIdentityDigest = residue.assembly.IdentityDigest
+	}
+	for _, ref := range residue.stagingRefs {
+		view.StagingRefs = append(view.StagingRefs, StagingReferenceView{
+			Slot: ref.slot, ContentID: ref.contentID, ContentDigest: ref.contentDigest,
+			Size: ref.size, Purpose: ref.purpose,
+			PhysicalGeneration: ref.physicalGeneration, AdapterID: ref.adapterID,
+		})
+	}
+	return view
+}
+
+// debtView builds the content-free inspection view of one C05-owned debt.
+func debtView(debt *cleanupDebtRecord) *CleanupDebtView {
+	view := &CleanupDebtView{
+		DebtID: debt.debtID, Revision: debt.revision,
+		OperationID: debt.operationID, PolicyDomainID: debt.policyDomainID,
+		TaskID: debt.taskID, Owner: debt.owner,
+		ResourceReference: debt.resourceRef, ResourceIdentityDigest: debt.resourceDigest,
+		ResourceGeneration: debt.resourceGeneration, ResourceFence: debt.resourceFence,
+		Status: debt.status, CreatedAt: debt.createdAt, EligibleAt: debt.eligibleAt,
+		FirstAttemptAt: debt.firstAttemptAt, LastAttemptAt: debt.lastAttemptAt,
+		NextRetryAt: debt.nextRetryAt, AttemptCount: debt.attemptCount,
+		ConsecutiveFailures: debt.consecutiveFailures, ClaimGeneration: debt.claimGeneration,
+		ClaimFence: debt.claimFence, RetryDisposition: debt.retryDisposition,
+		LastErrorCategory: debt.lastErrorCategory, Blockers: debt.blockers,
+		ResolvedAt: debt.resolvedAt, ResolutionClass: debt.resolutionClass,
+		ResolutionReason:      debt.resolutionReason,
+		ResolutionEvidence:    cloneResolutionEvidence(debt.resolutionEvidence),
+		ResolutionAuditFactID: debt.resolutionAuditFactID,
+		ResolutionExpiresAt:   debt.resolutionExpiresAt,
+	}
+	return view
 }
 
 func (m *inMemory) queryOperation(query PublicationQuery) (PublicationView, error) {

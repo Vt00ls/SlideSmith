@@ -44,6 +44,7 @@ func newPostgresFixture(t *testing.T) *postgresFixture {
 		DurableObjectAuthorityID:     base.durableObjectAuthority,
 		TaskOrchestrationAuthorityID: base.taskOrchestrationAuthority,
 		RecoveryAuthorityID:          base.recoveryAuthority,
+		CleanupAuthorityID:           base.cleanupAuthority,
 		PublicationAuthorityID:       base.publicationAuthority,
 	})
 	if err != nil {
@@ -71,6 +72,7 @@ func newPostgresFixtureOver(t *testing.T, db *sql.DB, schema string) *postgresFi
 		DurableObjectAuthorityID:     base.durableObjectAuthority,
 		TaskOrchestrationAuthorityID: base.taskOrchestrationAuthority,
 		RecoveryAuthorityID:          base.recoveryAuthority,
+		CleanupAuthorityID:           base.cleanupAuthority,
 		PublicationAuthorityID:       base.publicationAuthority,
 	})
 	if err != nil {

@@ -96,10 +96,19 @@ type fixture struct {
 	durableObjectAuthority     AuthorityID
 	recoveryAuthority          AuthorityID
 	publicationAuthority       AuthorityID
+	cleanupAuthority           AuthorityID
 
 	safetyEpoch SafetyEpoch
 	generation  Generation
 	fence       Fence
+
+	// releaseStaging is the Durable Object release port double. When set,
+	// residue release flows call it with the exact typed staging references;
+	// tests control the receipt/ambiguity/error per scenario.
+	releaseStaging func(refs []stagingRecord, safetyEpoch SafetyEpoch) (ReleaseReceipt, bool, error)
+	// residueRetention is the residue expiry computation double. When set,
+	// the residue records the computed expiry at creation.
+	residueRetention func(createdAt Instant) Instant
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -114,27 +123,19 @@ func newFixture(t *testing.T) *fixture {
 		durableObjectAuthority:     "durable-object-authority",
 		recoveryAuthority:          "recovery-authority",
 		publicationAuthority:       "artifact-publication-authority",
+		cleanupAuthority:           "publication-cleanup-authority",
 		safetyEpoch:                7, generation: 3, fence: 4,
 	}
 	f.registry = newCapabilityRegistry()
 	f.scopes = newScopeRegistry()
 	f.persistence = newPersistence()
-	f.core = NewInMemory(InMemoryConfig{
-		Now:                          func() Instant { return f.now },
-		RuntimeAuthorityID:           f.runtimeAuthority,
-		ValidationAuthorityID:        f.validationAuthority,
-		C04AuthorityID:               f.c04Authority,
-		DurableObjectAuthorityID:     f.durableObjectAuthority,
-		TaskOrchestrationAuthorityID: f.taskOrchestrationAuthority,
-		RecoveryAuthorityID:          f.recoveryAuthority,
-		PublicationAuthorityID:       f.publicationAuthority,
-		CurrentContentCapability:     f.registry.resolve,
-		CurrentContentScope:          f.scopes.resolve,
-	}, f.persistence)
+	f.rebuild()
 	return f
 }
 
-// rebuild resumes the authority from the same persistence (restart).
+// rebuild resumes the authority from the same persistence (restart). The
+// controlled release port and residue retention are re-applied so tests can
+// change them and rebuild the authority over the same facts.
 func (f *fixture) rebuild() {
 	f.core = NewInMemory(InMemoryConfig{
 		Now:                          func() Instant { return f.now },
@@ -145,8 +146,11 @@ func (f *fixture) rebuild() {
 		TaskOrchestrationAuthorityID: f.taskOrchestrationAuthority,
 		RecoveryAuthorityID:          f.recoveryAuthority,
 		PublicationAuthorityID:       f.publicationAuthority,
+		CleanupAuthorityID:           f.cleanupAuthority,
 		CurrentContentCapability:     f.registry.resolve,
 		CurrentContentScope:          f.scopes.resolve,
+		ResidueRetention:             f.residueRetention,
+		ReleaseStaging:               f.releaseStaging,
 	}, f.persistence)
 }
 
@@ -201,6 +205,15 @@ func bindDigest(intent PublicationIntent) PublicationIntent {
 		typed.intentHeader = header
 		return typed
 	case ReconcilePublication:
+		typed.intentHeader = header
+		return typed
+	case RecordResidueAssembly:
+		typed.intentHeader = header
+		return typed
+	case ReleaseResidue:
+		typed.intentHeader = header
+		return typed
+	case ResolveCleanupDebt:
 		typed.intentHeader = header
 		return typed
 	default:
@@ -519,6 +532,110 @@ func (f *fixture) cancelIntent(operationID string, reason CancelReason) Publicat
 
 func (f *fixture) reconcileIntent(operationID string, mode ReconcileMode) PublicationIntent {
 	return bindDigest(NewReconcilePublication(f.header(operationID), mode))
+}
+
+// cleanupAuthorityValue returns the protected publication cleanup authority
+// presented by cleanup/release intents.
+func (f *fixture) cleanupAuthorityValue() PublicationAuthority {
+	return PublicationAuthority{
+		Kind: AuthorityPublicationCleanup, ID: f.cleanupAuthority, Generation: 1,
+	}
+}
+
+// cleanupHeader returns a header bound to the protected publication cleanup
+// authority for the given operation.
+func (f *fixture) cleanupHeader(operationID string) PublicationIntentHeader {
+	header := f.header(operationID)
+	header.Authority = f.cleanupAuthorityValue()
+	return header
+}
+
+// recordAssemblyIntent builds the record_residue_assembly intent for the
+// given opaque C05-owned assembly reference.
+func (f *fixture) recordAssemblyIntent(operationID string, reference AssemblyReference) PublicationIntent {
+	return bindDigest(NewRecordResidueAssembly(f.cleanupHeader(operationID), reference))
+}
+
+// releaseResidueIntent builds the release_residue intent.
+func (f *fixture) releaseResidueIntent(operationID string) PublicationIntent {
+	return bindDigest(NewReleaseResidue(f.cleanupHeader(operationID)))
+}
+
+// resolveDebtIntent builds an evidence-backed debt resolution intent.
+func (f *fixture) resolveDebtIntent(operationID string, class CleanupDebtResolutionClass, evidence CleanupResolutionEvidence) PublicationIntent {
+	return bindDigest(NewResolveCleanupDebtEvidence(f.cleanupHeader(operationID), class, evidence))
+}
+
+// resolveDebtExceptionIntent builds an audited AcceptedException debt
+// resolution intent.
+func (f *fixture) resolveDebtExceptionIntent(operationID string, approvalReference string, expiresAt Instant) PublicationIntent {
+	return bindDigest(NewResolveCleanupDebtException(f.cleanupHeader(operationID), approvalReference, expiresAt))
+}
+
+// assemblyReference is the standard opaque C05-owned assembly reference.
+func (f *fixture) assemblyReference() AssemblyReference {
+	return AssemblyReference{
+		Reference: "assembly-resource-1", IdentityDigest: testDigest("assembly-identity"),
+		Generation: 9, Fence: 8,
+	}
+}
+
+// releaseReceipt builds an evidence-backed release receipt for the given
+// outcome, minted by the Durable Object authority.
+func (f *fixture) releaseReceipt(receiptID string, outcome ReleaseOutcome) ReleaseReceipt {
+	receipt := ReleaseReceipt{
+		ReceiptID: receiptID,
+		Producer:  EvidenceProducer{AuthorityID: f.durableObjectAuthority, Generation: 1},
+		Outcome:   outcome, OccurredAt: f.now,
+	}
+	receipt.Digest = receipt.CanonicalDigest()
+	return receipt
+}
+
+// cleanupResolutionEvidence builds evidence for the given resource digest/
+// generation/fence, minted by the Durable Object authority.
+func (f *fixture) cleanupResolutionEvidence(resourceDigest Digest, resourceGeneration, resourceFence uint64) CleanupResolutionEvidence {
+	evidence := CleanupResolutionEvidence{
+		EvidenceID:             "cleanup-evidence-1",
+		Producer:               EvidenceProducer{AuthorityID: f.durableObjectAuthority, Generation: 1},
+		ResourceIdentityDigest: resourceDigest,
+		ResourceGeneration:     resourceGeneration, ResourceFence: resourceFence,
+		OccurredAt: f.now,
+	}
+	evidence.Digest = evidence.CanonicalDigest()
+	return evidence
+}
+
+// queryResidue drives the residue inspection query.
+func (f *fixture) queryResidue(t *testing.T, operationID string) *ResidueView {
+	t.Helper()
+	view, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryResidue, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+		OperationID: PublicationOperationID(operationID),
+	})
+	if err != nil {
+		t.Fatalf("query residue: %v", err)
+	}
+	if view.Residue == nil {
+		t.Fatal("query residue returned no residue view")
+	}
+	return view.Residue
+}
+
+// queryDebt drives the C05-owned Cleanup Debt inspection query by operation.
+func (f *fixture) queryDebt(t *testing.T, operationID string) *CleanupDebtView {
+	t.Helper()
+	view, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryCleanupDebt, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+		OperationID: PublicationOperationID(operationID),
+	})
+	if err != nil {
+		t.Fatalf("query cleanup debt: %v", err)
+	}
+	if view.CleanupDebt == nil {
+		t.Fatal("query cleanup debt returned no debt view")
+	}
+	return view.CleanupDebt
 }
 
 // prepareAndVerify drives the standard first-generation happy path and

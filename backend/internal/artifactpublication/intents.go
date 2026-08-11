@@ -6,18 +6,22 @@ package artifactpublication
 type PublicationIntentKind string
 
 const (
-	IntentPreparePublication   PublicationIntentKind = "prepare"
-	IntentVerifyPublication    PublicationIntentKind = "verify"
-	IntentActivatePublication  PublicationIntentKind = "activate"
-	IntentRejectPublication    PublicationIntentKind = "reject"
-	IntentCancelPublication    PublicationIntentKind = "cancel"
-	IntentReconcilePublication PublicationIntentKind = "reconcile"
+	IntentPreparePublication    PublicationIntentKind = "prepare"
+	IntentVerifyPublication     PublicationIntentKind = "verify"
+	IntentActivatePublication   PublicationIntentKind = "activate"
+	IntentRejectPublication     PublicationIntentKind = "reject"
+	IntentCancelPublication     PublicationIntentKind = "cancel"
+	IntentReconcilePublication  PublicationIntentKind = "reconcile"
+	IntentRecordResidueAssembly PublicationIntentKind = "record_residue_assembly"
+	IntentReleaseResidue        PublicationIntentKind = "release_residue"
+	IntentResolveCleanupDebt    PublicationIntentKind = "resolve_cleanup_debt"
 )
 
 func validIntentKind(kind PublicationIntentKind) bool {
 	switch kind {
 	case IntentPreparePublication, IntentVerifyPublication, IntentActivatePublication,
-		IntentRejectPublication, IntentCancelPublication, IntentReconcilePublication:
+		IntentRejectPublication, IntentCancelPublication, IntentReconcilePublication,
+		IntentRecordResidueAssembly, IntentReleaseResidue, IntentResolveCleanupDebt:
 		return true
 	default:
 		return false
@@ -43,7 +47,7 @@ func (a PublicationAuthority) canonical() map[string]any {
 
 func validMutationAuthority(authority PublicationAuthority) bool {
 	switch authority.Kind {
-	case AuthorityTaskOrchestration, AuthorityRecovery:
+	case AuthorityTaskOrchestration, AuthorityRecovery, AuthorityPublicationCleanup:
 		return authority.ID != "" && authority.Generation != 0
 	default:
 		return false
@@ -430,12 +434,18 @@ const (
 	ReconcileCompleteVerification ReconcileMode = "complete_verification"
 	ReconcileConfirmCancellation  ReconcileMode = "confirm_cancellation"
 	ReconcileConfirmRejection     ReconcileMode = "confirm_rejection"
+	// ReconcileCompleteRelease re-evaluates an in-flight/ambiguous/expired
+	// residue release against the ORIGINAL operation and its exact typed
+	// staging references. It never creates a new ArtifactVersionID and
+	// never changes the manifest, parent or head. It requires the protected
+	// publication cleanup authority.
+	ReconcileCompleteRelease ReconcileMode = "complete_release"
 )
 
 func validReconcileMode(mode ReconcileMode) bool {
 	switch mode {
 	case ReconcileInspect, ReconcileCompleteVerification,
-		ReconcileConfirmCancellation, ReconcileConfirmRejection:
+		ReconcileConfirmCancellation, ReconcileConfirmRejection, ReconcileCompleteRelease:
 		return true
 	default:
 		return false
@@ -466,6 +476,201 @@ func (r ReconcilePublication) canonical() map[string]any {
 
 func (r ReconcilePublication) valid() bool {
 	return validReconcilePayload(r)
+}
+
+// AssemblyReference is the opaque C05-owned physical publication assembly
+// resource reference. It is the ONLY physical resource C05 owns; the
+// Durable Object authority owns physical staging, replica, cache,
+// quarantine and physical reclamation. It never contains a path, object
+// key, prefix, bucket, vendor or locator.
+type AssemblyReference struct {
+	// Reference is the opaque resource reference C05 minted when it
+	// created the assembly resource.
+	Reference string
+	// IdentityDigest is the content-free identity digest of the resource.
+	IdentityDigest Digest
+	Generation     uint64
+	Fence          uint64
+}
+
+func (a AssemblyReference) canonical() map[string]any {
+	return map[string]any{
+		"reference":       a.Reference,
+		"identity_digest": string(a.IdentityDigest),
+		"generation":      a.Generation,
+		"fence":           a.Fence,
+	}
+}
+
+// RecordResidueAssembly durably records the C05-owned publication assembly
+// resource of a terminal non-activated operation and mints the single
+// C05-owned Cleanup Debt (DebtID) for it. It is persisted BEFORE the first
+// physical cleanup attempt and is idempotent: an identical assembly
+// reference exact-replays; a different reference under the same operation
+// is a durable integrity conflict. It requires the protected publication
+// cleanup authority.
+type RecordResidueAssembly struct {
+	intentBase
+	Assembly AssemblyReference
+}
+
+func NewRecordResidueAssembly(header PublicationIntentHeader, assembly AssemblyReference) PublicationIntent {
+	return RecordResidueAssembly{intentBase: intentBase{intentHeader: header}, Assembly: assembly}
+}
+
+func (r RecordResidueAssembly) kind() PublicationIntentKind { return IntentRecordResidueAssembly }
+
+func (r RecordResidueAssembly) canonicalPayload() map[string]any {
+	return map[string]any{"assembly": r.Assembly.canonical()}
+}
+
+func (r RecordResidueAssembly) canonical() map[string]any {
+	return r.header().canonical(r.kind(), r.canonicalPayload())
+}
+
+func (r RecordResidueAssembly) valid() bool {
+	return validRecordResidueAssemblyPayload(r)
+}
+
+// ReleaseResidue requests the physical release of the EXACT typed staging
+// references of one residue from the Durable Object authority. Before any
+// physical action it re-verifies the operation identity, the residue
+// generation/fence, the expiry, and each typed reference against the
+// current Durable Object registry; a stale or ambiguous state fails closed
+// (or stays release-requested) and is never guessed as success, failure,
+// zero bytes or already absent. The evidence-backed receipt is recorded and
+// the residue disposition only transitions on that receipt. When the
+// residue carries a C05-owned assembly resource, the release attempt claims
+// the C05-owned Cleanup Debt and records the attempt/backoff/blocker facts.
+// It requires the protected publication cleanup authority.
+type ReleaseResidue struct {
+	intentBase
+}
+
+func NewReleaseResidue(header PublicationIntentHeader) PublicationIntent {
+	return ReleaseResidue{intentBase: intentBase{intentHeader: header}}
+}
+
+func (r ReleaseResidue) kind() PublicationIntentKind { return IntentReleaseResidue }
+
+func (r ReleaseResidue) canonicalPayload() map[string]any {
+	return map[string]any{}
+}
+
+func (r ReleaseResidue) canonical() map[string]any {
+	return r.header().canonical(r.kind(), r.canonicalPayload())
+}
+
+func (r ReleaseResidue) valid() bool {
+	return validHeader(r.header())
+}
+
+// ResolveCleanupDebt closes one C05-owned Cleanup Debt. It accepts exactly
+// one closure: evidence-backed Reclaimed/AlreadyAbsent/RetainedByAuthority
+// (evidence produced by the registered Durable Object authority and bound
+// to the exact resource identity/generation/fence) or an audited
+// AcceptedException (approval reference + expiry + mandatory audit). A
+// path disappearance, empty directory, object listing, log, metric or
+// operator assertion is never accepted as evidence. It requires the
+// protected publication cleanup authority.
+type ResolveCleanupDebt struct {
+	intentBase
+	ResolutionClass   CleanupDebtResolutionClass
+	Evidence          *CleanupResolutionEvidence
+	ApprovalReference string
+	ExpiresAt         Instant
+}
+
+// NewResolveCleanupDebtEvidence builds an evidence-backed debt resolution
+// (reclaimed/already_absent/retained_by_authority).
+func NewResolveCleanupDebtEvidence(header PublicationIntentHeader, class CleanupDebtResolutionClass, evidence CleanupResolutionEvidence) PublicationIntent {
+	return ResolveCleanupDebt{
+		intentBase: intentBase{intentHeader: header}, ResolutionClass: class, Evidence: &evidence,
+	}
+}
+
+// NewResolveCleanupDebtException builds an audited AcceptedException debt
+// resolution.
+func NewResolveCleanupDebtException(header PublicationIntentHeader, approvalReference string, expiresAt Instant) PublicationIntent {
+	return ResolveCleanupDebt{
+		intentBase: intentBase{intentHeader: header}, ResolutionClass: CleanupResolutionAcceptedException,
+		ApprovalReference: approvalReference, ExpiresAt: expiresAt,
+	}
+}
+
+// CleanupDebtResolutionAcceptedException carries the audited exception
+// facts for closing a C05-owned debt.
+type CleanupDebtResolutionAcceptedException struct {
+	ApprovalReference string
+	ExpiresAt         Instant
+}
+
+func (r ResolveCleanupDebt) kind() PublicationIntentKind { return IntentResolveCleanupDebt }
+
+func (r ResolveCleanupDebt) canonicalPayload() map[string]any {
+	evidence := map[string]any(nil)
+	if r.Evidence != nil {
+		evidence = map[string]any{
+			"evidence_id":              string(r.Evidence.EvidenceID),
+			"digest":                   string(r.Evidence.Digest),
+			"producer_id":              string(r.Evidence.Producer.AuthorityID),
+			"producer_generation":      uint64(r.Evidence.Producer.Generation),
+			"resource_identity_digest": string(r.Evidence.ResourceIdentityDigest),
+			"resource_generation":      r.Evidence.ResourceGeneration,
+			"resource_fence":           r.Evidence.ResourceFence,
+			"occurred_at":              uint64(r.Evidence.OccurredAt),
+		}
+	}
+	return map[string]any{
+		"resolution_class":   string(r.ResolutionClass),
+		"evidence":           evidence,
+		"approval_reference": r.ApprovalReference,
+		"expires_at":         uint64(r.ExpiresAt),
+	}
+}
+
+func (r ResolveCleanupDebt) canonical() map[string]any {
+	return r.header().canonical(r.kind(), r.canonicalPayload())
+}
+
+func (r ResolveCleanupDebt) valid() bool {
+	return validResolveCleanupDebtPayload(r)
+}
+
+func validRecordResidueAssemblyPayload(intent RecordResidueAssembly) bool {
+	if !validHeader(intent.header()) {
+		return false
+	}
+	if intent.header().Authority.Kind != AuthorityPublicationCleanup {
+		return false
+	}
+	if intent.Assembly.Reference == "" || !validDigest(intent.Assembly.IdentityDigest) ||
+		intent.Assembly.Generation == 0 || intent.Assembly.Fence == 0 {
+		return false
+	}
+	return true
+}
+
+func validResolveCleanupDebtPayload(intent ResolveCleanupDebt) bool {
+	if !validHeader(intent.header()) {
+		return false
+	}
+	if intent.header().Authority.Kind != AuthorityPublicationCleanup {
+		return false
+	}
+	switch intent.ResolutionClass {
+	case CleanupResolutionReclaimed, CleanupResolutionAlreadyAbsent, CleanupResolutionRetainedByAuthority:
+		return intent.Evidence != nil && intent.Evidence.EvidenceID != "" &&
+			validDigest(intent.Evidence.Digest) && intent.Evidence.Producer.AuthorityID != "" &&
+			intent.Evidence.Producer.Generation != 0 && validDigest(intent.Evidence.ResourceIdentityDigest) &&
+			intent.Evidence.ResourceGeneration != 0 && intent.Evidence.ResourceFence != 0 &&
+			intent.Evidence.OccurredAt != 0 && intent.ApprovalReference == "" && intent.ExpiresAt == 0
+	case CleanupResolutionAcceptedException:
+		return intent.Evidence == nil && intent.ApprovalReference != "" &&
+			intent.ExpiresAt != 0 && intent.ExpiresAt > intent.header().OccurredAt
+	default:
+		return false
+	}
 }
 
 // CanonicalRequestDigest computes the deterministic digest of an intent
