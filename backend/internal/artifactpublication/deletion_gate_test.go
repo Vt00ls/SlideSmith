@@ -10,6 +10,7 @@ package artifactpublication
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,17 +23,20 @@ import (
 const backendModulePrefix = "github.com/slidesmith/slidesmith/backend"
 
 // allowlistedOwnedPorts are the only SlideSmith packages the C05 Artifact
-// Publication core and its future Task Orchestration integration may depend
-// on: the module itself, the two upstream module ports whose evidence it
-// consumes (Task Workspace Lifecycle, Runtime Execution), the Task
-// Orchestration port, and the test-only PostgreSQL harness. Legacy
-// service/handler/repository/model/router/config/database packages are
-// deletion targets, never dependencies.
+// Publication core, its owned transport adapter, and the Task Orchestration
+// publication bridge may depend on: the module itself, the two upstream
+// module ports whose evidence it consumes (Task Workspace Lifecycle,
+// Runtime Execution), the Task Orchestration port (whose publication bridge
+// is one of the gated targets), the Scheduler port (an owned Platform
+// Control Plane deep module consumed by Task Orchestration), and the
+// test-only PostgreSQL harness. Legacy service/handler/repository/model/
+// router/config/database packages are deletion targets, never dependencies.
 var allowlistedOwnedPorts = map[string]bool{
 	backendModulePrefix + "/internal/artifactpublication": true,
 	backendModulePrefix + "/internal/taskorchestration":   true,
 	backendModulePrefix + "/internal/taskworkspace":       true,
 	backendModulePrefix + "/internal/runtimeexecution":    true,
+	backendModulePrefix + "/internal/scheduler":           true,
 	backendModulePrefix + "/internal/testpostgres":        true,
 }
 
@@ -49,16 +53,20 @@ var legacyPackagePrefixes = []string{
 }
 
 // TestStructuralDeletionGateLegacyPackagesAbsentFromBuildClosure proves by
-// import-graph inspection that the Artifact Publication package builds and
-// runs its contract without any legacy package: every SlideSmith package in
-// the transitive closure (including test dependencies) is an allowlisted
-// owned port.
+// import-graph inspection that the Artifact Publication package (C05 core
+// and owned transport adapter) AND the Task Orchestration publication bridge
+// build and run their contracts without any legacy package: every
+// SlideSmith package in the transitive closure (including test
+// dependencies) is an allowlisted owned port. The two target packages are
+// listed explicitly so the bridge (child SPEC #109 / C05-06) is itself a
+// gated build target, not merely a transitive dependency.
 func TestStructuralDeletionGateLegacyPackagesAbsentFromBuildClosure(t *testing.T) {
 	root, err := findBackendModuleRoot()
 	if err != nil {
 		t.Fatalf("locate backend module root: %v", err)
 	}
-	command := exec.Command("go", "list", "-deps", "-test", "./internal/artifactpublication")
+	command := exec.Command("go", "list", "-deps", "-test",
+		"./internal/artifactpublication", "./internal/taskorchestration")
 	command.Dir = root
 	var stdout, stderr bytes.Buffer
 	command.Stdout = &stdout
@@ -87,33 +95,41 @@ func TestStructuralDeletionGateLegacyPackagesAbsentFromBuildClosure(t *testing.T
 				pkg, sortedMapKeys(allowlistedOwnedPorts))
 		}
 	}
-	if !seen[backendModulePrefix+"/internal/artifactpublication"] {
-		t.Fatal("dependency closure is missing the target package")
+	for _, required := range []string{
+		backendModulePrefix + "/internal/artifactpublication",
+		backendModulePrefix + "/internal/taskorchestration",
+	} {
+		if !seen[required] {
+			t.Fatalf("dependency closure is missing target package %q; full closure: %v", required, sortedMapKeys(seen))
+		}
 	}
 }
 
 // TestStructuralDeletionGateTargetBuildsWithoutLegacyPackages proves the
-// target package compiles as a standalone build target with the legacy
-// packages absent.
+// two target packages (C05 core + owned adapter, Task Orchestration bridge)
+// compile as standalone build targets, which together with the import-graph
+// gate above demonstrates that the C05 contract and its bridge execute with
+// the legacy packages absent.
 func TestStructuralDeletionGateTargetBuildsWithoutLegacyPackages(t *testing.T) {
 	root, err := findBackendModuleRoot()
 	if err != nil {
 		t.Fatalf("locate backend module root: %v", err)
 	}
-	command := exec.Command("go", "build", "./internal/artifactpublication")
+	command := exec.Command("go", "build", "./internal/artifactpublication", "./internal/taskorchestration")
 	command.Dir = root
 	var stderr bytes.Buffer
 	command.Stderr = &stderr
 	if err := command.Run(); err != nil {
-		t.Fatalf("target package does not build without legacy packages: %v\n%s", err, stderr.String())
+		t.Fatalf("target packages do not build without legacy packages: %v\n%s", err, stderr.String())
 	}
 }
 
 // TestStructuralDeletionGateCapabilitySurfaceAbsence proves no seam exposes
 // a path, object key, bucket, mount, vendor, credential, session, signed
-// URL, general repository, or active-setter capability. The check walks the
-// actual method signatures and reachable value types, so a rename cannot
-// satisfy or break it.
+// URL, general repository, active-setter, legacy `PublishVersion` string, or
+// timestamp-derived version authority. The check walks the actual method
+// signatures and reachable value types, so a rename cannot satisfy or break
+// it.
 func TestStructuralDeletionGateCapabilitySurfaceAbsence(t *testing.T) {
 	seams := []reflect.Type{
 		reflect.TypeOf((*PublicationCore)(nil)).Elem(),
@@ -151,7 +167,9 @@ func TestStructuralDeletionGateCapabilitySurfaceAbsence(t *testing.T) {
 	forbiddenFieldFragments := []string{
 		"path", "object_key", "objectkey", "prefix", "bucket", "mount",
 		"vendor", "credential", "session", "signed_url", "locator", "latest",
-		"created_at", "activated_at", "timestamp",
+		"created_at", "activated_at", "timestamp", "publish_version",
+		"publishversion", "version_string", "versionstring", "directory_scan",
+		"directoryscan",
 	}
 	forbiddenMethodFragments := []string{
 		"SetActive", "Set", "Update", "Delete", "Insert", "Save",
@@ -298,6 +316,127 @@ func TestBehavioralGateHistoryAndHeadUseExplicitStreamFactsOnly(t *testing.T) {
 	if parent.ArtifactVersionID > child.ArtifactVersionID {
 		t.Fatalf("precondition: parent ID %q should be lexically after child %q for a misleading-string scenario",
 			parent.ArtifactVersionID, child.ArtifactVersionID)
+	}
+}
+
+// TestBehavioralGateObjectKeyPrefixesAndLatestFactsDoNotDriveAuthority
+// plants misleading object-key prefixes, directory entries, and "latest
+// file" facts in the Durable Object capability facts and member names, and
+// proves the canonical manifest, stream facts, and current head are fully
+// determined by explicit IDs, manifest, stream revision/head and evidence —
+// never by the object-key-looking strings, directory scan results, or
+// latest-file inference.
+func TestBehavioralGateObjectKeyPrefixesAndLatestFactsDoNotDriveAuthority(t *testing.T) {
+	f := newFixture(t)
+	set := f.buildEvidence(t, []ArtifactMemberSpec{f.deckMemberSpec()})
+
+	// Plant misleading capability facts: object-key prefixes, a bucket,
+	// directory entries, and a "latest" marker on the Durable Object
+	// content identity. These are opaque evidence facts; they must never
+	// become the manifest, the member set, the version identity, or the
+	// head.
+	planted := set.capabilities[0]
+	planted.ContentID = ContentID("s3://canary-bucket/prefix/2026/08/10/latest/Deck.pptx")
+	planted.Digest = planted.CanonicalDigest()
+	set.capabilities[0] = planted
+	f.registry.register(planted, true)
+
+	// A member logical name that looks like a directory entry / object-key
+	// path is unsafe and must fail closed: the manifest never accepts a
+	// path-like name.
+	pathLike := f.deckMemberSpec()
+	pathLike.LogicalName = "s3://canary-bucket/prefix/latest/Deck.pptx"
+	pathPayload := f.preparePayload("op-path-like", set, []ArtifactMemberSpec{pathLike})
+	if _, err := f.core.Mutate(context.Background(), f.prepareIntent("op-path-like", pathPayload)); err == nil {
+		t.Fatal("path-like member logical name must fail closed (no directory-scan capability)")
+	}
+
+	// The clean candidate with the planted (but opaque) content identity
+	// activates exactly like any other candidate: the manifest is derived
+	// from explicit member facts (ArtifactID, kind, normalized name, media
+	// type, size, digest), never from the content identity string.
+	prepare := f.mustPrepare(t, "op-prefix-1", set)
+	view, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryOperation, PolicyDomainID: f.policyDomain, TaskID: f.taskID, OperationID: "op-prefix-1",
+	})
+	if err != nil {
+		t.Fatalf("query operation: %v", err)
+	}
+	encoded := string(mustMarshalJSON(t, view))
+	for _, canary := range []string{"s3://", "canary-bucket", "prefix/", "latest/", "directory"} {
+		if strings.Contains(encoded, canary) {
+			t.Fatalf("planted object-key/directory canary %q leaked into the operation view: %s", canary, encoded)
+		}
+	}
+
+	f.mustVerify(t, "op-prefix-1", set)
+	activated := f.mustActivate(t, "op-prefix-1")
+	if activated.ActivationEvidence == nil || activated.ActivationEvidence.ArtifactVersionID != prepare.ArtifactVersionID {
+		t.Fatalf("activation must bind the explicit candidate identity: %#v", activated)
+	}
+
+	// A second candidate whose content identity lexically "looks" newer or
+	// more "latest" must never win by string comparison: only the explicit
+	// stream CAS decides.
+	setB := f.buildEvidence(t, []ArtifactMemberSpec{f.deckMemberSpec()})
+	setB.capabilities[0].ContentID = ContentID("s3://canary-bucket/prefix/2099/12/31/latest/z-latest.pptx")
+	setB.capabilities[0].Digest = setB.capabilities[0].CanonicalDigest()
+	f.registry.register(setB.capabilities[0], true)
+	// The stream is at revision 1 after the activation; the second prepare
+	// must state the current explicit stream facts (a stale revision fails
+	// closed, never by content-identity comparison).
+	headerB := f.header("op-prefix-2")
+	headerB.ExpectedStreamRevision = 1
+	headerB.ExpectedHead = activated.ActivationEvidence.ArtifactVersionID
+	prepareB, err := f.core.Mutate(context.Background(), bindDigest(NewPreparePublication(headerB, f.preparePayload("op-prefix-2", setB, []ArtifactMemberSpec{f.deckMemberSpec()}))))
+	if err != nil {
+		t.Fatalf("prepare op-prefix-2: %v", err)
+	}
+	if prepareB.ArtifactVersionID == prepare.ArtifactVersionID {
+		t.Fatal("distinct operations must have distinct candidate identities")
+	}
+	if prepareB.ManifestDigest == prepare.ManifestDigest {
+		t.Fatal("manifest digest must be derived from explicit member facts, not content identities")
+	}
+
+	stream, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryTaskStream, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+	})
+	if err != nil {
+		t.Fatalf("query stream: %v", err)
+	}
+	if stream.StreamRevision != 1 || stream.CurrentHead != activated.ActivationEvidence.ArtifactVersionID {
+		t.Fatalf("stream facts must reflect only the explicit CAS winner: %#v", stream)
+	}
+}
+
+// TestBehavioralGatePublishVersionStringIsNotAuthority proves a
+// `PublishVersion`-style string (the legacy timestamp-derived version
+// authority) is never accepted as an identity input: the public surface has
+// no such field, an unknown query kind fails closed, and a version-string
+// value cannot be used to select or create a version.
+func TestBehavioralGatePublishVersionStringIsNotAuthority(t *testing.T) {
+	f := newFixture(t)
+
+	// The closed query union has no "by version string" kind: an unknown
+	// kind is an invalid intent, never a lookup by legacy version string.
+	_, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: "publish_version", PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+	})
+	var publicationError *Error
+	if !errors.As(err, &publicationError) || publicationError.Code != ErrorInvalidIntent {
+		t.Fatalf("unknown publish-version query kind must fail closed as invalid intent, got %v", err)
+	}
+
+	// A candidate whose member facts are submitted at a misleading
+	// timestamp-derived "version string" moment still gets an opaque,
+	// non-reused ArtifactVersionID; the identity never equals or derives
+	// from a version string.
+	set := f.buildEvidence(t, []ArtifactMemberSpec{f.deckMemberSpec()})
+	prepare := f.mustPrepare(t, "op-no-version-string", set)
+	if prepare.ArtifactVersionID == "" || strings.Contains(string(prepare.ArtifactVersionID), "2026") ||
+		strings.Contains(string(prepare.ArtifactVersionID), "08") {
+		t.Fatalf("ArtifactVersionID must be opaque and never contain timestamp/version-string facts: %q", prepare.ArtifactVersionID)
 	}
 }
 
