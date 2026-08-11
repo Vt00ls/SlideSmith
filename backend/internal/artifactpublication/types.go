@@ -10,9 +10,13 @@
 // Child SPEC #104 establishes the canonical core and the complete operation
 // lifecycle (prepare, verify, reject, cancel, reconcile) over a
 // deterministic, restartable in-memory authority. Atomic activation of an
-// Artifact Version and manual-edit lineage activation are delivered by a
-// later child SPEC (#105); this package's types and invariant engine are
-// built so that later adapters must reuse the same engine.
+// Artifact Version and manual-edit lineage activation are delivered by
+// child SPEC #105; real PostgreSQL owned persistence and the restricted
+// Durable Object participant by child SPEC #107; the durable Publication
+// Residue lifecycle, restart-safe release reconciliation and the
+// C05/Durable Object Cleanup Debt ownership boundary by child SPEC #108.
+// This package's types and invariant engine are built so that later
+// adapters must reuse the same engine.
 package artifactpublication
 
 import (

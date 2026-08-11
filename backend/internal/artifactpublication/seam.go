@@ -138,6 +138,15 @@ type PublicationDecision struct {
 	CancelReason       CancelReason
 	ReconcileMode      ReconcileMode
 	ResidueRelease     bool
+	// C05-05 residue/debt facts reported by residue release, assembly
+	// recording and debt resolution decisions. They are content-free and
+	// already durable.
+	ResidueDisposition ResidueDisposition
+	ResidueExpiry      Instant
+	ReleaseReceipt     *ReleaseReceipt
+	CleanupDebtID      CleanupDebtID
+	CleanupDebtStatus  CleanupDebtStatus
+	ResolutionClass    CleanupDebtResolutionClass
 	OccurredAt         Instant
 }
 
@@ -190,6 +199,14 @@ const (
 	// publication authority identity, the current availability fact, and
 	// the declared expiry.
 	QueryVerifyC04ReconstructionCapability PublicationQueryKind = "verify_c04_reconstruction_capability"
+	// QueryResidue inspects the durable PublicationResidue of one exact
+	// operation: owner, opaque references, expiry, retry state, release
+	// disposition and C05-owned debt identity. It is read-only and never
+	// triggers physical release.
+	QueryResidue PublicationQueryKind = "residue"
+	// QueryCleanupDebt inspects one C05-owned Cleanup Debt by DebtID or by
+	// exact operation. It is read-only and never triggers cleanup.
+	QueryCleanupDebt PublicationQueryKind = "cleanup_debt"
 )
 
 func validQueryKind(kind PublicationQueryKind) bool {
@@ -197,7 +214,7 @@ func validQueryKind(kind PublicationQueryKind) bool {
 	case QueryOperation, QueryCandidate, QueryTaskStream, QueryExactVersion,
 		QueryExactMember, QueryVersionHistory, QueryResolveContentTarget,
 		QueryVerifyContentTarget, QueryIssueC04ReconstructionCapability,
-		QueryVerifyC04ReconstructionCapability:
+		QueryVerifyC04ReconstructionCapability, QueryResidue, QueryCleanupDebt:
 		return true
 	default:
 		return false
@@ -233,6 +250,10 @@ type PublicationQuery struct {
 	// C04Capability is the presented capability for
 	// QueryVerifyC04ReconstructionCapability.
 	C04Capability *C04ReconstructionCapability
+	// CleanupDebtID identifies the C05-owned Cleanup Debt to inspect. It is
+	// required by QueryCleanupDebt when the operation identity is not
+	// supplied.
+	CleanupDebtID CleanupDebtID
 }
 
 // ArtifactMemberView is the opaque, immutable metadata of one member
@@ -263,6 +284,84 @@ type ArtifactVersionView struct {
 	Members           []ArtifactMemberView
 }
 
+// ResidueView is the content-free inspection view of one durable
+// PublicationResidue. It exposes only the closed disposition, the opaque
+// typed references, the owner, generation/fence, expiry, retry state and
+// the C05-owned debt identity; it never contains a path, object key,
+// bucket, vendor or locator.
+type ResidueView struct {
+	OperationID            PublicationOperationID
+	PolicyDomainID         PolicyDomainID
+	TaskID                 TaskID
+	Owner                  EvidenceAuthorityKind
+	Generation             Generation
+	Fence                  Fence
+	ReleaseIntent          string
+	StagingRefs            []StagingReferenceView
+	OccurredAt             Instant
+	Expiry                 Instant
+	Disposition            ResidueDisposition
+	RequiresReconciliation bool
+	AttemptCount           uint64
+	ConsecutiveFailures    uint64
+	NextRetryAt            Instant
+	ClaimGeneration        Generation
+	ClaimFence             Fence
+	LastErrorCategory      ResidueErrorCategory
+	ReleaseReceipt         *ReleaseReceipt
+	AssemblyReference      string
+	AssemblyIdentityDigest Digest
+	DebtID                 CleanupDebtID
+}
+
+// StagingReferenceView is the opaque, content-free view of one typed
+// staging reference.
+type StagingReferenceView struct {
+	Slot               MemberSlotID
+	ContentID          ContentID
+	ContentDigest      Digest
+	Size               uint64
+	Purpose            ContentPurpose
+	PhysicalGeneration uint64
+	AdapterID          AdapterID
+}
+
+// CleanupDebtView is the content-free inspection view of one C05-owned
+// Cleanup Debt. It exposes the claim/retry/backoff/blocker facts and the
+// evidence-backed (or audited) resolution; it never contains a path,
+// locator or raw error.
+type CleanupDebtView struct {
+	DebtID                 CleanupDebtID
+	Revision               uint64
+	OperationID            PublicationOperationID
+	PolicyDomainID         PolicyDomainID
+	TaskID                 TaskID
+	Owner                  EvidenceAuthorityKind
+	ResourceReference      string
+	ResourceIdentityDigest Digest
+	ResourceGeneration     uint64
+	ResourceFence          uint64
+	Status                 CleanupDebtStatus
+	CreatedAt              Instant
+	EligibleAt             Instant
+	FirstAttemptAt         Instant
+	LastAttemptAt          Instant
+	NextRetryAt            Instant
+	AttemptCount           uint64
+	ConsecutiveFailures    uint64
+	ClaimGeneration        Generation
+	ClaimFence             Fence
+	RetryDisposition       CleanupRetryDisposition
+	LastErrorCategory      ResidueErrorCategory
+	Blockers               CleanupBlockerClass
+	ResolvedAt             Instant
+	ResolutionClass        CleanupDebtResolutionClass
+	ResolutionReason       CleanupResolutionReason
+	ResolutionEvidence     *CleanupResolutionEvidence
+	ResolutionAuditFactID  string
+	ResolutionExpiresAt    Instant
+}
+
 // PublicationView is the closed, content-free read result. Ordinary queries
 // expose only activated immutable versions and safe operation status;
 // prepared, verifying, rejected, cancelled, and residue are visible only
@@ -288,6 +387,10 @@ type PublicationView struct {
 	ActivationEvidence *PublicationEvidence
 	ResidueRelease     bool
 	CurrentHead        ArtifactVersionID
+	// Residue is set by residue inspection queries.
+	Residue *ResidueView
+	// CleanupDebt is set by C05-owned Cleanup Debt inspection queries.
+	CleanupDebt *CleanupDebtView
 	// ContentTarget is set by content-target resolution and verification
 	// queries.
 	ContentTarget *ArtifactContentTarget

@@ -429,19 +429,26 @@ func (m *inMemory) cancel(
 }
 
 // releaseResidue records the typed staging references as C05-owned
-// publication residue with a content-free release intent. It is the only
-// residue transition in the canonical core; physical release is owned by the
-// Durable Object authority.
+// publication residue with a content-free release intent, the durable
+// expiry, the pending disposition and the claim bound to the original
+// operation generation/fence. It is the only residue transition in the
+// canonical core and is persisted BEFORE any physical release action;
+// physical release is owned by the Durable Object authority and only
+// evidence-backed receipts close the obligation.
 func (m *inMemory) releaseResidue(record *operationRecord, header PublicationIntentHeader) *residueRecord {
 	if record.candidate == nil {
 		return nil
 	}
+	now := m.now()
 	return &residueRecord{
 		operationID: record.operationID, policyDomainID: header.PolicyDomainID,
 		taskID: header.TaskID, owner: header.Authority.Kind,
 		generation: record.generation, fence: record.fence,
 		releaseIntent: "release_staging", stagingRefs: cloneStaging(record.candidate.staging),
-		occurredAt: m.now(),
+		occurredAt:      now,
+		expiry:          m.residueExpiry(now),
+		disposition:     ResiduePending,
+		claimGeneration: record.generation, claimFence: record.fence,
 	}
 }
 
@@ -460,7 +467,7 @@ func (m *inMemory) reconcile(
 	scope operationScope,
 	record *operationRecord,
 ) (PublicationDecision, error) {
-	if err := m.ensureAuthority(header.Authority, IntentReconcilePublication); err != nil {
+	if err := m.ensureReconcileAuthority(header.Authority, intent.Mode); err != nil {
 		return PublicationDecision{}, err
 	}
 	switch intent.Mode {
@@ -469,6 +476,16 @@ func (m *inMemory) reconcile(
 		decision := decisionForRecord(record, false, m.now())
 		m.recordOutcome(record, IntentReconcilePublication, digest, record.state, decision, nil)
 		return decision, nil
+
+	case ReconcileCompleteRelease:
+		// Release reconciliation re-evaluates the ORIGINAL operation's
+		// residue against the current Durable Object registry. It never
+		// creates a new ArtifactVersionID and never changes the manifest,
+		// parent or head.
+		record.reconcileMode = ReconcileCompleteRelease
+		decision, reconcileErr := m.runRelease(ctx, header, digest, scope, record, record.operationID, true)
+		m.recordOutcome(record, IntentReconcilePublication, digest, record.state, decision, toError(reconcileErr))
+		return decision, reconcileErr
 
 	case ReconcileCompleteVerification:
 		if record.state == OperationReconciliationRequired && record.verification != nil {

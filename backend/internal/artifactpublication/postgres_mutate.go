@@ -58,6 +58,12 @@ func (p *PostgresAuthority) Mutate(ctx context.Context, intent PublicationIntent
 		return p.cancelFlow(ctx, intent.(CancelPublication), header, digest, scope)
 	case IntentReconcilePublication:
 		return p.reconcileFlow(ctx, intent.(ReconcilePublication), header, digest, scope)
+	case IntentRecordResidueAssembly:
+		return p.recordResidueAssemblyFlow(ctx, intent.(RecordResidueAssembly), header, digest, scope)
+	case IntentReleaseResidue:
+		return p.releaseResidueFlow(ctx, intent.(ReleaseResidue), header, digest, scope)
+	case IntentResolveCleanupDebt:
+		return p.resolveCleanupDebtFlow(ctx, intent.(ResolveCleanupDebt), header, digest, scope)
 	default:
 		return PublicationDecision{}, &Error{Code: ErrorInvalidIntent}
 	}
@@ -139,6 +145,27 @@ func (p *PostgresAuthority) writeAudit(ctx context.Context, tx *sql.Tx, header P
 		string(header.Authority.Kind), string(header.Authority.ID), uint64(header.Authority.Generation),
 		string(state), string(versionID), string(manifestDigest), uint64(streamRevision))
 	return err
+}
+
+// writeAuditReturningID persists one mandatory audit fact and returns its
+// opaque audit identity. It is used by resolutions whose audited audit-fact
+// id must be recorded on the resolved debt.
+func (p *PostgresAuthority) writeAuditReturningID(ctx context.Context, tx *sql.Tx, header PublicationIntentHeader, action string, state PublicationOperationState, versionID ArtifactVersionID, manifestDigest Digest, streamRevision StreamRevision) (string, error) {
+	var auditID int64
+	err := tx.QueryRowContext(ctx, `INSERT INTO `+p.q("publication_audit")+`
+		(occurred_at, policy_domain_id, task_id, operation_id, intent_kind, action,
+		 actor_kind, actor_id, actor_generation, state, version_id, manifest_digest, stream_revision)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		RETURNING audit_id`,
+		int64(p.nowValue()), string(header.PolicyDomainID), string(header.TaskID),
+		string(header.Operation.ID), string(action), action,
+		string(header.Authority.Kind), string(header.Authority.ID), uint64(header.Authority.Generation),
+		string(state), string(versionID), string(manifestDigest), uint64(streamRevision)).
+		Scan(&auditID)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("audit-%d", auditID), nil
 }
 
 // writeOutbox persists one committed Task Orchestration outbox envelope in
@@ -1050,18 +1077,65 @@ func (p *PostgresAuthority) persistTerminal(ctx context.Context, tx *sql.Tx, sco
 	if record.residue == nil {
 		return nil
 	}
+	return p.persistResidue(ctx, tx, scope, record.residue)
+}
+
+// persistResidue writes the full durable residue record (owner, opaque
+// references, operation, generation/fence, expiry, retry, disposition and
+// optional C05-owned assembly obligation) in the current transaction.
+func (p *PostgresAuthority) persistResidue(ctx context.Context, tx *sql.Tx, scope operationScope, residue *residueRecord) error {
+	receiptJSON := []byte(nil)
+	if residue.releaseReceipt != nil {
+		var err error
+		receiptJSON, err = marshalJSONSafe(residue.releaseReceipt)
+		if err != nil {
+			return err
+		}
+	}
+	assemblyRef, assemblyDigest := "", ""
+	assemblyGeneration, assemblyFence := uint64(0), uint64(0)
+	if residue.assembly != nil {
+		assemblyRef = residue.assembly.Reference
+		assemblyDigest = string(residue.assembly.IdentityDigest)
+		assemblyGeneration = residue.assembly.Generation
+		assemblyFence = residue.assembly.Fence
+	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO `+p.q("publication_residue")+`
-		(policy_domain_id, task_id, operation_id, owner, generation, fence, release_intent, occurred_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		(policy_domain_id, task_id, operation_id, owner, generation, fence, release_intent, occurred_at,
+		 expiry, disposition, requires_reconciliation, attempt_count, consecutive_failures, next_retry_at,
+		 claim_generation, claim_fence, last_error_category, release_receipt,
+		 assembly_ref, assembly_digest, assembly_generation, assembly_fence, debt_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+		ON CONFLICT (policy_domain_id, task_id, operation_id) DO UPDATE
+			SET expiry = EXCLUDED.expiry, disposition = EXCLUDED.disposition,
+			    requires_reconciliation = EXCLUDED.requires_reconciliation,
+			    attempt_count = EXCLUDED.attempt_count,
+			    consecutive_failures = EXCLUDED.consecutive_failures,
+			    next_retry_at = EXCLUDED.next_retry_at,
+			    claim_generation = EXCLUDED.claim_generation, claim_fence = EXCLUDED.claim_fence,
+			    last_error_category = EXCLUDED.last_error_category,
+			    release_receipt = EXCLUDED.release_receipt,
+			    assembly_ref = EXCLUDED.assembly_ref, assembly_digest = EXCLUDED.assembly_digest,
+			    assembly_generation = EXCLUDED.assembly_generation, assembly_fence = EXCLUDED.assembly_fence,
+			    debt_id = EXCLUDED.debt_id`,
 		string(scope.policyDomainID), string(scope.taskID), string(scope.operationID),
-		string(record.residue.owner), uint64(record.residue.generation), uint64(record.residue.fence),
-		record.residue.releaseIntent, int64(record.residue.occurredAt)); err != nil {
+		string(residue.owner), uint64(residue.generation), uint64(residue.fence),
+		residue.releaseIntent, int64(residue.occurredAt),
+		int64(residue.expiry), string(residue.disposition), residue.requiresReconciliation,
+		residue.attemptCount, residue.consecutiveFailures, int64(residue.nextRetryAt),
+		uint64(residue.claimGeneration), uint64(residue.claimFence), string(residue.lastErrorCategory),
+		receiptJSON, assemblyRef, assemblyDigest, assemblyGeneration, assemblyFence,
+		string(residue.debtID)); err != nil {
 		return err
 	}
-	for _, staging := range record.residue.stagingRefs {
+	for _, staging := range residue.stagingRefs {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO `+p.q("publication_residue_staging")+`
 			(policy_domain_id, task_id, operation_id, slot, content_id, content_digest, size, purpose, physical_generation, adapter_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (policy_domain_id, task_id, operation_id, slot) DO UPDATE
+				SET content_id = EXCLUDED.content_id, content_digest = EXCLUDED.content_digest,
+				    size = EXCLUDED.size, purpose = EXCLUDED.purpose,
+				    physical_generation = EXCLUDED.physical_generation, adapter_id = EXCLUDED.adapter_id`,
 			string(scope.policyDomainID), string(scope.taskID), string(scope.operationID),
 			string(staging.slot), string(staging.contentID), string(staging.contentDigest),
 			staging.size, string(staging.purpose), staging.physicalGeneration, string(staging.adapterID)); err != nil {
@@ -1072,19 +1146,26 @@ func (p *PostgresAuthority) persistTerminal(ctx context.Context, tx *sql.Tx, sco
 }
 
 // releaseResidue records the typed staging references as C05-owned
-// publication residue with a content-free release intent. It is the only
-// residue transition in the canonical core; physical release is owned by
-// the Durable Object authority.
+// publication residue with a content-free release intent, the durable
+// expiry, the pending disposition and the claim bound to the original
+// operation generation/fence. It is the only residue transition in the
+// canonical core and is persisted BEFORE any physical release action;
+// physical release is owned by the Durable Object authority and only
+// evidence-backed receipts close the obligation.
 func (p *PostgresAuthority) releaseResidue(record *operationRecord, header PublicationIntentHeader) *residueRecord {
 	if record.candidate == nil {
 		return nil
 	}
+	now := p.nowValue()
 	return &residueRecord{
 		operationID: record.operationID, policyDomainID: header.PolicyDomainID,
 		taskID: header.TaskID, owner: header.Authority.Kind,
 		generation: record.generation, fence: record.fence,
 		releaseIntent: "release_staging", stagingRefs: cloneStaging(record.candidate.staging),
-		occurredAt: p.nowValue(),
+		occurredAt:      now,
+		expiry:          p.residueExpiry(now),
+		disposition:     ResiduePending,
+		claimGeneration: record.generation, claimFence: record.fence,
 	}
 }
 
@@ -1092,7 +1173,7 @@ func (p *PostgresAuthority) releaseResidue(record *operationRecord, header Publi
 // evidence references. It cannot allocate a new ArtifactVersionID, modify
 // the manifest or parent, or create a Task retry.
 func (p *PostgresAuthority) reconcileFlow(ctx context.Context, intent ReconcilePublication, header PublicationIntentHeader, digest Digest, scope operationScope) (PublicationDecision, error) {
-	if err := p.ensureAuthority(header.Authority, IntentReconcilePublication); err != nil {
+	if err := p.ensureReconcileAuthority(header.Authority, intent.Mode); err != nil {
 		return PublicationDecision{}, err
 	}
 	tx, err := p.db.BeginTx(ctx, nil)
@@ -1117,6 +1198,34 @@ func (p *PostgresAuthority) reconcileFlow(ctx context.Context, intent ReconcileP
 	switch intent.Mode {
 	case ReconcileInspect:
 		record.reconcileMode = ReconcileInspect
+	case ReconcileCompleteRelease:
+		// Release reconciliation re-evaluates the ORIGINAL operation's
+		// residue against the current Durable Object registry. It never
+		// creates a new ArtifactVersionID and never changes the manifest,
+		// parent or head. Attempt facts (backoff, error category) stay
+		// durable even when the re-evaluation reports a retryable or
+		// ambiguous error.
+		record.reconcileMode = ReconcileCompleteRelease
+		decision, reconcileErr := p.evaluateRelease(ctx, tx, header, digest, scope, record, record.operationID)
+		if err := p.writeAudit(ctx, tx, header, "reconcile", record.state, m0VersionID(record), m0ManifestDigest(record), record.streamRevision); err != nil {
+			return PublicationDecision{}, normalizePersistenceError(err)
+		}
+		outcomeRecord := intentOutcome{
+			digest: digest, state: record.state, decision: decision, recordedAt: p.nowValue(),
+		}
+		if err := p.saveOutcome(ctx, tx, scope, IntentReconcilePublication, outcomeRecord); err != nil {
+			return PublicationDecision{}, normalizePersistenceError(err)
+		}
+		if err := p.injectFault(PostgresFaultBeforeCommit, scope.operationID, IntentReconcilePublication, ""); err != nil {
+			return PublicationDecision{}, normalizePersistenceError(err)
+		}
+		if err := tx.Commit(); err != nil {
+			return PublicationDecision{}, normalizePersistenceError(err)
+		}
+		if err := p.injectFault(PostgresFaultAfterCommit, scope.operationID, IntentReconcilePublication, ""); err != nil {
+			return PublicationDecision{}, normalizePersistenceError(err)
+		}
+		return decision, reconcileErr
 	case ReconcileCompleteVerification:
 		if record.state == OperationReconciliationRequired && record.verification != nil {
 			resolved, failure := p.completeVerification(ctx, tx, record)
@@ -1215,7 +1324,10 @@ func (p *PostgresAuthority) completeVerification(ctx context.Context, tx *sql.Tx
 
 // ensureAuthority enforces the typed mutation authority. Only the Task
 // Orchestration authority may submit prepare/verify/activate/reject/
-// cancel/reconcile; the protected recovery authority may only cancel.
+// cancel/reconcile; the protected recovery authority may only cancel; the
+// protected publication cleanup authority may only record assembly
+// obligations, request residue release, and resolve C05-owned Cleanup
+// Debts.
 func (p *PostgresAuthority) ensureAuthority(authority PublicationAuthority, kind PublicationIntentKind) *Error {
 	if authority.Kind == AuthorityRecovery {
 		if kind != IntentCancelPublication {
@@ -1225,6 +1337,17 @@ func (p *PostgresAuthority) ensureAuthority(authority PublicationAuthority, kind
 			return &Error{Code: ErrorOwnershipDenied}
 		}
 		return nil
+	}
+	if authority.Kind == AuthorityPublicationCleanup {
+		switch kind {
+		case IntentRecordResidueAssembly, IntentReleaseResidue, IntentResolveCleanupDebt:
+			if authority.ID != p.cleanupAuth {
+				return &Error{Code: ErrorOwnershipDenied}
+			}
+			return nil
+		default:
+			return &Error{Code: ErrorOwnershipDenied}
+		}
 	}
 	if authority.Kind != AuthorityTaskOrchestration {
 		return &Error{Code: ErrorOwnershipDenied}

@@ -200,6 +200,13 @@ func (p *PostgresAuthority) loadOperation(ctx context.Context, querier sqlQuerie
 	if found {
 		record.residue = residue
 	}
+	debt, found, err := p.loadDebt(ctx, querier, scope)
+	if err != nil {
+		return nil, false, err
+	}
+	if found {
+		record.debt = debt
+	}
 	return record, true, nil
 }
 
@@ -429,11 +436,25 @@ func (p *PostgresAuthority) loadAcceptedEvidence(ctx context.Context, querier sq
 func (p *PostgresAuthority) loadResidue(ctx context.Context, querier sqlQuerier, scope operationScope) (*residueRecord, bool, error) {
 	var owner, releaseIntent string
 	var generation, fence, occurredAt uint64
-	err := querier.QueryRowContext(ctx, `SELECT owner, generation, fence, release_intent, occurred_at
+	var expiry, attemptCount, consecutiveFailures, nextRetryAt uint64
+	var claimGeneration, claimFence uint64
+	var lastErrorCategory string
+	var disposition string
+	var requiresReconciliation bool
+	var receiptJSON []byte
+	var assemblyRef, assemblyDigest, debtID string
+	var assemblyGeneration, assemblyFence uint64
+	err := querier.QueryRowContext(ctx, `SELECT owner, generation, fence, release_intent, occurred_at,
+		expiry, disposition, requires_reconciliation, attempt_count, consecutive_failures, next_retry_at,
+		claim_generation, claim_fence, last_error_category, release_receipt,
+		assembly_ref, assembly_digest, assembly_generation, assembly_fence, debt_id
 		FROM `+p.q("publication_residue")+`
 		WHERE policy_domain_id = $1 AND task_id = $2 AND operation_id = $3`,
 		string(scope.policyDomainID), string(scope.taskID), string(scope.operationID)).
-		Scan(&owner, &generation, &fence, &releaseIntent, &occurredAt)
+		Scan(&owner, &generation, &fence, &releaseIntent, &occurredAt,
+			&expiry, &disposition, &requiresReconciliation, &attemptCount, &consecutiveFailures, &nextRetryAt,
+			&claimGeneration, &claimFence, &lastErrorCategory, &receiptJSON,
+			&assemblyRef, &assemblyDigest, &assemblyGeneration, &assemblyFence, &debtID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, false, nil
@@ -444,6 +465,25 @@ func (p *PostgresAuthority) loadResidue(ctx context.Context, querier sqlQuerier,
 		operationID: scope.operationID, policyDomainID: scope.policyDomainID, taskID: scope.taskID,
 		owner: EvidenceAuthorityKind(owner), generation: Generation(generation), fence: Fence(fence),
 		releaseIntent: releaseIntent, occurredAt: Instant(occurredAt),
+		expiry: Instant(expiry), disposition: ResidueDisposition(disposition),
+		requiresReconciliation: requiresReconciliation,
+		attemptCount:           attemptCount, consecutiveFailures: consecutiveFailures,
+		nextRetryAt: Instant(nextRetryAt), claimGeneration: Generation(claimGeneration),
+		claimFence: Fence(claimFence), lastErrorCategory: ResidueErrorCategory(lastErrorCategory),
+		debtID: CleanupDebtID(debtID),
+	}
+	if len(receiptJSON) > 0 && string(receiptJSON) != "null" {
+		var receipt ReleaseReceipt
+		if err := json.Unmarshal(receiptJSON, &receipt); err != nil {
+			return nil, false, err
+		}
+		record.releaseReceipt = &receipt
+	}
+	if assemblyRef != "" {
+		record.assembly = &assemblyResource{
+			Reference: assemblyRef, IdentityDigest: Digest(assemblyDigest),
+			Generation: assemblyGeneration, Fence: assemblyFence,
+		}
 	}
 	rows, err := querier.QueryContext(ctx, `SELECT slot, content_id, content_digest, size, purpose, physical_generation, adapter_id
 		FROM `+p.q("publication_residue_staging")+`
@@ -467,6 +507,175 @@ func (p *PostgresAuthority) loadResidue(ctx context.Context, querier sqlQuerier,
 		record.stagingRefs = append(record.stagingRefs, staging)
 	}
 	return record, true, rows.Err()
+}
+
+// loadDebt loads one C05-owned Cleanup Debt for an operation, or (nil,
+// false) when none exists.
+func (p *PostgresAuthority) loadDebt(ctx context.Context, querier sqlQuerier, scope operationScope) (*cleanupDebtRecord, bool, error) {
+	var debtID, owner, resourceRef, resourceDigest, status string
+	var revision, resourceGeneration, resourceFence uint64
+	var createdAt, eligibleAt, firstAttemptAt, lastAttemptAt, nextRetryAt uint64
+	var attemptCount, consecutiveFailures uint64
+	var claimGeneration, claimFence uint64
+	var retryDisposition, lastErrorCategory string
+	var blockerClasses uint64
+	var resolvedAt, resolutionExpiresAt uint64
+	var resolutionClass, resolutionReason, auditFactID, approvalRef string
+	var evidenceJSON []byte
+	err := querier.QueryRowContext(ctx, `SELECT debt_id, revision, owner, resource_ref, resource_digest,
+		resource_generation, resource_fence, status, created_at, eligible_at,
+		first_attempt_at, last_attempt_at, next_retry_at, attempt_count, consecutive_failures,
+		claim_generation, claim_fence, retry_disposition, last_error_category, blocker_classes,
+		resolved_at, resolution_class, resolution_reason, resolution_evidence,
+		resolution_audit_fact_id, resolution_approval_ref, resolution_expires_at
+		FROM `+p.q("publication_cleanup_debt")+`
+		WHERE policy_domain_id = $1 AND task_id = $2 AND operation_id = $3`,
+		string(scope.policyDomainID), string(scope.taskID), string(scope.operationID)).
+		Scan(&debtID, &revision, &owner, &resourceRef, &resourceDigest,
+			&resourceGeneration, &resourceFence, &status, &createdAt, &eligibleAt,
+			&firstAttemptAt, &lastAttemptAt, &nextRetryAt, &attemptCount, &consecutiveFailures,
+			&claimGeneration, &claimFence, &retryDisposition, &lastErrorCategory, &blockerClasses,
+			&resolvedAt, &resolutionClass, &resolutionReason, &evidenceJSON,
+			&auditFactID, &approvalRef, &resolutionExpiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	record := &cleanupDebtRecord{
+		debtID: CleanupDebtID(debtID), revision: revision,
+		policyDomainID: scope.policyDomainID, taskID: scope.taskID, operationID: scope.operationID,
+		owner: EvidenceAuthorityKind(owner), resourceRef: resourceRef, resourceDigest: Digest(resourceDigest),
+		resourceGeneration: resourceGeneration, resourceFence: resourceFence,
+		status: CleanupDebtStatus(status), createdAt: Instant(createdAt), eligibleAt: Instant(eligibleAt),
+		firstAttemptAt: Instant(firstAttemptAt), lastAttemptAt: Instant(lastAttemptAt),
+		nextRetryAt: Instant(nextRetryAt), attemptCount: attemptCount, consecutiveFailures: consecutiveFailures,
+		claimGeneration: Generation(claimGeneration), claimFence: Fence(claimFence),
+		retryDisposition:  CleanupRetryDisposition(retryDisposition),
+		lastErrorCategory: ResidueErrorCategory(lastErrorCategory), blockers: CleanupBlockerClass(blockerClasses),
+		resolvedAt: Instant(resolvedAt), resolutionClass: CleanupDebtResolutionClass(resolutionClass),
+		resolutionReason:      CleanupResolutionReason(resolutionReason),
+		resolutionAuditFactID: auditFactID, resolutionApprovalRef: approvalRef,
+		resolutionExpiresAt: Instant(resolutionExpiresAt),
+	}
+	if len(evidenceJSON) > 0 && string(evidenceJSON) != "null" {
+		var evidence CleanupResolutionEvidence
+		if err := json.Unmarshal(evidenceJSON, &evidence); err != nil {
+			return nil, false, err
+		}
+		record.resolutionEvidence = &evidence
+	}
+	return record, true, nil
+}
+
+// loadDebtByID loads one C05-owned Cleanup Debt by its opaque identity and
+// verifies it belongs to the given policy domain/Task (cross-workspace
+// identity is never disclosed).
+func (p *PostgresAuthority) loadDebtByID(ctx context.Context, querier sqlQuerier, debtID CleanupDebtID, policyDomainID PolicyDomainID, taskID TaskID) (*cleanupDebtRecord, bool, error) {
+	var operationID, owner, resourceRef, resourceDigest, status string
+	var revision, resourceGeneration, resourceFence uint64
+	var createdAt, eligibleAt, firstAttemptAt, lastAttemptAt, nextRetryAt uint64
+	var attemptCount, consecutiveFailures uint64
+	var claimGeneration, claimFence uint64
+	var retryDisposition, lastErrorCategory string
+	var blockerClasses uint64
+	var resolvedAt, resolutionExpiresAt uint64
+	var resolutionClass, resolutionReason, auditFactID, approvalRef string
+	var evidenceJSON []byte
+	err := querier.QueryRowContext(ctx, `SELECT operation_id, revision, owner, resource_ref, resource_digest,
+		resource_generation, resource_fence, status, created_at, eligible_at,
+		first_attempt_at, last_attempt_at, next_retry_at, attempt_count, consecutive_failures,
+		claim_generation, claim_fence, retry_disposition, last_error_category, blocker_classes,
+		resolved_at, resolution_class, resolution_reason, resolution_evidence,
+		resolution_audit_fact_id, resolution_approval_ref, resolution_expires_at
+		FROM `+p.q("publication_cleanup_debt")+`
+		WHERE debt_id = $1 AND policy_domain_id = $2 AND task_id = $3`,
+		string(debtID), string(policyDomainID), string(taskID)).
+		Scan(&operationID, &revision, &owner, &resourceRef, &resourceDigest,
+			&resourceGeneration, &resourceFence, &status, &createdAt, &eligibleAt,
+			&firstAttemptAt, &lastAttemptAt, &nextRetryAt, &attemptCount, &consecutiveFailures,
+			&claimGeneration, &claimFence, &retryDisposition, &lastErrorCategory, &blockerClasses,
+			&resolvedAt, &resolutionClass, &resolutionReason, &evidenceJSON,
+			&auditFactID, &approvalRef, &resolutionExpiresAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	record := &cleanupDebtRecord{
+		debtID: debtID, revision: revision,
+		policyDomainID: policyDomainID, taskID: taskID, operationID: PublicationOperationID(operationID),
+		owner: EvidenceAuthorityKind(owner), resourceRef: resourceRef, resourceDigest: Digest(resourceDigest),
+		resourceGeneration: resourceGeneration, resourceFence: resourceFence,
+		status: CleanupDebtStatus(status), createdAt: Instant(createdAt), eligibleAt: Instant(eligibleAt),
+		firstAttemptAt: Instant(firstAttemptAt), lastAttemptAt: Instant(lastAttemptAt),
+		nextRetryAt: Instant(nextRetryAt), attemptCount: attemptCount, consecutiveFailures: consecutiveFailures,
+		claimGeneration: Generation(claimGeneration), claimFence: Fence(claimFence),
+		retryDisposition:  CleanupRetryDisposition(retryDisposition),
+		lastErrorCategory: ResidueErrorCategory(lastErrorCategory), blockers: CleanupBlockerClass(blockerClasses),
+		resolvedAt: Instant(resolvedAt), resolutionClass: CleanupDebtResolutionClass(resolutionClass),
+		resolutionReason:      CleanupResolutionReason(resolutionReason),
+		resolutionAuditFactID: auditFactID, resolutionApprovalRef: approvalRef,
+		resolutionExpiresAt: Instant(resolutionExpiresAt),
+	}
+	if len(evidenceJSON) > 0 && string(evidenceJSON) != "null" {
+		var evidence CleanupResolutionEvidence
+		if err := json.Unmarshal(evidenceJSON, &evidence); err != nil {
+			return nil, false, err
+		}
+		record.resolutionEvidence = &evidence
+	}
+	return record, true, nil
+}
+
+// saveDebt upserts one C05-owned Cleanup Debt in the current transaction.
+func (p *PostgresAuthority) saveDebt(ctx context.Context, tx *sql.Tx, scope operationScope, debt *cleanupDebtRecord) error {
+	evidenceJSON := []byte(nil)
+	if debt.resolutionEvidence != nil {
+		var err error
+		evidenceJSON, err = marshalJSONSafe(debt.resolutionEvidence)
+		if err != nil {
+			return err
+		}
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO `+p.q("publication_cleanup_debt")+`
+		(debt_id, revision, policy_domain_id, task_id, operation_id, owner, resource_ref, resource_digest,
+		 resource_generation, resource_fence, status, created_at, eligible_at,
+		 first_attempt_at, last_attempt_at, next_retry_at, attempt_count, consecutive_failures,
+		 claim_generation, claim_fence, retry_disposition, last_error_category, blocker_classes,
+		 resolved_at, resolution_class, resolution_reason, resolution_evidence,
+		 resolution_audit_fact_id, resolution_approval_ref, resolution_expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+		        $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30)
+		ON CONFLICT (debt_id) DO UPDATE
+			SET revision = EXCLUDED.revision, status = EXCLUDED.status,
+			    first_attempt_at = EXCLUDED.first_attempt_at, last_attempt_at = EXCLUDED.last_attempt_at,
+			    next_retry_at = EXCLUDED.next_retry_at, attempt_count = EXCLUDED.attempt_count,
+			    consecutive_failures = EXCLUDED.consecutive_failures,
+			    claim_generation = EXCLUDED.claim_generation, claim_fence = EXCLUDED.claim_fence,
+			    retry_disposition = EXCLUDED.retry_disposition,
+			    last_error_category = EXCLUDED.last_error_category,
+			    blocker_classes = EXCLUDED.blocker_classes,
+			    resolved_at = EXCLUDED.resolved_at, resolution_class = EXCLUDED.resolution_class,
+			    resolution_reason = EXCLUDED.resolution_reason,
+			    resolution_evidence = EXCLUDED.resolution_evidence,
+			    resolution_audit_fact_id = EXCLUDED.resolution_audit_fact_id,
+			    resolution_approval_ref = EXCLUDED.resolution_approval_ref,
+			    resolution_expires_at = EXCLUDED.resolution_expires_at`,
+		string(debt.debtID), debt.revision, string(scope.policyDomainID), string(scope.taskID), string(scope.operationID),
+		string(debt.owner), debt.resourceRef, string(debt.resourceDigest),
+		debt.resourceGeneration, debt.resourceFence, string(debt.status),
+		int64(debt.createdAt), int64(debt.eligibleAt),
+		int64(debt.firstAttemptAt), int64(debt.lastAttemptAt), int64(debt.nextRetryAt),
+		debt.attemptCount, debt.consecutiveFailures,
+		uint64(debt.claimGeneration), uint64(debt.claimFence), string(debt.retryDisposition),
+		string(debt.lastErrorCategory), uint64(debt.blockers),
+		int64(debt.resolvedAt), string(debt.resolutionClass), string(debt.resolutionReason),
+		evidenceJSON, debt.resolutionAuditFactID, debt.resolutionApprovalRef,
+		int64(debt.resolutionExpiresAt))
+	return err
 }
 
 // loadActivated loads one committed Artifact Version with its immutable

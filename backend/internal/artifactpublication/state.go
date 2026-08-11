@@ -111,10 +111,14 @@ type verificationRecord struct {
 }
 
 // residueRecord is the durable C05-owned publication residue created when a
-// non-activated operation reaches a terminal disposition. It records the
-// typed staging references to release, the owning module, generation/fence,
-// and a content-free estimate. Residue is not an Artifact Version and is
-// never visible to ordinary queries.
+// non-activated operation reaches a terminal disposition. It is recorded
+// durably BEFORE any physical release action (child SPEC #108), together
+// with the owner, the opaque typed staging references, the operation,
+// generation/fence, expiry, retry state and the release disposition. It
+// optionally carries the opaque C05-owned publication assembly resource and
+// the C05-owned Cleanup Debt identity when C05 actually created a physical
+// assembly resource; a staging-only residue never mints a DebtID. Residue
+// is not an Artifact Version and is never visible to ordinary queries.
 type residueRecord struct {
 	operationID    PublicationOperationID
 	policyDomainID PolicyDomainID
@@ -125,6 +129,64 @@ type residueRecord struct {
 	releaseIntent  string
 	stagingRefs    []stagingRecord
 	occurredAt     Instant
+	// C05-05: durable residue lifecycle. expiry is the retention window
+	// recorded at creation; passing it marks the residue expired but never
+	// guesses absence. disposition is the closed release disposition;
+	// requiresReconciliation is set only by an ambiguous Durable Object
+	// receipt and cleared by an evidence-backed receipt.
+	expiry                 Instant
+	disposition            ResidueDisposition
+	requiresReconciliation bool
+	attemptCount           uint64
+	consecutiveFailures    uint64
+	nextRetryAt            Instant
+	claimGeneration        Generation
+	claimFence             Fence
+	lastErrorCategory      ResidueErrorCategory
+	releaseReceipt         *ReleaseReceipt
+	assembly               *assemblyResource
+	debtID                 CleanupDebtID
+}
+
+// cleanupDebtRecord is the durable C05-owned Cleanup Debt for one physical
+// publication assembly resource C05 actually created. It is minted once per
+// operation/resource (no duplicate DebtID), persisted before the first
+// physical cleanup attempt, and supports claim, retry, backoff, blocker and
+// safe error. It closes only on evidence-backed Reclaimed/AlreadyAbsent/
+// RetainedByAuthority or an audited AcceptedException; path disappearance,
+// empty directories, object listings, logs, metrics and operator assertions
+// can never close it.
+type cleanupDebtRecord struct {
+	debtID                CleanupDebtID
+	revision              uint64
+	policyDomainID        PolicyDomainID
+	taskID                TaskID
+	operationID           PublicationOperationID
+	owner                 EvidenceAuthorityKind
+	resourceRef           string
+	resourceDigest        Digest
+	resourceGeneration    uint64
+	resourceFence         uint64
+	status                CleanupDebtStatus
+	createdAt             Instant
+	eligibleAt            Instant
+	firstAttemptAt        Instant
+	lastAttemptAt         Instant
+	nextRetryAt           Instant
+	attemptCount          uint64
+	consecutiveFailures   uint64
+	claimGeneration       Generation
+	claimFence            Fence
+	retryDisposition      CleanupRetryDisposition
+	lastErrorCategory     ResidueErrorCategory
+	blockers              CleanupBlockerClass
+	resolvedAt            Instant
+	resolutionClass       CleanupDebtResolutionClass
+	resolutionReason      CleanupResolutionReason
+	resolutionEvidence    *CleanupResolutionEvidence
+	resolutionAuditFactID string
+	resolutionApprovalRef string
+	resolutionExpiresAt   Instant
 }
 
 // intentOutcome is the replayable outcome of one intent submission for one
@@ -158,6 +220,7 @@ type operationRecord struct {
 	cancelReason       CancelReason
 	reconcileMode      ReconcileMode
 	residue            *residueRecord
+	debt               *cleanupDebtRecord
 	integrityConflict  bool
 	outcomes           map[PublicationIntentKind]map[Digest]intentOutcome
 }

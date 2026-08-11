@@ -38,8 +38,75 @@ func (p *PostgresAuthority) Query(ctx context.Context, query PublicationQuery) (
 		return p.queryIssueC04ReconstructionCapability(ctx, query)
 	case QueryVerifyC04ReconstructionCapability:
 		return p.queryVerifyC04ReconstructionCapability(ctx, query)
+	case QueryResidue:
+		return p.queryResidue(ctx, query)
+	case QueryCleanupDebt:
+		return p.queryCleanupDebt(ctx, query)
 	default:
 		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+}
+
+func (p *PostgresAuthority) queryResidue(ctx context.Context, query PublicationQuery) (PublicationView, error) {
+	scope := operationScope{policyDomainID: query.PolicyDomainID, taskID: query.TaskID, operationID: query.OperationID}
+	record, found, err := p.loadOperation(ctx, p.db, scope)
+	if err != nil {
+		return PublicationView{}, normalizePersistenceError(err)
+	}
+	if !found || record == nil || record.residue == nil {
+		// Non-enumerating: the same error is returned whether the residue
+		// exists in another scope or does not exist at all.
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	view := residueView(record.residue)
+	effectiveDisposition(view, record.residue, p.nowValue())
+	return PublicationView{
+		Kind: QueryResidue, PolicyDomainID: query.PolicyDomainID, TaskID: query.TaskID,
+		OperationID: record.operationID, State: record.state,
+		OccurredAt: record.occurredAt, Residue: view,
+	}, nil
+}
+
+func (p *PostgresAuthority) queryCleanupDebt(ctx context.Context, query PublicationQuery) (PublicationView, error) {
+	if query.CleanupDebtID == "" && query.OperationID == "" {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	scope := operationScope{policyDomainID: query.PolicyDomainID, taskID: query.TaskID, operationID: query.OperationID}
+	var debt *cleanupDebtRecord
+	var found bool
+	var err error
+	if query.CleanupDebtID != "" && query.OperationID == "" {
+		debt, found, err = p.loadDebtByID(ctx, p.db, query.CleanupDebtID, query.PolicyDomainID, query.TaskID)
+	} else {
+		var record *operationRecord
+		record, found, err = p.loadOperation(ctx, p.db, scope)
+		if found && record != nil && record.debt != nil {
+			debt, found = record.debt, true
+		}
+	}
+	if err != nil {
+		return PublicationView{}, normalizePersistenceError(err)
+	}
+	if !found || debt == nil {
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	return PublicationView{
+		Kind: QueryCleanupDebt, PolicyDomainID: query.PolicyDomainID, TaskID: query.TaskID,
+		OperationID: debt.operationID, State: "",
+		OccurredAt: debt.createdAt, CleanupDebt: debtView(debt),
+	}, nil
+}
+
+// effectiveDisposition overrides the displayed residue disposition when the
+// recorded retention window passed and the obligation is not yet closed by
+// evidence: the residue is reported as expired, which never guesses absence
+// and keeps the obligation open for reconciliation.
+func effectiveDisposition(view *ResidueView, residue *residueRecord, now Instant) {
+	if view == nil || residue == nil {
+		return
+	}
+	if residue.expiry != 0 && now > residue.expiry && !residueClosedByEvidence(residue.disposition) {
+		view.Disposition = ResidueExpired
 	}
 }
 

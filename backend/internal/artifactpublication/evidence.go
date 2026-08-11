@@ -17,13 +17,19 @@ const (
 	AuthorityTaskOrchestration EvidenceAuthorityKind = "task_orchestration"
 	// AuthorityRecovery is the protected recovery authority for cancels.
 	AuthorityRecovery EvidenceAuthorityKind = "protected_recovery"
+	// AuthorityPublicationCleanup is the protected publication cleanup
+	// authority: it records C05-owned assembly obligations, requests
+	// Durable Object residue release, resolves C05-owned Cleanup Debts, and
+	// reconciles release. It can never prepare/verify/activate/reject/
+	// cancel a publication or mutate a candidate.
+	AuthorityPublicationCleanup EvidenceAuthorityKind = "publication_cleanup"
 )
 
 func validEvidenceAuthorityKind(kind EvidenceAuthorityKind) bool {
 	switch kind {
 	case AuthorityRuntimeExecution, AuthorityPlatformValidation,
 		AuthorityTaskWorkspaceLifecycle, AuthorityDurableObject,
-		AuthorityTaskOrchestration, AuthorityRecovery:
+		AuthorityTaskOrchestration, AuthorityRecovery, AuthorityPublicationCleanup:
 		return true
 	default:
 		return false

@@ -66,9 +66,29 @@ type PostgresConfig struct {
 	TaskOrchestrationAuthorityID AuthorityID
 	// RecoveryAuthorityID registers the protected recovery authority.
 	RecoveryAuthorityID AuthorityID
+	// CleanupAuthorityID registers the protected publication cleanup
+	// authority that records C05-owned assembly obligations, requests
+	// Durable Object residue release, resolves C05-owned Cleanup Debts and
+	// reconciles release. It can never prepare/verify/activate/reject/
+	// cancel a publication or mutate a candidate.
+	CleanupAuthorityID AuthorityID
 	// PublicationAuthorityID is C05's own authority identity bound by
 	// every C04 reconstruction capability.
 	PublicationAuthorityID AuthorityID
+	// ResidueRetention computes the residue expiry instant from the residue
+	// creation instant. When nil or zero, the residue has no expiry.
+	ResidueRetention func(createdAt Instant) Instant
+	// DurableObjectRelease is the restricted same-PostgreSQL Durable Object
+	// participant that performs the physical release of the EXACT typed
+	// staging references of one residue and returns an evidence-backed
+	// receipt. When nil, the default participant validates every typed fact
+	// against publication_do_capability, verifies no activated attach row
+	// exists for the references, writes the release evidence row and marks
+	// the capabilities released in the same transaction. A participant can
+	// only release the exact typed references of one residue; it cannot
+	// list objects, infer a publication from a path/prefix/bucket, or
+	// perform remote I/O.
+	DurableObjectRelease DurableObjectReleaseParticipant
 	// CurrentContentCapability optionally overrides the current
 	// verified-content capability resolution. When nil, the adapter reads
 	// the restricted publication_do_capability registry owned by the
@@ -104,10 +124,13 @@ type PostgresAuthority struct {
 	doAuth             AuthorityID
 	toAuth             AuthorityID
 	recoveryAuth       AuthorityID
+	cleanupAuth        AuthorityID
 	publicationAuth    AuthorityID
+	residueRetention   func(createdAt Instant) Instant
 	capabilityResolver func(ContentCapabilityID) (ContentCapabilityEvidence, bool)
 	scopeResolver      func(ContentScopeKey) (ContentScope, bool)
 	attach             DurableObjectAttachParticipant
+	release            DurableObjectReleaseParticipant
 }
 
 var _ PublicationCore = (*PostgresAuthority)(nil)
@@ -133,14 +156,17 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 	}
 	authority := &PostgresAuthority{
 		db: db, schema: schema, now: now, faults: config.Faults,
-		runtimeAuth:     config.RuntimeAuthorityID,
-		validationAuth:  config.ValidationAuthorityID,
-		c04Auth:         config.C04AuthorityID,
-		doAuth:          config.DurableObjectAuthorityID,
-		toAuth:          config.TaskOrchestrationAuthorityID,
-		recoveryAuth:    config.RecoveryAuthorityID,
-		publicationAuth: config.PublicationAuthorityID,
-		attach:          config.DurableObjectAttach,
+		runtimeAuth:      config.RuntimeAuthorityID,
+		validationAuth:   config.ValidationAuthorityID,
+		c04Auth:          config.C04AuthorityID,
+		doAuth:           config.DurableObjectAuthorityID,
+		toAuth:           config.TaskOrchestrationAuthorityID,
+		recoveryAuth:     config.RecoveryAuthorityID,
+		cleanupAuth:      config.CleanupAuthorityID,
+		publicationAuth:  config.PublicationAuthorityID,
+		residueRetention: config.ResidueRetention,
+		attach:           config.DurableObjectAttach,
+		release:          config.DurableObjectRelease,
 	}
 	authority.capabilityResolver = config.CurrentContentCapability
 	if authority.capabilityResolver == nil {
@@ -156,6 +182,9 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 	}
 	if authority.attach == nil {
 		authority.attach = &postgresDurableObjectAttach{authority: authority}
+	}
+	if authority.release == nil {
+		authority.release = &postgresDurableObjectRelease{authority: authority}
 	}
 	return authority, nil
 }
@@ -393,7 +422,8 @@ CREATE TABLE IF NOT EXISTS %[17]s (
     fence BIGINT NOT NULL,
     safety_epoch BIGINT NOT NULL,
     digest TEXT NOT NULL,
-    current BOOLEAN NOT NULL
+    current BOOLEAN NOT NULL,
+    released BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE TABLE IF NOT EXISTS %[18]s (
     policy_domain_id TEXT NOT NULL,
@@ -413,6 +443,21 @@ CREATE TABLE IF NOT EXISTS %[19]s (
     fence BIGINT NOT NULL,
     release_intent TEXT NOT NULL,
     occurred_at BIGINT NOT NULL,
+    expiry BIGINT NOT NULL DEFAULT 0,
+    disposition TEXT NOT NULL DEFAULT 'pending',
+    requires_reconciliation BOOLEAN NOT NULL DEFAULT FALSE,
+    attempt_count BIGINT NOT NULL DEFAULT 0,
+    consecutive_failures BIGINT NOT NULL DEFAULT 0,
+    next_retry_at BIGINT NOT NULL DEFAULT 0,
+    claim_generation BIGINT NOT NULL DEFAULT 0,
+    claim_fence BIGINT NOT NULL DEFAULT 0,
+    last_error_category TEXT NOT NULL DEFAULT '',
+    release_receipt JSONB,
+    assembly_ref TEXT NOT NULL DEFAULT '',
+    assembly_digest TEXT NOT NULL DEFAULT '',
+    assembly_generation BIGINT NOT NULL DEFAULT 0,
+    assembly_fence BIGINT NOT NULL DEFAULT 0,
+    debt_id TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (policy_domain_id, task_id, operation_id)
 );
 CREATE TABLE IF NOT EXISTS %[20]s (
@@ -464,9 +509,71 @@ CREATE TABLE IF NOT EXISTS %[23]s (
     kind TEXT NOT NULL,
     subject_id TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS %[24]s (
+    debt_id TEXT PRIMARY KEY,
+    revision BIGINT NOT NULL,
+    policy_domain_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    resource_ref TEXT NOT NULL,
+    resource_digest TEXT NOT NULL,
+    resource_generation BIGINT NOT NULL,
+    resource_fence BIGINT NOT NULL,
+    status TEXT NOT NULL,
+    created_at BIGINT NOT NULL,
+    eligible_at BIGINT NOT NULL,
+    first_attempt_at BIGINT NOT NULL DEFAULT 0,
+    last_attempt_at BIGINT NOT NULL DEFAULT 0,
+    next_retry_at BIGINT NOT NULL DEFAULT 0,
+    attempt_count BIGINT NOT NULL DEFAULT 0,
+    consecutive_failures BIGINT NOT NULL DEFAULT 0,
+    claim_generation BIGINT NOT NULL DEFAULT 0,
+    claim_fence BIGINT NOT NULL DEFAULT 0,
+    retry_disposition TEXT NOT NULL DEFAULT '',
+    last_error_category TEXT NOT NULL DEFAULT '',
+    blocker_classes BIGINT NOT NULL DEFAULT 0,
+    resolved_at BIGINT NOT NULL DEFAULT 0,
+    resolution_class TEXT NOT NULL DEFAULT '',
+    resolution_reason TEXT NOT NULL DEFAULT '',
+    resolution_evidence JSONB,
+    resolution_audit_fact_id TEXT NOT NULL DEFAULT '',
+    resolution_approval_ref TEXT NOT NULL DEFAULT '',
+    resolution_expires_at BIGINT NOT NULL DEFAULT 0,
+    UNIQUE (policy_domain_id, task_id, operation_id)
+);
+CREATE TABLE IF NOT EXISTS %[25]s (
+    receipt_id TEXT PRIMARY KEY,
+    policy_domain_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    producer_authority_id TEXT NOT NULL,
+    producer_generation BIGINT NOT NULL,
+    outcome TEXT NOT NULL,
+    blocker_classes BIGINT NOT NULL DEFAULT 0,
+    expiry BIGINT NOT NULL DEFAULT 0,
+    occurred_at BIGINT NOT NULL,
+    digest TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_activated_op ON %[14]s (policy_domain_id, task_id, stream_revision);
 CREATE INDEX IF NOT EXISTS idx_outcome_kind ON %[4]s (policy_domain_id, task_id, operation_id, intent_kind);
 CREATE INDEX IF NOT EXISTS idx_candidate_version ON %[5]s (version_id);
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS expiry BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS disposition TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS requires_reconciliation BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS attempt_count BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS consecutive_failures BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS next_retry_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS claim_generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS claim_fence BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS last_error_category TEXT NOT NULL DEFAULT '';
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS release_receipt JSONB;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS assembly_ref TEXT NOT NULL DEFAULT '';
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS assembly_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS assembly_generation BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS assembly_fence BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS debt_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE %[17]s ADD COLUMN IF NOT EXISTS released BOOLEAN NOT NULL DEFAULT FALSE;
 `,
 		q("publication_identity_seq"),
 		q("publication_stream"),
@@ -490,7 +597,9 @@ CREATE INDEX IF NOT EXISTS idx_candidate_version ON %[5]s (version_id);
 		q("publication_residue_staging"),
 		q("publication_audit"),
 		q("publication_outbox"),
-		q("publication_integrity_incident"))
+		q("publication_integrity_incident"),
+		q("publication_cleanup_debt"),
+		q("publication_do_release"))
 	return ddl
 }
 
@@ -527,6 +636,24 @@ func normalizePersistenceError(err error) *Error {
 // now returns the controlled diagnostic clock.
 func (p *PostgresAuthority) nowValue() Instant {
 	return p.now()
+}
+
+// residueExpiry computes the residue expiry from its creation instant.
+func (p *PostgresAuthority) residueExpiry(createdAt Instant) Instant {
+	if p.residueRetention == nil {
+		return 0
+	}
+	return p.residueRetention(createdAt)
+}
+
+// mintCleanupDebtID allocates the next opaque, non-reused C05-owned Cleanup
+// Debt identity from the owned sequence.
+func (p *PostgresAuthority) mintCleanupDebtID(ctx context.Context, tx *sql.Tx) (CleanupDebtID, error) {
+	var next string
+	if err := tx.QueryRowContext(ctx, `SELECT nextval('`+p.q("publication_identity_seq")+`')::text`).Scan(&next); err != nil {
+		return "", err
+	}
+	return CleanupDebtID("publication-cleanup-debt-" + next), nil
 }
 
 // injectFault aborts the mutation exactly at the given bounded persistence
