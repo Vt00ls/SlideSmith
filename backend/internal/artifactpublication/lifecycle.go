@@ -32,7 +32,7 @@ func (m *inMemory) verify(
 		return PublicationDecision{}, &Error{Code: ErrorStaleAuthority}
 	}
 	switch record.state {
-	case OperationCancelled, OperationRejected:
+	case OperationCancelled, OperationRejected, OperationActivated:
 		// Late verify on an already terminal operation stays stale/terminal.
 		return PublicationDecision{}, &Error{Code: ErrorTerminalConflict}
 	case OperationVerified:
@@ -204,6 +204,11 @@ func (m *inMemory) evaluateEvidence(
 			export.SourceArtifactVersionID != candidate.parent ||
 			export.PolicyDomainID != header.PolicyDomainID || export.TaskID != header.TaskID ||
 			export.ValidationEvidenceID != validation.ID ||
+			// The export must bind the same new Revision/Checkpoint the C04
+			// commit evidence binds: the child cannot reconstruct from an
+			// arbitrary workspace revision (SPEC #105 manual-edit child
+			// must match the new Revision/Checkpoint).
+			export.RevisionID != commit.RevisionID || export.CheckpointID != commit.CheckpointID ||
 			!validDigest(export.Digest) || export.Digest != export.CanonicalDigest() {
 			return evaluation, false, &EvidenceFailure{Kind: "c04_export_scope", EvidenceID: commit.ID}, nil
 		}
@@ -331,6 +336,10 @@ func (m *inMemory) reject(
 		return PublicationDecision{}, &Error{Code: ErrorTerminalConflict}
 	case OperationRejected:
 		return PublicationDecision{}, &Error{Code: ErrorTerminalConflict}
+	case OperationActivated:
+		// Rejection after an atomic activation cannot undo the committed
+		// version; the operation is already terminal-active.
+		return PublicationDecision{}, &Error{Code: ErrorTerminalConflict}
 	}
 	// Reject, like cancel, accepts only the exact current operation
 	// generation and fence; a stale reject fails closed.
@@ -376,6 +385,13 @@ func (m *inMemory) cancel(
 		return PublicationDecision{}, &Error{Code: ErrorTerminalConflict}
 	case OperationCancelled:
 		return PublicationDecision{}, &Error{Code: ErrorTerminalConflict}
+	case OperationActivated:
+		// Activation-first linearization: the operation is already terminal
+		// with an active Artifact Version. Cancel returns the existing
+		// active terminal result and must never delete the version or
+		// release its references as residue.
+		decision := decisionForRecord(record, true, m.now())
+		return decision, nil
 	}
 	if header.Generation != record.generation || header.Fence != record.fence {
 		return PublicationDecision{}, &Error{Code: ErrorStaleAuthority}

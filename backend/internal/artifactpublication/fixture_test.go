@@ -145,6 +145,9 @@ func bindDigest(intent PublicationIntent) PublicationIntent {
 	case VerifyPublication:
 		typed.intentHeader = header
 		return typed
+	case ActivatePublication:
+		typed.intentHeader = header
+		return typed
 	case RejectPublication:
 		typed.intentHeader = header
 		return typed
@@ -349,12 +352,115 @@ func (f *fixture) verifyPayload(set *evidenceSet) VerifyPublicationPayload {
 	}
 }
 
+// exportEvidence builds the ValidatedExportEvidence binding an activated
+// parent Artifact Version so a manual-edit child's C04 commit evidence can
+// be validated against the exact parent (C04 reconstruction/export source).
+func (f *fixture) exportEvidence(parent ArtifactVersionID, validation ValidationEvidence) *ValidatedExportEvidence {
+	export := &ValidatedExportEvidence{
+		ID:                       "export-1",
+		PublicationAuthorityID:   f.c04Authority,
+		PolicyDomainID:           f.policyDomain,
+		TaskID:                   f.taskID,
+		TaskWorkspaceID:          "task-workspace-1",
+		SourceArtifactVersionID:  parent,
+		ReconstructionEvidenceID: "reconstruction-1",
+		RevisionID:               "revision-3",
+		CheckpointID:             "checkpoint-3",
+		ValidationEvidenceID:     validation.ID,
+		Generation:               f.generation,
+		Fence:                    f.fence,
+	}
+	export.Digest = export.CanonicalDigest()
+	return export
+}
+
+// childEvidenceSet builds one internally consistent manual-edit evidence
+// set whose C04 commit evidence binds the exact activated parent through
+// ValidatedExportEvidence, and registers its Durable Object capabilities as
+// currently valid.
+func (f *fixture) childEvidenceSet(t *testing.T, parent ArtifactVersionID, operationID string) *evidenceSet {
+	t.Helper()
+	member := f.deckMemberSpec()
+	set := &evidenceSet{proposalDigest: testDigest("proposal-manifest-child")}
+	set.runtimeEvidence = []RuntimeEvidence{f.runtimeEvidence(ChannelDeck, set.proposalDigest)}
+	set.validation = f.validationEvidence("publication-contract-1", set.runtimeEvidence, set.proposalDigest)
+	set.c04 = f.c04Commit(set.validation, f.exportEvidence(parent, set.validation))
+	set.c04.RevisionID = "revision-3"
+	set.c04.CheckpointID = "checkpoint-3"
+	set.c04.Digest = set.c04.CanonicalDigest()
+	capability := f.contentCapability(
+		"capability-child-"+operationID, string(member.Slot), "content-child-"+operationID,
+		member.ContentDigest, member.Size,
+	)
+	set.capabilities = []ContentCapabilityEvidence{capability}
+	f.registry.register(capability, true)
+	return set
+}
+
+// childPreparePayload builds the canonical manual-edit child prepare
+// request: kind manual-edit, exact parent, and the pinned references of the
+// child evidence set. The caller must advance the header's expected stream
+// revision/head to the parent's committed state.
+func (f *fixture) childPreparePayload(operationID string, parent ArtifactVersionID, set *evidenceSet) PreparePublicationPayload {
+	capability := set.capabilities[0]
+	staging := []StagingReference{{
+		MemberSlot: capability.MemberSlot, ContentID: capability.ContentID,
+		ContentDigest: capability.ContentDigest, Size: capability.Size,
+		Purpose: ContentPurposePublicationMember, PhysicalGeneration: capability.PhysicalGeneration,
+		AdapterID: capability.AdapterID,
+	}}
+	capabilityRefs := []ContentCapabilityRef{{
+		MemberSlot: capability.MemberSlot, CapabilityID: capability.ID, Digest: capability.Digest,
+	}}
+	runtimeRefs := make([]RuntimeEvidenceRef, 0, len(set.runtimeEvidence))
+	for _, evidence := range set.runtimeEvidence {
+		runtimeRefs = append(runtimeRefs, RuntimeEvidenceRef{
+			Channel: evidence.Channel, EvidenceID: evidence.ID, Digest: evidence.Digest,
+		})
+	}
+	return PreparePublicationPayload{
+		ContractID:            set.validation.ContractID,
+		Kind:                  PublicationKindManualEdit,
+		Parent:                parent,
+		PhaseRunID:            f.phaseRunID,
+		Members:               []ArtifactMemberSpec{f.deckMemberSpec()},
+		Staging:               staging,
+		RequiredChannels:      []ChannelKind{ChannelDeck},
+		RuntimeRefs:           runtimeRefs,
+		ValidationRef:         EvidenceRef{EvidenceID: set.validation.ID, Digest: set.validation.Digest},
+		C04CommitRef:          EvidenceRef{EvidenceID: set.c04.ID, Digest: set.c04.Digest},
+		ContentCapabilityRefs: capabilityRefs,
+	}
+}
+
+// activateAndReturn drives the standard first-generation happy path through
+// activation and returns the evidence set and activation decision.
+func (f *fixture) prepareVerifyActivate(t *testing.T, operationID string) (*evidenceSet, PublicationDecision) {
+	t.Helper()
+	set, _, _ := f.prepareAndVerify(t, operationID)
+	activated, err := f.core.Mutate(context.Background(), f.activateIntent(operationID))
+	if err != nil {
+		t.Fatalf("activate %s: %v", operationID, err)
+	}
+	return set, activated
+}
+
 func (f *fixture) prepareIntent(operationID string, payload PreparePublicationPayload) PublicationIntent {
 	return bindDigest(NewPreparePublication(f.header(operationID), payload))
 }
 
 func (f *fixture) verifyIntent(operationID string, payload VerifyPublicationPayload) PublicationIntent {
 	return bindDigest(NewVerifyPublication(f.header(operationID), payload))
+}
+
+func (f *fixture) activateIntent(operationID string) PublicationIntent {
+	return bindDigest(NewActivatePublication(f.header(operationID)))
+}
+
+// activateIntentWithHeader activates with an explicit header so tests can
+// pin an expected stream revision/head, generation/fence, or authority.
+func (f *fixture) activateIntentWithHeader(header PublicationIntentHeader) PublicationIntent {
+	return bindDigest(NewActivatePublication(header))
 }
 
 func (f *fixture) rejectIntent(operationID string, reason RejectReason, failure *EvidenceFailure) PublicationIntent {

@@ -59,19 +59,21 @@ func TestPublicSeamClosedSurfaces(t *testing.T) {
 }
 
 // TestMutationIntentUnionIsClosed proves the PublicationIntent union is
-// closed: only the five typed intents exist, each with an unexported marker,
+// closed: only the six typed intents exist, each with an unexported marker,
 // and the engine rejects anything else as invalid.
 func TestMutationIntentUnionIsClosed(t *testing.T) {
 	intentTypes := []reflect.Type{
 		reflect.TypeOf(PreparePublication{}),
 		reflect.TypeOf(VerifyPublication{}),
+		reflect.TypeOf(ActivatePublication{}),
 		reflect.TypeOf(RejectPublication{}),
 		reflect.TypeOf(CancelPublication{}),
 		reflect.TypeOf(ReconcilePublication{}),
 	}
-	// Exactly the five SPEC #104 intents.
-	if len(intentTypes) != 5 {
-		t.Fatalf("PublicationIntent union must have exactly five members, got %d", len(intentTypes))
+	// Exactly the six SPEC intents (prepare, verify, activate, reject,
+	// cancel, reconcile).
+	if len(intentTypes) != 6 {
+		t.Fatalf("PublicationIntent union must have exactly six members, got %d", len(intentTypes))
 	}
 	for _, typ := range intentTypes {
 		_, hasMarker := typ.MethodByName("publicationIntent")

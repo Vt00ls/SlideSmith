@@ -152,6 +152,64 @@ func TestCanonicalEncodingNeverContainsLocators(t *testing.T) {
 	_ = prepare
 }
 
+// TestNonLeakageActivationEvidenceAndVersionViews proves the activation
+// evidence and the committed version/member/history views never leak
+// content, paths, object keys, buckets, vendors, credentials, sessions, or
+// materialization locators even when hostile values are injected into the
+// request.
+func TestNonLeakageActivationEvidenceAndVersionViews(t *testing.T) {
+	f := newFixture(t)
+	set := f.buildEvidence(t, []ArtifactMemberSpec{f.deckMemberSpec()})
+
+	// Inject canaries into opaque evidence fields BEFORE prepare so the
+	// pinned references match the submitted evidence, and rebuild the
+	// dependent evidence.
+	set.runtimeEvidence[0].ProposalRef = canaryValues[1]
+	set.runtimeEvidence[0].Digest = set.runtimeEvidence[0].CanonicalDigest()
+	set.validation = f.validationEvidence(set.validation.ContractID, set.runtimeEvidence, set.proposalDigest)
+	set.c04 = f.c04Commit(set.validation, nil)
+	set.c04.ContentEvidenceRoot = canaryValues[4]
+	set.c04.DurabilityEvidenceRoot = canaryValues[5]
+	set.c04.Digest = set.c04.CanonicalDigest()
+
+	f.mustPrepare(t, "op-leak-activate", set)
+	f.mustVerify(t, "op-leak-activate", set)
+	activated, err := f.core.Mutate(context.Background(), f.activateIntent("op-leak-activate"))
+	if err != nil {
+		t.Fatalf("activate: %v", err)
+	}
+
+	encoded := string(mustMarshalJSON(t, activated))
+	if activated.ActivationEvidence != nil {
+		encoded += string(mustMarshalJSON(t, activated.ActivationEvidence))
+	}
+	for _, canary := range canaryValues {
+		if strings.Contains(encoded, canary) {
+			t.Fatalf("activation decision leaks canary %q", canary)
+		}
+	}
+
+	versionView, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryExactVersion, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+		ArtifactVersionID: activated.ArtifactVersionID,
+	})
+	if err != nil {
+		t.Fatalf("query exact version: %v", err)
+	}
+	historyView, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryVersionHistory, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+	})
+	if err != nil {
+		t.Fatalf("query history: %v", err)
+	}
+	allViews := string(mustMarshalJSON(t, versionView)) + string(mustMarshalJSON(t, historyView))
+	for _, canary := range canaryValues {
+		if strings.Contains(allViews, canary) {
+			t.Fatalf("version view leaks canary %q", canary)
+		}
+	}
+}
+
 // TestTestOutputFreeOfLocators proves the safe status fields exposed by the
 // seam never carry a materialization locator (content-free residue status).
 func TestTestOutputFreeOfLocators(t *testing.T) {

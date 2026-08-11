@@ -67,6 +67,10 @@ const (
 	// FaultBeforeVerificationResult aborts after evidence evaluation but
 	// before the verification result is recorded.
 	FaultBeforeVerificationResult
+	// FaultBeforeActivationCommit aborts after the activation revalidation
+	// but before the Artifact Version, members, lineage, stream revision,
+	// current head, and activation evidence are committed.
+	FaultBeforeActivationCommit
 	// FaultBeforeResponse aborts after durable persistence but before the
 	// decision is returned (response loss).
 	FaultBeforeResponse
@@ -95,6 +99,9 @@ type InMemoryPersistence struct {
 	versionFacts  map[ArtifactVersionID]contentFact
 	artifactFacts map[ArtifactID]contentFact
 	versionIndex  map[ArtifactVersionID]operationScope
+	// activated is the immutable set of committed Artifact Versions. It is
+	// written exactly once per activation and only read afterwards.
+	activated map[ArtifactVersionID]activatedRecord
 }
 
 func newPersistence() *InMemoryPersistence {
@@ -104,6 +111,7 @@ func newPersistence() *InMemoryPersistence {
 		versionFacts:  make(map[ArtifactVersionID]contentFact),
 		artifactFacts: make(map[ArtifactID]contentFact),
 		versionIndex:  make(map[ArtifactVersionID]operationScope),
+		activated:     make(map[ArtifactVersionID]activatedRecord),
 	}
 }
 
@@ -231,6 +239,8 @@ func (m *inMemory) continueOperation(
 	switch intent.kind() {
 	case IntentVerifyPublication:
 		return m.verify(ctx, intent.(VerifyPublication), header, digest, scope, record)
+	case IntentActivatePublication:
+		return m.activate(ctx, intent.(ActivatePublication), header, digest, scope, record)
 	case IntentRejectPublication:
 		return m.reject(ctx, intent.(RejectPublication), header, digest, scope, record)
 	case IntentCancelPublication:
@@ -276,22 +286,31 @@ func (m *inMemory) recordOutcome(record *operationRecord, kind PublicationIntent
 
 func decisionForRecord(record *operationRecord, replay bool, occurredAt Instant) PublicationDecision {
 	decision := PublicationDecision{
-		Operation:         Operation{ID: record.operationID, RequestDigest: record.requestDigest},
-		State:             record.state,
-		StreamRevision:    record.streamRevision,
-		ArtifactVersionID: m0VersionID(record),
-		ManifestDigest:    m0ManifestDigest(record),
-		LineageDigest:     m0LineageDigest(record),
-		Verification:      m0Verification(record),
-		Replay:            replay,
-		IntegrityConflict: record.integrityConflict,
-		RejectReason:      record.rejectReason,
-		CancelReason:      record.cancelReason,
-		ReconcileMode:     record.reconcileMode,
-		ResidueRelease:    record.residue != nil,
-		OccurredAt:        occurredAt,
+		Operation:          Operation{ID: record.operationID, RequestDigest: record.requestDigest},
+		State:              record.state,
+		StreamRevision:     record.streamRevision,
+		ArtifactVersionID:  m0VersionID(record),
+		ManifestDigest:     m0ManifestDigest(record),
+		LineageDigest:      m0LineageDigest(record),
+		Verification:       m0Verification(record),
+		ActivationEvidence: cloneEvidence(record.activationEvidence),
+		Replay:             replay,
+		IntegrityConflict:  record.integrityConflict,
+		RejectReason:       record.rejectReason,
+		CancelReason:       record.cancelReason,
+		ReconcileMode:      record.reconcileMode,
+		ResidueRelease:     record.residue != nil,
+		OccurredAt:         occurredAt,
 	}
 	return decision
+}
+
+func cloneEvidence(evidence *PublicationEvidence) *PublicationEvidence {
+	if evidence == nil {
+		return nil
+	}
+	clone := *evidence
+	return &clone
 }
 
 func m0VersionID(record *operationRecord) ArtifactVersionID {

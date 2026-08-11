@@ -156,6 +156,8 @@ func faultPointName(point FaultPoint) string {
 		return "before_evidence_acceptance"
 	case FaultBeforeVerificationResult:
 		return "before_verification_result"
+	case FaultBeforeActivationCommit:
+		return "before_activation_commit"
 	case FaultBeforeResponse:
 		return "before_response"
 	case FaultAfterResponse:
