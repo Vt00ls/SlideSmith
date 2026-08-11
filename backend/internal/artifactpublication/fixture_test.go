@@ -109,6 +109,13 @@ type fixture struct {
 	// residueRetention is the residue expiry computation double. When set,
 	// the residue records the computed expiry at creation.
 	residueRetention func(createdAt Instant) Instant
+	// telemetry is the deterministic bounded telemetry adapter double wired
+	// into the in-memory authority so post-commit telemetry projections are
+	// observable through the protected snapshot surface.
+	telemetry *DeterministicTelemetry
+	// auditFaults is the deterministic fail-closed seam proving protected
+	// diagnostics are never returned without access audit.
+	auditFaults *DiagnosticAuditFaultController
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -151,7 +158,33 @@ func (f *fixture) rebuild() {
 		CurrentContentScope:          f.scopes.resolve,
 		ResidueRetention:             f.residueRetention,
 		ReleaseStaging:               f.releaseStaging,
+		ExternalAuditSink:            f.telemetry,
+		TelemetrySink:                f.telemetry,
+		Adapter:                      MetricAdapterInMemory,
+		DiagnosticAuditFaults:        f.auditFaults,
 	}, f.persistence)
+}
+
+// newObservableFixture returns a fixture wired with the deterministic
+// bounded telemetry adapter (which also serves as the external audit sink)
+// so post-commit projections are observable through the protected surfaces.
+func newObservableFixture(t *testing.T) *fixture {
+	t.Helper()
+	f := newFixture(t)
+	f.telemetry = NewDeterministicTelemetry(DeterministicTelemetryConfig{
+		Now: func() time.Time { return time.Unix(int64(f.now), 0).UTC() },
+	})
+	f.auditFaults = &DiagnosticAuditFaultController{}
+	f.rebuild()
+	return f
+}
+
+// auditAuthority returns the reason-bound administrator metadata authority
+// used by protected diagnostics.
+func (f *fixture) auditAuthority() AdministratorMetadataAuthority {
+	return NewAdministratorMetadataAuthority(
+		f.publicationAuthority, 1, DiagnosticReasonOperations,
+	)
 }
 
 func (f *fixture) orchestrationAuthority() PublicationAuthority {
@@ -658,6 +691,16 @@ func (f *fixture) prepareAndVerify(t *testing.T, operationID string) (*evidenceS
 func (f *fixture) mustPrepare(t *testing.T, operationID string, set *evidenceSet) PublicationDecision {
 	t.Helper()
 	return f.mustPreparePayload(t, operationID, f.preparePayload(operationID, set, []ArtifactMemberSpec{f.deckMemberSpec()}))
+}
+
+// mustActivate drives activation and fails the test on error.
+func (f *fixture) mustActivate(t *testing.T, operationID string) PublicationDecision {
+	t.Helper()
+	activated, err := f.core.Mutate(context.Background(), f.activateIntent(operationID))
+	if err != nil {
+		t.Fatalf("activate %s: %v", operationID, err)
+	}
+	return activated
 }
 
 func (f *fixture) mustPreparePayload(t *testing.T, operationID string, payload PreparePublicationPayload) PublicationDecision {

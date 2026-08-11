@@ -132,27 +132,21 @@ func (p *PostgresAuthority) recordIncident(ctx context.Context, tx *sql.Tx, scop
 	return err
 }
 
-// writeAudit persists one mandatory audit fact in the current transaction.
-// The audit row is content-free: opaque identities, closed enum facts, and
-// digests only.
-func (p *PostgresAuthority) writeAudit(ctx context.Context, tx *sql.Tx, header PublicationIntentHeader, action string, state PublicationOperationState, versionID ArtifactVersionID, manifestDigest Digest, streamRevision StreamRevision) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO `+p.q("publication_audit")+`
-		(occurred_at, policy_domain_id, task_id, operation_id, intent_kind, action,
-		 actor_kind, actor_id, actor_generation, state, version_id, manifest_digest, stream_revision)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-		int64(p.nowValue()), string(header.PolicyDomainID), string(header.TaskID),
-		string(header.Operation.ID), string(action), action,
-		string(header.Authority.Kind), string(header.Authority.ID), uint64(header.Authority.Generation),
-		string(state), string(versionID), string(manifestDigest), uint64(streamRevision))
+// writeAudit persists one canonical mandatory audit fact in the current
+// transaction. The audit row is content-free: opaque identities, closed
+// enum facts, digests and the canonical audit digest only. A failure here
+// aborts the whole protected decision (all-or-none with the business fact).
+func (p *PostgresAuthority) writeAudit(ctx context.Context, tx *sql.Tx, header PublicationIntentHeader, action string, state PublicationOperationState, versionID ArtifactVersionID, manifestDigest Digest, lineageDigest Digest, streamRevision StreamRevision) error {
+	_, err := p.writeAuditReturningID(ctx, tx, header, action, state, versionID, manifestDigest, lineageDigest, streamRevision)
 	return err
 }
 
-// writeAuditReturningID persists one mandatory audit fact and returns its
-// opaque audit identity. It is used by resolutions whose audited audit-fact
-// id must be recorded on the resolved debt.
-func (p *PostgresAuthority) writeAuditReturningID(ctx context.Context, tx *sql.Tx, header PublicationIntentHeader, action string, state PublicationOperationState, versionID ArtifactVersionID, manifestDigest Digest, streamRevision StreamRevision) (string, error) {
+// writeAuditReturningID persists one canonical mandatory audit fact and
+// returns its opaque audit identity. It is used by resolutions whose
+// audited audit-fact id must be recorded on the resolved debt.
+func (p *PostgresAuthority) writeAuditReturningID(ctx context.Context, tx *sql.Tx, header PublicationIntentHeader, action string, state PublicationOperationState, versionID ArtifactVersionID, manifestDigest Digest, lineageDigest Digest, streamRevision StreamRevision) (string, error) {
 	var auditID int64
-	err := tx.QueryRowContext(ctx, `INSERT INTO `+p.q("publication_audit")+`
+	if err := tx.QueryRowContext(ctx, `INSERT INTO `+p.q("publication_audit")+`
 		(occurred_at, policy_domain_id, task_id, operation_id, intent_kind, action,
 		 actor_kind, actor_id, actor_generation, state, version_id, manifest_digest, stream_revision)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
@@ -161,12 +155,37 @@ func (p *PostgresAuthority) writeAuditReturningID(ctx context.Context, tx *sql.T
 		string(header.Operation.ID), string(action), action,
 		string(header.Authority.Kind), string(header.Authority.ID), uint64(header.Authority.Generation),
 		string(state), string(versionID), string(manifestDigest), uint64(streamRevision)).
-		Scan(&auditID)
-	if err != nil {
+		Scan(&auditID); err != nil {
+		return "", err
+	}
+	// The canonical content-free audit fact is stored with its digest in
+	// the same row: the mandatory audit is part of the protected decision's
+	// transaction and a canonicalization failure here rolls back the whole
+	// decision.
+	fact := newPublicationAuditFact(
+		fmt.Sprintf("audit-%d", auditID),
+		header, PublicationIntentKind(action), state, versionID, manifestDigest,
+		lineageDigest, streamRevision, p.nowValue(), p.nowTimeValue(),
+	)
+	if !validPublicationAuditFact(fact) {
+		return "", errAuditCanonicalization
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE `+p.q("publication_audit")+` SET
+		schema_version=$2, integrity_version=$3, owning_module=$4, canonical_digest=$5,
+		request_id=$6, request_digest=$7, result=$8, lineage_digest=$9, recorded_at=$10, source_clock=$11
+		WHERE audit_id=$1`,
+		auditID, uint32(fact.SchemaVersion), uint64(fact.IntegrityVersion), uint64(fact.OwningModule),
+		fact.CanonicalDigest[:], string(fact.RequestID), string(fact.RequestDigest),
+		uint64(fact.Result), string(fact.LineageDigest), int64(fact.RecordedAt.Unix()), uint64(fact.SourceClock)); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("audit-%d", auditID), nil
 }
+
+// errAuditCanonicalization is the sentinel for a mandatory audit
+// canonicalization failure. It is never exposed with detail; the protected
+// decision rolls back.
+var errAuditCanonicalization = errors.New("mandatory audit canonicalization failure")
 
 // writeOutbox persists one committed Task Orchestration outbox envelope in
 // the current transaction. It is written only for terminal dispositions
@@ -343,7 +362,7 @@ func (p *PostgresAuthority) prepareFlow(ctx context.Context, intent PreparePubli
 	if err := p.injectFault(PostgresFaultBeforeMandatoryAudit, operationID, IntentPreparePublication, string(versionID)); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
-	if err := p.writeAudit(ctx, tx, header, "prepare", OperationPrepared, versionID, manifestDigest, stream.revision); err != nil {
+	if err := p.writeAudit(ctx, tx, header, "prepare", OperationPrepared, versionID, manifestDigest, lineageDigest, stream.revision); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
 	if err := p.injectFault(PostgresFaultBeforeCommit, operationID, IntentPreparePublication, string(versionID)); err != nil {
@@ -355,6 +374,7 @@ func (p *PostgresAuthority) prepareFlow(ctx context.Context, intent PreparePubli
 	if err := p.injectFault(PostgresFaultAfterCommit, operationID, IntentPreparePublication, string(versionID)); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
+	p.deliverCommittedProjection(ctx, header, "prepare", OperationPrepared, versionID, manifestDigest, lineageDigest, stream.revision)
 	return decision, nil
 }
 
@@ -609,7 +629,7 @@ func (p *PostgresAuthority) verifyFlow(ctx context.Context, intent VerifyPublica
 	if err := p.injectFault(PostgresFaultBeforeMandatoryAudit, operationID, IntentVerifyPublication, ""); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
-	if err := p.writeAudit(ctx, tx, header, "verify", nextState, m0VersionID(record), m0ManifestDigest(record), record.streamRevision); err != nil {
+	if err := p.writeAudit(ctx, tx, header, "verify", nextState, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
 	if err := p.injectFault(PostgresFaultBeforeCommit, operationID, IntentVerifyPublication, ""); err != nil {
@@ -621,6 +641,7 @@ func (p *PostgresAuthority) verifyFlow(ctx context.Context, intent VerifyPublica
 	if err := p.injectFault(PostgresFaultAfterCommit, operationID, IntentVerifyPublication, ""); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
+	p.deliverCommittedProjection(ctx, header, "verify", nextState, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	if outcomeErr != nil {
 		return decision, outcomeErr
 	}
@@ -817,7 +838,7 @@ func (p *PostgresAuthority) activateFlow(ctx context.Context, intent ActivatePub
 	if err := p.persistActivated(ctx, tx, scope, header, candidate, record, evidence, nextRevision); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
-	if err := p.writeAudit(ctx, tx, header, "activate", OperationActivated, candidate.versionID, candidate.manifestDigest, nextRevision); err != nil {
+	if err := p.writeAudit(ctx, tx, header, "activate", OperationActivated, candidate.versionID, candidate.manifestDigest, candidate.lineageDigest, nextRevision); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
 	if err := p.injectFault(PostgresFaultBeforeOutbox, operationID, IntentActivatePublication, string(candidate.versionID)); err != nil {
@@ -847,6 +868,7 @@ func (p *PostgresAuthority) activateFlow(ctx context.Context, intent ActivatePub
 	if err := p.injectFault(PostgresFaultAfterCommit, operationID, IntentActivatePublication, string(candidate.versionID)); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
+	p.deliverCommittedProjection(ctx, header, "activate", OperationActivated, candidate.versionID, candidate.manifestDigest, candidate.lineageDigest, nextRevision)
 	return decision, nil
 }
 
@@ -945,7 +967,7 @@ func (p *PostgresAuthority) rejectFlow(ctx context.Context, intent RejectPublica
 	if err := p.injectFault(PostgresFaultBeforeMandatoryAudit, operationID, IntentRejectPublication, ""); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
-	if err := p.writeAudit(ctx, tx, header, "reject", OperationRejected, m0VersionID(record), m0ManifestDigest(record), record.streamRevision); err != nil {
+	if err := p.writeAudit(ctx, tx, header, "reject", OperationRejected, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
 	if err := p.injectFault(PostgresFaultBeforeOutbox, operationID, IntentRejectPublication, ""); err != nil {
@@ -970,6 +992,7 @@ func (p *PostgresAuthority) rejectFlow(ctx context.Context, intent RejectPublica
 	if err := p.injectFault(PostgresFaultAfterCommit, operationID, IntentRejectPublication, ""); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
+	p.deliverCommittedProjection(ctx, header, "reject", OperationRejected, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	return decision, nil
 }
 
@@ -1035,7 +1058,7 @@ func (p *PostgresAuthority) cancelFlow(ctx context.Context, intent CancelPublica
 	if err := p.injectFault(PostgresFaultBeforeMandatoryAudit, operationID, IntentCancelPublication, ""); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
-	if err := p.writeAudit(ctx, tx, header, "cancel", OperationCancelled, m0VersionID(record), m0ManifestDigest(record), record.streamRevision); err != nil {
+	if err := p.writeAudit(ctx, tx, header, "cancel", OperationCancelled, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
 	if err := p.injectFault(PostgresFaultBeforeOutbox, operationID, IntentCancelPublication, ""); err != nil {
@@ -1060,6 +1083,7 @@ func (p *PostgresAuthority) cancelFlow(ctx context.Context, intent CancelPublica
 	if err := p.injectFault(PostgresFaultAfterCommit, operationID, IntentCancelPublication, ""); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
+	p.deliverCommittedProjection(ctx, header, "cancel", OperationCancelled, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	return decision, nil
 }
 
@@ -1207,7 +1231,7 @@ func (p *PostgresAuthority) reconcileFlow(ctx context.Context, intent ReconcileP
 		// ambiguous error.
 		record.reconcileMode = ReconcileCompleteRelease
 		decision, reconcileErr := p.evaluateRelease(ctx, tx, header, digest, scope, record, record.operationID)
-		if err := p.writeAudit(ctx, tx, header, "reconcile", record.state, m0VersionID(record), m0ManifestDigest(record), record.streamRevision); err != nil {
+		if err := p.writeAudit(ctx, tx, header, "reconcile", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision); err != nil {
 			return PublicationDecision{}, normalizePersistenceError(err)
 		}
 		outcomeRecord := intentOutcome{
@@ -1225,6 +1249,7 @@ func (p *PostgresAuthority) reconcileFlow(ctx context.Context, intent ReconcileP
 		if err := p.injectFault(PostgresFaultAfterCommit, scope.operationID, IntentReconcilePublication, ""); err != nil {
 			return PublicationDecision{}, normalizePersistenceError(err)
 		}
+		p.deliverCommittedProjection(ctx, header, "reconcile", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 		return decision, reconcileErr
 	case ReconcileCompleteVerification:
 		if record.state == OperationReconciliationRequired && record.verification != nil {
@@ -1274,7 +1299,7 @@ func (p *PostgresAuthority) reconcileFlow(ctx context.Context, intent ReconcileP
 	if err := p.injectFault(PostgresFaultBeforeMandatoryAudit, scope.operationID, IntentReconcilePublication, ""); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
-	if err := p.writeAudit(ctx, tx, header, "reconcile", record.state, m0VersionID(record), m0ManifestDigest(record), record.streamRevision); err != nil {
+	if err := p.writeAudit(ctx, tx, header, "reconcile", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
 	if err := p.injectFault(PostgresFaultBeforeCommit, scope.operationID, IntentReconcilePublication, ""); err != nil {
@@ -1286,6 +1311,7 @@ func (p *PostgresAuthority) reconcileFlow(ctx context.Context, intent ReconcileP
 	if err := p.injectFault(PostgresFaultAfterCommit, scope.operationID, IntentReconcilePublication, ""); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
+	p.deliverCommittedProjection(ctx, header, "reconcile", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	return decision, nil
 }
 
