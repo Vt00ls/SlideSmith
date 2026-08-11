@@ -144,7 +144,7 @@ func (m *inMemory) queryExactVersion(query PublicationQuery) (PublicationView, e
 	if activated.policyDomainID != query.PolicyDomainID || activated.taskID != query.TaskID {
 		return PublicationView{}, &Error{Code: ErrorNotFound}
 	}
-	if err := m.validatePresentedScope(query.Scope, activated); err != nil {
+	if err := validatePresentedScope(m.currentContentScope, query.Scope, activated); err != nil {
 		return PublicationView{}, err
 	}
 	return versionView(QueryExactVersion, query.PolicyDomainID, query.TaskID, activated), nil
@@ -166,7 +166,7 @@ func (m *inMemory) queryExactMember(query PublicationQuery) (PublicationView, er
 	if activated.policyDomainID != query.PolicyDomainID || activated.taskID != query.TaskID {
 		return PublicationView{}, &Error{Code: ErrorNotFound}
 	}
-	if err := m.validatePresentedScope(query.Scope, activated); err != nil {
+	if err := validatePresentedScope(m.currentContentScope, query.Scope, activated); err != nil {
 		return PublicationView{}, err
 	}
 	for _, member := range activated.members {
@@ -258,14 +258,16 @@ func memberRecordView(member memberRecord) ArtifactMemberView {
 // the same non-enumerating not-found error as a missing or cross-workspace
 // identity. A scope is optional for ordinary version/member queries (the
 // historical C05-02 contract), but when one is claimed it must be correct.
-func (m *inMemory) validatePresentedScope(scope ContentScope, activated activatedRecord) *Error {
+// It is shared by the in-memory authority and the real PostgreSQL adapter
+// through the same narrow scope-resolution port.
+func validatePresentedScope(resolve func(ContentScopeKey) (ContentScope, bool), scope ContentScope, activated activatedRecord) *Error {
 	if scope.Kind == "" && scope.ID == "" && scope.AvailabilityGeneration == 0 {
 		return nil // no scope presented: ordinary lookup semantics
 	}
 	if !scope.valid() {
 		return &Error{Code: ErrorInvalidIntent}
 	}
-	return m.validateScopeForVersion(scope, activated)
+	return validateScopeForVersion(resolve, scope, activated)
 }
 
 // validateScopeForVersion checks that the presented scope is the current
@@ -276,12 +278,12 @@ func (m *inMemory) validatePresentedScope(scope ContentScope, activated activate
 // principal, share token, Access Code, Verification Session, or implicit
 // administrator content authority, and owner/share/break-glass scopes can
 // never union.
-func (m *inMemory) validateScopeForVersion(scope ContentScope, activated activatedRecord) *Error {
+func validateScopeForVersion(resolve func(ContentScopeKey) (ContentScope, bool), scope ContentScope, activated activatedRecord) *Error {
 	key := ContentScopeKey{
 		PolicyDomainID: activated.policyDomainID, TaskID: activated.taskID,
 		ArtifactVersionID: activated.versionID, Kind: scope.Kind, ID: scope.ID,
 	}
-	current, ok := m.currentContentScope(key)
+	current, ok := resolve(key)
 	if !ok {
 		// Unknown or revoked scope: non-enumerating not-found, never
 		// discloses the version or the scope existence.
@@ -323,7 +325,7 @@ func (m *inMemory) queryResolveContentTarget(query PublicationQuery) (Publicatio
 	}
 	// The scope must be the current availability fact of the exact version
 	// before any member fact is disclosed.
-	if err := m.validateScopeForVersion(query.Scope, activated); err != nil {
+	if err := validateScopeForVersion(m.currentContentScope, query.Scope, activated); err != nil {
 		return PublicationView{}, err
 	}
 	disposition := dispositionForMediaType(member.mediaType)
@@ -405,7 +407,7 @@ func (m *inMemory) queryVerifyContentTarget(query PublicationQuery) (Publication
 		// can never be presented under another.
 		return PublicationView{}, &Error{Code: ErrorNotFound}
 	}
-	if err := m.validateScopeForVersion(presented, activated); err != nil {
+	if err := validateScopeForVersion(m.currentContentScope, presented, activated); err != nil {
 		return PublicationView{}, err
 	}
 	if presented.AvailabilityGeneration != target.AvailabilityGeneration {
@@ -454,7 +456,7 @@ func (m *inMemory) queryIssueC04ReconstructionCapability(query PublicationQuery)
 	if !ok || activated.policyDomainID != query.PolicyDomainID || activated.taskID != query.TaskID {
 		return PublicationView{}, &Error{Code: ErrorNotFound}
 	}
-	if err := m.validateScopeForVersion(query.Scope, activated); err != nil {
+	if err := validateScopeForVersion(m.currentContentScope, query.Scope, activated); err != nil {
 		return PublicationView{}, err
 	}
 	capability := C04ReconstructionCapability{
@@ -514,7 +516,7 @@ func (m *inMemory) queryVerifyC04ReconstructionCapability(query PublicationQuery
 	if !presented.valid() {
 		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
 	}
-	if err := m.validateScopeForVersion(presented, activated); err != nil {
+	if err := validateScopeForVersion(m.currentContentScope, presented, activated); err != nil {
 		return PublicationView{}, err
 	}
 	if presented.AvailabilityGeneration != capability.AvailabilityGeneration {

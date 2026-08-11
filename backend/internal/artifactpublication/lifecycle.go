@@ -39,7 +39,12 @@ func (m *inMemory) verify(
 		return PublicationDecision{}, &Error{Code: ErrorTerminalConflict}
 	}
 
-	result, ambiguous, failure, err := m.evaluateEvidence(record.candidate, header, intent)
+	result, ambiguous, failure, err := evaluateEvidence(evidenceAuthority{
+		runtimeAuthorityID:       m.config.RuntimeAuthorityID,
+		validationAuthorityID:    m.config.ValidationAuthorityID,
+		c04AuthorityID:           m.config.C04AuthorityID,
+		durableObjectAuthorityID: m.config.DurableObjectAuthorityID,
+	}, m.currentContentCapability, record.candidate, header, intent)
 	if err != nil {
 		// Retryable/unavailable faults are not recorded: a retry with the
 		// same payload re-runs instead of replaying a transient failure.
@@ -89,14 +94,29 @@ type verificationEvaluation struct {
 	pendingSlots []MemberSlotID
 }
 
+// evidenceAuthority is the narrow registered-authority registry the closed
+// evidence matrix needs. It is populated by each adapter from its own
+// configuration; the matrix itself is shared so no adapter can diverge on
+// which producers are accepted.
+type evidenceAuthority struct {
+	runtimeAuthorityID       AuthorityID
+	validationAuthorityID    AuthorityID
+	c04AuthorityID           AuthorityID
+	durableObjectAuthorityID AuthorityID
+}
+
 // evaluateEvidence runs the closed evidence matrix: producer, scope,
 // operation, manifest/member facts, policy domain, generation, fence, and
 // safety epoch are checked item by item; missing, extra, partial,
 // cross-scope, or unknown evidence fails closed. The returned failure binds
 // the exact evidence that failed; ambiguous returns true when a Durable
 // Object capability is not currently resolvable and reconciliation is
-// required.
-func (m *inMemory) evaluateEvidence(
+// required. It is a pure function shared by the in-memory authority and the
+// real PostgreSQL owned persistence adapter: both must accept exactly the
+// same evidence, so the matrix lives in exactly one place.
+func evaluateEvidence(
+	registry evidenceAuthority,
+	resolveCapability func(ContentCapabilityID) (ContentCapabilityEvidence, bool),
 	candidate *candidateRecord,
 	header PublicationIntentHeader,
 	intent VerifyPublication,
@@ -130,7 +150,7 @@ func (m *inMemory) evaluateEvidence(
 		if !validDigest(evidence.Digest) || evidence.Digest != evidence.CanonicalDigest() {
 			return evaluation, false, &EvidenceFailure{Kind: "runtime_evidence_corrupt", EvidenceID: evidence.ID}, nil
 		}
-		if evidence.Producer.AuthorityID != m.config.RuntimeAuthorityID ||
+		if evidence.Producer.AuthorityID != registry.runtimeAuthorityID ||
 			evidence.PolicyDomainID != header.PolicyDomainID || evidence.TaskID != header.TaskID ||
 			evidence.PhaseRunID != candidate.phaseRunID || evidence.SafetyEpoch != header.SafetyEpoch {
 			return evaluation, false, &EvidenceFailure{Kind: "runtime_evidence_scope", EvidenceID: evidence.ID}, nil
@@ -161,7 +181,7 @@ func (m *inMemory) evaluateEvidence(
 	if !validDigest(validation.Digest) || validation.Digest != validation.CanonicalDigest() {
 		return evaluation, false, &EvidenceFailure{Kind: "validation_evidence_corrupt", EvidenceID: validation.ID}, nil
 	}
-	if validation.Producer.AuthorityID != m.config.ValidationAuthorityID ||
+	if validation.Producer.AuthorityID != registry.validationAuthorityID ||
 		validation.PolicyDomainID != header.PolicyDomainID || validation.TaskID != header.TaskID ||
 		validation.ContractID != candidate.contractID || validation.SafetyEpoch != header.SafetyEpoch {
 		return evaluation, false, &EvidenceFailure{Kind: "validation_evidence_scope", EvidenceID: validation.ID}, nil
@@ -185,7 +205,7 @@ func (m *inMemory) evaluateEvidence(
 	if !validDigest(commit.Digest) || commit.Digest != commit.CanonicalDigest() {
 		return evaluation, false, &EvidenceFailure{Kind: "c04_evidence_corrupt", EvidenceID: commit.ID}, nil
 	}
-	if commit.Producer.AuthorityID != m.config.C04AuthorityID ||
+	if commit.Producer.AuthorityID != registry.c04AuthorityID ||
 		commit.PolicyDomainID != header.PolicyDomainID || commit.TaskID != header.TaskID ||
 		commit.ValidationEvidenceID != validation.ID ||
 		commit.ValidationEvidenceDigest != validation.Digest ||
@@ -200,7 +220,7 @@ func (m *inMemory) evaluateEvidence(
 			return evaluation, false, &EvidenceFailure{Kind: "c04_export_missing", EvidenceID: commit.ID}, nil
 		}
 		export := commit.ValidatedExportEvidence
-		if export.PublicationAuthorityID != m.config.C04AuthorityID ||
+		if export.PublicationAuthorityID != registry.c04AuthorityID ||
 			export.SourceArtifactVersionID != candidate.parent ||
 			export.PolicyDomainID != header.PolicyDomainID || export.TaskID != header.TaskID ||
 			export.ValidationEvidenceID != validation.ID ||
@@ -247,7 +267,7 @@ func (m *inMemory) evaluateEvidence(
 		if !validDigest(capability.Digest) || capability.Digest != capability.CanonicalDigest() {
 			return evaluation, false, &EvidenceFailure{Kind: "capability_corrupt", CapabilityID: capability.ID}, nil
 		}
-		if capability.Producer.AuthorityID != m.config.DurableObjectAuthorityID ||
+		if capability.Producer.AuthorityID != registry.durableObjectAuthorityID ||
 			capability.PolicyDomainID != header.PolicyDomainID ||
 			capability.Purpose != ContentPurposePublicationMember ||
 			capability.ContentID != staged.contentID ||
@@ -258,7 +278,7 @@ func (m *inMemory) evaluateEvidence(
 			capability.SafetyEpoch != header.SafetyEpoch {
 			return evaluation, false, &EvidenceFailure{Kind: "capability_facts", CapabilityID: capability.ID}, nil
 		}
-		current, currentOK := m.currentContentCapability(capability.ID)
+		current, currentOK := resolveCapability(capability.ID)
 		if !currentOK {
 			// The capability is not currently resolvable in the Durable
 			// Object authority: durability is unverified and the operation

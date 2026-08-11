@@ -98,7 +98,7 @@ func (m *inMemory) activate(
 	// ---- Commit: immutable version + explicit stream advance + terminal
 	// operation + activation evidence, all under one lock ----
 	nextRevision := stream.revision + 1
-	evidence := m.buildActivationEvidence(record, header, candidate, nextRevision)
+	evidence := buildActivationEvidence(record, header, candidate, nextRevision, m.now())
 	activated := activatedRecord{
 		versionID: candidate.versionID, schemaVersion: candidate.schemaVersion,
 		policyDomainID: header.PolicyDomainID, taskID: header.TaskID,
@@ -134,12 +134,15 @@ func (m *inMemory) activate(
 // stream revision and current head, the Phase Run identity with the
 // publication generation/fence, the activity generation, and the safety
 // epoch. Trace IDs, delivery attempts, claims, and telemetry attributes
-// never enter the evidence.
-func (m *inMemory) buildActivationEvidence(
+// never enter the evidence. It is a pure shared function: the in-memory
+// authority and the real PostgreSQL adapter must commit byte-identical
+// evidence for the same linearization point.
+func buildActivationEvidence(
 	record *operationRecord,
 	header PublicationIntentHeader,
 	candidate *candidateRecord,
 	streamRevision StreamRevision,
+	now Instant,
 ) *PublicationEvidence {
 	evidence := &PublicationEvidence{
 		OperationID:        record.operationID,
@@ -158,7 +161,7 @@ func (m *inMemory) buildActivationEvidence(
 		Generation:         header.Generation,
 		Fence:              header.Fence,
 		SafetyEpoch:        header.SafetyEpoch,
-		OccurredAt:         m.now(),
+		OccurredAt:         now,
 	}
 	return evidence
 }
