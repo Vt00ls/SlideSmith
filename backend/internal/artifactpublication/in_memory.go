@@ -35,6 +35,18 @@ type InMemoryConfig struct {
 	// resolvable (in-flight, expired, or unknown), which fails closed as
 	// durability-unverified and requires reconciliation.
 	CurrentContentCapability func(ContentCapabilityID) (ContentCapabilityEvidence, bool)
+	// PublicationAuthorityID is C05's own authority identity, bound by every
+	// C04 reconstruction capability as the publication authority. When it is
+	// empty, C04 capability issuance fails closed.
+	PublicationAuthorityID AuthorityID
+	// CurrentContentScope resolves the current availability fact of one
+	// owner/share-link/break-glass scope instance for one exact Artifact
+	// Version. It is the narrow black-box port to Identity & Ownership /
+	// Sharing: C05 never creates a principal, share token, Access Code,
+	// Verification Session, or implicit administrator content authority, and
+	// scopes can never union. (zero, false) means the scope is unknown or
+	// revoked, which fails closed non-enumerating.
+	CurrentContentScope func(ContentScopeKey) (ContentScope, bool)
 	// FaultHook injects faults at bounded points. A non-nil error aborts
 	// the mutation exactly at that point; points before persistence leave
 	// the operation absent (retry re-runs), points after persistence leave
@@ -154,6 +166,13 @@ func (m *inMemory) currentContentCapability(id ContentCapabilityID) (ContentCapa
 		return ContentCapabilityEvidence{}, false
 	}
 	return m.config.CurrentContentCapability(id)
+}
+
+func (m *inMemory) currentContentScope(key ContentScopeKey) (ContentScope, bool) {
+	if m.config.CurrentContentScope == nil {
+		return ContentScope{}, false
+	}
+	return m.config.CurrentContentScope(key)
 }
 
 // Mutate is the single mutation seam of the Artifact Publication authority.

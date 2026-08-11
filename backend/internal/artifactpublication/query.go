@@ -27,6 +27,14 @@ func (m *inMemory) Query(ctx context.Context, query PublicationQuery) (Publicati
 		return m.queryExactMember(query)
 	case QueryVersionHistory:
 		return m.queryVersionHistory(query)
+	case QueryResolveContentTarget:
+		return m.queryResolveContentTarget(query)
+	case QueryVerifyContentTarget:
+		return m.queryVerifyContentTarget(query)
+	case QueryIssueC04ReconstructionCapability:
+		return m.queryIssueC04ReconstructionCapability(query)
+	case QueryVerifyC04ReconstructionCapability:
+		return m.queryVerifyC04ReconstructionCapability(query)
 	default:
 		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
 	}
@@ -122,7 +130,9 @@ func (m *inMemory) queryTaskStream(query PublicationQuery) (PublicationView, err
 // queryExactVersion resolves one activated Artifact Version by identity.
 // Only versions committed by atomic activation are visible; prepared or
 // verified candidates that were never activated are not visible to this
-// ordinary query, and cross-workspace identities are never disclosed.
+// ordinary query, and cross-workspace identities are never disclosed. When
+// an authority scope is presented it must be the current availability fact
+// of the exact version, otherwise the lookup fails closed non-enumerating.
 func (m *inMemory) queryExactVersion(query PublicationQuery) (PublicationView, error) {
 	if query.ArtifactVersionID == "" {
 		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
@@ -134,12 +144,17 @@ func (m *inMemory) queryExactVersion(query PublicationQuery) (PublicationView, e
 	if activated.policyDomainID != query.PolicyDomainID || activated.taskID != query.TaskID {
 		return PublicationView{}, &Error{Code: ErrorNotFound}
 	}
+	if err := m.validatePresentedScope(query.Scope, activated); err != nil {
+		return PublicationView{}, err
+	}
 	return versionView(QueryExactVersion, query.PolicyDomainID, query.TaskID, activated), nil
 }
 
 // queryExactMember resolves one exact member of an activated Artifact
 // Version by ArtifactID. Members of never-activated candidates are not
-// visible, and cross-workspace identities are never disclosed.
+// visible, and cross-workspace identities are never disclosed. When an
+// authority scope is presented it must be the current availability fact of
+// the exact version, otherwise the lookup fails closed non-enumerating.
 func (m *inMemory) queryExactMember(query PublicationQuery) (PublicationView, error) {
 	if query.ArtifactVersionID == "" || query.ArtifactID == "" {
 		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
@@ -150,6 +165,9 @@ func (m *inMemory) queryExactMember(query PublicationQuery) (PublicationView, er
 	}
 	if activated.policyDomainID != query.PolicyDomainID || activated.taskID != query.TaskID {
 		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	if err := m.validatePresentedScope(query.Scope, activated); err != nil {
+		return PublicationView{}, err
 	}
 	for _, member := range activated.members {
 		if member.artifactID != query.ArtifactID {
@@ -232,4 +250,291 @@ func memberRecordView(member memberRecord) ArtifactMemberView {
 		ArtifactID: member.artifactID, Kind: member.kind, LogicalName: member.logicalName,
 		MediaType: member.mediaType, Size: member.size, ContentDigest: member.contentDigest,
 	}
+}
+
+// validatePresentedScope enforces acceptance #4: an exact version/member
+// lookup that presents an authority scope must resolve the current
+// availability fact of that exact version, otherwise it fails closed with
+// the same non-enumerating not-found error as a missing or cross-workspace
+// identity. A scope is optional for ordinary version/member queries (the
+// historical C05-02 contract), but when one is claimed it must be correct.
+func (m *inMemory) validatePresentedScope(scope ContentScope, activated activatedRecord) *Error {
+	if scope.Kind == "" && scope.ID == "" && scope.AvailabilityGeneration == 0 {
+		return nil // no scope presented: ordinary lookup semantics
+	}
+	if !scope.valid() {
+		return &Error{Code: ErrorInvalidIntent}
+	}
+	return m.validateScopeForVersion(scope, activated)
+}
+
+// validateScopeForVersion checks that the presented scope is the current
+// availability fact of the exact Artifact Version. Unknown, revoked, or
+// stale/rotated scopes fail closed with a non-enumerating not-found error
+// that is identical whether the scope is wrong or the version does not
+// exist. This is the only scope gate in the module: C05 never creates a
+// principal, share token, Access Code, Verification Session, or implicit
+// administrator content authority, and owner/share/break-glass scopes can
+// never union.
+func (m *inMemory) validateScopeForVersion(scope ContentScope, activated activatedRecord) *Error {
+	key := ContentScopeKey{
+		PolicyDomainID: activated.policyDomainID, TaskID: activated.taskID,
+		ArtifactVersionID: activated.versionID, Kind: scope.Kind, ID: scope.ID,
+	}
+	current, ok := m.currentContentScope(key)
+	if !ok {
+		// Unknown or revoked scope: non-enumerating not-found, never
+		// discloses the version or the scope existence.
+		return &Error{Code: ErrorNotFound}
+	}
+	if current.Kind != scope.Kind || current.ID != scope.ID ||
+		current.AvailabilityGeneration != scope.AvailabilityGeneration {
+		// A scope mismatch or a stale/rotated availability generation fails
+		// closed: the generation is the revocation fence.
+		return &Error{Code: ErrorNotFound}
+	}
+	return nil
+}
+
+// queryResolveContentTarget resolves one exact member of one activated
+// Artifact Version into a locator-free opaque ArtifactContentTarget under
+// exactly one typed owner/share-link/break-glass scope and one short-term
+// intent. Only versions committed by atomic activation resolve; prepared,
+// verifying, rejected, cancelled, and residue are never resolvable. The
+// query never creates a Durable Object read handle; mandatory access audit
+// and authorization remain with the content delivery flow before any
+// Durable Object open. Active-content dispositions fail closed.
+func (m *inMemory) queryResolveContentTarget(query PublicationQuery) (PublicationView, error) {
+	if query.ArtifactVersionID == "" || query.ArtifactID == "" {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if !validContentIntent(query.ContentIntent) || !query.Scope.valid() {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	activated, ok := m.persistence.activated[query.ArtifactVersionID]
+	if !ok || activated.policyDomainID != query.PolicyDomainID || activated.taskID != query.TaskID {
+		// Cross-workspace, unactivated, and unknown identities all resolve
+		// to the same non-enumerating not-found error.
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	member, ok := activated.memberByArtifactID(query.ArtifactID)
+	if !ok {
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	// The scope must be the current availability fact of the exact version
+	// before any member fact is disclosed.
+	if err := m.validateScopeForVersion(query.Scope, activated); err != nil {
+		return PublicationView{}, err
+	}
+	disposition := dispositionForMediaType(member.mediaType)
+	if disposition == ContentDispositionActive {
+		// Unsafe active-content disposition fails closed: C05 cannot
+		// guarantee the safe active-content handling that HTML/SVG require,
+		// so it refuses to issue a delivery target for them.
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	target := ArtifactContentTarget{
+		SchemaVersion: activated.schemaVersion, PolicyDomainID: query.PolicyDomainID,
+		TaskID: query.TaskID, ArtifactVersionID: activated.versionID,
+		ArtifactID: member.artifactID, ManifestDigest: activated.manifestDigest,
+		MemberDigest: member.contentDigest, Size: member.size,
+		MediaType: member.mediaType, LogicalName: member.logicalName,
+		Disposition:            disposition,
+		AvailabilityGeneration: query.Scope.AvailabilityGeneration,
+		Intent:                 query.ContentIntent,
+		ScopeKind:              query.Scope.Kind,
+		OccurredAt:             m.now(),
+	}
+	target.Digest = target.CanonicalDigest()
+	return PublicationView{
+		Kind: QueryResolveContentTarget, PolicyDomainID: query.PolicyDomainID,
+		TaskID: query.TaskID, ArtifactVersionID: query.ArtifactVersionID,
+		ArtifactID: query.ArtifactID, ContentTarget: &target,
+		State: OperationActivated,
+	}, nil
+}
+
+// queryVerifyContentTarget re-validates a presented ArtifactContentTarget
+// against the current immutable version facts and the current availability
+// fact of the presented scope. Tampering, an expired/unknown version, a
+// revoked/rotated scope, a stale availability generation, and a scope-kind
+// union all fail closed. It remains a pure read-only query: it never
+// creates a Durable Object read handle, never writes audit, and never
+// changes any version fact.
+func (m *inMemory) queryVerifyContentTarget(query PublicationQuery) (PublicationView, error) {
+	target := query.ContentTarget
+	if target == nil {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if !validContentIntent(target.Intent) || !validContentScopeKind(target.ScopeKind) ||
+		!validContentDisposition(target.Disposition) || target.ArtifactID == "" {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if target.SchemaVersion.Major() != SchemaV1.Major() {
+		return PublicationView{}, &Error{Code: ErrorUnsupportedSchema}
+	}
+	if !validDigest(target.Digest) || target.Digest != target.CanonicalDigest() {
+		// A tampered or re-signed target fails closed as an integrity
+		// conflict.
+		return PublicationView{}, &Error{Code: ErrorIntegrityConflict}
+	}
+	activated, ok := m.persistence.activated[target.ArtifactVersionID]
+	if !ok || activated.policyDomainID != target.PolicyDomainID || activated.taskID != target.TaskID {
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	if activated.manifestDigest != target.ManifestDigest {
+		return PublicationView{}, &Error{Code: ErrorIntegrityConflict}
+	}
+	member, ok := activated.memberByArtifactID(target.ArtifactID)
+	if !ok {
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	if member.contentDigest != target.MemberDigest || member.size != target.Size ||
+		member.mediaType != target.MediaType || member.logicalName != target.LogicalName {
+		return PublicationView{}, &Error{Code: ErrorIntegrityConflict}
+	}
+	if dispositionForMediaType(member.mediaType) != target.Disposition {
+		return PublicationView{}, &Error{Code: ErrorIntegrityConflict}
+	}
+	presented := query.Scope
+	if !presented.valid() {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if presented.Kind != target.ScopeKind {
+		// Scope union attempt: a target resolved under one authority path
+		// can never be presented under another.
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	if err := m.validateScopeForVersion(presented, activated); err != nil {
+		return PublicationView{}, err
+	}
+	if presented.AvailabilityGeneration != target.AvailabilityGeneration {
+		// The target was issued under an availability epoch that is no
+		// longer current (revoked or rotated): stale and fail closed.
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	return PublicationView{
+		Kind: QueryVerifyContentTarget, PolicyDomainID: target.PolicyDomainID,
+		TaskID: target.TaskID, ArtifactVersionID: target.ArtifactVersionID,
+		ArtifactID: target.ArtifactID, ContentTarget: target,
+		State: OperationActivated,
+	}, nil
+}
+
+// queryIssueC04ReconstructionCapability issues the exact Artifact Version
+// input capability for C04 manual-edit reconstruction. Only the Platform
+// (Task Orchestration authority) may select the exact version; C04 can
+// never request issuance, and C05 never resolves a current/latest version
+// here. Issuance requires exactly one typed scope whose current availability
+// generation is bound into the capability, a declared expiry in the future,
+// and an activated version in the exact policy domain/Task. Unactivated
+// candidates and residue never resolve.
+func (m *inMemory) queryIssueC04ReconstructionCapability(query PublicationQuery) (PublicationView, error) {
+	if query.ArtifactVersionID == "" {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if !query.Scope.valid() {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if query.ExpiresAt <= m.now() {
+		// A capability that is already expired is useless: the Platform
+		// must declare a future expiry.
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if m.config.PublicationAuthorityID == "" {
+		return PublicationView{}, &Error{Code: ErrorRetryableUnavailable}
+	}
+	if query.Authority.Kind != AuthorityTaskOrchestration ||
+		query.Authority.ID != m.config.TaskOrchestrationAuthorityID {
+		// Only the Platform's exact selection can be issued; C04, Runtime,
+		// validators, and unregistered authorities are denied.
+		return PublicationView{}, &Error{Code: ErrorOwnershipDenied}
+	}
+	activated, ok := m.persistence.activated[query.ArtifactVersionID]
+	if !ok || activated.policyDomainID != query.PolicyDomainID || activated.taskID != query.TaskID {
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	if err := m.validateScopeForVersion(query.Scope, activated); err != nil {
+		return PublicationView{}, err
+	}
+	capability := C04ReconstructionCapability{
+		SchemaVersion:          activated.schemaVersion,
+		PublicationAuthorityID: m.config.PublicationAuthorityID,
+		PolicyDomainID:         query.PolicyDomainID,
+		TaskID:                 query.TaskID,
+		ArtifactVersionID:      activated.versionID,
+		ManifestDigest:         activated.manifestDigest,
+		AvailabilityGeneration: query.Scope.AvailabilityGeneration,
+		ExpiresAt:              query.ExpiresAt,
+		OccurredAt:             m.now(),
+	}
+	capability.Digest = capability.CanonicalDigest()
+	return PublicationView{
+		Kind: QueryIssueC04ReconstructionCapability, PolicyDomainID: query.PolicyDomainID,
+		TaskID: query.TaskID, ArtifactVersionID: query.ArtifactVersionID,
+		C04Capability: &capability, State: OperationActivated,
+	}, nil
+}
+
+// queryVerifyC04ReconstructionCapability verifies a presented C04
+// reconstruction capability against the current version facts, the
+// publication authority identity, the current availability fact of the
+// presented scope, the bound availability generation, and the declared
+// expiry. Expired, tampered, cross-scope, or stale capabilities fail
+// closed; the capability can never select a current/latest version or a
+// publication target.
+func (m *inMemory) queryVerifyC04ReconstructionCapability(query PublicationQuery) (PublicationView, error) {
+	capability := query.C04Capability
+	if capability == nil {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if capability.SchemaVersion.Major() != SchemaV1.Major() {
+		return PublicationView{}, &Error{Code: ErrorUnsupportedSchema}
+	}
+	if !validDigest(capability.Digest) || capability.Digest != capability.CanonicalDigest() {
+		return PublicationView{}, &Error{Code: ErrorIntegrityConflict}
+	}
+	if capability.PublicationAuthorityID != m.config.PublicationAuthorityID {
+		// The capability must come from the publication authority itself.
+		return PublicationView{}, &Error{Code: ErrorIntegrityConflict}
+	}
+	if capability.ExpiresAt <= m.now() {
+		// The declared expiry has passed: the Platform must issue a fresh
+		// capability for a fresh reconstruction.
+		return PublicationView{}, &Error{Code: ErrorStaleAuthority}
+	}
+	activated, ok := m.persistence.activated[capability.ArtifactVersionID]
+	if !ok || activated.policyDomainID != capability.PolicyDomainID || activated.taskID != capability.TaskID {
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	if activated.manifestDigest != capability.ManifestDigest {
+		return PublicationView{}, &Error{Code: ErrorIntegrityConflict}
+	}
+	presented := query.Scope
+	if !presented.valid() {
+		return PublicationView{}, &Error{Code: ErrorInvalidIntent}
+	}
+	if err := m.validateScopeForVersion(presented, activated); err != nil {
+		return PublicationView{}, err
+	}
+	if presented.AvailabilityGeneration != capability.AvailabilityGeneration {
+		// The capability is bound to a stale/rotated availability epoch.
+		return PublicationView{}, &Error{Code: ErrorNotFound}
+	}
+	return PublicationView{
+		Kind: QueryVerifyC04ReconstructionCapability, PolicyDomainID: capability.PolicyDomainID,
+		TaskID: capability.TaskID, ArtifactVersionID: capability.ArtifactVersionID,
+		C04Capability: capability, State: OperationActivated,
+	}, nil
+}
+
+// memberByArtifactID returns the exact member of an activated version by
+// ArtifactID.
+func (a activatedRecord) memberByArtifactID(id ArtifactID) (memberRecord, bool) {
+	for _, member := range a.members {
+		if member.artifactID == id {
+			return member, true
+		}
+	}
+	return memberRecord{}, false
 }

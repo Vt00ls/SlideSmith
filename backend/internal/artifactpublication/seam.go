@@ -164,12 +164,40 @@ const (
 	// QueryVersionHistory returns the Task's committed version history
 	// ordered exclusively by the explicit publication-stream revision.
 	QueryVersionHistory PublicationQueryKind = "version_history"
+	// QueryResolveContentTarget resolves one exact member of one activated
+	// Artifact Version into a locator-free opaque ArtifactContentTarget
+	// under exactly one typed owner/share-link/break-glass scope and one
+	// short-term intent. It never creates a Durable Object read handle and
+	// never performs mandatory access audit (that is owned by the content
+	// delivery flow before any Durable Object open).
+	QueryResolveContentTarget PublicationQueryKind = "resolve_content_target"
+	// QueryVerifyContentTarget re-validates a presented ArtifactContentTarget
+	// against the current immutable version facts and the current
+	// availability fact of the presented scope. A revoked/rotated scope, a
+	// stale availability generation, tampering, or a scope-kind union fails
+	// closed. It is still a pure query: it never creates a Durable Object
+	// read handle.
+	QueryVerifyContentTarget PublicationQueryKind = "verify_content_target"
+	// QueryIssueC04ReconstructionCapability issues the exact Artifact
+	// Version input capability for C04 manual-edit reconstruction. It
+	// requires the exact ArtifactVersionID selected by the Platform (Task
+	// Orchestration authority), exactly one typed scope, and a declared
+	// expiry; C04 can never request issuance and C05 never resolves a
+	// current/latest version here.
+	QueryIssueC04ReconstructionCapability PublicationQueryKind = "issue_c04_reconstruction_capability"
+	// QueryVerifyC04ReconstructionCapability verifies a presented C04
+	// reconstruction capability against the current version facts, the
+	// publication authority identity, the current availability fact, and
+	// the declared expiry.
+	QueryVerifyC04ReconstructionCapability PublicationQueryKind = "verify_c04_reconstruction_capability"
 )
 
 func validQueryKind(kind PublicationQueryKind) bool {
 	switch kind {
 	case QueryOperation, QueryCandidate, QueryTaskStream, QueryExactVersion,
-		QueryExactMember, QueryVersionHistory:
+		QueryExactMember, QueryVersionHistory, QueryResolveContentTarget,
+		QueryVerifyContentTarget, QueryIssueC04ReconstructionCapability,
+		QueryVerifyC04ReconstructionCapability:
 		return true
 	default:
 		return false
@@ -184,6 +212,27 @@ type PublicationQuery struct {
 	OperationID       PublicationOperationID
 	ArtifactVersionID ArtifactVersionID
 	ArtifactID        ArtifactID
+	// Scope is exactly one typed owner/share-link/break-glass authority
+	// path. It is required by content-target resolution, content-target
+	// verification, and C04 capability issuance/verification; when an exact
+	// version/member query presents one, it must be the current availability
+	// fact of the exact version or the lookup fails closed non-enumerating.
+	// A single field makes scope union structurally impossible.
+	Scope ContentScope
+	// ContentIntent is the short-term intent of a resolved content target.
+	ContentIntent ContentIntent
+	// ExpiresAt is the expiry declared by the Platform when issuing a C04
+	// reconstruction capability.
+	ExpiresAt Instant
+	// Authority is the typed seam authority. C04 capability issuance
+	// requires exactly the Task Orchestration authority: only the Platform's
+	// exact version selection can be issued.
+	Authority PublicationAuthority
+	// ContentTarget is the presented target for QueryVerifyContentTarget.
+	ContentTarget *ArtifactContentTarget
+	// C04Capability is the presented capability for
+	// QueryVerifyC04ReconstructionCapability.
+	C04Capability *C04ReconstructionCapability
 }
 
 // ArtifactMemberView is the opaque, immutable metadata of one member
@@ -239,7 +288,13 @@ type PublicationView struct {
 	ActivationEvidence *PublicationEvidence
 	ResidueRelease     bool
 	CurrentHead        ArtifactVersionID
-	OccurredAt         Instant
+	// ContentTarget is set by content-target resolution and verification
+	// queries.
+	ContentTarget *ArtifactContentTarget
+	// C04Capability is set by C04 capability issuance and verification
+	// queries.
+	C04Capability *C04ReconstructionCapability
+	OccurredAt    Instant
 }
 
 // PublicationCore is the single public seam of the Artifact Publication
