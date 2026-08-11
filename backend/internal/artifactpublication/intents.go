@@ -8,6 +8,7 @@ type PublicationIntentKind string
 const (
 	IntentPreparePublication   PublicationIntentKind = "prepare"
 	IntentVerifyPublication    PublicationIntentKind = "verify"
+	IntentActivatePublication  PublicationIntentKind = "activate"
 	IntentRejectPublication    PublicationIntentKind = "reject"
 	IntentCancelPublication    PublicationIntentKind = "cancel"
 	IntentReconcilePublication PublicationIntentKind = "reconcile"
@@ -15,8 +16,8 @@ const (
 
 func validIntentKind(kind PublicationIntentKind) bool {
 	switch kind {
-	case IntentPreparePublication, IntentVerifyPublication, IntentRejectPublication,
-		IntentCancelPublication, IntentReconcilePublication:
+	case IntentPreparePublication, IntentVerifyPublication, IntentActivatePublication,
+		IntentRejectPublication, IntentCancelPublication, IntentReconcilePublication:
 		return true
 	default:
 		return false
@@ -271,6 +272,37 @@ func (v VerifyPublication) canonical() map[string]any {
 
 func (v VerifyPublication) valid() bool {
 	return validVerifyPayload(v)
+}
+
+// ActivatePublication atomically activates the verified candidate: it is
+// the single business linearization point that revalidates the expected
+// publication-stream revision and expected current head, commits the
+// immutable Artifact Version (members, manifest, lineage), advances the
+// stream revision/current head, and returns the committed publication
+// evidence. It accepts only the exact Task Orchestration authority with the
+// current generation and fence. The payload is empty: activation never
+// carries evidence, never patches the candidate, and never selects a new
+// parent.
+type ActivatePublication struct {
+	intentBase
+}
+
+func NewActivatePublication(header PublicationIntentHeader) PublicationIntent {
+	return ActivatePublication{intentBase: intentBase{intentHeader: header}}
+}
+
+func (a ActivatePublication) kind() PublicationIntentKind { return IntentActivatePublication }
+
+func (a ActivatePublication) canonicalPayload() map[string]any {
+	return map[string]any{}
+}
+
+func (a ActivatePublication) canonical() map[string]any {
+	return a.header().canonical(a.kind(), a.canonicalPayload())
+}
+
+func (a ActivatePublication) valid() bool {
+	return validHeader(a.header())
 }
 
 // RejectReason is the closed set of safe, content-free rejection reasons.

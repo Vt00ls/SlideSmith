@@ -67,6 +67,31 @@ type candidateRecord struct {
 	lineageDigest    Digest
 }
 
+// activatedRecord is the immutable committed Artifact Version created by
+// atomic activation. It is a snapshot of the candidate at the linearization
+// point: members, manifest digest, and lineage digest are copied and can
+// never be modified or deleted by any ordinary operation. It also records
+// the committed publication-stream revision and the activation evidence
+// bound to the operation. Physical retention follows ADR 0012; this SPEC
+// has no ordinary deletion mutation.
+type activatedRecord struct {
+	versionID      ArtifactVersionID
+	schemaVersion  SchemaVersion
+	policyDomainID PolicyDomainID
+	taskID         TaskID
+	kind           PublicationKind
+	parent         ArtifactVersionID
+	contractID     PublicationContractID
+	phaseRunID     PhaseRunID
+	operationID    PublicationOperationID
+	streamRevision StreamRevision
+	manifestDigest Digest
+	lineageDigest  Digest
+	members        []memberRecord
+	evidence       *PublicationEvidence
+	occurredAt     Instant
+}
+
 // evidenceAcceptedRecord is one accepted evidence reference.
 type evidenceAcceptedRecord struct {
 	kind       string
@@ -128,6 +153,7 @@ type operationRecord struct {
 	occurredAt         Instant
 	candidate          *candidateRecord
 	verification       *verificationRecord
+	activationEvidence *PublicationEvidence
 	rejectReason       RejectReason
 	cancelReason       CancelReason
 	reconcileMode      ReconcileMode

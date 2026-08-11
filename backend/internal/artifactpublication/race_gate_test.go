@@ -37,7 +37,7 @@ func newRaceChannels() (chan PublicationIntentKind, map[PublicationIntentKind]ch
 	entered := make(chan PublicationIntentKind, 2)
 	release := make(map[PublicationIntentKind]chan struct{})
 	for _, kind := range []PublicationIntentKind{
-		IntentPreparePublication, IntentVerifyPublication,
+		IntentPreparePublication, IntentVerifyPublication, IntentActivatePublication,
 		IntentRejectPublication, IntentCancelPublication, IntentReconcilePublication,
 	} {
 		release[kind] = make(chan struct{})

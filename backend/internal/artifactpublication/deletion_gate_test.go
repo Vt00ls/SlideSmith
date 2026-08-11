@@ -221,6 +221,60 @@ func TestBehavioralGateMisleadingTimestampsDoNotDriveAuthority(t *testing.T) {
 	}
 }
 
+// TestBehavioralGateHistoryAndHeadUseExplicitStreamFactsOnly proves the
+// committed version history order and the current head are driven only by
+// the explicit publication-stream revision and head pointer: a child whose
+// diagnostic time is earlier than its parent still appears after the parent
+// and never becomes the head by time.
+func TestBehavioralGateHistoryAndHeadUseExplicitStreamFactsOnly(t *testing.T) {
+	f := newFixture(t)
+	_, parent := f.prepareVerifyActivate(t, "op-order-1")
+
+	// Misleading diagnostic time: the child records an EARLIER wall-clock
+	// time than the parent activation, but the stream facts must win.
+	f.now = f.now - 5000
+	childSet := f.childEvidenceSet(t, parent.ArtifactVersionID, "op-order-child")
+	header := f.header("op-order-child")
+	header.ExpectedStreamRevision = 1
+	header.ExpectedHead = parent.ArtifactVersionID
+	childPrepare := bindDigest(NewPreparePublication(header, f.childPreparePayload("op-order-child", parent.ArtifactVersionID, childSet)))
+	if _, err := f.core.Mutate(context.Background(), childPrepare); err != nil {
+		t.Fatalf("child prepare: %v", err)
+	}
+	if _, err := f.core.Mutate(context.Background(), f.verifyIntent("op-order-child", f.verifyPayload(childSet))); err != nil {
+		t.Fatalf("child verify: %v", err)
+	}
+	child, err := f.core.Mutate(context.Background(), f.activateIntentWithHeader(header))
+	if err != nil {
+		t.Fatalf("child activate: %v", err)
+	}
+	if child.ActivationEvidence.OccurredAt >= parent.ActivationEvidence.OccurredAt {
+		t.Fatal("test precondition: child diagnostic time must be earlier than the parent")
+	}
+
+	history, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryVersionHistory, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+	})
+	if err != nil {
+		t.Fatalf("query history: %v", err)
+	}
+	if len(history.History) != 2 ||
+		history.History[0].ArtifactVersionID != parent.ArtifactVersionID ||
+		history.History[1].ArtifactVersionID != child.ArtifactVersionID {
+		t.Fatalf("history must be ordered by committed stream revision, not time: %#v", history)
+	}
+	if history.CurrentHead != child.ArtifactVersionID || history.StreamRevision != 2 {
+		t.Fatalf("current head must be the explicit pointer, not the latest time: %#v", history)
+	}
+
+	// A misleading "latest" string fact (lexically later version ID on the
+	// parent) must never select the head.
+	if parent.ArtifactVersionID > child.ArtifactVersionID {
+		t.Fatalf("precondition: parent ID %q should be lexically after child %q for a misleading-string scenario",
+			parent.ArtifactVersionID, child.ArtifactVersionID)
+	}
+}
+
 func normalizeGoListPackage(raw string) string {
 	line := strings.TrimSpace(raw)
 	if line == "" {

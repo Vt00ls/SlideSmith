@@ -315,6 +315,32 @@ func TestManualEditExportLineageEvidenceFailsClosed(t *testing.T) {
 	if failure := evaluateManualEdit(t, f, candidateWrong, wrongPayload); failure == nil || failure.Kind != "c04_export_scope" {
 		t.Fatalf("wrong source export failure = %#v, want c04_export_scope", failure)
 	}
+
+	// A pin whose export binds a different Revision/Checkpoint than the C04
+	// commit evidence fails closed: the child must match the new
+	// Revision/Checkpoint the commit bound (SPEC #105).
+	revisionSet := cloneEvidenceSet(set)
+	revisionExport := &ValidatedExportEvidence{ID: "validated-export-1", PublicationAuthorityID: f.c04Authority,
+		PolicyDomainID: f.policyDomain, TaskID: f.taskID, TaskWorkspaceID: "task-workspace-1",
+		SourceArtifactVersionID:  parent,
+		ReconstructionEvidenceID: "reconstruction-1", RevisionID: "revision-other",
+		CheckpointID: "checkpoint-other", ValidationEvidenceID: set.validation.ID,
+		Generation: f.generation, Fence: f.fence,
+	}
+	revisionExport.Digest = revisionExport.CanonicalDigest()
+	revisionSet.c04.ValidatedExportEvidence = revisionExport
+	revisionSet.c04.Digest = revisionSet.c04.CanonicalDigest()
+
+	payloadRevision := f.preparePayload("op-export-unit", revisionSet, []ArtifactMemberSpec{f.deckMemberSpec()})
+	payloadRevision.Kind = PublicationKindManualEdit
+	payloadRevision.Parent = parent
+	candidateRevision := manualEditCandidate(payloadRevision, revisionSet)
+	revisionPayload := f.verifyPayload(revisionSet)
+	revisionPayload.C04CommitEvidence.ValidatedExportEvidence = revisionExport
+	revisionPayload.C04CommitEvidence.Digest = revisionPayload.C04CommitEvidence.CanonicalDigest()
+	if failure := evaluateManualEdit(t, f, candidateRevision, revisionPayload); failure == nil || failure.Kind != "c04_export_scope" {
+		t.Fatalf("revision mismatch export failure = %#v, want c04_export_scope", failure)
+	}
 }
 
 // cloneEvidenceSet returns a shallow copy of an evidence set with fresh
