@@ -14,7 +14,10 @@
 // child SPEC #105; real PostgreSQL owned persistence and the restricted
 // Durable Object participant by child SPEC #107; the durable Publication
 // Residue lifecycle, restart-safe release reconciliation and the
-// C05/Durable Object Cleanup Debt ownership boundary by child SPEC #108.
+// C05/Durable Object Cleanup Debt ownership boundary by child SPEC #108;
+// the owned publication transport and Task Orchestration bridge by child
+// SPEC #109; and the canonical mandatory audit, bounded observability,
+// versioned safe errors and full-surface non-leakage by child SPEC #111.
 // This package's types and invariant engine are built so that later
 // adapters must reuse the same engine.
 package artifactpublication
@@ -193,6 +196,15 @@ const (
 	ErrorNotFound               ErrorCode = "not_found"
 )
 
+// SafeErrorSchemaVersion is the closed schema version of the safe-error
+// surface. Callers must fail closed on an unknown major version.
+type SafeErrorSchemaVersion uint32
+
+// SafeErrorSchemaV1 is the initial safe-error schema.
+const SafeErrorSchemaV1 SafeErrorSchemaVersion = 1 << 16
+
+func (version SafeErrorSchemaVersion) Major() uint16 { return uint16(uint32(version) >> 16) }
+
 // SafeErrorCategory is the closed safe-error surface visible to callers.
 type SafeErrorCategory string
 
@@ -202,6 +214,7 @@ const (
 	SafeErrorIdempotencyConflict          SafeErrorCategory = "idempotency_conflict"
 	SafeErrorStaleRevisionGenerationFence SafeErrorCategory = "stale_revision_generation_fence"
 	SafeErrorTerminalConflict             SafeErrorCategory = "terminal_conflict"
+	SafeErrorBindingUnavailable           SafeErrorCategory = "binding_unavailable"
 	SafeErrorIntegrityUnavailableContent  SafeErrorCategory = "integrity_unavailable_content"
 	SafeErrorDurabilityUnverified         SafeErrorCategory = "durability_unverified"
 	SafeErrorResourceExhausted            SafeErrorCategory = "resource_exhausted"
@@ -211,10 +224,13 @@ const (
 )
 
 // Error is the typed safe error returned by the Artifact Publication seam.
-// It never carries content, paths, object keys, locators, credentials, or
-// raw downstream error chains.
+// It is closed, versioned, and content-free: it never carries content,
+// paths, object keys, locators, credentials, or raw downstream error
+// chains. The schema version lets a caller fail closed on an unknown
+// major version without parsing an error string.
 type Error struct {
-	Code ErrorCode
+	Code    ErrorCode
+	Version SafeErrorSchemaVersion
 }
 
 func (e *Error) Error() string {
@@ -265,7 +281,9 @@ func (e *Error) SafeCategory() SafeErrorCategory {
 		return SafeErrorStaleRevisionGenerationFence
 	case ErrorTerminalConflict:
 		return SafeErrorTerminalConflict
-	case ErrorIntegrityFailure, ErrorEvidenceMissing, ErrorEvidenceCorrupt:
+	case ErrorEvidenceMissing, ErrorEvidenceCorrupt:
+		return SafeErrorBindingUnavailable
+	case ErrorIntegrityFailure:
 		return SafeErrorIntegrityUnavailableContent
 	case ErrorDurabilityUnverified:
 		return SafeErrorDurabilityUnverified
@@ -280,6 +298,20 @@ func (e *Error) SafeCategory() SafeErrorCategory {
 	default:
 		return SafeErrorInvalidIntent
 	}
+}
+
+// SchemaVersion returns the closed safe-error schema version. The error
+// code set is closed and versioned as a whole: every defined code belongs
+// to schema V1, so a zero Version (existing literals) means V1, and an
+// unknown major version must fail closed.
+func (e *Error) SchemaVersion() SafeErrorSchemaVersion {
+	if e == nil {
+		return SafeErrorSchemaV1
+	}
+	if e.Version == 0 {
+		return SafeErrorSchemaV1
+	}
+	return e.Version
 }
 
 func (e *Error) Retryable() bool {
@@ -308,7 +340,12 @@ func normalizeError(err error) *Error {
 	var publicationError *Error
 	if errors.As(err, &publicationError) && publicationError != nil &&
 		knownErrorCode(publicationError.Code) {
-		return &Error{Code: publicationError.Code}
+		return &Error{Code: publicationError.Code, Version: SafeErrorSchemaV1}
 	}
-	return &Error{Code: ErrorRetryableUnavailable}
+	return &Error{Code: ErrorRetryableUnavailable, Version: SafeErrorSchemaV1}
+}
+
+// newError constructs the closed safe error for one known code.
+func newError(code ErrorCode) *Error {
+	return &Error{Code: code, Version: SafeErrorSchemaV1}
 }

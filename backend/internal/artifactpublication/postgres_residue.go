@@ -97,7 +97,7 @@ func (p *PostgresAuthority) recordResidueAssemblyFlow(
 	if err := p.injectFault(PostgresFaultBeforeMandatoryAudit, operationID, IntentRecordResidueAssembly, string(debtID)); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
-	if err := p.writeAudit(ctx, tx, header, "record_assembly", record.state, m0VersionID(record), m0ManifestDigest(record), record.streamRevision); err != nil {
+	if err := p.writeAudit(ctx, tx, header, "record_residue_assembly", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
 	decision := decisionForRecord(record, false, now)
@@ -116,6 +116,7 @@ func (p *PostgresAuthority) recordResidueAssemblyFlow(
 	if err := p.injectFault(PostgresFaultAfterCommit, operationID, IntentRecordResidueAssembly, string(debtID)); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
+	p.deliverCommittedProjection(ctx, header, "record_residue_assembly", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	return decision, nil
 }
 
@@ -155,7 +156,7 @@ func (p *PostgresAuthority) releaseResidueFlow(
 	if err := p.injectFault(PostgresFaultBeforeMandatoryAudit, operationID, IntentReleaseResidue, string(operationID)); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
-	if err := p.writeAudit(ctx, tx, header, "release_residue", record.state, m0VersionID(record), m0ManifestDigest(record), record.streamRevision); err != nil {
+	if err := p.writeAudit(ctx, tx, header, "release_residue", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
 	outcomeRecord := intentOutcome{
@@ -173,6 +174,7 @@ func (p *PostgresAuthority) releaseResidueFlow(
 	if err := p.injectFault(PostgresFaultAfterCommit, operationID, IntentReleaseResidue, string(operationID)); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
+	p.deliverCommittedProjection(ctx, header, "release_residue", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	return decision, releaseErr
 }
 
@@ -392,7 +394,7 @@ func (p *PostgresAuthority) resolveCleanupDebtFlow(
 	if err := p.injectFault(PostgresFaultBeforeMandatoryAudit, operationID, IntentResolveCleanupDebt, string(record.debt.debtID)); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
-	auditID, err := p.writeAuditReturningID(ctx, tx, header, "resolve_cleanup_debt", record.state, m0VersionID(record), m0ManifestDigest(record), record.streamRevision)
+	auditID, err := p.writeAuditReturningID(ctx, tx, header, "resolve_cleanup_debt", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	if err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
@@ -417,6 +419,7 @@ func (p *PostgresAuthority) resolveCleanupDebtFlow(
 	if err := p.injectFault(PostgresFaultAfterCommit, operationID, IntentResolveCleanupDebt, string(record.debt.debtID)); err != nil {
 		return PublicationDecision{}, normalizePersistenceError(err)
 	}
+	p.deliverCommittedProjection(ctx, header, "resolve_cleanup_debt", record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	return decision, nil
 }
 

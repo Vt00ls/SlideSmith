@@ -132,6 +132,21 @@ func TestStructuralDeletionGateCapabilitySurfaceAbsence(t *testing.T) {
 		reflect.TypeOf(OwnedTransportMachineAuthority{}),
 		reflect.TypeOf(OwnedTransportBinding{}),
 		reflect.TypeOf((*OwnedTransportClient)(nil)).Elem(),
+		// C05-07 audit/observability surfaces: canonical mandatory audit
+		// facts, external audit projections, bounded telemetry, structured
+		// logs/traces, and the protected projection backlog.
+		reflect.TypeOf(PublicationAuditFact{}),
+		reflect.TypeOf(ExternalAuditProjection{}),
+		reflect.TypeOf(PublicationTelemetryProjection{}),
+		reflect.TypeOf(MetricSample{}),
+		reflect.TypeOf(MetricLabels{}),
+		reflect.TypeOf(StructuredLogRecord{}),
+		reflect.TypeOf(TraceSpanRecord{}),
+		reflect.TypeOf(PublicationProjectionBacklog{}),
+		reflect.TypeOf(ProjectionDeliveryEvidence{}),
+		reflect.TypeOf(TelemetrySnapshot{}),
+		reflect.TypeOf(ResidueView{}),
+		reflect.TypeOf(CleanupDebtView{}),
 	}
 	forbiddenFieldFragments := []string{
 		"path", "object_key", "objectkey", "prefix", "bucket", "mount",

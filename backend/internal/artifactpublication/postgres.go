@@ -107,6 +107,22 @@ type PostgresConfig struct {
 	// the exact typed references of one candidate; it cannot list objects,
 	// infer a publication from a path/prefix/bucket, or perform remote I/O.
 	DurableObjectAttach DurableObjectAttachParticipant
+	// ExternalAudit receives content-free copies of committed mandatory
+	// audit facts strictly after the protected decision commits. Sink
+	// failure never rolls back the committed decision; it produces a
+	// durable, rebuildable delivery backlog (child SPEC #111).
+	ExternalAudit ExternalAuditProjectionSink
+	// Telemetry receives bounded content-free telemetry projections
+	// strictly after the protected decision commits. Sink failure never
+	// rolls back the committed decision; it produces a durable,
+	// rebuildable delivery backlog.
+	Telemetry TelemetrySink
+	// TelemetryAdapter is the adapter-class dimension recorded in the
+	// telemetry projections of this authority.
+	TelemetryAdapter MetricAdapter
+	// DiagnosticAuditFaults is the deterministic fail-closed seam proving
+	// protected diagnostics are never returned without access audit.
+	DiagnosticAuditFaults *DiagnosticAuditFaultController
 }
 
 // PostgresAuthority owns real PostgreSQL persistence behind the closed
@@ -114,23 +130,27 @@ type PostgresConfig struct {
 // repository, or a caller-controlled transaction handle; the public surface
 // remains Mutate(PublicationIntent) and Query(PublicationQuery) only.
 type PostgresAuthority struct {
-	db                 *sql.DB
-	schema             string
-	now                func() Instant
-	faults             PostgresFaultHook
-	runtimeAuth        AuthorityID
-	validationAuth     AuthorityID
-	c04Auth            AuthorityID
-	doAuth             AuthorityID
-	toAuth             AuthorityID
-	recoveryAuth       AuthorityID
-	cleanupAuth        AuthorityID
-	publicationAuth    AuthorityID
-	residueRetention   func(createdAt Instant) Instant
-	capabilityResolver func(ContentCapabilityID) (ContentCapabilityEvidence, bool)
-	scopeResolver      func(ContentScopeKey) (ContentScope, bool)
-	attach             DurableObjectAttachParticipant
-	release            DurableObjectReleaseParticipant
+	db                    *sql.DB
+	schema                string
+	now                   func() Instant
+	faults                PostgresFaultHook
+	runtimeAuth           AuthorityID
+	validationAuth        AuthorityID
+	c04Auth               AuthorityID
+	doAuth                AuthorityID
+	toAuth                AuthorityID
+	recoveryAuth          AuthorityID
+	cleanupAuth           AuthorityID
+	publicationAuth       AuthorityID
+	residueRetention      func(createdAt Instant) Instant
+	capabilityResolver    func(ContentCapabilityID) (ContentCapabilityEvidence, bool)
+	scopeResolver         func(ContentScopeKey) (ContentScope, bool)
+	attach                DurableObjectAttachParticipant
+	release               DurableObjectReleaseParticipant
+	externalAudit         ExternalAuditProjectionSink
+	telemetry             TelemetrySink
+	telemetryAdapter      MetricAdapter
+	diagnosticAuditFaults *DiagnosticAuditFaultController
 }
 
 var _ PublicationCore = (*PostgresAuthority)(nil)
@@ -156,17 +176,21 @@ func NewPostgresAuthority(db *sql.DB, config PostgresConfig) (*PostgresAuthority
 	}
 	authority := &PostgresAuthority{
 		db: db, schema: schema, now: now, faults: config.Faults,
-		runtimeAuth:      config.RuntimeAuthorityID,
-		validationAuth:   config.ValidationAuthorityID,
-		c04Auth:          config.C04AuthorityID,
-		doAuth:           config.DurableObjectAuthorityID,
-		toAuth:           config.TaskOrchestrationAuthorityID,
-		recoveryAuth:     config.RecoveryAuthorityID,
-		cleanupAuth:      config.CleanupAuthorityID,
-		publicationAuth:  config.PublicationAuthorityID,
-		residueRetention: config.ResidueRetention,
-		attach:           config.DurableObjectAttach,
-		release:          config.DurableObjectRelease,
+		runtimeAuth:           config.RuntimeAuthorityID,
+		validationAuth:        config.ValidationAuthorityID,
+		c04Auth:               config.C04AuthorityID,
+		doAuth:                config.DurableObjectAuthorityID,
+		toAuth:                config.TaskOrchestrationAuthorityID,
+		recoveryAuth:          config.RecoveryAuthorityID,
+		cleanupAuth:           config.CleanupAuthorityID,
+		publicationAuth:       config.PublicationAuthorityID,
+		residueRetention:      config.ResidueRetention,
+		attach:                config.DurableObjectAttach,
+		release:               config.DurableObjectRelease,
+		externalAudit:         config.ExternalAudit,
+		telemetry:             config.Telemetry,
+		telemetryAdapter:      config.TelemetryAdapter,
+		diagnosticAuditFaults: config.DiagnosticAuditFaults,
 	}
 	authority.capabilityResolver = config.CurrentContentCapability
 	if authority.capabilityResolver == nil {
@@ -489,6 +513,21 @@ CREATE TABLE IF NOT EXISTS %[21]s (
     manifest_digest TEXT NOT NULL,
     stream_revision BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS %[26]s (
+    audit_fact_id TEXT PRIMARY KEY,
+    audit_canonical_digest BYTEA NOT NULL,
+    task_id TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    state TEXT NOT NULL,
+    audit_delivery_status SMALLINT NOT NULL,
+    telemetry_delivery_status SMALLINT NOT NULL,
+    attempt_count BIGINT NOT NULL DEFAULT 0,
+    degraded BOOLEAN NOT NULL DEFAULT FALSE,
+    first_attempt_at TIMESTAMPTZ,
+    last_attempt_at TIMESTAMPTZ,
+    delivered_at TIMESTAMPTZ
+);
 CREATE TABLE IF NOT EXISTS %[22]s (
     outbox_id BIGSERIAL PRIMARY KEY,
     policy_domain_id TEXT NOT NULL,
@@ -574,6 +613,17 @@ ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS assembly_generation BIGINT NOT NULL 
 ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS assembly_fence BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE %[19]s ADD COLUMN IF NOT EXISTS debt_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE %[17]s ADD COLUMN IF NOT EXISTS released BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS schema_version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS integrity_version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS owning_module BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS canonical_digest BYTEA NOT NULL DEFAULT '\x00'::bytea;
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS request_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS request_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS result BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS lineage_digest TEXT NOT NULL DEFAULT '';
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS recorded_at BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE %[21]s ADD COLUMN IF NOT EXISTS source_clock BIGINT NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_audit_task ON %[21]s (task_id, audit_id);
 `,
 		q("publication_identity_seq"),
 		q("publication_stream"),
@@ -599,7 +649,8 @@ ALTER TABLE %[17]s ADD COLUMN IF NOT EXISTS released BOOLEAN NOT NULL DEFAULT FA
 		q("publication_outbox"),
 		q("publication_integrity_incident"),
 		q("publication_cleanup_debt"),
-		q("publication_do_release"))
+		q("publication_do_release"),
+		q("publication_projection_backlog"))
 	return ddl
 }
 
@@ -636,6 +687,11 @@ func normalizePersistenceError(err error) *Error {
 // now returns the controlled diagnostic clock.
 func (p *PostgresAuthority) nowValue() Instant {
 	return p.now()
+}
+
+// nowTimeValue returns the controlled diagnostic clock as a time.Time.
+func (p *PostgresAuthority) nowTimeValue() time.Time {
+	return time.Unix(int64(p.nowValue()), 0).UTC()
 }
 
 // residueExpiry computes the residue expiry from its creation instant.

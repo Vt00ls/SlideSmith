@@ -71,6 +71,7 @@ func (m *inMemory) verify(
 		verifyErr := &Error{Code: failureErrorCode(failure.Kind)}
 		decision := decisionForRecord(record, false, m.now())
 		m.recordOutcome(record, IntentVerifyPublication, digest, record.state, decision, verifyErr)
+		m.recordAudit(header, IntentVerifyPublication, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 		if err := m.injectFault(FaultBeforeResponse, operationID, IntentVerifyPublication, ""); err != nil {
 			return PublicationDecision{}, normalizeError(err)
 		}
@@ -81,6 +82,7 @@ func (m *inMemory) verify(
 	}
 	decision := decisionForRecord(record, false, m.now())
 	m.recordOutcome(record, IntentVerifyPublication, digest, record.state, decision, nil)
+	m.recordAudit(header, IntentVerifyPublication, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 
 	if err := m.injectFault(FaultBeforeResponse, operationID, IntentVerifyPublication, ""); err != nil {
 		return PublicationDecision{}, normalizeError(err)
@@ -371,6 +373,7 @@ func (m *inMemory) reject(
 	record.residue = m.releaseResidue(record, header)
 	decision := decisionForRecord(record, false, m.now())
 	m.recordOutcome(record, IntentRejectPublication, digest, record.state, decision, nil)
+	m.recordAudit(header, IntentRejectPublication, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 
 	if err := m.injectFault(FaultBeforeResponse, operationID, IntentRejectPublication, ""); err != nil {
 		return PublicationDecision{}, normalizeError(err)
@@ -421,6 +424,7 @@ func (m *inMemory) cancel(
 	record.residue = m.releaseResidue(record, header)
 	decision := decisionForRecord(record, false, m.now())
 	m.recordOutcome(record, IntentCancelPublication, digest, record.state, decision, nil)
+	m.recordAudit(header, IntentCancelPublication, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 
 	if err := m.injectFault(FaultBeforeResponse, operationID, IntentCancelPublication, ""); err != nil {
 		return PublicationDecision{}, normalizeError(err)
@@ -475,6 +479,7 @@ func (m *inMemory) reconcile(
 		record.reconcileMode = ReconcileInspect
 		decision := decisionForRecord(record, false, m.now())
 		m.recordOutcome(record, IntentReconcilePublication, digest, record.state, decision, nil)
+		m.recordAudit(header, IntentReconcilePublication, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 		return decision, nil
 
 	case ReconcileCompleteRelease:
@@ -485,6 +490,7 @@ func (m *inMemory) reconcile(
 		record.reconcileMode = ReconcileCompleteRelease
 		decision, reconcileErr := m.runRelease(ctx, header, digest, scope, record, record.operationID, true)
 		m.recordOutcome(record, IntentReconcilePublication, digest, record.state, decision, toError(reconcileErr))
+		m.recordAudit(header, IntentReconcilePublication, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 		return decision, reconcileErr
 
 	case ReconcileCompleteVerification:
@@ -505,6 +511,7 @@ func (m *inMemory) reconcile(
 		record.reconcileMode = ReconcileCompleteVerification
 		decision := decisionForRecord(record, false, m.now())
 		m.recordOutcome(record, IntentReconcilePublication, digest, record.state, decision, nil)
+		m.recordAudit(header, IntentReconcilePublication, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 		return decision, nil
 
 	case ReconcileConfirmCancellation:
@@ -514,6 +521,7 @@ func (m *inMemory) reconcile(
 		record.reconcileMode = ReconcileConfirmCancellation
 		decision := decisionForRecord(record, false, m.now())
 		m.recordOutcome(record, IntentReconcilePublication, digest, record.state, decision, nil)
+		m.recordAudit(header, IntentReconcilePublication, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 		return decision, nil
 
 	case ReconcileConfirmRejection:
@@ -523,6 +531,7 @@ func (m *inMemory) reconcile(
 		record.reconcileMode = ReconcileConfirmRejection
 		decision := decisionForRecord(record, false, m.now())
 		m.recordOutcome(record, IntentReconcilePublication, digest, record.state, decision, nil)
+		m.recordAudit(header, IntentReconcilePublication, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 		return decision, nil
 
 	default:

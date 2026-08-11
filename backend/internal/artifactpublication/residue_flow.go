@@ -69,6 +69,7 @@ func (m *inMemory) recordResidueAssembly(
 	}
 	decision := decisionForRecord(record, false, now)
 	m.recordOutcome(record, IntentRecordResidueAssembly, digest, record.state, decision, nil)
+	m.recordAudit(header, IntentRecordResidueAssembly, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	if err := m.injectFault(FaultBeforeResponse, operationID, IntentRecordResidueAssembly, string(debtID)); err != nil {
 		return PublicationDecision{}, normalizeError(err)
 	}
@@ -100,7 +101,13 @@ func (m *inMemory) releaseResidueFlow(
 	if err := m.ensureAuthority(header.Authority, IntentReleaseResidue); err != nil {
 		return PublicationDecision{}, err
 	}
-	return m.runRelease(ctx, header, digest, scope, record, operationID, false)
+	decision, releaseErr := m.runRelease(ctx, header, digest, scope, record, operationID, false)
+	// Every protected release submission is audited with the resulting
+	// residue disposition, matching the PostgreSQL adapter; an ambiguous or
+	// unavailable release is still an audited protected decision and never
+	// guesses closure.
+	m.recordAudit(header, IntentReleaseResidue, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
+	return decision, releaseErr
 }
 
 // runRelease is the shared residue release evaluation used by the release
@@ -297,6 +304,7 @@ func (m *inMemory) resolveCleanupDebt(
 	record.debt.revision++
 	decision := decisionForRecord(record, false, now)
 	m.recordOutcome(record, IntentResolveCleanupDebt, digest, record.state, decision, nil)
+	m.recordAudit(header, IntentResolveCleanupDebt, record.state, m0VersionID(record), m0ManifestDigest(record), m0LineageDigest(record), record.streamRevision)
 	if err := m.injectFault(FaultBeforeResponse, operationID, IntentResolveCleanupDebt, string(record.debt.debtID)); err != nil {
 		return PublicationDecision{}, normalizeError(err)
 	}

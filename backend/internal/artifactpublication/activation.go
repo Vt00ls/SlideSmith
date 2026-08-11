@@ -120,6 +120,7 @@ func (m *inMemory) activate(
 
 	decision := decisionForRecord(record, false, m.now())
 	m.recordOutcome(record, IntentActivatePublication, digest, record.state, decision, nil)
+	m.recordAudit(header, IntentActivatePublication, record.state, candidate.versionID, candidate.manifestDigest, candidate.lineageDigest, nextRevision)
 
 	if err := m.injectFault(FaultBeforeResponse, operationID, IntentActivatePublication, string(candidate.versionID)); err != nil {
 		return PublicationDecision{}, normalizeError(err)

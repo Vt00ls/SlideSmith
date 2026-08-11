@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 // InMemoryConfig configures the deterministic in-memory authority.
@@ -74,6 +75,22 @@ type InMemoryConfig struct {
 	// ScheduleHook is invoked at the start of each mutation before the
 	// authority lock is taken, allowing deterministic race scheduling.
 	ScheduleHook func(IntentScheduleEvent)
+	// ExternalAuditSink receives content-free copies of committed mandatory
+	// audit facts strictly after the protected decision is durable. Sink
+	// failure never rolls back the decision; it produces a rebuildable
+	// durable delivery backlog (child SPEC #111).
+	ExternalAuditSink ExternalAuditProjectionSink
+	// TelemetrySink receives bounded content-free telemetry projections
+	// strictly after the protected decision is durable. Sink failure never
+	// rolls back the decision; it produces a rebuildable durable delivery
+	// backlog.
+	TelemetrySink TelemetrySink
+	// Adapter identifies the adapter class dimension used in telemetry
+	// projections (in-memory adapter reports the in-memory class).
+	Adapter MetricAdapter
+	// DiagnosticAuditFaults is the deterministic fail-closed seam proving
+	// protected diagnostics are never returned without access audit.
+	DiagnosticAuditFaults *DiagnosticAuditFaultController
 }
 
 // IntentScheduleEvent reports one mutation about to enter the engine.
@@ -135,16 +152,49 @@ type InMemoryPersistence struct {
 	// activated is the immutable set of committed Artifact Versions. It is
 	// written exactly once per activation and only read afterwards.
 	activated map[ArtifactVersionID]activatedRecord
+	// auditFacts retains the canonical mandatory audit facts of every
+	// protected decision. They survive restart and are the authoritative
+	// source for external audit and telemetry projections (child SPEC
+	// #111); projections never replace them.
+	auditFacts []PublicationAuditFact
+	// projectionDeliveries tracks the durable delivery disposition of one
+	// external audit projection per retained audit fact. An unavailable
+	// external audit or telemetry sink never rolls back the committed
+	// decision; the fact stays pending/failed in the backlog and is
+	// rebuildable.
+	projectionDeliveries map[string]*projectionDeliveryRecord
+	// nextDiagnosticAuditSequence allocates the opaque identities of the
+	// access-audit facts of protected diagnostic queries.
+	nextDiagnosticAuditSequence uint64
+	// diagnosticAuditFacts retains the access-audit facts of protected
+	// diagnostic queries (reason-bound, content-free).
+	diagnosticAuditFacts map[string]DiagnosticAuditFactRef
+}
+
+// projectionDeliveryRecord is the durable delivery disposition of one
+// external audit projection for one retained authoritative audit fact.
+// Duplicate or out-of-order delivery is idempotent by AuditFactID and
+// canonical digest; a same-ID/different-digest delivery is an integrity
+// conflict that never rewrites the retained fact.
+type projectionDeliveryRecord struct {
+	auditFactID        string
+	canonicalDigest    AuditFactDigest
+	auditDelivered     bool
+	telemetryDelivered bool
+	attemptCount       uint64
+	degraded           bool
 }
 
 func newPersistence() *InMemoryPersistence {
 	return &InMemoryPersistence{
-		operations:    make(map[operationScope]*operationRecord),
-		streams:       make(map[taskScope]*streamRecord),
-		versionFacts:  make(map[ArtifactVersionID]contentFact),
-		artifactFacts: make(map[ArtifactID]contentFact),
-		versionIndex:  make(map[ArtifactVersionID]operationScope),
-		activated:     make(map[ArtifactVersionID]activatedRecord),
+		operations:           make(map[operationScope]*operationRecord),
+		streams:              make(map[taskScope]*streamRecord),
+		versionFacts:         make(map[ArtifactVersionID]contentFact),
+		artifactFacts:        make(map[ArtifactID]contentFact),
+		versionIndex:         make(map[ArtifactVersionID]operationScope),
+		activated:            make(map[ArtifactVersionID]activatedRecord),
+		projectionDeliveries: make(map[string]*projectionDeliveryRecord),
+		diagnosticAuditFacts: make(map[string]DiagnosticAuditFactRef),
 	}
 }
 
@@ -347,6 +397,72 @@ func (m *inMemory) recordOutcome(record *operationRecord, kind PublicationIntent
 		digest: digest, state: state, decision: decision, err: cloneError(err), recordedAt: m.now(),
 	}
 	record.state = state
+}
+
+// recordAudit persists one canonical mandatory audit fact for one accepted
+// protected decision, then best-effort projects the content-free external
+// audit copy and the bounded telemetry envelope strictly after the fact is
+// durable. A mandatory audit fact is always retained; an unavailable
+// external sink never rolls back the decision and only marks the durable
+// backlog as pending/failed for rebuild.
+func (m *inMemory) recordAudit(
+	header PublicationIntentHeader,
+	action PublicationIntentKind,
+	state PublicationOperationState,
+	versionID ArtifactVersionID,
+	manifestDigest Digest,
+	lineageDigest Digest,
+	streamRevision StreamRevision,
+) {
+	m.persistence.nextAudit++
+	fact := newPublicationAuditFact(
+		fmt.Sprintf("audit-%016x", m.persistence.nextAudit),
+		header, action, state, versionID, manifestDigest, lineageDigest, streamRevision,
+		m.now(), m.nowTime(),
+	)
+	m.persistence.auditFacts = append(m.persistence.auditFacts, fact)
+	m.deliverProjection(fact)
+}
+
+// deliverProjection best-effort delivers the external audit copy and the
+// bounded telemetry projection of one retained authoritative audit fact.
+// Delivery failure never rolls back the committed fact; the durable
+// delivery record keeps the backlog for rebuild (child SPEC #111).
+func (m *inMemory) deliverProjection(fact PublicationAuditFact) {
+	if m.config.ExternalAuditSink == nil && m.config.TelemetrySink == nil {
+		return
+	}
+	record := m.persistence.projectionDeliveries[fact.AuditFactID]
+	if record == nil {
+		record = &projectionDeliveryRecord{
+			auditFactID: fact.AuditFactID, canonicalDigest: fact.CanonicalDigest,
+		}
+		m.persistence.projectionDeliveries[fact.AuditFactID] = record
+	}
+	record.attemptCount++
+	if m.config.ExternalAuditSink != nil && !record.auditDelivered {
+		if err := m.config.ExternalAuditSink.ProjectExternalAudit(context.Background(), auditProjectionFromFact(fact)); err != nil {
+			record.degraded = true
+		} else {
+			record.auditDelivered = true
+		}
+	}
+	if m.config.TelemetrySink != nil && !record.telemetryDelivered {
+		adapter := m.config.Adapter
+		if !validMetricAdapter(adapter) {
+			adapter = MetricAdapterInMemory
+		}
+		if err := m.config.TelemetrySink.ProjectTelemetry(context.Background(), telemetryProjectionFromAudit(fact, adapter)); err != nil {
+			record.degraded = true
+		} else {
+			record.telemetryDelivered = true
+		}
+	}
+}
+
+// nowTime returns the controlled diagnostic clock as a time.Time.
+func (m *inMemory) nowTime() time.Time {
+	return time.Unix(int64(m.now()), 0).UTC()
 }
 
 func decisionForRecord(record *operationRecord, replay bool, occurredAt Instant) PublicationDecision {
@@ -554,6 +670,7 @@ func (m *inMemory) prepare(ctx context.Context, intent PreparePublication, heade
 
 	decision := decisionForRecord(record, false, m.now())
 	m.recordOutcome(record, IntentPreparePublication, digest, OperationPrepared, decision, nil)
+	m.recordAudit(header, IntentPreparePublication, OperationPrepared, versionID, manifestDigest, lineageDigest, stream.revision)
 
 	if err := m.injectFault(FaultBeforeResponse, operationID, IntentPreparePublication, string(versionID)); err != nil {
 		return PublicationDecision{}, normalizeError(err)
