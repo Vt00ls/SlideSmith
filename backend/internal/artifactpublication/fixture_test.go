@@ -40,11 +40,50 @@ func (r *capabilityRegistry) resolve(id ContentCapabilityID) (ContentCapabilityE
 	return fact, true
 }
 
+// scopeRegistry is the deterministic Identity & Ownership / Sharing double.
+// It resolves the current availability fact of one owner/share-link/
+// break-glass scope instance for one exact Artifact Version. Revocation or
+// rotation advances the generation or removes the fact, which makes content
+// targets and C04 capabilities bound to the old generation stale. C05 never
+// owns the scope lifecycle; it only binds and compares the generation.
+type scopeRegistry struct {
+	facts map[ContentScopeKey]ContentScope
+}
+
+func newScopeRegistry() *scopeRegistry {
+	return &scopeRegistry{facts: make(map[ContentScopeKey]ContentScope)}
+}
+
+func (r *scopeRegistry) register(key ContentScopeKey, scope ContentScope) {
+	r.facts[key] = scope
+}
+
+func (r *scopeRegistry) resolve(key ContentScopeKey) (ContentScope, bool) {
+	fact, ok := r.facts[key]
+	return fact, ok
+}
+
+// revoke removes the current fact: the scope is no longer available and
+// every target/capability bound to it fails closed.
+func (r *scopeRegistry) revoke(key ContentScopeKey) {
+	delete(r.facts, key)
+}
+
+// rotate advances the current availability generation: targets/capabilities
+// bound to the older generation become stale.
+func (r *scopeRegistry) rotate(key ContentScopeKey, generation Generation) {
+	if fact, ok := r.facts[key]; ok {
+		fact.AvailabilityGeneration = generation
+		r.facts[key] = fact
+	}
+}
+
 // fixture is the deterministic test authority over the public seam.
 type fixture struct {
 	core         PublicationCore
 	persistence  *InMemoryPersistence
 	registry     *capabilityRegistry
+	scopes       *scopeRegistry
 	now          Instant
 	policyDomain PolicyDomainID
 	taskID       TaskID
@@ -56,6 +95,7 @@ type fixture struct {
 	c04Authority               AuthorityID
 	durableObjectAuthority     AuthorityID
 	recoveryAuthority          AuthorityID
+	publicationAuthority       AuthorityID
 
 	safetyEpoch SafetyEpoch
 	generation  Generation
@@ -73,9 +113,11 @@ func newFixture(t *testing.T) *fixture {
 		c04Authority:               "c04-authority",
 		durableObjectAuthority:     "durable-object-authority",
 		recoveryAuthority:          "recovery-authority",
+		publicationAuthority:       "artifact-publication-authority",
 		safetyEpoch:                7, generation: 3, fence: 4,
 	}
 	f.registry = newCapabilityRegistry()
+	f.scopes = newScopeRegistry()
 	f.persistence = newPersistence()
 	f.core = NewInMemory(InMemoryConfig{
 		Now:                          func() Instant { return f.now },
@@ -85,7 +127,9 @@ func newFixture(t *testing.T) *fixture {
 		DurableObjectAuthorityID:     f.durableObjectAuthority,
 		TaskOrchestrationAuthorityID: f.taskOrchestrationAuthority,
 		RecoveryAuthorityID:          f.recoveryAuthority,
+		PublicationAuthorityID:       f.publicationAuthority,
 		CurrentContentCapability:     f.registry.resolve,
+		CurrentContentScope:          f.scopes.resolve,
 	}, f.persistence)
 	return f
 }
@@ -100,7 +144,9 @@ func (f *fixture) rebuild() {
 		DurableObjectAuthorityID:     f.durableObjectAuthority,
 		TaskOrchestrationAuthorityID: f.taskOrchestrationAuthority,
 		RecoveryAuthorityID:          f.recoveryAuthority,
+		PublicationAuthorityID:       f.publicationAuthority,
 		CurrentContentCapability:     f.registry.resolve,
+		CurrentContentScope:          f.scopes.resolve,
 	}, f.persistence)
 }
 
@@ -513,4 +559,114 @@ func (f *fixture) mustVerify(t *testing.T, operationID string, set *evidenceSet)
 		t.Fatalf("verify %s: %v", operationID, err)
 	}
 	return decision
+}
+
+// scopeKey builds the registry key for one scope instance of one exact
+// Artifact Version in the fixture's policy domain and Task.
+func (f *fixture) scopeKey(versionID ArtifactVersionID, kind ContentScopeKind, id ScopeID) ContentScopeKey {
+	return ContentScopeKey{
+		PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+		ArtifactVersionID: versionID, Kind: kind, ID: id,
+	}
+}
+
+// ownerScope is the standard owner availability scope for one version.
+func (f *fixture) ownerScope(versionID ArtifactVersionID) ContentScope {
+	return ContentScope{Kind: ContentScopeOwner, ID: "owner-principal-1", AvailabilityGeneration: 1}
+}
+
+// shareScope is the standard Share Grant availability scope for one version.
+func (f *fixture) shareScope(versionID ArtifactVersionID) ContentScope {
+	return ContentScope{Kind: ContentScopeShareLink, ID: "share-grant-1", AvailabilityGeneration: 5}
+}
+
+// breakGlassScope is the standard BreakGlass grant availability scope for
+// one version.
+func (f *fixture) breakGlassScope(versionID ArtifactVersionID) ContentScope {
+	return ContentScope{Kind: ContentScopeBreakGlass, ID: "break-glass-grant-1", AvailabilityGeneration: 3}
+}
+
+// registerScope records the current availability fact of one scope for one
+// exact version in the Identity & Ownership / Sharing double.
+func (f *fixture) registerScope(versionID ArtifactVersionID, scope ContentScope) {
+	f.scopes.register(f.scopeKey(versionID, scope.Kind, scope.ID), scope)
+}
+
+// revokeScope removes the current availability fact (revocation).
+func (f *fixture) revokeScope(versionID ArtifactVersionID, scope ContentScope) {
+	f.scopes.revoke(f.scopeKey(versionID, scope.Kind, scope.ID))
+}
+
+// rotateScope advances the availability generation (rotation/revocation
+// epoch advance).
+func (f *fixture) rotateScope(versionID ArtifactVersionID, scope ContentScope, generation Generation) {
+	f.scopes.rotate(f.scopeKey(versionID, scope.Kind, scope.ID), generation)
+}
+
+// platformAuthority is the Task Orchestration authority presented by the
+// Platform when selecting the exact Artifact Version for a C04
+// reconstruction capability.
+func (f *fixture) platformAuthority() PublicationAuthority {
+	return PublicationAuthority{
+		Kind: AuthorityTaskOrchestration, ID: f.taskOrchestrationAuthority, Generation: 1,
+	}
+}
+
+// resolveTarget drives the standard content-target resolution happy path
+// for the exact member of the activated version under the owner scope with
+// the download intent.
+func (f *fixture) resolveTarget(t *testing.T, versionID ArtifactVersionID, artifactID ArtifactID, scope ContentScope) *ArtifactContentTarget {
+	t.Helper()
+	view, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryResolveContentTarget, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+		ArtifactVersionID: versionID, ArtifactID: artifactID,
+		Scope: scope, ContentIntent: ContentIntentDownload,
+	})
+	if err != nil {
+		t.Fatalf("resolve content target: %v", err)
+	}
+	if view.ContentTarget == nil {
+		t.Fatal("resolve content target returned no target")
+	}
+	return view.ContentTarget
+}
+
+// verifyTarget drives content-target verification with the presented scope.
+func (f *fixture) verifyTarget(t *testing.T, target *ArtifactContentTarget, scope ContentScope) error {
+	t.Helper()
+	_, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryVerifyContentTarget, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+		Scope: scope, ContentTarget: target,
+	})
+	return err
+}
+
+// issueC04Capability drives the standard C04 reconstruction capability
+// issuance happy path: the Platform selects the exact version under the
+// owner scope with a future expiry.
+func (f *fixture) issueC04Capability(t *testing.T, versionID ArtifactVersionID, scope ContentScope, expiresAt Instant) *C04ReconstructionCapability {
+	t.Helper()
+	view, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryIssueC04ReconstructionCapability, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+		ArtifactVersionID: versionID, Scope: scope, ExpiresAt: expiresAt,
+		Authority: f.platformAuthority(),
+	})
+	if err != nil {
+		t.Fatalf("issue C04 reconstruction capability: %v", err)
+	}
+	if view.C04Capability == nil {
+		t.Fatal("issue C04 reconstruction capability returned no capability")
+	}
+	return view.C04Capability
+}
+
+// verifyC04Capability drives C04 capability verification with the presented
+// scope.
+func (f *fixture) verifyC04Capability(t *testing.T, capability *C04ReconstructionCapability, scope ContentScope) error {
+	t.Helper()
+	_, err := f.core.Query(context.Background(), PublicationQuery{
+		Kind: QueryVerifyC04ReconstructionCapability, PolicyDomainID: f.policyDomain, TaskID: f.taskID,
+		Scope: scope, C04Capability: capability,
+	})
+	return err
 }

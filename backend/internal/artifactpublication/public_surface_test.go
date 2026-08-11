@@ -111,6 +111,9 @@ func TestNoRepositoryOrActiveSetterCapability(t *testing.T) {
 		reflect.TypeOf(Lineage{}),
 		reflect.TypeOf(ArtifactMember{}),
 		reflect.TypeOf(ArtifactMemberView{}),
+		reflect.TypeOf(ArtifactContentTarget{}),
+		reflect.TypeOf(C04ReconstructionCapability{}),
+		reflect.TypeOf(ContentScope{}),
 	}
 	forbiddenFieldFragments := []string{
 		"path", "object_key", "objectkey", "bucket", "prefix", "mount",
